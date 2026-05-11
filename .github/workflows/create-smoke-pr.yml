@@ -1,0 +1,52 @@
+name: Create Smoke PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Upstream issue number this smoke PR is testing.
+        required: true
+        default: "789"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create bot-authored smoke PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+
+          branch="gha-smoke-${ISSUE_NUMBER}-${GITHUB_RUN_ID}"
+          path="docs/smoke-tests/review-followup-bot-${GITHUB_RUN_ID}.md"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+
+          mkdir -p "$(dirname "$path")"
+          {
+            echo "# Bot Smoke Test for #${ISSUE_NUMBER}"
+            echo
+            echo "This harmless fixture creates a bot-authored PR for testing review follow-up issue creation."
+            echo
+            echo "Related upstream issue: fullsend-ai/fullsend#${ISSUE_NUMBER}."
+          } > "$path"
+
+          git add "$path"
+          git commit -m "Add bot smoke test fixture for #${ISSUE_NUMBER}"
+          git push origin "$branch"
+
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Bot smoke test review follow-up issues for #${ISSUE_NUMBER}" \
+            --body "Smoke-test fixture for validating review follow-up issue creation. Related upstream issue: fullsend-ai/fullsend#${ISSUE_NUMBER}."
