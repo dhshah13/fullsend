@@ -238,6 +238,15 @@ func TestValidateRunnerEnv_LiteralValue(t *testing.T) {
 	require.NoError(t, h.ValidateRunnerEnv())
 }
 
+func TestValidateRunnerEnv_EmptyVarAllowed(t *testing.T) {
+	t.Setenv("EMPTY_ALLOWED_VAR", "")
+	h := &Harness{
+		Agent:     "test.md",
+		RunnerEnv: map[string]string{"KEY": "${EMPTY_ALLOWED_VAR}"},
+	}
+	require.NoError(t, h.ValidateRunnerEnv())
+}
+
 // --- Security config tests ---
 
 func TestSecurityEnabled_Default(t *testing.T) {
@@ -481,6 +490,61 @@ func TestValidate_NegativeTimeout(t *testing.T) {
 	assert.Contains(t, err.Error(), "timeout_minutes must be non-negative")
 }
 
+func TestValidate_NegativeSandboxTimeout(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: -1}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sandbox_timeout_seconds must be 0 (default) or between 30 and 600")
+}
+
+func TestValidate_SandboxTimeoutTooSmall(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 10}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sandbox_timeout_seconds must be 0 (default) or between 30 and 600")
+}
+
+func TestValidate_SandboxTimeoutTooLarge(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 601}
+	err := h.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sandbox_timeout_seconds must be 0 (default) or between 30 and 600")
+}
+
+func TestValidate_SandboxTimeoutAtMin(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 30}
+	require.NoError(t, h.Validate())
+}
+
+func TestValidate_SandboxTimeoutAtMax(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 600}
+	require.NoError(t, h.Validate())
+}
+
+func TestValidate_ZeroSandboxTimeout(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 0}
+	require.NoError(t, h.Validate())
+}
+
+func TestValidate_PositiveSandboxTimeout(t *testing.T) {
+	h := &Harness{Agent: "agents/test.md", SandboxTimeoutSeconds: 180}
+	require.NoError(t, h.Validate())
+}
+
+func TestLoad_SandboxTimeoutField(t *testing.T) {
+	content := `
+agent: agents/test.md
+sandbox_timeout_seconds: 180
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	h, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 180, h.SandboxTimeoutSeconds)
+}
+
 func TestLoad_ModelField(t *testing.T) {
 	content := `
 agent: agents/test.md
@@ -531,6 +595,76 @@ func TestValidateFilesExist_SkipsVarPaths(t *testing.T) {
 	require.NoError(t, h.ValidateFilesExist())
 }
 
+func TestValidate_PluginNameValid(t *testing.T) {
+	h := &Harness{
+		Agent:   "agents/test.md",
+		Plugins: []string{"plugins/gopls-lsp", "plugins/my_plugin-2"},
+	}
+	require.NoError(t, h.Validate())
+}
+
+func TestValidate_PluginNameInvalid(t *testing.T) {
+	for _, name := range []string{"my plugin", "foo;bar", "bad@name"} {
+		h := &Harness{
+			Agent:   "agents/test.md",
+			Plugins: []string{"plugins/" + name},
+		}
+		err := h.Validate()
+		require.Error(t, err, "expected error for plugin name %q", name)
+		assert.Contains(t, err.Error(), "contains invalid characters")
+	}
+}
+
+func TestResolveRelativeTo_Plugins(t *testing.T) {
+	h := &Harness{
+		Agent:   "agents/test.md",
+		Plugins: []string{"plugins/gopls-lsp"},
+	}
+	require.NoError(t, h.ResolveRelativeTo("/base/dir"))
+	assert.Equal(t, []string{"/base/dir/plugins/gopls-lsp"}, h.Plugins)
+}
+
+func TestResolveRelativeTo_PluginTraversalRejected(t *testing.T) {
+	h := &Harness{
+		Agent:   "agents/test.md",
+		Plugins: []string{"../../etc/evil"},
+	}
+	err := h.ResolveRelativeTo("/base/dir")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolves outside fullsend directory")
+}
+
+func TestResolveRelativeTo_URLsUnchanged(t *testing.T) {
+	agentURL := "https://example.com/agents/code.md#sha256=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	skillURL := "https://example.com/skills/review.md#sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	h := &Harness{
+		Agent:  agentURL,
+		Policy: "policies/readonly.yaml",
+		Skills: []string{"skills/local-skill", skillURL},
+	}
+
+	require.NoError(t, h.ResolveRelativeTo("/base/dir"))
+
+	assert.Equal(t, agentURL, h.Agent)
+	assert.Equal(t, skillURL, h.Skills[1])
+	assert.Equal(t, "/base/dir/policies/readonly.yaml", h.Policy)
+	assert.Equal(t, "/base/dir/skills/local-skill", h.Skills[0])
+}
+
+func TestValidateFilesExist_MissingPlugin(t *testing.T) {
+	dir := t.TempDir()
+	agentFile := filepath.Join(dir, "agent.md")
+	require.NoError(t, os.WriteFile(agentFile, []byte("agent"), 0o644))
+
+	h := &Harness{
+		Agent:   agentFile,
+		Plugins: []string{"/nonexistent/plugin"},
+	}
+	err := h.ValidateFilesExist()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plugins[0]")
+}
+
 func TestValidateFilesExist_SkipsOptionalPaths(t *testing.T) {
 	dir := t.TempDir()
 	agentFile := filepath.Join(dir, "agent.md")
@@ -544,4 +678,398 @@ func TestValidateFilesExist_SkipsOptionalPaths(t *testing.T) {
 	}
 	// Should not error — optional host files may not exist until runtime.
 	require.NoError(t, h.ValidateFilesExist())
+}
+
+// --- AllowedRemoteResources tests ---
+
+func TestHarness_AllowedRemoteResources_Parse(t *testing.T) {
+	t.Run("with allowed_remote_resources", func(t *testing.T) {
+		content := `
+agent: agents/test.md
+allowed_remote_resources:
+  - https://example.com/skills/
+  - https://cdn.example.com/policies/
+`
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+		h, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"https://example.com/skills/", "https://cdn.example.com/policies/"}, h.AllowedRemoteResources)
+	})
+
+	t.Run("without allowed_remote_resources", func(t *testing.T) {
+		content := `
+agent: agents/test.md
+`
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+		h, err := Load(path)
+		require.NoError(t, err)
+		assert.Empty(t, h.AllowedRemoteResources)
+	})
+}
+
+func TestValidateAllowedRemoteResources(t *testing.T) {
+	t.Run("valid entries with matching org allowlist", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://example.com/skills/",
+				"https://cdn.example.com/policies/",
+			},
+		}
+		orgAllowlist := []string{
+			"https://example.com/",
+			"https://cdn.example.com/policies/",
+		}
+		require.NoError(t, h.ValidateAllowedRemoteResources(orgAllowlist))
+	})
+
+	t.Run("non-HTTPS entry", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"http://example.com/skills/",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"http://example.com/"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not a valid HTTPS URL")
+	})
+
+	t.Run("missing trailing slash", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://example.com/skills",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"https://example.com/"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must end with /")
+	})
+
+	t.Run("entry not covered by org allowlist", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://evil.com/skills/",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"https://example.com/"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not covered by the org allowlist")
+	})
+
+	t.Run("org entry without trailing slash", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://example.com/skills/",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"https://example.com"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "org allowlist")
+		assert.Contains(t, err.Error(), "must end with /")
+	})
+
+	t.Run("org entry non-HTTPS", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://example.com/skills/",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"http://example.com/"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "org allowlist")
+		assert.Contains(t, err.Error(), "not a valid HTTPS URL")
+	})
+
+	t.Run("org entry with double encoding", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://example.com/skills/",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"https://example.com/%252f/"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "double-encoded")
+	})
+
+	t.Run("harness entry with double encoding", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://example.com/%252fskills/",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"https://example.com/"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "double-encoded")
+	})
+
+	t.Run("org entry without trailing slash enables domain confusion", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://example.com.evil.com/",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"https://example.com/"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not covered by the org allowlist")
+	})
+
+	t.Run("percent-encoded traversal not covered", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			AllowedRemoteResources: []string{
+				"https://example.com/skills/%2e%2e/evil/",
+			},
+		}
+		err := h.ValidateAllowedRemoteResources([]string{"https://example.com/skills/"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not covered by the org allowlist")
+	})
+}
+
+func TestValidateResourceTypes(t *testing.T) {
+	t.Run("URL in pre_script", func(t *testing.T) {
+		h := &Harness{
+			Agent:     "agents/test.md",
+			PreScript: "https://example.com/scripts/pre.sh",
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be a local path")
+	})
+
+	t.Run("URL in post_script", func(t *testing.T) {
+		h := &Harness{
+			Agent:      "agents/test.md",
+			PostScript: "https://example.com/scripts/post.sh",
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be a local path")
+	})
+
+	t.Run("URL in agent without hash", func(t *testing.T) {
+		h := &Harness{
+			Agent: "https://example.com/agents/test.md",
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "integrity hash")
+	})
+
+	t.Run("URL in agent with valid hash", func(t *testing.T) {
+		h := &Harness{
+			Agent: "https://example.com/agents/test.md#sha256=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+		}
+		require.NoError(t, h.ValidateResourceTypes())
+	})
+
+	t.Run("all-local harness", func(t *testing.T) {
+		h := &Harness{
+			Agent:      "agents/test.md",
+			Policy:     "policies/readonly.yaml",
+			Skills:     []string{"skills/summarize"},
+			PreScript:  "scripts/pre.sh",
+			PostScript: "scripts/post.sh",
+			HostFiles:  []HostFile{{Src: "/etc/ssl/certs/ca.crt", Dest: "/tmp/ca.crt"}},
+			APIServers: []APIServer{{Name: "api", Script: "scripts/api.sh", Port: 8080}},
+			ValidationLoop: &ValidationLoop{
+				Script:        "scripts/validate.sh",
+				MaxIterations: 1,
+			},
+		}
+		require.NoError(t, h.ValidateResourceTypes())
+	})
+
+	t.Run("URL in skills without hash", func(t *testing.T) {
+		h := &Harness{
+			Agent:  "agents/test.md",
+			Skills: []string{"https://example.com/skills/summarize.md"},
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "integrity hash")
+	})
+
+	t.Run("URL in validation_loop.script", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			ValidationLoop: &ValidationLoop{
+				Script:        "https://example.com/scripts/validate.sh",
+				MaxIterations: 1,
+			},
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be a local path")
+	})
+
+	t.Run("URL in host_files src", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			HostFiles: []HostFile{
+				{Src: "https://example.com/file.txt", Dest: "/tmp/file.txt"},
+			},
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be a local path")
+	})
+
+	t.Run("URL in api_servers script", func(t *testing.T) {
+		h := &Harness{
+			Agent: "agents/test.md",
+			APIServers: []APIServer{
+				{Name: "api", Script: "https://example.com/api.sh", Port: 8080},
+			},
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be a local path")
+	})
+
+	t.Run("URL in agent_input", func(t *testing.T) {
+		h := &Harness{
+			Agent:      "agents/test.md",
+			AgentInput: "https://example.com/input.txt",
+		}
+		err := h.ValidateResourceTypes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "agent_input must be a local path")
+	})
+}
+
+func TestHasURLReferences(t *testing.T) {
+	tests := []struct {
+		name string
+		h    Harness
+		want bool
+	}{
+		{
+			name: "local only",
+			h:    Harness{Agent: "agents/test.md", Policy: "policies/p.yaml", Skills: []string{"skills/a"}},
+			want: false,
+		},
+		{
+			name: "empty fields",
+			h:    Harness{Agent: "agents/test.md"},
+			want: false,
+		},
+		{
+			name: "URL agent",
+			h:    Harness{Agent: "https://example.com/agents/test.md#sha256=abc"},
+			want: true,
+		},
+		{
+			name: "URL policy",
+			h:    Harness{Agent: "agents/test.md", Policy: "https://example.com/p.yaml#sha256=abc"},
+			want: true,
+		},
+		{
+			name: "URL skill",
+			h:    Harness{Agent: "agents/test.md", Skills: []string{"skills/a", "https://example.com/s.md#sha256=abc"}},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.h.HasURLReferences())
+		})
+	}
+}
+
+func TestMatchesAllowedPrefix(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		AllowedRemoteResources: []string{
+			"https://example.com/skills/",
+			"https://cdn.example.com/policies/",
+		},
+	}
+
+	t.Run("matching URL", func(t *testing.T) {
+		assert.True(t, h.MatchesAllowedPrefix("https://example.com/skills/summarize.md"))
+	})
+
+	t.Run("non-matching URL", func(t *testing.T) {
+		assert.False(t, h.MatchesAllowedPrefix("https://evil.com/skills/summarize.md"))
+	})
+
+	t.Run("double-encoded URL", func(t *testing.T) {
+		assert.False(t, h.MatchesAllowedPrefix("https://example.com/skills/%2561gent.md"))
+	})
+
+	t.Run("case-insensitive match", func(t *testing.T) {
+		assert.True(t, h.MatchesAllowedPrefix("https://EXAMPLE.COM/skills/summarize.md"))
+	})
+
+	t.Run("path traversal rejected", func(t *testing.T) {
+		assert.False(t, h.MatchesAllowedPrefix("https://example.com/skills/../evil/payload"))
+	})
+
+	t.Run("dot segment in matching path", func(t *testing.T) {
+		assert.True(t, h.MatchesAllowedPrefix("https://example.com/skills/./summarize.md"))
+	})
+
+	t.Run("percent-encoded traversal rejected", func(t *testing.T) {
+		assert.False(t, h.MatchesAllowedPrefix("https://example.com/skills/%2e%2e/evil/payload"))
+	})
+
+	t.Run("percent-encoded dot segment in matching path", func(t *testing.T) {
+		assert.True(t, h.MatchesAllowedPrefix("https://example.com/skills/%2e/summarize.md"))
+	})
+
+	t.Run("backslash traversal rejected", func(t *testing.T) {
+		assert.False(t, h.MatchesAllowedPrefix(`https://example.com/skills\..\secret`))
+	})
+
+	t.Run("trailing slash from query not path", func(t *testing.T) {
+		assert.False(t, h.MatchesAllowedPrefix("https://evil.com/path?ref=v1/"))
+	})
+}
+
+func TestMatchingAllowedPrefix(t *testing.T) {
+	h := &Harness{
+		Agent: "agents/test.md",
+		AllowedRemoteResources: []string{
+			"https://example.com/skills/",
+			"https://cdn.example.com/policies/",
+		},
+	}
+
+	t.Run("returns matching prefix", func(t *testing.T) {
+		assert.Equal(t, "https://example.com/skills/", h.MatchingAllowedPrefix("https://example.com/skills/summarize.md"))
+	})
+
+	t.Run("returns second prefix when matched", func(t *testing.T) {
+		assert.Equal(t, "https://cdn.example.com/policies/", h.MatchingAllowedPrefix("https://cdn.example.com/policies/readonly.yaml"))
+	})
+
+	t.Run("returns empty for non-matching URL", func(t *testing.T) {
+		assert.Equal(t, "", h.MatchingAllowedPrefix("https://evil.com/skills/summarize.md"))
+	})
+
+	t.Run("returns empty for path traversal", func(t *testing.T) {
+		assert.Equal(t, "", h.MatchingAllowedPrefix("https://example.com/skills/../evil/payload"))
+	})
+
+	t.Run("preserves original prefix casing", func(t *testing.T) {
+		h2 := &Harness{
+			AllowedRemoteResources: []string{"https://Example.Com/Skills/"},
+		}
+		assert.Equal(t, "https://Example.Com/Skills/", h2.MatchingAllowedPrefix("https://example.com/skills/test.md"))
+	})
 }

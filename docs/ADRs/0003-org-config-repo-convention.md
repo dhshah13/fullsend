@@ -1,6 +1,6 @@
 ---
 title: "3. Org-level configuration lives in a conventional repo"
-status: Proposed
+status: Accepted
 relates_to:
   - governance
   - codebase-context
@@ -20,7 +20,7 @@ Date: 2026-03-25
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -179,6 +179,14 @@ The convention is:
    exclude bot/service accounts from write access and require human approval
    via CODEOWNERS on all paths. This aligns with the principle that CODEOWNERS
    files are always human-owned.
+5. **The `.fullsend` repo is public by default.** Cross-repo `workflow_call`
+   only works reliably when the called repo is public, across all GitHub plan
+   tiers (free, team, enterprise). If made private, only other private repos
+   can trigger workflows — public and internal repos fail silently. The repo
+   contains only open-source orchestration scaffolding (workflows, agent
+   definitions, harness configs). Org-specific private knowledge (custom
+   skills, proprietary prompts) belongs in a separate private repo that
+   agents pull from at runtime.
 
 ### Repo structure (initial)
 

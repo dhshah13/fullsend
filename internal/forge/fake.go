@@ -16,6 +16,7 @@ func NewFakeClient() *FakeClient {
 		WorkflowRuns:   make(map[string]*WorkflowRun),
 		Secrets:        make(map[string]bool),
 		VariablesExist: make(map[string]bool),
+		VariableValues: make(map[string]string),
 		Errors:         make(map[string]error),
 	}
 }
@@ -37,6 +38,12 @@ type OrgSecretRecord struct {
 	RepoIDs          []int64
 }
 
+// OrgVariableRecord records an org-level variable creation/update call.
+type OrgVariableRecord struct {
+	Org, Name, Value string
+	RepoIDs          []int64
+}
+
 // VariableRecord records a variable creation/update call.
 type VariableRecord struct {
 	Owner, Repo, Name, Value string
@@ -47,6 +54,14 @@ type UpdatedCommentRecord struct {
 	Owner, Repo string
 	CommentID   int
 	Body        string
+}
+
+// CreatedIssueRecord records an issue creation call.
+type CreatedIssueRecord struct {
+	Owner, Repo string
+	Title, Body string
+	Labels      []string
+	Number      int
 }
 
 // MinimizedCommentRecord records a comment minimize call.
@@ -61,6 +76,7 @@ type ReviewRecord struct {
 	Number      int
 	Event, Body string
 	CommitSHA   string
+	Comments    []ReviewComment
 }
 
 // DismissedReviewRecord records a review dismissal call.
@@ -88,11 +104,13 @@ type FakeClient struct {
 	FileContents      map[string][]byte       // key: "owner/repo/path"
 	WorkflowRuns      map[string]*WorkflowRun // key: "owner/repo/workflow"
 	AuthenticatedUser string
+	OrgPlan           string // plan name returned by GetOrgPlan (default: "free")
 	Installations     []Installation
 	Secrets           map[string]bool             // key: "owner/repo/name"
 	PullRequests      map[string][]ChangeProposal // key: "owner/repo"
 	TokenScopes       []string                    // scopes returned by GetTokenScopes
 	VariablesExist    map[string]bool             // key: "owner/repo/name"
+	VariableValues    map[string]string           // key: "owner/repo/name"
 
 	// App client IDs for GetAppClientID
 	AppClientIDs map[string]string // key: app slug → client ID
@@ -101,11 +119,17 @@ type FakeClient struct {
 	OrgSecrets       map[string]bool    // key: "org/name"
 	OrgSecretRepoIDs map[string][]int64 // key: "org/name" → repo IDs
 
+	// Org-level variable state
+	OrgVariables       map[string]bool    // key: "org/name"
+	OrgVariableValues  map[string]string  // key: "org/name" → value
+	OrgVariableRepoIDs map[string][]int64 // key: "org/name" → repo IDs
+
 	// Error injection: key is method name, value is error to return.
 	Errors map[string]error
 
 	// Issue comments for ListIssueComments / UpdateIssueComment.
 	IssueComments map[string][]IssueComment // key: "owner/repo/number"
+	OpenIssues    map[string][]Issue        // key: "owner/repo"
 
 	// CommitFilesChanged controls the return value of CommitFiles (default true).
 	CommitFilesChanged *bool
@@ -113,29 +137,43 @@ type FakeClient struct {
 	// Pull request head SHA for GetPullRequestHeadSHA.
 	PullRequestHeadSHA string
 
+	// Pull request files for ListPullRequestFiles.
+	PRFiles map[string][]string // key: "owner/repo/number"
+
+	// Pull request file diffs for ListPullRequestFileDiffs.
+	PRFileDiffs map[string][]PullRequestFileDiff // key: "owner/repo/number"
+
 	// Pull request reviews for ListPullRequestReviews.
 	PRReviews map[string][]PullRequestReview // key: "owner/repo/number"
 
+	// Annotations for GetWorkflowRunAnnotations.
+	Annotations []Annotation
+
 	// Call recorders
-	CreatedRepos      []Repository
-	CreatedFiles      []FileRecord
-	CreatedBranches   []string // "owner/repo/branch"
-	CreatedProposals  []ChangeProposal
-	DeletedRepos      []string // "owner/repo"
-	DeletedFiles      []FileRecord
-	CreatedSecrets    []SecretRecord
-	Variables         []VariableRecord
-	DeletedOrgSecrets []string // "org/name"
-	CreatedOrgSecrets []OrgSecretRecord
-	UpdatedComments   []UpdatedCommentRecord
-	MinimizedComments []MinimizedCommentRecord
-	CreatedReviews    []ReviewRecord
-	DismissedReviews  []DismissedReviewRecord
-	CommittedFiles    []CommitFilesRecord
+	CreatedRepos        []Repository
+	CreatedFiles        []FileRecord
+	CreatedBranches     []string // "owner/repo/branch"
+	CreatedProposals    []ChangeProposal
+	DeletedRepos        []string // "owner/repo"
+	DeletedFiles        []FileRecord
+	CreatedSecrets      []SecretRecord
+	Variables           []VariableRecord
+	DeletedOrgSecrets   []string // "org/name"
+	CreatedOrgSecrets   []OrgSecretRecord
+	CreatedOrgVariables []OrgVariableRecord
+	DeletedOrgVariables []string // "org/name"
+	CreatedIssues       []CreatedIssueRecord
+	UpdatedComments     []UpdatedCommentRecord
+	MinimizedComments   []MinimizedCommentRecord
+	CreatedReviews      []ReviewRecord
+	DismissedReviews    []DismissedReviewRecord
+	CommittedFiles      []CommitFilesRecord
+	DeletedComments []int // comment IDs
 
 	// internal counters
 	proposalCounter int
 	commentCounter  int
+	issueCounter    int
 }
 
 // err checks for an injected error for the given method name.
@@ -156,7 +194,7 @@ func (f *FakeClient) ListOrgRepos(_ context.Context, _ string) ([]Repository, er
 
 	var result []Repository
 	for _, r := range f.Repos {
-		if r.Archived || r.Fork {
+		if r.Archived || r.Fork || r.Private {
 			continue
 		}
 		result = append(result, r)
@@ -175,13 +213,13 @@ func (f *FakeClient) CreateRepo(_ context.Context, org, name, description string
 	fullName := org + "/" + name
 	// Check for duplicates in pre-populated repos.
 	for _, r := range f.Repos {
-		if r.FullName == fullName || r.Name == name {
+		if r.FullName == fullName {
 			return nil, fmt.Errorf("repository already exists: %s", fullName)
 		}
 	}
 	// Check for duplicates in previously created repos.
 	for _, r := range f.CreatedRepos {
-		if r.FullName == fullName || r.Name == name {
+		if r.FullName == fullName {
 			return nil, fmt.Errorf("repository already exists: %s", fullName)
 		}
 	}
@@ -204,14 +242,15 @@ func (f *FakeClient) GetRepo(_ context.Context, owner, repo string) (*Repository
 		return nil, e
 	}
 
+	fullName := owner + "/" + repo
 	for i := range f.Repos {
-		if f.Repos[i].FullName == owner+"/"+repo || f.Repos[i].Name == repo {
+		if f.Repos[i].FullName == fullName {
 			return &f.Repos[i], nil
 		}
 	}
 	// Also check created repos.
 	for i := range f.CreatedRepos {
-		if f.CreatedRepos[i].FullName == owner+"/"+repo || f.CreatedRepos[i].Name == repo {
+		if f.CreatedRepos[i].FullName == fullName {
 			return &f.CreatedRepos[i], nil
 		}
 	}
@@ -232,7 +271,7 @@ func (f *FakeClient) DeleteRepo(_ context.Context, owner, repo string) error {
 	fullName := owner + "/" + repo
 	filtered := f.Repos[:0]
 	for _, r := range f.Repos {
-		if r.FullName != fullName && r.Name != repo {
+		if r.FullName != fullName {
 			filtered = append(filtered, r)
 		}
 	}
@@ -241,7 +280,7 @@ func (f *FakeClient) DeleteRepo(_ context.Context, owner, repo string) error {
 	// Remove from CreatedRepos.
 	filteredCreated := f.CreatedRepos[:0]
 	for _, r := range f.CreatedRepos {
-		if r.FullName != fullName && r.Name != repo {
+		if r.FullName != fullName {
 			filteredCreated = append(filteredCreated, r)
 		}
 	}
@@ -458,6 +497,20 @@ func (f *FakeClient) ListRepoPullRequests(_ context.Context, owner, repo string)
 	return []ChangeProposal{}, nil
 }
 
+func (f *FakeClient) GetOrgPlan(_ context.Context, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if e := f.err("GetOrgPlan"); e != nil {
+		return "", e
+	}
+
+	if f.OrgPlan == "" {
+		return "free", nil
+	}
+	return f.OrgPlan, nil
+}
+
 func (f *FakeClient) GetAuthenticatedUser(_ context.Context) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -494,6 +547,10 @@ func (f *FakeClient) CreateRepoSecret(_ context.Context, owner, repo, name, valu
 		Name:  name,
 		Value: value,
 	})
+	if f.Secrets == nil {
+		f.Secrets = make(map[string]bool)
+	}
+	f.Secrets[owner+"/"+repo+"/"+name] = true
 	return nil
 }
 
@@ -542,6 +599,22 @@ func (f *FakeClient) RepoVariableExists(_ context.Context, owner, repo, name str
 	return f.VariablesExist[owner+"/"+repo+"/"+name], nil
 }
 
+func (f *FakeClient) GetRepoVariable(_ context.Context, owner, repo, name string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if e := f.err("GetRepoVariable"); e != nil {
+		return "", false, e
+	}
+
+	if f.VariableValues != nil {
+		if val, ok := f.VariableValues[owner+"/"+repo+"/"+name]; ok {
+			return val, true, nil
+		}
+	}
+	return "", false, nil
+}
+
 func (f *FakeClient) GetLatestWorkflowRun(_ context.Context, owner, repo, workflowFile string) (*WorkflowRun, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -585,19 +658,75 @@ func (f *FakeClient) DispatchWorkflow(_ context.Context, _, _, _, _ string, _ ma
 	return nil
 }
 
-func (f *FakeClient) CreateIssue(_ context.Context, _, _, _, _ string) (*Issue, error) {
+func (f *FakeClient) CreateIssue(_ context.Context, owner, repo, title, body string, labels ...string) (*Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if e := f.err("CreateIssue"); e != nil {
 		return nil, e
 	}
-	return &Issue{Number: 1, Title: "fake", URL: "https://fake"}, nil
+	f.issueCounter++
+	issue := Issue{
+		Number: f.issueCounter,
+		Title:  title,
+		Body:   body,
+		URL:    fmt.Sprintf("https://github.com/%s/%s/issues/%d", owner, repo, f.issueCounter),
+		Labels: append([]string(nil), labels...),
+	}
+	f.CreatedIssues = append(f.CreatedIssues, CreatedIssueRecord{
+		Owner:  owner,
+		Repo:   repo,
+		Title:  title,
+		Body:   body,
+		Labels: append([]string(nil), labels...),
+		Number: issue.Number,
+	})
+	key := owner + "/" + repo
+	if f.OpenIssues == nil {
+		f.OpenIssues = make(map[string][]Issue)
+	}
+	f.OpenIssues[key] = append(f.OpenIssues[key], issue)
+	return &issue, nil
 }
 
 func (f *FakeClient) CloseIssue(_ context.Context, _, _ string, _ int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.err("CloseIssue")
+}
+
+func (f *FakeClient) ListOpenIssues(_ context.Context, owner, repo string, labels ...string) ([]Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e := f.err("ListOpenIssues"); e != nil {
+		return nil, e
+	}
+	if f.OpenIssues == nil {
+		return nil, nil
+	}
+	issues := f.OpenIssues[owner+"/"+repo]
+	if len(labels) == 0 {
+		return append([]Issue(nil), issues...), nil
+	}
+	filtered := make([]Issue, 0, len(issues))
+	for _, issue := range issues {
+		if issueHasLabels(issue, labels) {
+			filtered = append(filtered, issue)
+		}
+	}
+	return filtered, nil
+}
+
+func issueHasLabels(issue Issue, labels []string) bool {
+	present := make(map[string]struct{}, len(issue.Labels))
+	for _, label := range issue.Labels {
+		present[label] = struct{}{}
+	}
+	for _, label := range labels {
+		if _, ok := present[label]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *FakeClient) ListIssueComments(_ context.Context, owner, repo string, number int) ([]IssueComment, error) {
@@ -661,6 +790,24 @@ func (f *FakeClient) UpdateIssueComment(_ context.Context, owner, repo string, c
 	return nil
 }
 
+func (f *FakeClient) DeleteIssueComment(_ context.Context, _, _ string, commentID int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e := f.err("DeleteIssueComment"); e != nil {
+		return e
+	}
+	f.DeletedComments = append(f.DeletedComments, commentID)
+	for key, comments := range f.IssueComments {
+		for i, c := range comments {
+			if c.ID == commentID {
+				f.IssueComments[key] = append(comments[:i], comments[i+1:]...)
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
 func (f *FakeClient) MinimizeComment(_ context.Context, nodeID, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -683,7 +830,37 @@ func (f *FakeClient) GetPullRequestHeadSHA(_ context.Context, _, _ string, _ int
 	return f.PullRequestHeadSHA, nil
 }
 
-func (f *FakeClient) CreatePullRequestReview(_ context.Context, owner, repo string, number int, event, body, commitSHA string) error {
+func (f *FakeClient) ListPullRequestFiles(_ context.Context, owner, repo string, number int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e := f.err("ListPullRequestFiles"); e != nil {
+		return nil, e
+	}
+	if f.PRFiles != nil {
+		key := fmt.Sprintf("%s/%s/%d", owner, repo, number)
+		if files, ok := f.PRFiles[key]; ok {
+			return files, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *FakeClient) ListPullRequestFileDiffs(_ context.Context, owner, repo string, number int) ([]PullRequestFileDiff, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e := f.err("ListPullRequestFileDiffs"); e != nil {
+		return nil, e
+	}
+	if f.PRFileDiffs != nil {
+		key := fmt.Sprintf("%s/%s/%d", owner, repo, number)
+		if files, ok := f.PRFileDiffs[key]; ok {
+			return files, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f *FakeClient) CreatePullRequestReview(_ context.Context, owner, repo string, number int, event, body, commitSHA string, comments []ReviewComment) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if e := f.err("CreatePullRequestReview"); e != nil {
@@ -696,6 +873,7 @@ func (f *FakeClient) CreatePullRequestReview(_ context.Context, owner, repo stri
 		Event:     event,
 		Body:      body,
 		CommitSHA: commitSHA,
+		Comments:  comments,
 	})
 
 	review := PullRequestReview{
@@ -779,6 +957,15 @@ func (f *FakeClient) GetWorkflowRunLogs(_ context.Context, _, _ string, _ int) (
 		return "", e
 	}
 	return "[fake workflow logs]", nil
+}
+
+func (f *FakeClient) GetWorkflowRunAnnotations(_ context.Context, _, _ string, _ int) ([]Annotation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e := f.err("GetWorkflowRunAnnotations"); e != nil {
+		return nil, e
+	}
+	return f.Annotations, nil
 }
 
 func (f *FakeClient) ListOrgInstallations(_ context.Context, _ string) ([]Installation, error) {
@@ -883,4 +1070,92 @@ func (f *FakeClient) GetOrgSecretRepos(_ context.Context, org, name string) ([]i
 		return nil, nil
 	}
 	return f.OrgSecretRepoIDs[org+"/"+name], nil
+}
+
+func (f *FakeClient) CreateOrUpdateOrgVariable(_ context.Context, org, name, value string, selectedRepoIDs []int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if e := f.err("CreateOrUpdateOrgVariable"); e != nil {
+		return e
+	}
+
+	f.CreatedOrgVariables = append(f.CreatedOrgVariables, OrgVariableRecord{
+		Org:     org,
+		Name:    name,
+		Value:   value,
+		RepoIDs: selectedRepoIDs,
+	})
+
+	if f.OrgVariables == nil {
+		f.OrgVariables = make(map[string]bool)
+	}
+	f.OrgVariables[org+"/"+name] = true
+
+	if f.OrgVariableValues == nil {
+		f.OrgVariableValues = make(map[string]string)
+	}
+	f.OrgVariableValues[org+"/"+name] = value
+
+	if f.OrgVariableRepoIDs == nil {
+		f.OrgVariableRepoIDs = make(map[string][]int64)
+	}
+	f.OrgVariableRepoIDs[org+"/"+name] = selectedRepoIDs
+	return nil
+}
+
+func (f *FakeClient) OrgVariableExists(_ context.Context, org, name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if e := f.err("OrgVariableExists"); e != nil {
+		return false, e
+	}
+
+	if f.OrgVariables == nil {
+		return false, nil
+	}
+	return f.OrgVariables[org+"/"+name], nil
+}
+
+func (f *FakeClient) SetOrgVariableRepos(_ context.Context, org, name string, repoIDs []int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if e := f.err("SetOrgVariableRepos"); e != nil {
+		return e
+	}
+
+	if f.OrgVariableRepoIDs == nil {
+		f.OrgVariableRepoIDs = make(map[string][]int64)
+	}
+	f.OrgVariableRepoIDs[org+"/"+name] = repoIDs
+	return nil
+}
+
+func (f *FakeClient) GetOrgVariableRepos(_ context.Context, org, name string) ([]int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if e := f.err("GetOrgVariableRepos"); e != nil {
+		return nil, e
+	}
+
+	if f.OrgVariableRepoIDs == nil {
+		return nil, nil
+	}
+	return f.OrgVariableRepoIDs[org+"/"+name], nil
+}
+
+func (f *FakeClient) DeleteOrgVariable(_ context.Context, org, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if e := f.err("DeleteOrgVariable"); e != nil {
+		return e
+	}
+
+	f.DeletedOrgVariables = append(f.DeletedOrgVariables, org+"/"+name)
+	delete(f.OrgVariables, org+"/"+name)
+	return nil
 }

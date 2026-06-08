@@ -47,7 +47,7 @@ understand what is true *now*, without tracing a chain of ADRs.
 ## When to Use
 
 - A specific decision has emerged from discussion in a problem doc
-- You need to frame an upcoming decision (Undecided status)
+- You need to frame an upcoming decision
 - An ADR has been accepted and living documents need updating
 
 Do NOT use for open-ended exploration -- that belongs in problem docs.
@@ -124,9 +124,8 @@ Follow these steps in order:
    the `title` field and the `# heading` must have **no leading zeros**
    (e.g., `"1. Use ADRs"`, not `"0001. Use ADRs"`). The four-digit
    zero-padded format is only for filenames.
-4. **Choose the right status.** Use **Proposed** for a draft awaiting
-   discussion. Use **Undecided** when the problem is identified but no choice
-   has been made. Use **Accepted** when the decision is made. Include an
+4. **Choose the right status.** Use **Accepted** when the decision is made.
+   Use **Deprecated** or **Superseded** when retiring an ADR. Include an
    Options section only when there are genuine alternatives worth documenting;
    if the decision is obvious, just decide it.
 5. **Write the ADR.** Follow the conciseness rules above.

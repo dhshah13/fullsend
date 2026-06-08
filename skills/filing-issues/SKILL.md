@@ -119,6 +119,38 @@ EOF
 
 Return the issue URL to the user.
 
+#### Sub-issues (parent / child in GitHub)
+
+When the user wants a **child issue under a parent** (epic, breakdown, hierarchy),
+GitHub’s **sub-issue relationship is not created by the issue body**. Text like
+“Part of #N” or cross-links is optional for readers only; the graph stays flat
+without an API call.
+
+After creating the parent and child (parent first, then child), link them with
+the **REST sub-issues API**:
+
+1. Resolve the child’s **database `id`** (integer), which is **not** the issue
+   `number`, and assign it (example: `CHILD_ID=$(gh api ... --jq .id)`):
+   ```bash
+   CHILD_ID=$(gh api repos/<owner>/<name>/issues/<child_number> --jq .id)
+   ```
+2. Attach the child to the parent:
+   ```bash
+   echo "{\"sub_issue_id\": $CHILD_ID}" | gh api repos/<owner>/<name>/issues/<parent_number>/sub_issues \
+     --method POST --input -
+   ```
+   Use `"replace_parent": true` in the JSON body only when moving a child that
+   already has a parent.
+3. Confirm:
+   ```bash
+   gh api repos/<owner>/<name>/issues/<child_number>/parent
+   ```
+
+**GraphQL (alternative):** `addSubIssue` with parent and child node IDs, or
+`createIssue` with `parentIssueId` when the child is created in the same step.
+
+Do this **after** each `gh issue create` succeeds; then return all issue URLs.
+
 ## Constraints
 
 - **Never file without user approval.** Always present the draft and wait.
@@ -127,3 +159,5 @@ Return the issue URL to the user.
   numbers, error messages, or reproduction steps.
 - **Respect the repo's conventions.** If existing issues use a template or
   follow a pattern, match it. Check `.github/ISSUE_TEMPLATE/` if it exists.
+- **Sub-issues:** If there is a parent/child hierarchy, use GitHub’s sub-issue
+  API after creation; do not rely on body mentions alone.

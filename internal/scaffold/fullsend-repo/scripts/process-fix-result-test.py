@@ -196,7 +196,8 @@ class TestCommentTruncation(unittest.TestCase):
 
 
 class TestUnknownActionType(unittest.TestCase):
-    def test_unknown_type_logged(self):
+    def test_unknown_type_rejected_by_schema(self):
+        """Unknown action types are now caught by schema validation (exit 1)."""
         data = {
             "pr_number": 1,
             "trigger_source": "bot",
@@ -216,8 +217,8 @@ class TestUnknownActionType(unittest.TestCase):
                 sys.stderr = captured
                 result = main([f.name, "org/repo", "1", "--dry-run"])
                 sys.stderr = sys.__stderr__
-                self.assertEqual(result, 0)
-                self.assertIn("Unknown action type 'exfiltrate'", captured.getvalue())
+                self.assertEqual(result, 1)
+                self.assertIn("schema validation", captured.getvalue())
             finally:
                 os.unlink(f.name)
 
@@ -284,7 +285,7 @@ class TestMain(unittest.TestCase):
             finally:
                 os.unlink(f.name)
 
-    def test_empty_actions_dry_run(self):
+    def test_empty_actions_fails_schema_validation(self):
         data = {
             "pr_number": 10,
             "trigger_source": "human",
@@ -297,7 +298,132 @@ class TestMain(unittest.TestCase):
             json.dump(data, f)
             f.flush()
             try:
-                self.assertEqual(main([f.name, "org/repo", "10", "--dry-run"]), 0)
+                self.assertEqual(main([f.name, "org/repo", "10", "--dry-run"]), 1)
+            finally:
+                os.unlink(f.name)
+
+
+class TestSchemaValidation(unittest.TestCase):
+    """Tests for schema validation added in #412."""
+
+    def test_missing_required_field_fails(self):
+        """Missing 'actions' field triggers a validation error."""
+        data = {
+            "pr_number": 1,
+            "trigger_source": "bot",
+            "summary": "Done.",
+            "tests_passed": True,
+            "files_changed": [],
+            # 'actions' is missing
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            f.flush()
+            try:
+                self.assertEqual(main([f.name, "org/repo", "1", "--dry-run"]), 1)
+            finally:
+                os.unlink(f.name)
+
+    def test_fix_action_missing_description_fails(self):
+        """A 'fix' action without 'description' fails validation."""
+        data = {
+            "pr_number": 1,
+            "trigger_source": "bot",
+            "actions": [
+                {"type": "fix", "finding": "bug"},
+                # missing 'description' required for fix actions
+            ],
+            "summary": "Done.",
+            "tests_passed": True,
+            "files_changed": [],
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            f.flush()
+            try:
+                self.assertEqual(main([f.name, "org/repo", "1", "--dry-run"]), 1)
+            finally:
+                os.unlink(f.name)
+
+    def test_disagree_action_missing_reason_fails(self):
+        """A 'disagree' action without 'reason' fails validation."""
+        data = {
+            "pr_number": 1,
+            "trigger_source": "bot",
+            "actions": [
+                {"type": "disagree", "finding": "refactor"},
+                # missing 'reason' required for disagree actions
+            ],
+            "summary": "Done.",
+            "tests_passed": True,
+            "files_changed": [],
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            f.flush()
+            try:
+                self.assertEqual(main([f.name, "org/repo", "1", "--dry-run"]), 1)
+            finally:
+                os.unlink(f.name)
+
+    def test_additional_properties_rejected(self):
+        """Extra top-level keys are rejected by the schema."""
+        data = {
+            "pr_number": 1,
+            "trigger_source": "bot",
+            "actions": [
+                {"type": "fix", "finding": "bug", "description": "Fixed"},
+            ],
+            "summary": "Done.",
+            "tests_passed": True,
+            "files_changed": [],
+            "unexpected_field": "should fail",
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            f.flush()
+            try:
+                self.assertEqual(main([f.name, "org/repo", "1", "--dry-run"]), 1)
+            finally:
+                os.unlink(f.name)
+
+    def test_valid_data_passes_validation(self):
+        """Fully valid data passes schema validation and processes normally."""
+        data = {
+            "pr_number": 42,
+            "trigger_source": "bot",
+            "actions": [
+                {"type": "fix", "finding": "nil check", "description": "Fixed"},
+            ],
+            "summary": "All good.",
+            "tests_passed": True,
+            "files_changed": ["foo.go"],
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            f.flush()
+            try:
+                self.assertEqual(main([f.name, "org/repo", "42", "--dry-run"]), 0)
+            finally:
+                os.unlink(f.name)
+
+    def test_invalid_trigger_source_fails(self):
+        """trigger_source must be 'bot' or 'human'."""
+        data = {
+            "pr_number": 1,
+            "trigger_source": "unknown",
+            "actions": [
+                {"type": "fix", "finding": "bug", "description": "Fixed"},
+            ],
+            "summary": "Done.",
+            "tests_passed": True,
+            "files_changed": [],
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            f.flush()
+            try:
+                self.assertEqual(main([f.name, "org/repo", "1", "--dry-run"]), 1)
             finally:
                 os.unlink(f.name)
 

@@ -19,18 +19,16 @@ type ConfigRepoLayer struct {
 	client     forge.Client
 	config     *config.OrgConfig
 	ui         *ui.Printer
-	hasPrivate bool // whether org supports private repos
+	hasPrivate bool // whether org plan supports private workflow_call repos
 }
 
 // Compile-time check that ConfigRepoLayer implements Layer.
 var _ Layer = (*ConfigRepoLayer)(nil)
 
 // NewConfigRepoLayer creates a new ConfigRepoLayer.
-// Set hasPrivate to true if the org has any private repos — the config repo
-// will be created as private to match the org's existing pattern. For orgs
-// with only public repos (e.g., open source orgs), it is created as public
-// to avoid surprises. This matters because the .fullsend repo may contain
-// workflow files referenced by public repos.
+// Set hasPrivate to true if the org's GitHub plan (team/enterprise) supports
+// workflow_call from private repos. GitHub free tier cannot use workflow_call
+// with private repos, so the config repo must be public on free orgs.
 func NewConfigRepoLayer(org string, client forge.Client, cfg *config.OrgConfig, printer *ui.Printer, hasPrivate bool) *ConfigRepoLayer {
 	return &ConfigRepoLayer{
 		org:        org,
@@ -70,30 +68,36 @@ func (l *ConfigRepoLayer) RequiredScopes(op Operation) []string {
 // this, but callers should be aware that the first file write to a newly
 // created repo may take several seconds to succeed.
 func (l *ConfigRepoLayer) Install(ctx context.Context) error {
-	exists, err := l.repoExists(ctx)
+	repo, err := l.getRepo(ctx)
 	if err != nil {
 		return fmt.Errorf("checking for config repo: %w", err)
 	}
 
-	if !exists {
+	if repo == nil {
 		l.ui.StepStart("Creating " + forge.ConfigRepoName + " repository")
 		desc := fmt.Sprintf("fullsend configuration for %s", l.org)
 		_, err := l.client.CreateRepo(ctx, l.org, forge.ConfigRepoName, desc, l.hasPrivate)
 		if err != nil {
 			// Idempotent: if the repo was created between our check and this
 			// call (race), or if we got an "already exists" error, proceed.
-			recheck, recheckErr := l.repoExists(ctx)
-			if recheckErr == nil && recheck {
+			recheck, recheckErr := l.getRepo(ctx)
+			if recheckErr == nil && recheck != nil {
 				l.ui.StepInfo(forge.ConfigRepoName + " repository already exists")
 			} else {
 				l.ui.StepFail("Failed to create " + forge.ConfigRepoName + " repository")
 				return fmt.Errorf("creating config repo: %w", err)
 			}
 		} else {
-			l.ui.StepDone("Created " + forge.ConfigRepoName + " repository")
+			l.ui.StepDone("Created " + forge.ConfigRepoName + " repository (public)")
+			l.ui.StepWarn(forge.ConfigRepoName + " is public so cross-repo workflow_call works with all enrolled repos. " +
+				"If you later make it private, only private repos in the org will be able to trigger workflows.")
 		}
 	} else {
 		l.ui.StepInfo(forge.ConfigRepoName + " repository already exists")
+		if repo.Private {
+			l.ui.StepWarn(forge.ConfigRepoName + " is private — only other private repos in the org can trigger workflows via workflow_call. " +
+				"Public and internal repos will fail silently. Consider making " + forge.ConfigRepoName + " public.")
+		}
 	}
 
 	l.ui.StepStart("Writing " + configFilePath)
@@ -193,14 +197,20 @@ func (l *ConfigRepoLayer) Analyze(ctx context.Context) (*LayerReport, error) {
 	return report, nil
 }
 
-// repoExists checks whether the .fullsend repo exists in the org.
-func (l *ConfigRepoLayer) repoExists(ctx context.Context) (bool, error) {
-	_, err := l.client.GetRepo(ctx, l.org, forge.ConfigRepoName)
+// getRepo returns the config repo if it exists, or nil if not found.
+func (l *ConfigRepoLayer) getRepo(ctx context.Context) (*forge.Repository, error) {
+	repo, err := l.client.GetRepo(ctx, l.org, forge.ConfigRepoName)
 	if err == nil {
-		return true, nil
+		return repo, nil
 	}
 	if forge.IsNotFound(err) {
-		return false, nil
+		return nil, nil
 	}
-	return false, err
+	return nil, err
+}
+
+// repoExists checks whether the .fullsend repo exists in the org.
+func (l *ConfigRepoLayer) repoExists(ctx context.Context) (bool, error) {
+	repo, err := l.getRepo(ctx)
+	return repo != nil, err
 }

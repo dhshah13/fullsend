@@ -2,7 +2,7 @@
 
 How do fullsend agents execute on CI runners, what does the sandbox environment contain, and how does it work across GitHub Actions and GitLab CI?
 
-**Note:** This is an implementation plan companion to [ADR-0036](../ADRs/0036-agent-execution-sandbox.md). It provides detailed implementation guidance for the chosen sandbox architecture, structured for iterative evolution as the design is validated in production. Once the architecture stabilizes and moves from "Proposed" to "Accepted", operational content may migrate to `docs/guides/` per ADR-0023.
+**Note:** This is an implementation plan companion to [ADR-0036](../ADRs/0036-agent-execution-sandbox.md). It provides detailed implementation guidance for the chosen sandbox architecture, structured for iterative evolution as the design is validated in production. Once the architecture stabilizes, operational content may migrate to `docs/guides/` per ADR-0023.
 
 ## Table of Contents
 

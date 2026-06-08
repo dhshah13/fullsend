@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -49,10 +50,25 @@ func (c *LiveClient) WithBaseURL(url string) *LiveClient {
 type APIError struct {
 	StatusCode int
 	Message    string
+	Errors     []APIErrorDetail
+}
+
+// APIErrorDetail is one validation error entry returned by GitHub.
+type APIErrorDetail struct {
+	Resource string `json:"resource"`
+	Field    string `json:"field"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("github api: %d %s", e.StatusCode, e.Message)
+	s := fmt.Sprintf("github api: %d %s", e.StatusCode, e.Message)
+	for _, d := range e.Errors {
+		if d.Message != "" {
+			s += fmt.Sprintf(" (%s)", d.Message)
+		}
+	}
+	return s
 }
 
 // Unwrap returns forge.ErrNotFound for 404 errors, enabling errors.Is checks.
@@ -101,19 +117,31 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body any) (*ht
 			return nil, fmt.Errorf("http %s %s: %w", method, path, err)
 		}
 
-		if !isRetryable(resp) {
+		retryable, respBody := isRetryable(resp)
+		if !retryable {
+			if respBody != nil {
+				// We read the body to check for secondary rate limit;
+				// replace it so callers can still read it.
+				resp.Body.Close()
+				resp.Body = io.NopCloser(bytes.NewReader(respBody))
+			}
 			return resp, nil
 		}
 
-		// Drain and close the body before retrying.
-		io.Copy(io.Discard, resp.Body)
+		// Body already read or drained by isRetryable.
 		resp.Body.Close()
 
-		if attempt == maxRetries-1 {
-			return nil, &APIError{StatusCode: resp.StatusCode, Message: "rate limited after retries"}
-		}
-
 		delay := retryDelay(resp, attempt)
+		retryAfter := resp.Header.Get("Retry-After")
+
+		if attempt == maxRetries-1 {
+			msg := fmt.Sprintf("rate limited after %d retries on %s %s (last delay: %s", maxRetries, method, path, delay)
+			if retryAfter != "" {
+				msg += fmt.Sprintf(", Retry-After: %s", retryAfter)
+			}
+			msg += ")"
+			return nil, &APIError{StatusCode: resp.StatusCode, Message: msg}
+		}
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
@@ -126,26 +154,49 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body any) (*ht
 }
 
 // isRetryable returns true for responses that should trigger a retry.
-// GitHub uses 429 for primary rate limits and 403 with Retry-After for
-// secondary rate limits. A plain 403 (e.g., permission denied) is not retried.
-func isRetryable(resp *http.Response) bool {
+// GitHub uses 429 for primary rate limits and 403 for secondary rate limits.
+// Secondary rate limits may include a Retry-After header, or may only be
+// identifiable by the response body containing "secondary rate limit".
+func isRetryable(resp *http.Response) (bool, []byte) {
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return true
+		io.Copy(io.Discard, resp.Body)
+		return true, nil
 	}
-	// GitHub secondary rate limit: 403 + Retry-After header.
-	if resp.StatusCode == http.StatusForbidden && resp.Header.Get("Retry-After") != "" {
-		return true
+	if resp.StatusCode == http.StatusForbidden {
+		if resp.Header.Get("Retry-After") != "" {
+			io.Copy(io.Discard, resp.Body)
+			return true, nil
+		}
+		// Check body for secondary rate limit without Retry-After header.
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<16)) // 64KB max
+		if readErr != nil {
+			return false, nil
+		}
+		if strings.Contains(strings.ToLower(string(data)), "secondary rate limit") {
+			return true, nil
+		}
+		// Not a rate limit — return the body so the caller can still use it.
+		return false, data
 	}
-	return false
+	return false, nil
 }
+
+// secondaryRateLimitBackoff is the minimum backoff for secondary rate limits
+// when no Retry-After header is present. GitHub's secondary rate limits
+// typically require waiting at least 60 seconds.
+var secondaryRateLimitBackoff = 60 * time.Second
 
 // retryDelay calculates how long to wait before retrying.
 // It uses the Retry-After header if present, otherwise exponential backoff.
 func retryDelay(resp *http.Response, attempt int) time.Duration {
 	if ra := resp.Header.Get("Retry-After"); ra != "" {
-		if secs, err := strconv.Atoi(ra); err == nil {
+		if secs, err := strconv.Atoi(ra); err == nil && secs > 0 && secs <= 300 {
 			return time.Duration(secs) * time.Second
 		}
+	}
+	// For secondary rate limits (403), use a longer backoff.
+	if resp.StatusCode == http.StatusForbidden {
+		return secondaryRateLimitBackoff + time.Duration(math.Pow(2, float64(attempt)))*time.Second
 	}
 	// Exponential backoff: 1s, 2s, 4s
 	return time.Duration(math.Pow(2, float64(attempt))) * time.Second
@@ -164,10 +215,11 @@ func checkStatus(resp *http.Response, acceptable ...int) error {
 	data, _ := io.ReadAll(resp.Body)
 
 	var msg struct {
-		Message string `json:"message"`
+		Message string           `json:"message"`
+		Errors  []APIErrorDetail `json:"errors"`
 	}
 	if json.Unmarshal(data, &msg) == nil && msg.Message != "" {
-		return &APIError{StatusCode: resp.StatusCode, Message: msg.Message}
+		return &APIError{StatusCode: resp.StatusCode, Message: msg.Message, Errors: msg.Errors}
 	}
 	return &APIError{StatusCode: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
 }
@@ -236,7 +288,11 @@ func decodeJSON(resp *http.Response, v any) error {
 	return json.NewDecoder(resp.Body).Decode(v)
 }
 
-// ListOrgRepos returns all non-archived, non-fork repositories for an org.
+// ListOrgRepos returns public, non-archived, non-fork repositories for an org.
+//
+// Private repos are excluded because the default .fullsend config repo is
+// public and agent workflow logs are visible to anyone. Enrolling a private
+// repo would expose its code in those public logs.
 //
 // Forks are excluded because fullsend's trust model assumes org-owned repos
 // where CODEOWNERS governance and org-level permissions control agent
@@ -267,7 +323,7 @@ func (c *LiveClient) ListOrgRepos(ctx context.Context, org string) ([]forge.Repo
 		}
 
 		for _, r := range repos {
-			if r.Archived || r.Fork {
+			if r.Archived || r.Fork || r.Private {
 				continue
 			}
 			result = append(result, forge.Repository{
@@ -506,7 +562,7 @@ func (c *LiveClient) retryOnTransient(ctx context.Context, label string, fn func
 		// Retry on transient errors:
 		// - 404: repo not ready (async init)
 		// - 409: branch ref conflict
-		// - 502/503/504: transient server-side errors
+		// - 500/502/503/504: transient server-side errors
 		var apiErr *APIError
 		if !errors.As(lastErr, &apiErr) || !isTransientStatus(apiErr.StatusCode) {
 			return lastErr
@@ -525,11 +581,12 @@ func (c *LiveClient) retryOnTransient(ctx context.Context, label string, fn func
 
 // isTransientStatus returns true for HTTP status codes that indicate a
 // transient error worth retrying: 404 (async repo init), 409 (branch ref
-// conflict), and server-side 502, 503, 504 (GitHub infrastructure errors).
+// conflict), and server-side 500, 502, 503, 504 (GitHub infrastructure errors).
 func isTransientStatus(code int) bool {
 	switch code {
 	case http.StatusNotFound,
 		http.StatusConflict,
+		http.StatusInternalServerError,
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,
 		http.StatusGatewayTimeout:
@@ -868,20 +925,61 @@ func (c *LiveClient) ListRepoPullRequests(ctx context.Context, owner, repo strin
 	return result, nil
 }
 
+// GetOrgPlan returns the billing plan name for the org (e.g. "free", "team", "enterprise").
+func (c *LiveClient) GetOrgPlan(ctx context.Context, org string) (string, error) {
+	resp, err := c.get(ctx, fmt.Sprintf("/orgs/%s", org))
+	if err != nil {
+		return "", fmt.Errorf("get org plan: %w", err)
+	}
+	var orgResp struct {
+		Plan struct {
+			Name string `json:"name"`
+		} `json:"plan"`
+	}
+	if err := decodeJSON(resp, &orgResp); err != nil {
+		return "", fmt.Errorf("decode org plan: %w", err)
+	}
+	return orgResp.Plan.Name, nil
+}
+
 // GetAuthenticatedUser returns the login of the authenticated user.
+//
+// For classic PATs and OAuth tokens the identity comes from GET /user.
+// GitHub App installation tokens cannot call /user, so when that call
+// fails the method falls back to GET /app and constructs the
+// conventional bot login "{slug}[bot]".
 func (c *LiveClient) GetAuthenticatedUser(ctx context.Context) (string, error) {
 	resp, err := c.get(ctx, "/user")
-	if err != nil {
-		return "", fmt.Errorf("get authenticated user: %w", err)
+	if err == nil {
+		var user struct {
+			Login string `json:"login"`
+		}
+		if err := decodeJSON(resp, &user); err != nil {
+			return "", fmt.Errorf("decode user: %w", err)
+		}
+		return user.Login, nil
 	}
 
-	var user struct {
-		Login string `json:"login"`
+	// /user is not available for GitHub App installation tokens.
+	// Fall back to /app which returns the app's metadata including
+	// its slug, from which we derive the bot login.
+	appResp, appErr := c.get(ctx, "/app")
+	if appErr != nil {
+		// Neither endpoint worked — return the original /user error
+		// because that is the more common path.
+		return "", fmt.Errorf("get authenticated user: %w (app fallback: %v)", err, appErr)
 	}
-	if err := decodeJSON(resp, &user); err != nil {
-		return "", fmt.Errorf("decode user: %w", err)
+
+	var app struct {
+		Slug string `json:"slug"`
 	}
-	return user.Login, nil
+	if appErr := decodeJSON(appResp, &app); appErr != nil {
+		return "", fmt.Errorf("decode app: %w", appErr)
+	}
+	if app.Slug == "" {
+		return "", fmt.Errorf("get authenticated user: /app returned empty slug")
+	}
+	return app.Slug + "[bot]", nil
 }
 
 // GetTokenScopes returns the OAuth scopes granted to the current token
@@ -1030,6 +1128,31 @@ func (c *LiveClient) RepoVariableExists(ctx context.Context, owner, repo, name s
 	return false, &APIError{StatusCode: resp.StatusCode, Message: "unexpected status checking variable"}
 }
 
+// GetRepoVariable returns the value of a repository Actions variable.
+// Returns ("", false, nil) if the variable does not exist.
+func (c *LiveClient) GetRepoVariable(ctx context.Context, owner, repo, name string) (string, bool, error) {
+	resp, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/actions/variables/%s", owner, repo, name), nil)
+	if err != nil {
+		return "", false, fmt.Errorf("get variable %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", false, &APIError{StatusCode: resp.StatusCode, Message: "unexpected status getting variable"}
+	}
+
+	var result struct {
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", false, fmt.Errorf("decode variable %s: %w", name, err)
+	}
+	return result.Value, true, nil
+}
+
 // GetLatestWorkflowRun returns the most recent workflow run for a workflow file.
 func (c *LiveClient) GetLatestWorkflowRun(ctx context.Context, owner, repo, workflowFile string) (*forge.WorkflowRun, error) {
 	resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/actions/workflows/%s/runs?per_page=1", owner, repo, workflowFile))
@@ -1117,22 +1240,44 @@ func (c *LiveClient) DispatchWorkflow(ctx context.Context, owner, repo, workflow
 	return nil
 }
 
-// CreateIssue creates a new issue on a repository.
-func (c *LiveClient) CreateIssue(ctx context.Context, owner, repo, title, body string) (*forge.Issue, error) {
-	payload := map[string]string{"title": title, "body": body}
+// CreateIssue creates a new issue on a repository. Labels are best-effort:
+// if GitHub rejects the create because a label is unavailable in the target
+// repo, the request is retried without labels so issue creation still succeeds.
+func (c *LiveClient) CreateIssue(ctx context.Context, owner, repo, title, body string, labels ...string) (*forge.Issue, error) {
+	payload := map[string]any{"title": title, "body": body}
+	if len(labels) > 0 {
+		payload["labels"] = labels
+	}
 	resp, err := c.post(ctx, fmt.Sprintf("/repos/%s/%s/issues", owner, repo), payload)
 	if err != nil {
-		return nil, fmt.Errorf("create issue: %w", err)
+		var apiErr *APIError
+		if len(labels) == 0 || !errors.As(err, &apiErr) || !isValidationErrorForField(apiErr, "labels") {
+			return nil, fmt.Errorf("create issue: %w", err)
+		}
+		resp, err = c.post(ctx, fmt.Sprintf("/repos/%s/%s/issues", owner, repo), map[string]any{"title": title, "body": body})
+		if err != nil {
+			return nil, fmt.Errorf("create issue without labels after label rejection: %w", err)
+		}
 	}
 	var result struct {
 		Number  int    `json:"number"`
 		Title   string `json:"title"`
+		Body    string `json:"body"`
 		HTMLURL string `json:"html_url"`
+		Labels  []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
 	}
 	if err := decodeJSON(resp, &result); err != nil {
 		return nil, fmt.Errorf("decode issue: %w", err)
 	}
-	return &forge.Issue{Number: result.Number, Title: result.Title, URL: result.HTMLURL}, nil
+	return &forge.Issue{
+		Number: result.Number,
+		Title:  result.Title,
+		Body:   result.Body,
+		URL:    result.HTMLURL,
+		Labels: labelNames(result.Labels),
+	}, nil
 }
 
 // CloseIssue closes an issue by number.
@@ -1143,6 +1288,79 @@ func (c *LiveClient) CloseIssue(ctx context.Context, owner, repo string, number 
 	}
 	resp.Body.Close()
 	return nil
+}
+
+func labelNames(labels []struct {
+	Name string `json:"name"`
+}) []string {
+	names := make([]string, 0, len(labels))
+	for _, label := range labels {
+		names = append(names, label.Name)
+	}
+	return names
+}
+
+func isValidationErrorForField(err *APIError, field string) bool {
+	if err == nil || err.StatusCode != http.StatusUnprocessableEntity {
+		return false
+	}
+	for _, detail := range err.Errors {
+		if detail.Field == field {
+			return true
+		}
+	}
+	return false
+}
+
+// ListOpenIssues returns open issues on a repository, excluding pull requests.
+// When labels are provided, GitHub filters to issues carrying those labels.
+func (c *LiveClient) ListOpenIssues(ctx context.Context, owner, repo string, labels ...string) ([]forge.Issue, error) {
+	var result []forge.Issue
+
+	for page := 1; page <= 100; page++ {
+		query := url.Values{}
+		query.Set("state", "open")
+		query.Set("per_page", "100")
+		query.Set("page", strconv.Itoa(page))
+		if len(labels) > 0 {
+			query.Set("labels", strings.Join(labels, ","))
+		}
+		resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/issues?%s", owner, repo, query.Encode()))
+		if err != nil {
+			return nil, fmt.Errorf("list open issues page %d: %w", page, err)
+		}
+		var raw []struct {
+			Number      int    `json:"number"`
+			Title       string `json:"title"`
+			Body        string `json:"body"`
+			HTMLURL     string `json:"html_url"`
+			PullRequest *struct {
+				URL string `json:"url"`
+			} `json:"pull_request"`
+			Labels []struct {
+				Name string `json:"name"`
+			} `json:"labels"`
+		}
+		if err := decodeJSON(resp, &raw); err != nil {
+			return nil, fmt.Errorf("decode open issues page %d: %w", page, err)
+		}
+		for _, item := range raw {
+			if item.PullRequest != nil {
+				continue
+			}
+			result = append(result, forge.Issue{
+				Number: item.Number,
+				Title:  item.Title,
+				Body:   item.Body,
+				URL:    item.HTMLURL,
+				Labels: labelNames(item.Labels),
+			})
+		}
+		if len(raw) < 100 {
+			break
+		}
+	}
+	return result, nil
 }
 
 // ListIssueComments returns all comments on an issue, paginating automatically.
@@ -1227,6 +1445,11 @@ func (c *LiveClient) UpdateIssueComment(ctx context.Context, owner, repo string,
 	return nil
 }
 
+// DeleteIssueComment deletes an issue comment by its numeric ID.
+func (c *LiveClient) DeleteIssueComment(ctx context.Context, owner, repo string, commentID int) error {
+	return c.delete_(ctx, fmt.Sprintf("/repos/%s/%s/issues/comments/%d", owner, repo, commentID))
+}
+
 // MinimizeComment minimizes (hides) an issue or review comment via the
 // GitHub GraphQL API. The caller provides the GraphQL node ID directly
 // (available in IssueComment.NodeID and PullRequestReview.NodeID).
@@ -1287,26 +1510,102 @@ func (c *LiveClient) GetPullRequestHeadSHA(ctx context.Context, owner, repo stri
 	return pr.Head.SHA, nil
 }
 
+// ListPullRequestFiles returns the file paths changed by a pull request.
+// GitHub caps PR file lists at 3000 files total regardless of pagination.
+func (c *LiveClient) ListPullRequestFiles(ctx context.Context, owner, repo string, number int) ([]string, error) {
+	var files []string
+	for page := 1; page <= 100; page++ {
+		resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/pulls/%d/files?per_page=100&page=%d", owner, repo, number, page))
+		if err != nil {
+			return nil, fmt.Errorf("list pull request files page %d: %w", page, err)
+		}
+		var raw []struct {
+			Filename string `json:"filename"`
+		}
+		if err := decodeJSON(resp, &raw); err != nil {
+			return nil, fmt.Errorf("decoding pull request files page %d: %w", page, err)
+		}
+		for _, f := range raw {
+			files = append(files, f.Filename)
+		}
+		if len(raw) < 100 {
+			break
+		}
+	}
+	return files, nil
+}
+
+// ListPullRequestFileDiffs returns the files changed by a pull request
+// along with their unified diff patches. Same API endpoint as
+// ListPullRequestFiles but also extracts the patch field.
+func (c *LiveClient) ListPullRequestFileDiffs(ctx context.Context, owner, repo string, number int) ([]forge.PullRequestFileDiff, error) {
+	var files []forge.PullRequestFileDiff
+	for page := 1; page <= 100; page++ {
+		resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/pulls/%d/files?per_page=100&page=%d", owner, repo, number, page))
+		if err != nil {
+			return nil, fmt.Errorf("list pull request file diffs page %d: %w", page, err)
+		}
+		var raw []struct {
+			Filename string `json:"filename"`
+			Patch    string `json:"patch"`
+		}
+		if err := decodeJSON(resp, &raw); err != nil {
+			return nil, fmt.Errorf("decoding pull request file diffs page %d: %w", page, err)
+		}
+		for _, f := range raw {
+			files = append(files, forge.PullRequestFileDiff{
+				Path:  f.Filename,
+				Patch: f.Patch,
+			})
+		}
+		if len(raw) < 100 {
+			break
+		}
+	}
+	return files, nil
+}
+
 // CreatePullRequestReview submits a formal review on a pull request.
 // The event must be one of: APPROVE, REQUEST_CHANGES, COMMENT.
 // When commitSHA is non-empty it is sent as commit_id, pinning the
 // review to that commit. GitHub rejects the request if the commit is
 // not the PR's current HEAD, closing the TOCTOU gap between the
 // stale-head check and review submission.
-func (c *LiveClient) CreatePullRequestReview(ctx context.Context, owner, repo string, number int, event, body, commitSHA string) error {
+// When comments is non-nil, inline diff comments are attached to the
+// review via the GitHub "comments" field.
+func (c *LiveClient) CreatePullRequestReview(ctx context.Context, owner, repo string, number int, event, body, commitSHA string, comments []forge.ReviewComment) error {
 	switch event {
 	case "APPROVE", "REQUEST_CHANGES", "COMMENT":
 	default:
 		return fmt.Errorf("create review on #%d: invalid event %q", number, event)
 	}
 
-	payload := map[string]string{
-		"event": event,
-		"body":  body,
+	type reviewComment struct {
+		Path string `json:"path"`
+		Line int    `json:"line,omitempty"`
+		Body string `json:"body"`
 	}
-	if commitSHA != "" {
-		payload["commit_id"] = commitSHA
+
+	type reviewPayload struct {
+		Event    string          `json:"event"`
+		Body     string          `json:"body"`
+		CommitID string          `json:"commit_id,omitempty"`
+		Comments []reviewComment `json:"comments,omitempty"`
 	}
+
+	payload := reviewPayload{
+		Event:    event,
+		Body:     body,
+		CommitID: commitSHA,
+	}
+	for _, rc := range comments {
+		payload.Comments = append(payload.Comments, reviewComment{
+			Path: rc.Path,
+			Line: rc.Line,
+			Body: rc.Body,
+		})
+	}
+
 	resp, err := c.post(ctx, fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", owner, repo, number), payload)
 	if err != nil {
 		return fmt.Errorf("create pull request review on #%d: %w", number, err)
@@ -1478,6 +1777,47 @@ func (c *LiveClient) GetWorkflowRunLogs(ctx context.Context, owner, repo string,
 	return buf.String(), nil
 }
 
+// GetWorkflowRunAnnotations returns annotations from all jobs in a workflow run.
+// GitHub workflow commands (::notice::, ::warning::) produce check-run
+// annotations that are accessible via the check-runs API.
+func (c *LiveClient) GetWorkflowRunAnnotations(ctx context.Context, owner, repo string, runID int) ([]forge.Annotation, error) {
+	// List jobs for this run.
+	resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs", owner, repo, runID))
+	if err != nil {
+		return nil, fmt.Errorf("list jobs for run %d: %w", runID, err)
+	}
+	var jobsResult struct {
+		Jobs []struct {
+			ID int `json:"id"`
+		} `json:"jobs"`
+	}
+	if err := decodeJSON(resp, &jobsResult); err != nil {
+		return nil, fmt.Errorf("decode jobs: %w", err)
+	}
+
+	var annotations []forge.Annotation
+	for _, job := range jobsResult.Jobs {
+		resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/check-runs/%d/annotations", owner, repo, job.ID))
+		if err != nil {
+			continue // best-effort
+		}
+		var anns []struct {
+			Level   string `json:"annotation_level"`
+			Message string `json:"message"`
+		}
+		if err := decodeJSON(resp, &anns); err != nil {
+			continue
+		}
+		for _, a := range anns {
+			annotations = append(annotations, forge.Annotation{
+				Level:   a.Level,
+				Message: a.Message,
+			})
+		}
+	}
+	return annotations, nil
+}
+
 // ListOrgInstallations lists app installations for an organization.
 func (c *LiveClient) ListOrgInstallations(ctx context.Context, org string) ([]forge.Installation, error) {
 	resp, err := c.get(ctx, fmt.Sprintf("/orgs/%s/installations?per_page=100", org))
@@ -1491,6 +1831,11 @@ func (c *LiveClient) ListOrgInstallations(ctx context.Context, org string) ([]fo
 			AppID       int               `json:"app_id"`
 			AppSlug     string            `json:"app_slug"`
 			Permissions map[string]string `json:"permissions"`
+			App         struct {
+				Owner struct {
+					Login string `json:"login"`
+				} `json:"owner"`
+			} `json:"app"`
 		} `json:"installations"`
 	}
 	if err := decodeJSON(resp, &result); err != nil {
@@ -1500,10 +1845,11 @@ func (c *LiveClient) ListOrgInstallations(ctx context.Context, org string) ([]fo
 	installs := make([]forge.Installation, len(result.Installations))
 	for i, inst := range result.Installations {
 		installs[i] = forge.Installation{
-			ID:          inst.ID,
-			AppID:       inst.AppID,
-			AppSlug:     inst.AppSlug,
-			Permissions: inst.Permissions,
+			ID:            inst.ID,
+			AppID:         inst.AppID,
+			AppSlug:       inst.AppSlug,
+			AppOwnerLogin: inst.App.Owner.Login,
+			Permissions:   inst.Permissions,
 		}
 	}
 	return installs, nil
@@ -1568,9 +1914,9 @@ func (c *LiveClient) CreateOrgSecret(ctx context.Context, org, name, value strin
 		selectedRepoIDs = []int64{}
 	}
 	payload := map[string]any{
-		"encrypted_value":       base64.StdEncoding.EncodeToString(encrypted),
-		"key_id":                pubKey.KeyID,
-		"visibility":            "selected",
+		"encrypted_value":         base64.StdEncoding.EncodeToString(encrypted),
+		"key_id":                  pubKey.KeyID,
+		"visibility":              "selected",
 		"selected_repository_ids": selectedRepoIDs,
 	}
 
@@ -1659,6 +2005,121 @@ func (c *LiveClient) SetOrgSecretRepos(ctx context.Context, org, name string, re
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// CreateOrUpdateOrgVariable creates or updates an org-level Actions variable
+// scoped to the given repository IDs.
+func (c *LiveClient) CreateOrUpdateOrgVariable(ctx context.Context, org, name, value string, selectedRepoIDs []int64) error {
+	if selectedRepoIDs == nil {
+		selectedRepoIDs = []int64{}
+	}
+
+	// Try PATCH first (update existing).
+	patchPayload := map[string]any{
+		"value":                   value,
+		"visibility":              "selected",
+		"selected_repository_ids": selectedRepoIDs,
+	}
+
+	resp, err := c.patch(ctx, fmt.Sprintf("/orgs/%s/actions/variables/%s", org, name), patchPayload)
+	if err == nil {
+		resp.Body.Close()
+		return nil
+	}
+
+	// If the variable doesn't exist (404), create it.
+	if !isNotFound(err) {
+		return fmt.Errorf("update org variable %s: %w", name, err)
+	}
+
+	createPayload := map[string]any{
+		"name":                    name,
+		"value":                   value,
+		"visibility":              "selected",
+		"selected_repository_ids": selectedRepoIDs,
+	}
+	resp2, err := c.post(ctx, fmt.Sprintf("/orgs/%s/actions/variables", org), createPayload)
+	if err != nil {
+		return fmt.Errorf("create org variable %s: %w", name, err)
+	}
+	resp2.Body.Close()
+	return nil
+}
+
+// OrgVariableExists checks if an org-level variable exists.
+func (c *LiveClient) OrgVariableExists(ctx context.Context, org, name string) (bool, error) {
+	resp, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/orgs/%s/actions/variables/%s", org, name), nil)
+	if err != nil {
+		return false, fmt.Errorf("check org variable %s: %w", name, err)
+	}
+	resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	case http.StatusForbidden:
+		return false, &APIError{StatusCode: http.StatusForbidden, Message: "insufficient permissions to check org variable (missing admin:org scope?)"}
+	default:
+		return false, &APIError{StatusCode: resp.StatusCode, Message: "unexpected status checking org variable"}
+	}
+}
+
+// DeleteOrgVariable deletes an org-level variable. It is idempotent: a 404
+// (variable already gone) is not treated as an error.
+func (c *LiveClient) DeleteOrgVariable(ctx context.Context, org, name string) error {
+	resp, err := c.do(ctx, http.MethodDelete, fmt.Sprintf("/orgs/%s/actions/variables/%s", org, name), nil)
+	if err != nil {
+		return fmt.Errorf("delete org variable %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return &APIError{StatusCode: resp.StatusCode, Message: "unexpected status deleting org variable"}
+}
+
+// SetOrgVariableRepos sets the list of repositories that can access an org variable.
+func (c *LiveClient) SetOrgVariableRepos(ctx context.Context, org, name string, repoIDs []int64) error {
+	if repoIDs == nil {
+		repoIDs = []int64{}
+	}
+	payload := map[string]any{
+		"selected_repository_ids": repoIDs,
+	}
+
+	resp, err := c.put(ctx, fmt.Sprintf("/orgs/%s/actions/variables/%s/repositories", org, name), payload)
+	if err != nil {
+		return fmt.Errorf("set org variable repos for %s: %w", name, err)
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// GetOrgVariableRepos returns the repository IDs that have access to an org variable.
+func (c *LiveClient) GetOrgVariableRepos(ctx context.Context, org, name string) ([]int64, error) {
+	resp, err := c.get(ctx, fmt.Sprintf("/orgs/%s/actions/variables/%s/repositories", org, name))
+	if err != nil {
+		return nil, fmt.Errorf("get org variable repos for %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Repositories []struct {
+			ID int64 `json:"id"`
+		} `json:"repositories"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode org variable repos for %s: %w", name, err)
+	}
+
+	ids := make([]int64, len(result.Repositories))
+	for i, r := range result.Repositories {
+		ids[i] = r.ID
+	}
+	return ids, nil
 }
 
 // isNotFound checks whether an error is a 404 API error.

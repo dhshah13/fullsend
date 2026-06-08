@@ -9,7 +9,7 @@ set -euo pipefail
 : "${GITHUB_ENV:?GITHUB_ENV must be set}"
 : "${AGENT_PREFIX:?AGENT_PREFIX must be set}"
 
-delim="ENV_${RANDOM}_${RANDOM}_$$"
+delim="ENV_$(openssl rand -hex 16)"
 while IFS= read -r name; do
   case "${name}" in
     "${AGENT_PREFIX}"*)

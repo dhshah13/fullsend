@@ -13,63 +13,17 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
-func newDispatchLayer(t *testing.T, client *forge.FakeClient, token string, repoIDs []int64) (*DispatchTokenLayer, *bytes.Buffer) {
+// newPATUninstallLayer creates a minimal PAT-mode layer for uninstall tests.
+func newPATUninstallLayer(t *testing.T, client *forge.FakeClient) (*DispatchTokenLayer, *bytes.Buffer) {
 	t.Helper()
 	var buf bytes.Buffer
 	printer := ui.New(&buf)
-	layer := NewDispatchTokenLayer("test-org", client, token, repoIDs, printer, nil)
+	layer := &DispatchTokenLayer{
+		org:    "test-org",
+		client: client,
+		ui:     printer,
+	}
 	return layer, &buf
-}
-
-func TestDispatchTokenLayer_Name(t *testing.T) {
-	layer, _ := newDispatchLayer(t, &forge.FakeClient{}, "", nil)
-	assert.Equal(t, "dispatch-token", layer.Name())
-}
-
-func TestDispatchTokenLayer_Install_CreatesOrgSecret(t *testing.T) {
-	client := &forge.FakeClient{}
-	repoIDs := []int64{100, 200, 300}
-	layer, _ := newDispatchLayer(t, client, "ghp_secrettoken123", repoIDs)
-
-	err := layer.Install(context.Background())
-	require.NoError(t, err)
-
-	require.Len(t, client.CreatedOrgSecrets, 1)
-	assert.Equal(t, "test-org", client.CreatedOrgSecrets[0].Org)
-	assert.Equal(t, "FULLSEND_DISPATCH_TOKEN", client.CreatedOrgSecrets[0].Name)
-	assert.Equal(t, "ghp_secrettoken123", client.CreatedOrgSecrets[0].Value)
-	assert.Equal(t, repoIDs, client.CreatedOrgSecrets[0].RepoIDs)
-}
-
-func TestDispatchTokenLayer_Install_ReusesExistingToken(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{
-			"test-org/FULLSEND_DISPATCH_TOKEN": true,
-		},
-	}
-	repoIDs := []int64{100, 200}
-	layer, _ := newDispatchLayer(t, client, "", repoIDs)
-
-	err := layer.Install(context.Background())
-	require.NoError(t, err)
-
-	// No secret should be created when reusing existing
-	assert.Empty(t, client.CreatedOrgSecrets)
-
-	// But SetOrgSecretRepos should still be called to update access list
-	require.Contains(t, client.OrgSecretRepoIDs, "test-org/FULLSEND_DISPATCH_TOKEN")
-	assert.Equal(t, repoIDs, client.OrgSecretRepoIDs["test-org/FULLSEND_DISPATCH_TOKEN"])
-}
-
-func TestDispatchTokenLayer_Install_Error(t *testing.T) {
-	client := &forge.FakeClient{
-		Errors: map[string]error{"CreateOrgSecret": errors.New("permission denied")},
-	}
-	layer, _ := newDispatchLayer(t, client, "ghp_token", []int64{100})
-
-	err := layer.Install(context.Background())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "permission denied")
 }
 
 func TestDispatchTokenLayer_Uninstall_DeletesSecret(t *testing.T) {
@@ -78,9 +32,9 @@ func TestDispatchTokenLayer_Uninstall_DeletesSecret(t *testing.T) {
 			"test-org/FULLSEND_DISPATCH_TOKEN": true,
 		},
 	}
-	layer, _ := newDispatchLayer(t, client, "", nil)
+	layer, _ := newPATUninstallLayer(t, client)
 
-	err := layer.Uninstall(context.Background())
+	err := layer.uninstallPAT(context.Background())
 	require.NoError(t, err)
 
 	require.Len(t, client.DeletedOrgSecrets, 1)
@@ -91,163 +45,343 @@ func TestDispatchTokenLayer_Uninstall_AlreadyDeleted(t *testing.T) {
 	client := &forge.FakeClient{
 		OrgSecrets: map[string]bool{}, // secret doesn't exist
 	}
-	layer, _ := newDispatchLayer(t, client, "", nil)
+	layer, _ := newPATUninstallLayer(t, client)
 
-	err := layer.Uninstall(context.Background())
+	err := layer.uninstallPAT(context.Background())
 	require.NoError(t, err)
 
 	// Should not attempt to delete
 	assert.Empty(t, client.DeletedOrgSecrets)
 }
 
-func TestDispatchTokenLayer_Analyze_Installed(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{
-			"test-org/FULLSEND_DISPATCH_TOKEN": true,
-		},
-	}
-	layer, _ := newDispatchLayer(t, client, "", nil)
+// --- OIDC mode tests ---
 
-	report, err := layer.Analyze(context.Background())
-	require.NoError(t, err)
-
-	assert.Equal(t, "dispatch-token", report.Name)
-	assert.Equal(t, StatusInstalled, report.Status)
-	assert.Contains(t, report.Details, "FULLSEND_DISPATCH_TOKEN org secret exists")
-	assert.Empty(t, report.WouldInstall)
+// fakeDispatcher is a test double for dispatch.Dispatcher.
+type fakeDispatcher struct {
+	name         string
+	provisionErr error
+	variables    map[string]string
+	secretNames  []string
+	varNames     []string
 }
 
-func TestDispatchTokenLayer_Analyze_NotInstalled(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{},
+func (f *fakeDispatcher) Name() string { return f.name }
+func (f *fakeDispatcher) Provision(_ context.Context) (map[string]string, error) {
+	if f.provisionErr != nil {
+		return nil, f.provisionErr
 	}
-	layer, _ := newDispatchLayer(t, client, "", nil)
+	return f.variables, nil
+}
+func (f *fakeDispatcher) StoreAgentPEM(_ context.Context, _, _ string, _ []byte) error {
+	return nil
+}
+func (f *fakeDispatcher) OrgSecretNames() []string   { return f.secretNames }
+func (f *fakeDispatcher) OrgVariableNames() []string { return f.varNames }
 
-	report, err := layer.Analyze(context.Background())
-	require.NoError(t, err)
-
-	assert.Equal(t, "dispatch-token", report.Name)
-	assert.Equal(t, StatusNotInstalled, report.Status)
-	assert.Empty(t, report.Details)
-	assert.Contains(t, report.WouldInstall, "create FULLSEND_DISPATCH_TOKEN org secret")
+func newOIDCDispatchLayer(t *testing.T, client *forge.FakeClient, repoIDs []int64, dispatcher *fakeDispatcher) (*DispatchTokenLayer, *bytes.Buffer) {
+	t.Helper()
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	layer := NewOIDCDispatchLayer("test-org", client, repoIDs, dispatcher, printer)
+	return layer, &buf
 }
 
-func TestDispatchTokenLayer_Analyze_InstalledAllReposAccessible(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{
-			"test-org/FULLSEND_DISPATCH_TOKEN": true,
-		},
-		OrgSecretRepoIDs: map[string][]int64{
-			"test-org/FULLSEND_DISPATCH_TOKEN": {100, 200, 300},
-		},
-	}
-	layer, _ := newDispatchLayer(t, client, "", []int64{100, 200})
-
-	report, err := layer.Analyze(context.Background())
-	require.NoError(t, err)
-
-	assert.Equal(t, StatusInstalled, report.Status)
-	assert.Contains(t, report.Details, "FULLSEND_DISPATCH_TOKEN org secret exists")
-	assert.Empty(t, report.WouldFix)
-}
-
-func TestDispatchTokenLayer_Analyze_DegradedRepoInaccessible(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{
-			"test-org/FULLSEND_DISPATCH_TOKEN": true,
-		},
-		OrgSecretRepoIDs: map[string][]int64{
-			"test-org/FULLSEND_DISPATCH_TOKEN": {100}, // only repo 100 has access
-		},
-	}
-	// Enrolled repos include 100 and 200, but 200 is inaccessible
-	layer, _ := newDispatchLayer(t, client, "", []int64{100, 200})
-
-	report, err := layer.Analyze(context.Background())
-	require.NoError(t, err)
-
-	assert.Equal(t, StatusDegraded, report.Status)
-	assert.Contains(t, report.Details, "FULLSEND_DISPATCH_TOKEN org secret exists")
-	assert.Contains(t, report.Details, "FULLSEND_DISPATCH_TOKEN inaccessible in 1 enrolled repo(s)")
-	assert.Contains(t, report.WouldFix, "grant FULLSEND_DISPATCH_TOKEN access to 1 repo(s)")
-}
-
-func TestDispatchTokenLayer_Analyze_DegradedAllReposInaccessible(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{
-			"test-org/FULLSEND_DISPATCH_TOKEN": true,
-		},
-		OrgSecretRepoIDs: map[string][]int64{
-			"test-org/FULLSEND_DISPATCH_TOKEN": {}, // no repos have access
-		},
-	}
-	layer, _ := newDispatchLayer(t, client, "", []int64{100, 200})
-
-	report, err := layer.Analyze(context.Background())
-	require.NoError(t, err)
-
-	assert.Equal(t, StatusDegraded, report.Status)
-	assert.Contains(t, report.WouldFix, "grant FULLSEND_DISPATCH_TOKEN access to 2 repo(s)")
-}
-
-func TestDispatchTokenLayer_RequiredScopes(t *testing.T) {
-	layer, _ := newDispatchLayer(t, &forge.FakeClient{}, "", nil)
+func TestOIDCDispatchLayer_RequiredScopes(t *testing.T) {
+	client := forge.NewFakeClient()
+	layer, _ := newOIDCDispatchLayer(t, client, nil, &fakeDispatcher{name: "gcf"})
 
 	assert.Equal(t, []string{"admin:org"}, layer.RequiredScopes(OpInstall))
 	assert.Equal(t, []string{"admin:org"}, layer.RequiredScopes(OpUninstall))
 	assert.Equal(t, []string{"admin:org"}, layer.RequiredScopes(OpAnalyze))
+	assert.Nil(t, layer.RequiredScopes(Operation(99)))
 }
 
-func TestDispatchTokenLayer_Install_CallsPromptFn(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{}, // secret does not exist
+func TestOIDCDispatchLayer_Install(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{
+		{ID: 100, Name: "repo-a", FullName: "test-org/repo-a"},
+		{ID: 200, Name: ".github", FullName: "test-org/.github"},
+		{ID: 999, Name: ".fullsend", FullName: "test-org/.fullsend"},
 	}
 	repoIDs := []int64{100, 200}
-
-	promptFn := func(ctx context.Context) (string, error) {
-		return "ghp_prompted_token", nil
+	dispatcher := &fakeDispatcher{
+		name: "gcf",
+		variables: map[string]string{
+			"FULLSEND_MINT_URL": "https://fullsend-mint-abc123.run.app",
+		},
+		varNames: []string{"FULLSEND_MINT_URL"},
 	}
 
-	var buf bytes.Buffer
-	printer := ui.New(&buf)
-	layer := NewDispatchTokenLayer("test-org", client, "", repoIDs, printer, promptFn)
+	layer, _ := newOIDCDispatchLayer(t, client, repoIDs, dispatcher)
 
 	err := layer.Install(context.Background())
 	require.NoError(t, err)
 
-	require.Len(t, client.CreatedOrgSecrets, 1)
-	assert.Equal(t, "test-org", client.CreatedOrgSecrets[0].Org)
-	assert.Equal(t, "FULLSEND_DISPATCH_TOKEN", client.CreatedOrgSecrets[0].Name)
-	assert.Equal(t, "ghp_prompted_token", client.CreatedOrgSecrets[0].Value)
-	assert.Equal(t, repoIDs, client.CreatedOrgSecrets[0].RepoIDs)
+	// Verify org variable was created with config repo included.
+	require.Len(t, client.CreatedOrgVariables, 1)
+	assert.Equal(t, "test-org", client.CreatedOrgVariables[0].Org)
+	assert.Equal(t, "FULLSEND_MINT_URL", client.CreatedOrgVariables[0].Name)
+	assert.Equal(t, "https://fullsend-mint-abc123.run.app", client.CreatedOrgVariables[0].Value)
+	assert.Equal(t, []int64{100, 200, 999}, client.CreatedOrgVariables[0].RepoIDs)
+
+	// Repo-level variables should be set on all dot-prefixed enrolled repos.
+	// .github (ID 200) is enrolled; .fullsend (ID 999) was added to repoIDs
+	// automatically. Both have dot-prefixed names.
+	require.Len(t, client.Variables, 2)
+	repoNames := []string{client.Variables[0].Repo, client.Variables[1].Repo}
+	assert.ElementsMatch(t, []string{".github", ".fullsend"}, repoNames)
+	for _, v := range client.Variables {
+		assert.Equal(t, "test-org", v.Owner)
+		assert.Equal(t, "FULLSEND_MINT_URL", v.Name)
+		assert.Equal(t, "https://fullsend-mint-abc123.run.app", v.Value)
+	}
+
+	// No org secrets should be created in OIDC mode.
+	assert.Empty(t, client.CreatedOrgSecrets)
 }
 
-func TestDispatchTokenLayer_Install_ErrorWhenNoPromptFn(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{}, // secret does not exist
+func TestOIDCDispatchLayer_Install_ProvisionError(t *testing.T) {
+	client := forge.NewFakeClient()
+	dispatcher := &fakeDispatcher{
+		name:         "gcf",
+		provisionErr: errors.New("GCP auth failed"),
 	}
-	layer, _ := newDispatchLayer(t, client, "", []int64{100})
+
+	layer, _ := newOIDCDispatchLayer(t, client, nil, dispatcher)
 
 	err := layer.Install(context.Background())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "dispatch token not provided")
-	assert.Contains(t, err.Error(), "does not exist")
+	assert.Contains(t, err.Error(), "GCP auth failed")
 }
 
-func TestDispatchTokenLayer_Install_PromptFnError(t *testing.T) {
-	client := &forge.FakeClient{
-		OrgSecrets: map[string]bool{}, // secret does not exist
+func TestOIDCDispatchLayer_Install_CreateVariableError(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.Errors["CreateOrUpdateOrgVariable"] = errors.New("permission denied")
+	dispatcher := &fakeDispatcher{
+		name: "gcf",
+		variables: map[string]string{
+			"FULLSEND_MINT_URL": "https://example.com/fn",
+		},
 	}
 
-	promptFn := func(ctx context.Context) (string, error) {
-		return "", errors.New("user cancelled")
-	}
+	layer, _ := newOIDCDispatchLayer(t, client, nil, dispatcher)
+
+	err := layer.Install(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "permission denied")
+}
+
+func TestOIDCDispatchLayer_Install_NilDispatcher(t *testing.T) {
+	client := forge.NewFakeClient()
 
 	var buf bytes.Buffer
 	printer := ui.New(&buf)
-	layer := NewDispatchTokenLayer("test-org", client, "", []int64{100}, printer, promptFn)
+	layer := NewOIDCDispatchLayer("test-org", client, nil, nil, printer)
 
 	err := layer.Install(context.Background())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "user cancelled")
+	assert.Contains(t, err.Error(), "OIDC dispatcher not configured")
+}
+
+func TestOIDCDispatchLayer_Install_StaleCleanupFailureContinues(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.OrgSecrets = map[string]bool{
+		"test-org/FULLSEND_DISPATCH_TOKEN": true,
+	}
+	client.Errors["DeleteOrgSecret"] = errors.New("admin access revoked")
+	dispatcher := &fakeDispatcher{
+		name:      "gcf",
+		variables: map[string]string{"FULLSEND_MINT_URL": "https://example.com"},
+		varNames:  []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer, buf := newOIDCDispatchLayer(t, client, nil, dispatcher)
+
+	err := layer.Install(context.Background())
+	require.NoError(t, err, "install should succeed despite stale cleanup failure")
+
+	require.Len(t, client.CreatedOrgVariables, 1)
+	assert.Contains(t, buf.String(), "failed to remove stale")
+}
+
+func TestOIDCDispatchLayer_Uninstall_NilDispatcher(t *testing.T) {
+	client := forge.NewFakeClient()
+
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	layer := NewOIDCDispatchLayer("test-org", client, nil, nil, printer)
+
+	err := layer.Uninstall(context.Background())
+	require.NoError(t, err, "uninstall with nil dispatcher should succeed silently")
+	assert.Empty(t, client.DeletedOrgVariables)
+}
+
+func TestOIDCDispatchLayer_Uninstall_DeleteVariableError(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.OrgVariables = map[string]bool{
+		"test-org/FULLSEND_MINT_URL": true,
+	}
+	client.Errors["DeleteOrgVariable"] = errors.New("permission denied")
+	dispatcher := &fakeDispatcher{
+		name:     "gcf",
+		varNames: []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer, _ := newOIDCDispatchLayer(t, client, nil, dispatcher)
+
+	err := layer.Uninstall(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "permission denied")
+}
+
+func TestOIDCDispatchLayer_Uninstall(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.OrgVariables = map[string]bool{
+		"test-org/FULLSEND_MINT_URL": true,
+	}
+	dispatcher := &fakeDispatcher{
+		name:     "gcf",
+		varNames: []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer, buf := newOIDCDispatchLayer(t, client, nil, dispatcher)
+
+	err := layer.Uninstall(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, client.DeletedOrgVariables, 1)
+	assert.Equal(t, "test-org/FULLSEND_MINT_URL", client.DeletedOrgVariables[0])
+
+	// Verify the GCP warning was printed.
+	assert.Contains(t, buf.String(), "must be deleted manually")
+}
+
+func TestOIDCDispatchLayer_Uninstall_AlreadyDeleted(t *testing.T) {
+	client := forge.NewFakeClient()
+	dispatcher := &fakeDispatcher{
+		name:     "gcf",
+		varNames: []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer, _ := newOIDCDispatchLayer(t, client, nil, dispatcher)
+
+	err := layer.Uninstall(context.Background())
+	require.NoError(t, err)
+
+	assert.Empty(t, client.DeletedOrgVariables)
+}
+
+func TestOIDCDispatchLayer_Analyze_Installed(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.OrgVariables = map[string]bool{
+		"test-org/FULLSEND_MINT_URL": true,
+	}
+	dispatcher := &fakeDispatcher{
+		name:     "gcf",
+		varNames: []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer, _ := newOIDCDispatchLayer(t, client, nil, dispatcher)
+
+	report, err := layer.Analyze(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, StatusInstalled, report.Status)
+	assert.Contains(t, report.Details, "FULLSEND_MINT_URL org variable exists")
+}
+
+func TestOIDCDispatchLayer_Analyze_NotInstalled(t *testing.T) {
+	client := forge.NewFakeClient()
+	dispatcher := &fakeDispatcher{
+		name:     "gcf",
+		varNames: []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer, _ := newOIDCDispatchLayer(t, client, nil, dispatcher)
+
+	report, err := layer.Analyze(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, StatusNotInstalled, report.Status)
+	assert.Contains(t, report.WouldInstall, "create FULLSEND_MINT_URL org variable")
+}
+
+func TestOIDCDispatchLayer_Analyze_NilDispatcher(t *testing.T) {
+	client := forge.NewFakeClient()
+
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	layer := NewOIDCDispatchLayer("test-org", client, nil, nil, printer)
+
+	report, err := layer.Analyze(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, StatusNotInstalled, report.Status)
+	assert.Contains(t, report.WouldInstall, "configure OIDC dispatch")
+}
+
+func TestOIDCDispatchLayer_Install_CleansStale_PAT_Secret(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.OrgSecrets = map[string]bool{
+		"test-org/FULLSEND_DISPATCH_TOKEN": true,
+	}
+	dispatcher := &fakeDispatcher{
+		name: "gcf",
+		variables: map[string]string{
+			"FULLSEND_MINT_URL": "https://fullsend-mint-abc123.run.app",
+		},
+		varNames: []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer, buf := newOIDCDispatchLayer(t, client, []int64{100}, dispatcher)
+
+	err := layer.Install(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, client.DeletedOrgSecrets, 1)
+	assert.Equal(t, "test-org/FULLSEND_DISPATCH_TOKEN", client.DeletedOrgSecrets[0])
+	assert.Contains(t, buf.String(), "migrating to OIDC mint")
+	assert.Contains(t, buf.String(), "removed stale")
+}
+
+// --- BothModes tests ---
+
+func TestBothModesDispatchLayer_Uninstall(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.OrgSecrets = map[string]bool{
+		"test-org/FULLSEND_DISPATCH_TOKEN": true,
+	}
+	client.OrgVariables = map[string]bool{
+		"test-org/FULLSEND_MINT_URL": true,
+	}
+	dispatcher := &fakeDispatcher{
+		name:     "gcf",
+		varNames: []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer := NewBothModesDispatchLayer("test-org", client, dispatcher, ui.New(&bytes.Buffer{}))
+
+	err := layer.Uninstall(context.Background())
+	require.NoError(t, err)
+
+	assert.Contains(t, client.DeletedOrgSecrets, "test-org/FULLSEND_DISPATCH_TOKEN")
+	assert.Contains(t, client.DeletedOrgVariables, "test-org/FULLSEND_MINT_URL")
+}
+
+func TestBothModesDispatchLayer_Analyze(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.OrgSecrets = map[string]bool{
+		"test-org/FULLSEND_DISPATCH_TOKEN": true,
+	}
+	dispatcher := &fakeDispatcher{
+		name:     "gcf",
+		varNames: []string{"FULLSEND_MINT_URL"},
+	}
+
+	layer := NewBothModesDispatchLayer("test-org", client, dispatcher, ui.New(&bytes.Buffer{}))
+
+	report, err := layer.Analyze(context.Background())
+	require.NoError(t, err)
+
+	assert.Contains(t, report.Details, "FULLSEND_DISPATCH_TOKEN org secret exists")
 }

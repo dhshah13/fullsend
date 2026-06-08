@@ -2,23 +2,44 @@ name: E2E Tests
 
 permissions:
   contents: read
+  id-token: write
 
 on:
   push:
     branches: [main]
-    paths: ['**/*.go', 'go.mod', 'go.sum', 'e2e/**']
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'e2e/**'
+      - 'internal/scaffold/fullsend-repo/**'
+      - 'internal/security/hooks/**'
+      - 'internal/dispatch/gcf/mintsrc/**'
+      - 'internal/sentencetoken/english.json'
+      - 'Makefile'
+      - '.github/workflows/e2e.yml'
   pull_request:
-    paths: ['**/*.go', 'go.mod', 'go.sum', 'e2e/**']
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'e2e/**'
+      - 'internal/scaffold/fullsend-repo/**'
+      - 'internal/security/hooks/**'
+      - 'internal/dispatch/gcf/mintsrc/**'
+      - 'internal/sentencetoken/english.json'
+      - 'Makefile'
+      - '.github/workflows/e2e.yml'
   workflow_dispatch:
 
 concurrency:
-  group: e2e-halfsend
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -50,12 +71,22 @@ jobs:
         env:
           E2E_GITHUB_SESSION_B64: ${{ secrets.E2E_GITHUB_SESSION }}
 
+      - name: Authenticate to GCP
+        if: steps.secrets-check.outputs.available == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.E2E_GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.E2E_GCP_SERVICE_ACCOUNT }}
+
       - name: Run e2e tests
         if: steps.secrets-check.outputs.available == 'true'
         run: make e2e-test
         env:
           E2E_SCREENSHOT_DIR: ${{ runner.temp }}/e2e-screenshots
           E2E_GITHUB_PASSWORD: ${{ secrets.E2E_GITHUB_PASSWORD }}
+          E2E_GITHUB_TOTP_SECRET: ${{ secrets.E2E_GITHUB_TOTP_SECRET }}
+          E2E_MINT_URL: ${{ secrets.E2E_MINT_URL }}
+          E2E_GCP_PROJECT_ID: ${{ secrets.E2E_GCP_PROJECT_ID }}
 
       - name: Upload debug screenshots
         if: always() && steps.secrets-check.outputs.available == 'true'

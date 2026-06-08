@@ -1,0 +1,314 @@
+name: Fullsend
+description: >-
+  Install fullsend-cli, create ${GITHUB_WORKSPACE}/output, invoke fullsend run with
+  --output-dir pointing at that directory, then upload it with actions/upload-artifact. Does not
+  read agent configuration from the repository; configure the job environment or CLI as needed.
+
+branding:
+  icon: zap
+  color: purple
+
+inputs:
+  agent:
+    description: Agent name passed to fullsend run (e.g. triage, code, review).
+    required: true
+  version:
+    description: >-
+      Release tag or version: use latest, v0.0.1, or 0.0.1. Download URLs use a leading v; asset
+      names use the version without v (fullsend_0.0.1_linux_amd64.tar.gz).
+    default: latest
+  fullsend-dir:
+    description: Path to fullsend config directory (default GITHUB_WORKSPACE).
+    default: ""
+  target-repo:
+    description: Path to target repo checkout (default GITHUB_WORKSPACE/target-repo).
+    default: ""
+  github_token:
+    description: >-
+      GitHub token for authenticated API calls (avoids 60 req/hour unauthenticated rate limit).
+    default: ${{ github.token }}
+  run-url:
+    description: URL of the CI/CD run for status comments (optional).
+    default: ""
+  status-repo:
+    description: Repository (owner/repo) for status comments (optional).
+    default: ""
+  status-number:
+    description: Issue/PR number for status comments (optional).
+    default: ""
+  status-token:
+    description: Token for status comments (defaults to GH_TOKEN env var).
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install fullsend CLI
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        set -euo pipefail
+
+        # retry_curl: retry a curl command up to MAX_ATTEMPTS times with exponential backoff.
+        # Usage: retry_curl [curl args...]
+        retry_curl() {
+          local max_attempts=3
+          local attempt=1
+          local delay=5
+          while true; do
+            if curl "$@"; then
+              return 0
+            fi
+            if (( attempt >= max_attempts )); then
+              echo "::error::Download failed after ${max_attempts} attempts"
+              return 1
+            fi
+            echo "::warning::Download attempt ${attempt}/${max_attempts} failed, retrying in ${delay}s..."
+            sleep "${delay}"
+            (( attempt++ ))
+            (( delay *= 3 ))
+          done
+        }
+
+        # Use vendored binary if present (placed by fullsend admin install --vendor-fullsend-binary).
+        # Per-org mode stores it at bin/fullsend (in .fullsend config repo);
+        # per-repo mode stores it at .fullsend/bin/fullsend (in the target repo).
+        # GitHub Contents API does not preserve the executable bit, so check -f not -x.
+        VENDORED=""
+        if [[ -f "${GITHUB_WORKSPACE}/.fullsend/bin/fullsend" ]]; then
+          VENDORED="${GITHUB_WORKSPACE}/.fullsend/bin/fullsend"
+        elif [[ -f "${GITHUB_WORKSPACE}/bin/fullsend" ]]; then
+          VENDORED="${GITHUB_WORKSPACE}/bin/fullsend"
+        fi
+        if [[ -n "${VENDORED}" ]]; then
+          echo "Using vendored fullsend binary from ${VENDORED#"${GITHUB_WORKSPACE}/"}"
+          mkdir -p "${RUNNER_TEMP}/fullsend"
+          cp "${VENDORED}" "${RUNNER_TEMP}/fullsend/fullsend"
+          chmod +x "${RUNNER_TEMP}/fullsend/fullsend"
+          echo "${RUNNER_TEMP}/fullsend" >> "${GITHUB_PATH}"
+          exit 0
+        fi
+
+        VERSION="$(printf '%s' "${VERSION:-latest}" | tr -d '[:space:]')"
+        VERSION="${VERSION:-latest}"
+
+        os="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
+        case "${os}" in
+          macos) os=darwin ;;
+        esac
+
+        arch="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
+        case "${arch}" in
+          x64) arch=amd64 ;;
+          x86) arch=386 ;;
+          arm64|aarch64) arch=arm64 ;;
+        esac
+
+        if [[ "${VERSION}" == "latest" ]]; then
+          TAG="$(retry_curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/fullsend-ai/fullsend/releases/latest" | jq -r '.tag_name')"
+          if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
+            echo "::error::Could not resolve latest release tag"
+            exit 1
+          fi
+          if [[ "${TAG}" == v* ]]; then
+            VERSION_URL="${TAG}"
+            VERSION_ASSET="${TAG#v}"
+          else
+            VERSION_URL="v${TAG}"
+            VERSION_ASSET="${TAG}"
+          fi
+          BASE_URL="https://github.com/fullsend-ai/fullsend/releases/download/${VERSION_URL}"
+        else
+          if [[ "${VERSION}" == v* ]]; then
+            VERSION_URL="${VERSION}"
+            VERSION_ASSET="${VERSION#v}"
+          else
+            VERSION_URL="v${VERSION}"
+            VERSION_ASSET="${VERSION}"
+          fi
+          BASE_URL="https://github.com/fullsend-ai/fullsend/releases/download/${VERSION_URL}"
+        fi
+
+        ASSET_NAME="fullsend_${VERSION_ASSET}_${os}_${arch}.tar.gz"
+        URL="${BASE_URL}/${ASSET_NAME}"
+
+        echo "Downloading from: ${URL}"
+        retry_curl -fsSL "$URL" -o "/tmp/${ASSET_NAME}"
+        mkdir -p "${RUNNER_TEMP}/fullsend"
+        tar -xzf "/tmp/${ASSET_NAME}" -C "${RUNNER_TEMP}/fullsend"
+        echo "${RUNNER_TEMP}/fullsend" >> "${GITHUB_PATH}"
+
+    - name: Print fullsend version
+      shell: bash
+      run: fullsend --version
+
+    - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+
+    - name: Set OpenShell version
+      shell: bash
+      run: echo "OPENSHELL_VERSION=0.0.38" >> "${GITHUB_ENV}"
+
+    - name: Install OpenShell CLI
+      shell: bash
+      run: |
+        uv tool install openshell==${OPENSHELL_VERSION}
+        openshell --version
+
+    - name: Download openshell-gateway
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        arch="$(uname -m)"
+        case "${arch}" in
+          x86_64) ;;
+          aarch64|arm64) arch=aarch64 ;;
+          *) echo "::error::Unsupported architecture for openshell-gateway: ${arch}"; exit 1 ;;
+        esac
+
+        GATEWAY_ASSET="openshell-gateway-${arch}-unknown-linux-gnu.tar.gz"
+        GATEWAY_URL="https://github.com/NVIDIA/OpenShell/releases/download/v${OPENSHELL_VERSION}/${GATEWAY_ASSET}"
+        max_attempts=3; attempt=1; delay=5
+        while true; do
+          if curl -fsSL "${GATEWAY_URL}" -o "/tmp/${GATEWAY_ASSET}"; then break; fi
+          if (( attempt >= max_attempts )); then
+            echo "::error::Gateway download failed after ${max_attempts} attempts"
+            exit 1
+          fi
+          echo "::warning::Gateway download attempt ${attempt}/${max_attempts} failed, retrying in ${delay}s..."
+          sleep "${delay}"; (( attempt++ )); (( delay *= 3 ))
+        done
+        tar xzf "/tmp/${GATEWAY_ASSET}" -C "${RUNNER_TEMP}/fullsend"
+        rm -f "/tmp/${GATEWAY_ASSET}"
+
+    - name: Install Podman
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y podman
+        podman --version
+
+    - name: Configure rootless Podman
+      shell: bash
+      run: |
+        test -f /sys/fs/cgroup/cgroup.controllers || { echo "::error::cgroups v2 required"; exit 1; }
+        whoami_user="$(whoami)"
+        grep -q "^${whoami_user}:" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "${whoami_user}"
+        podman system migrate
+        podman info
+
+    - name: Start Podman API service
+      shell: bash
+      run: |
+        SOCKET_PATH="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+        if [ ! -S "${SOCKET_PATH}" ]; then
+          mkdir -p "$(dirname "${SOCKET_PATH}")"
+          podman system service --time=0 "unix://${SOCKET_PATH}" &
+          for i in $(seq 1 30); do
+            [ -S "${SOCKET_PATH}" ] && podman --url "unix://${SOCKET_PATH}" info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          [ -S "${SOCKET_PATH}" ] || { echo "::error::Podman socket not ready"; exit 1; }
+        fi
+        echo "Podman API service ready at ${SOCKET_PATH}"
+
+    - name: Start openshell-gateway
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        GATEWAY_LOG="${GITHUB_WORKSPACE}/output/openshell-gateway.log"
+        mkdir -p "${GITHUB_WORKSPACE}/output"
+
+        export OPENSHELL_SSH_HANDSHAKE_SECRET="ci-$(openssl rand -hex 16)"
+        echo "::add-mask::${OPENSHELL_SSH_HANDSHAKE_SECRET}"
+        # Version-tagged images start at 0.0.41; for 0.0.38 use the release commit SHA.
+        # TODO: pass via --podman-supervisor-image flag when one exists (Docker driver has --docker-supervisor-image).
+        export OPENSHELL_SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:dfd47683e7da4f1a4a8fa5d77f92d3696e6a41f9"
+
+        "${RUNNER_TEMP}/fullsend/openshell-gateway" \
+          --bind-address 0.0.0.0 \
+          --health-port 8081 \
+          --drivers podman \
+          --disable-tls \
+          --db-url "sqlite:/tmp/gateway.db?mode=rwc" \
+          >"${GATEWAY_LOG}" 2>&1 &
+
+        for i in $(seq 1 30); do
+          curl -sf http://127.0.0.1:8081/healthz >/dev/null 2>&1 && break
+          sleep 2
+        done
+        curl -sf http://127.0.0.1:8081/healthz >/dev/null 2>&1 || {
+          echo "::error::Gateway health check failed after 60s"
+          echo "::group::Gateway logs"
+          cat "${GATEWAY_LOG}" 2>/dev/null || echo "(no log file)"
+          echo "::endgroup::"
+          exit 1
+        }
+
+        openshell gateway add http://127.0.0.1:8080 --local --name local
+        openshell gateway select local
+
+    - name: Pre-pull sandbox image
+      shell: bash
+      run: |
+        IMAGE="${FULLSEND_SANDBOX_IMAGE:-ghcr.io/fullsend-ai/fullsend-code:latest}"
+        echo "Pre-pulling sandbox image: ${IMAGE}"
+        timeout 300 podman pull -- "${IMAGE}" || echo "::warning::Image pre-pull failed; sandbox create will pull on demand"
+
+    - name: Install validation dependencies
+      shell: bash
+      run: pip install --quiet "jsonschema>=4.18.0"
+
+    - name: Run fullsend
+      if: inputs.agent != '__install_only__'
+      shell: bash
+      env:
+        AGENT: ${{ inputs.agent }}
+        FULLSEND_DIR: ${{ inputs.fullsend-dir }}
+        TARGET_REPO: ${{ inputs.target-repo }}
+        STATUS_RUN_URL: ${{ inputs.run-url }}
+        STATUS_REPO: ${{ inputs.status-repo }}
+        STATUS_NUMBER: ${{ inputs.status-number }}
+        STATUS_TOKEN: ${{ inputs.status-token }}
+      run: |
+        set -euo pipefail
+        FULLSEND_DIR="${FULLSEND_DIR:-${GITHUB_WORKSPACE}}"
+        TARGET_REPO="${TARGET_REPO:-${GITHUB_WORKSPACE}/target-repo}"
+        mkdir -p "${GITHUB_WORKSPACE}/output"
+        # SECURITY: Never expose --no-post-script as a workflow input.
+        # Post-scripts enforce secret scanning, protected-path blocks,
+        # and review-downgrade controls. Skipping them in CI bypasses
+        # all post-push security gates.
+        if [[ -n "${STATUS_TOKEN}" ]]; then
+          echo "::add-mask::${STATUS_TOKEN}"
+        fi
+        STATUS_FLAGS=()
+        if [[ -n "${STATUS_REPO}" && -n "${STATUS_NUMBER}" ]]; then
+          STATUS_FLAGS+=(--status-repo "${STATUS_REPO}" --status-number "${STATUS_NUMBER}")
+          if [[ -n "${STATUS_RUN_URL}" ]]; then
+            STATUS_FLAGS+=(--run-url "${STATUS_RUN_URL}")
+          fi
+          if [[ -n "${STATUS_TOKEN}" ]]; then
+            STATUS_FLAGS+=(--status-token "${STATUS_TOKEN}")
+          fi
+        fi
+        fullsend run "${AGENT}" \
+          --fullsend-dir "${FULLSEND_DIR}" \
+          --output-dir "${GITHUB_WORKSPACE}/output" \
+          --target-repo "${TARGET_REPO}" \
+          "${STATUS_FLAGS[@]+"${STATUS_FLAGS[@]}"}"
+
+    - name: Upload fullsend artifacts
+      if: always() && inputs.agent != '__install_only__'
+      uses: actions/upload-artifact@v7
+      with:
+        name: fullsend-${{ inputs.agent }}
+        path: ${{ github.workspace }}/output

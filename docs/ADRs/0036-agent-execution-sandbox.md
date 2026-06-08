@@ -1,6 +1,6 @@
 ---
 title: "36. Agent Execution Sandbox Architecture"
-status: Proposed
+status: Accepted
 relates_to:
   - agent-infrastructure
 topics:
@@ -17,7 +17,7 @@ Date: 2026-05-05
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 

@@ -12,6 +12,10 @@ import (
 // configuration repository. See ADR-0003.
 const ConfigRepoName = ".fullsend"
 
+// PerRepoGuardVar is the repo variable set by per-repo install to prevent
+// per-org enrollment from overriding a per-repo installation.
+const PerRepoGuardVar = "FULLSEND_PER_REPO_INSTALL"
+
 // ErrNotFound indicates a requested resource was not found on the forge.
 var ErrNotFound = errors.New("not found")
 
@@ -48,11 +52,20 @@ type WorkflowRun struct {
 	CreatedAt  string
 }
 
+// Annotation represents a check-run annotation (e.g. from ::notice:: or
+// ::warning:: workflow commands).
+type Annotation struct {
+	Level   string // "notice", "warning", "failure"
+	Message string
+}
+
 // Issue represents a forge issue.
 type Issue struct {
 	Number int
 	Title  string
+	Body   string
 	URL    string
+	Labels []string
 }
 
 // IssueComment represents a comment on an issue.
@@ -75,12 +88,30 @@ type PullRequestReview struct {
 	SubmittedAt string
 }
 
+// ReviewComment represents an inline comment on a specific line of a
+// pull request diff. These are submitted as part of a formal PR review
+// via the GitHub "Create a review" API.
+type ReviewComment struct {
+	Path string // relative file path in the repository
+	Line int    // line number in the diff (right side)
+	Body string // comment body (Markdown)
+}
+
+// PullRequestFileDiff represents a file changed in a pull request along
+// with its unified diff patch. The patch may be empty for binary files,
+// rename-only changes, or when GitHub truncates large diffs.
+type PullRequestFileDiff struct {
+	Path  string
+	Patch string
+}
+
 // Installation represents an app installation on an org.
 type Installation struct {
-	ID          int
-	AppID       int
-	AppSlug     string
-	Permissions map[string]string
+	ID            int
+	AppID         int
+	AppSlug       string
+	AppOwnerLogin string // GitHub login of the app owner (org or user)
+	Permissions   map[string]string
 }
 
 // TreeFile represents a file to be committed via the Git Trees API.
@@ -96,8 +127,15 @@ type TreeFile struct {
 // Implementations exist for GitHub (and eventually GitLab, Forgejo).
 type Client interface {
 	// Repository operations
-	// ListOrgRepos returns repositories eligible for fullsend installation.
-	// It excludes archived repos (no active development) and forks.
+	// ListOrgRepos returns repositories eligible for fullsend enrollment.
+	// It excludes archived repos (no active development), forks, and
+	// private repos.
+	//
+	// Private repos are excluded because the default .fullsend config repo
+	// is public, and agent workflows dispatched to it run with public logs.
+	// Enrolling a private repo would expose its code in those logs when
+	// agents check out and process the repo content. Private repo support
+	// requires per-repo .fullsend mode where agents run on the target repo.
 	//
 	// Forks are excluded because fullsend's trust model is org-centric:
 	// trust derives from org repository permissions and CODEOWNERS
@@ -140,6 +178,10 @@ type Client interface {
 	CreateChangeProposal(ctx context.Context, owner, repo, title, body, head, base string) (*ChangeProposal, error)
 	ListRepoPullRequests(ctx context.Context, owner, repo string) ([]ChangeProposal, error)
 
+	// Organization metadata
+	// GetOrgPlan returns the billing plan name for the org (e.g. "free", "team", "enterprise").
+	GetOrgPlan(ctx context.Context, org string) (string, error)
+
 	// Authentication
 	GetAuthenticatedUser(ctx context.Context) (string, error)
 
@@ -153,6 +195,7 @@ type Client interface {
 	RepoSecretExists(ctx context.Context, owner, repo, name string) (bool, error)
 	CreateOrUpdateRepoVariable(ctx context.Context, owner, repo, name, value string) error
 	RepoVariableExists(ctx context.Context, owner, repo, name string) (bool, error)
+	GetRepoVariable(ctx context.Context, owner, repo, name string) (string, bool, error)
 
 	// Org-level secrets (for cross-repo dispatch tokens)
 	CreateOrgSecret(ctx context.Context, org, name, value string, selectedRepoIDs []int64) error
@@ -163,26 +206,45 @@ type Client interface {
 	// to the given org-level secret.
 	GetOrgSecretRepos(ctx context.Context, org, name string) ([]int64, error)
 
+	// Org-level variables (for dispatch function URL)
+	CreateOrUpdateOrgVariable(ctx context.Context, org, name, value string, selectedRepoIDs []int64) error
+	OrgVariableExists(ctx context.Context, org, name string) (bool, error)
+	DeleteOrgVariable(ctx context.Context, org, name string) error
+	SetOrgVariableRepos(ctx context.Context, org, name string, repoIDs []int64) error
+	// GetOrgVariableRepos returns the list of repository IDs that have access
+	// to the given org-level variable.
+	GetOrgVariableRepos(ctx context.Context, org, name string) ([]int64, error)
+
 	// CI/Workflow operations
 	GetLatestWorkflowRun(ctx context.Context, owner, repo, workflowFile string) (*WorkflowRun, error)
 	GetWorkflowRun(ctx context.Context, owner, repo string, runID int) (*WorkflowRun, error)
 	DispatchWorkflow(ctx context.Context, owner, repo, workflowFile, ref string, inputs map[string]string) error
 
 	// Issue operations
-	CreateIssue(ctx context.Context, owner, repo, title, body string) (*Issue, error)
+	CreateIssue(ctx context.Context, owner, repo, title, body string, labels ...string) (*Issue, error)
 	CloseIssue(ctx context.Context, owner, repo string, number int) error
+	ListOpenIssues(ctx context.Context, owner, repo string, labels ...string) ([]Issue, error)
 	ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error)
 	CreateIssueComment(ctx context.Context, owner, repo string, number int, body string) (*IssueComment, error)
 	UpdateIssueComment(ctx context.Context, owner, repo string, commentID int, body string) error
+	DeleteIssueComment(ctx context.Context, owner, repo string, commentID int) error
 	MinimizeComment(ctx context.Context, nodeID, reason string) error
 
 	// Pull request operations
 	GetPullRequestHeadSHA(ctx context.Context, owner, repo string, number int) (string, error)
+	// ListPullRequestFiles returns the relative file paths changed by a pull
+	// request. On GitHub, the API caps results at 3000 files total.
+	ListPullRequestFiles(ctx context.Context, owner, repo string, number int) ([]string, error)
+	// ListPullRequestFileDiffs returns the files changed by a pull request
+	// along with their unified diff patches. Use this when you need to
+	// determine which lines are within diff hunks (e.g. for inline comments).
+	ListPullRequestFileDiffs(ctx context.Context, owner, repo string, number int) ([]PullRequestFileDiff, error)
 
 	// Pull request review operations.
 	// commitSHA, when non-empty, pins the review to a specific commit.
 	// GitHub rejects the request if the commit is not the PR's current HEAD.
-	CreatePullRequestReview(ctx context.Context, owner, repo string, number int, event, body, commitSHA string) error
+	// comments, when non-nil, attaches inline diff comments to the review.
+	CreatePullRequestReview(ctx context.Context, owner, repo string, number int, event, body, commitSHA string, comments []ReviewComment) error
 	ListPullRequestReviews(ctx context.Context, owner, repo string, number int) ([]PullRequestReview, error)
 	DismissPullRequestReview(ctx context.Context, owner, repo string, number, reviewID int, message string) error
 
@@ -195,6 +257,10 @@ type Client interface {
 	// GetWorkflowRunLogs downloads the logs for a workflow run as plain text.
 	// On GitHub, this fetches job logs for each job in the run.
 	GetWorkflowRunLogs(ctx context.Context, owner, repo string, runID int) (string, error)
+
+	// GetWorkflowRunAnnotations returns annotations (::notice::, ::warning::,
+	// etc.) from all jobs in a workflow run.
+	GetWorkflowRunAnnotations(ctx context.Context, owner, repo string, runID int) ([]Annotation, error)
 
 	// App installation operations
 	ListOrgInstallations(ctx context.Context, org string) ([]Installation, error)

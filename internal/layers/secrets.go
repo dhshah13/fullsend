@@ -15,14 +15,20 @@ type AgentCredentials struct {
 	config.AgentEntry
 	PEM      string
 	ClientID string
+	AppID    int
 }
 
 // SecretsLayer manages agent app secrets and variables in the .fullsend repo.
+// When oidcMode is true, Install is a no-op because agent workflows use the
+// OIDC token mint instead of create-github-app-token, so repo secrets
+// (FULLSEND_{ROLE}_APP_PRIVATE_KEY) and variables (FULLSEND_{ROLE}_CLIENT_ID)
+// are not needed.
 type SecretsLayer struct {
-	org    string
-	client forge.Client
-	agents []AgentCredentials
-	ui     *ui.Printer
+	org      string
+	client   forge.Client
+	agents   []AgentCredentials
+	ui       *ui.Printer
+	oidcMode bool
 }
 
 var _ Layer = (*SecretsLayer)(nil)
@@ -37,15 +43,28 @@ func NewSecretsLayer(org string, client forge.Client, agents []AgentCredentials,
 	}
 }
 
+// WithOIDCMode enables OIDC mode and returns the receiver for chaining.
+// In OIDC mode, Install is a no-op because PEMs are stored in GCP Secret
+// Manager and workflows use the OIDC token mint.
+func (s *SecretsLayer) WithOIDCMode() *SecretsLayer {
+	s.oidcMode = true
+	return s
+}
+
 // Name returns the layer name.
 func (s *SecretsLayer) Name() string {
 	return "secrets"
 }
 
 // RequiredScopes returns the scopes needed for the given operation.
+// In OIDC mode, Install needs no scopes (it's a no-op) but Analyze still
+// needs "repo" to check for stale secrets via RepoSecretExists.
 func (s *SecretsLayer) RequiredScopes(op Operation) []string {
 	switch op {
 	case OpInstall:
+		if s.oidcMode {
+			return nil
+		}
 		return []string{"repo"}
 	case OpUninstall:
 		return nil // no-op
@@ -57,8 +76,13 @@ func (s *SecretsLayer) RequiredScopes(op Operation) []string {
 }
 
 // Install stores agent app private keys as repo secrets and client IDs as
-// repo variables in the .fullsend config repo.
+// repo variables in the .fullsend config repo. In OIDC mode this is a no-op
+// because PEMs are stored in GCP Secret Manager and workflows use the mint.
 func (s *SecretsLayer) Install(ctx context.Context) error {
+	if s.oidcMode {
+		s.ui.StepDone("skipping repo secrets (OIDC mint mode)")
+		return nil
+	}
 	for _, agent := range s.agents {
 		if agent.PEM != "" {
 			sName := secretName(agent.Role)
@@ -87,6 +111,7 @@ func (s *SecretsLayer) Uninstall(_ context.Context) error {
 }
 
 // Analyze checks whether all expected agent secrets and variables exist in the .fullsend repo.
+// In OIDC mode, repo secrets are not required — any present are flagged as stale.
 func (s *SecretsLayer) Analyze(ctx context.Context) (*LayerReport, error) {
 	report := &LayerReport{Name: s.Name()}
 
@@ -115,6 +140,19 @@ func (s *SecretsLayer) Analyze(ctx context.Context) (*LayerReport, error) {
 		} else {
 			missing = append(missing, vName)
 		}
+	}
+
+	if s.oidcMode {
+		report.Status = StatusInstalled
+		if len(present) > 0 {
+			report.Status = StatusDegraded
+			for _, name := range present {
+				report.WouldFix = append(report.WouldFix, fmt.Sprintf("remove stale %s (not needed in OIDC mode)", name))
+			}
+		} else {
+			report.Details = append(report.Details, "no repo secrets (OIDC mint mode)")
+		}
+		return report, nil
 	}
 
 	switch {

@@ -1,4 +1,6 @@
+---
 agent: agents/triage.md
+doc: docs/agents/triage.md
 model: opus
 image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
 policy: policies/triage.yaml
@@ -16,7 +18,8 @@ host_files:
     dest: /tmp/workspace/.env.d/triage.env
     expand: true
 
-skills: []
+skills:
+  - skills/issue-labels
 
 pre_script: scripts/pre-triage.sh
 

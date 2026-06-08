@@ -91,30 +91,37 @@ func TestConfigRepoLayer_Install_AlreadyExists(t *testing.T) {
 	assert.True(t, foundConfig, "config.yaml should have been written even when repo exists")
 }
 
-func TestConfigRepoLayer_Install_PrivateOrg(t *testing.T) {
+func TestConfigRepoLayer_Install_AlwaysPublic(t *testing.T) {
 	client := &forge.FakeClient{
 		Repos: []forge.Repository{},
 	}
-	layer, _ := newTestLayer(t, client, true)
+	layer, buf := newTestLayer(t, client, false)
 
 	err := layer.Install(context.Background())
 	require.NoError(t, err)
 
 	require.Len(t, client.CreatedRepos, 1)
-	assert.True(t, client.CreatedRepos[0].Private, "repo should be private when org has private repos")
+	assert.False(t, client.CreatedRepos[0].Private, "config repo should always be public")
+
+	output := buf.String()
+	assert.Contains(t, output, "public")
+	assert.Contains(t, output, "private", "should warn about consequences of making repo private later")
 }
 
-func TestConfigRepoLayer_Install_PublicOrg(t *testing.T) {
+func TestConfigRepoLayer_Install_ExistingPrivateRepo_Warns(t *testing.T) {
 	client := &forge.FakeClient{
-		Repos: []forge.Repository{},
+		Repos: []forge.Repository{
+			{Name: ".fullsend", FullName: "test-org/.fullsend", Private: true},
+		},
 	}
-	layer, _ := newTestLayer(t, client, false)
+	layer, buf := newTestLayer(t, client, false)
 
 	err := layer.Install(context.Background())
 	require.NoError(t, err)
 
-	require.Len(t, client.CreatedRepos, 1)
-	assert.False(t, client.CreatedRepos[0].Private, "repo should be public when org has no private repos")
+	output := buf.String()
+	assert.Contains(t, output, "private")
+	assert.Contains(t, output, "public", "should suggest making the repo public")
 }
 
 func TestConfigRepoLayer_Install_CreateRepoError(t *testing.T) {

@@ -1,3 +1,4 @@
+---
 # lint-workflow-size: max-lines=220
 name: Prioritize Scheduler
 
@@ -21,19 +22,19 @@ jobs:
     permissions:
       actions: write
       contents: read
+      id-token: write
 
     steps:
       - name: Checkout .fullsend repository
         uses: actions/checkout@v6
 
-      - name: Generate app token
+      - name: Mint fullsend token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: fullsend-ai/fullsend/.github/actions/mint-token@v0
         with:
-          client-id: ${{ vars.FULLSEND_FULLSEND_CLIENT_ID }}
-          private-key: ${{ secrets.FULLSEND_FULLSEND_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: .fullsend
+          role: fullsend
+          repos: .fullsend
+          mint_url: ${{ vars.FULLSEND_MINT_URL }}
 
       - name: Find issues and dispatch prioritize runs
         env:

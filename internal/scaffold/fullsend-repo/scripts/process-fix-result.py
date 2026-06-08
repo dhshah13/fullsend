@@ -14,8 +14,11 @@ Exit codes:
 """
 
 import json
+import os
 import subprocess
 import sys
+
+import jsonschema
 
 
 def build_summary_body(data):
@@ -146,6 +149,25 @@ def main(argv=None):
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         print(f"::error::Cannot read {result_file}: {e}", file=sys.stderr)
+        return 1
+
+    schema_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "schemas",
+        "fix-result.schema.json",
+    )
+    try:
+        with open(schema_path) as f:
+            schema = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"::error::Cannot read schema {schema_path}: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        jsonschema.validate(instance=data, schema=schema)
+    except jsonschema.ValidationError as e:
+        print(f"::error::fix-result.json failed schema validation: {e.message}", file=sys.stderr)
         return 1
 
     actions = data.get("actions", [])
