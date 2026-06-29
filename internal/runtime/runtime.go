@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 
@@ -9,7 +10,11 @@ import (
 
 // RunMetrics collects execution statistics from stream parsing.
 type RunMetrics struct {
-	ToolCalls atomic.Int32
+	ToolCalls    atomic.Int32
+	NumTurns     int     `json:"num_turns"`
+	TotalCostUSD float64 `json:"total_cost_usd"`
+	InputTokens  int     `json:"input_tokens"`
+	OutputTokens int     `json:"output_tokens"`
 }
 
 // RunParams configures a single agent invocation inside the sandbox.
@@ -39,7 +44,7 @@ type Runtime interface {
 	WorkspaceDir() string
 	EnvExports() []string
 	Bootstrap(input BootstrapInput) error
-	Run(params RunParams, printer *ui.Printer, start time.Time, metrics *RunMetrics) (exitCode int, err error)
+	Run(ctx context.Context, params RunParams, printer *ui.Printer, start time.Time, metrics *RunMetrics) (exitCode int, err error)
 	ClearIterationArtifacts(sandboxName string) error
 }
 

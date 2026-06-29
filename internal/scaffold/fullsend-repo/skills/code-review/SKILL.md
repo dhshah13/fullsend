@@ -52,6 +52,12 @@ git log --oneline -10 -- <test-file-path>
 - Read any security-sensitive files related to the change (auth
   middleware, RBAC configuration, sandboxing code) even if they are not
   directly modified.
+- **Cross-file verification:** If you intend to reference a file's
+  contents in a finding — even a file not in the diff — you MUST read
+  that file first. Never claim a file contains specific text without
+  having read it in this session. If you cannot read the file (e.g., it
+  is in another repository or inaccessible), state that you were unable
+  to verify the contents rather than assuming what they contain.
 
 ### 3. Evaluate each dimension
 
@@ -98,7 +104,31 @@ dimension carry over to another — each requires its own scrutiny.
   parties?
 - Privilege escalation: can a lower-privilege principal gain
   higher-privilege access through the changed code?
-- Injection vulnerabilities: SQL, command, LDAP, path traversal.
+- Injection vulnerabilities: SQL, command, LDAP, path traversal,
+  GitHub Actions workflow command injection.
+- **GitHub Actions workflow command injection:** Any code emitting GHA
+  workflow commands (`::error::`, `::warning::`, `::notice::`,
+  `::group::`, `::set-output::` (deprecated), `::set-env::` (deprecated,
+  but still active when `ACTIONS_ALLOW_UNSECURE_COMMANDS=true`),
+  `::add-mask::`) must
+  sanitize ALL interpolated values — not just message bodies — for `::`
+  sequences, `%0A`/`%0D` URL-encoded newlines, ANSI escapes, and
+  control characters. Title parameters, file paths, and metadata fields
+  are common blind spots. When reviewing sanitization, verify that EVERY
+  variable interpolated into the command string is sanitized
+  individually; do not conclude safety from partial verification (e.g.,
+  seeing the message body sanitized does not imply the title parameter
+  is also sanitized).
+- **Exhaustive security-control verification:** NEVER assert that a
+  security control (sanitization, validation, authorization, escaping)
+  covers all attack surfaces based on verifying a subset. When you find
+  a security-relevant function applied to one variable, explicitly
+  enumerate ALL other variables in the same context and verify each one
+  individually. In your findings, state which inputs you verified as
+  protected and which you could not confirm. If any input lacks the
+  control, raise a finding even if the unprotected input appears
+  low-risk — the risk assessment belongs in the finding's severity, not
+  in a decision to omit the finding.
 - Content security: does the change affect how user-supplied content is
   handled or rendered? Are there sandboxing gaps?
 - **Permission manifest changes:** If the diff modifies any file that
@@ -160,6 +190,12 @@ readability or correctness.
 - Do documentation files reference behavior, APIs, or configurations
   changed by this PR?
 - Are any docs now stale as a result of the change?
+- **Rename/deprecation completeness:** When a PR renames or removes an
+  identifier, grep for stale references using a bare-word pattern
+  (`\bOLD_NAME\b`) in addition to any syntax-specific pattern (e.g.,
+  `OLD_NAME:` for YAML). Documentation files (`.md`, `.adoc`, `.rst`)
+  often reference field names in prose without syntax suffixes and will
+  be missed by syntax-specific patterns alone.
 
 #### Cross-repo contracts
 
@@ -184,6 +220,13 @@ For each issue identified, record:
   items that can be fixed independently after merge. Use `false` for
   observations, praise, broad suggestions, and anything already handled
   by the PR.
+
+**Cross-file finding self-check:** Before recording any finding that
+asserts what a specific file contains, verify that you read that file
+during step 2. If you did not read it, read it now before finalizing
+the finding. If the file is unreadable, reframe the finding to state
+that the contents could not be verified — do not assert unverified
+contents as fact.
 
 #### Severity anchoring (re-reviews)
 

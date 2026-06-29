@@ -55,6 +55,7 @@ func TestGitHubSetupCmd_Flags(t *testing.T) {
 
 	mintURLFlag := cmd.Flags().Lookup("mint-url")
 	require.NotNil(t, mintURLFlag, "expected --mint-url flag")
+	assert.Equal(t, DefaultMintURL, mintURLFlag.DefValue)
 
 	agentsFlag := cmd.Flags().Lookup("agents")
 	require.NotNil(t, agentsFlag, "expected --agents flag")
@@ -79,8 +80,12 @@ func TestGitHubSetupCmd_Flags(t *testing.T) {
 	enrollNoneFlag := cmd.Flags().Lookup("enroll-none")
 	require.NotNil(t, enrollNoneFlag, "expected --enroll-none flag")
 
-	vendorBinaryFlag := cmd.Flags().Lookup("vendor-fullsend-binary")
-	require.NotNil(t, vendorBinaryFlag, "expected --vendor-fullsend-binary flag")
+	vendorFlag := cmd.Flags().Lookup("vendor")
+	require.NotNil(t, vendorFlag, "expected --vendor flag")
+
+	directFlag := cmd.Flags().Lookup("direct")
+	require.NotNil(t, directFlag, "expected --direct flag")
+	assert.Equal(t, "false", directFlag.DefValue)
 
 	inferenceProjectFlag := cmd.Flags().Lookup("inference-project")
 	require.NotNil(t, inferenceProjectFlag, "expected --inference-project flag")
@@ -93,13 +98,19 @@ func TestGitHubSetupCmd_Flags(t *testing.T) {
 	require.NotNil(t, inferenceWIFFlag, "expected --inference-wif-provider flag")
 }
 
-func TestGitHubSetupCmd_RequiresMintURL(t *testing.T) {
+func TestGitHubSetupCmd_UsesDefaultMintURL(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token")
 	cmd := newRootCmd()
-	cmd.SetArgs([]string{"github", "setup", "acme"})
+	// Without explicit --mint-url, the default should be used and
+	// validation should not fail on a missing URL. The command will
+	// fail later (listing repos), but not with a "mint-url is required" error.
+	cmd.SetArgs([]string{"github", "setup", "acme",
+		"--enroll-none"})
 	err := cmd.Execute()
+	// The error should be from a downstream step (e.g. listing repos),
+	// not from missing --mint-url.
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--mint-url is required")
+	assert.NotContains(t, err.Error(), "--mint-url is required")
 }
 
 func TestGitHubSetupCmd_PerRepoRejectsPerOrgFlags(t *testing.T) {
@@ -145,6 +156,19 @@ func TestGitHubSetupCmd_PerRepoDryRun(t *testing.T) {
 		"--inference-project", "my-project",
 		"--inference-wif-provider", "projects/123456789/locations/global/workloadIdentityPools/fullsend-pool/providers/github-oidc",
 		"--dry-run"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+}
+
+func TestGitHubSetupCmd_PerRepoDryRun_Vendor(t *testing.T) {
+	t.Setenv("GH_TOKEN", "test-token")
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"github", "setup", "acme/widget",
+		"--mint-url", "https://mint-test-abc123.run.app",
+		"--inference-project", "my-project",
+		"--inference-wif-provider", "projects/123456789/locations/global/workloadIdentityPools/fullsend-pool/providers/github-oidc",
+		"--dry-run",
+		"--vendor"})
 	err := cmd.Execute()
 	require.NoError(t, err)
 }
@@ -385,7 +409,7 @@ func TestRunGitHubStatus_BasicReport(t *testing.T) {
 	client.Repos = []forge.Repository{
 		{Name: ".fullsend", FullName: "acme/.fullsend"},
 	}
-	cfg := config.NewOrgConfig([]string{"widget"}, []string{"widget"}, []string{"triage"}, nil, "")
+	cfg := config.NewOrgConfig([]string{"widget"}, []string{"widget"}, []string{"triage"}, "", "")
 	cfgData, _ := cfg.Marshal()
 	client.FileContents["acme/.fullsend/config.yaml"] = cfgData
 	client.OrgVariables = map[string]bool{"acme/FULLSEND_MINT_URL": true}
@@ -446,6 +470,62 @@ func TestRunGitHubUninstall_NoConfigRepo(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestRunGitHubUninstall_UsesHarnessDiscovery(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{
+		{Name: ".fullsend", FullName: "acme/.fullsend"},
+	}
+	// Provide config.yaml with agents: block (should be bypassed).
+	client.FileContents = map[string][]byte{
+		"acme/.fullsend/config.yaml": []byte("version: v1\ndispatch:\n  platform: github-actions\nagents:\n  - role: triage\n    slug: old-triage\n"),
+	}
+	// Provide harness directory with wrapper files.
+	client.DirContents = map[string][]forge.DirectoryEntry{
+		"acme/.fullsend/harness@main": {
+			{Path: "harness/triage.yaml", Type: "file"},
+		},
+	}
+	client.FileContentsRef = map[string][]byte{
+		"acme/.fullsend/harness/triage.yaml@main": []byte("role: triage\nslug: harness-triage\n"),
+	}
+	client.Installations = []forge.Installation{
+		{ID: 1, AppSlug: "harness-triage"},
+	}
+
+	var buf strings.Builder
+	printer := ui.New(&buf)
+
+	err := runGitHubUninstall(context.Background(), client, printer, "acme", "fullsend-ai")
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "harness-triage")
+	assert.NotContains(t, output, "old-triage")
+	assert.NotContains(t, output, "agents: block")
+}
+
+func TestRunGitHubUninstall_NoHarnessFiles_FallsBackToDefaultNaming(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{
+		{Name: ".fullsend", FullName: "acme/.fullsend"},
+	}
+	client.FileContents = map[string][]byte{
+		"acme/.fullsend/config.yaml": []byte("version: v1\ndispatch:\n  platform: github-actions\n"),
+	}
+	client.Installations = []forge.Installation{
+		{ID: 1, AppSlug: "fullsend-ai-triage"},
+	}
+
+	var buf strings.Builder
+	printer := ui.New(&buf)
+
+	err := runGitHubUninstall(context.Background(), client, printer, "acme", "fullsend-ai")
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, "fullsend-ai-triage")
+}
+
 // --- Sync-scaffold command tests ---
 
 func TestGitHubSyncScaffoldCmd_RequiresOrg(t *testing.T) {
@@ -467,8 +547,62 @@ func TestRunGitHubSyncScaffold_CommitsFiles(t *testing.T) {
 	err := runGitHubSyncScaffold(context.Background(), client, printer, "acme")
 	require.NoError(t, err)
 
-	// Verify at least one file was committed.
-	require.NotEmpty(t, client.CommittedFiles, "expected scaffold files to be committed")
+	// sync-scaffold uses direct mode — files are committed to the default branch.
+	require.NotEmpty(t, client.CommittedFiles, "expected scaffold files to be committed directly")
+}
+
+func TestRunGitHubSyncScaffold_VendoredMarker(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{
+		{Name: ".fullsend", FullName: "acme/.fullsend"},
+	}
+	client.AuthenticatedUser = "testuser"
+	client.FileContents = map[string][]byte{
+		"acme/.fullsend/.defaults/action.yml": []byte("marker"),
+		"acme/.fullsend/config.yaml":          []byte("repos: {}\n"),
+	}
+	printer := ui.New(&discardWriter{})
+
+	err := runGitHubSyncScaffold(context.Background(), client, printer, "acme")
+	require.NoError(t, err)
+	require.NotEmpty(t, client.CommittedFiles)
+}
+
+func TestRunGitHubSyncScaffold_InvalidConfig(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{{Name: ".fullsend", FullName: "acme/.fullsend"}}
+	client.AuthenticatedUser = "testuser"
+	client.FileContents = map[string][]byte{
+		"acme/.fullsend/config.yaml": []byte("not: valid: yaml: ["),
+	}
+	printer := ui.New(&discardWriter{})
+
+	err := runGitHubSyncScaffold(context.Background(), client, printer, "acme")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing config.yaml")
+}
+
+func TestRunGitHubSetupPerOrg_DryRun(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.AuthenticatedUser = "testuser"
+	client.Repos = []forge.Repository{
+		{Name: forge.ConfigRepoName, FullName: "acme/" + forge.ConfigRepoName},
+		{Name: "widget", FullName: "acme/widget"},
+	}
+	var buf strings.Builder
+	err := runGitHubSetupPerOrg(context.Background(), client, ui.New(&buf), githubSetupConfig{
+		target:               "acme",
+		mintURL:              "https://mint.example.com/v1/token",
+		agents:               strings.Join(config.DefaultAgentRoles(), ","),
+		inferenceProject:     "my-project",
+		inferenceWIFProvider: "projects/123456789/locations/global/workloadIdentityPools/fullsend-pool/providers/github-oidc",
+		dryRun:               true,
+		enrollNone:           true,
+		skipAppSetup:         true,
+		vendor:               true,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), "Layer: vendor")
 }
 
 // --- parseTarget tests ---
@@ -492,21 +626,23 @@ func TestParseTarget_Repo(t *testing.T) {
 func TestRunGitHubSetupPerRepo(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token")
 	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{{FullName: "acme/widget", DefaultBranch: "main"}}
 	client.TokenScopes = []string{"repo", "workflow"}
 	printer := ui.New(&discardWriter{})
 
 	err := runGitHubSetupPerRepo(context.Background(), client, printer, githubSetupConfig{
-		target:              "acme/widget",
-		mintURL:             "https://mint-test-abc123.run.app",
-		inferenceProject:    "my-project",
+		target:               "acme/widget",
+		mintURL:              "https://mint-test-abc123.run.app",
+		inferenceProject:     "my-project",
 		inferenceWIFProvider: "projects/123456789/locations/global/workloadIdentityPools/fullsend-pool/providers/github-oidc",
-		inferenceRegion:     "global",
-		agents:              strings.Join(config.PerRepoDefaultRoles(), ","),
+		inferenceRegion:      "global",
+		agents:               strings.Join(config.PerRepoDefaultRoles(), ","),
 	})
 	require.NoError(t, err)
 
-	// Verify scaffold files were committed.
-	require.NotEmpty(t, client.CommittedFiles)
+	// Default mode delivers via PR — verify files were committed to the scaffold branch.
+	require.NotEmpty(t, client.CommittedFilesToBranch)
+	require.NotEmpty(t, client.CreatedProposals)
 
 	// Verify repo variables were set.
 	varNames := make(map[string]string)
@@ -599,13 +735,13 @@ func TestRunGitHubSetupPerRepo_DryRun(t *testing.T) {
 	printer := ui.New(&discardWriter{})
 
 	err := runGitHubSetupPerRepo(context.Background(), client, printer, githubSetupConfig{
-		target:              "acme/widget",
-		mintURL:             "https://mint-test-abc123.run.app",
-		inferenceProject:    "my-project",
+		target:               "acme/widget",
+		mintURL:              "https://mint-test-abc123.run.app",
+		inferenceProject:     "my-project",
 		inferenceWIFProvider: "projects/123456789/locations/global/workloadIdentityPools/fullsend-pool/providers/github-oidc",
-		inferenceRegion:     "global",
-		agents:              strings.Join(config.PerRepoDefaultRoles(), ","),
-		dryRun:              true,
+		inferenceRegion:      "global",
+		agents:               strings.Join(config.PerRepoDefaultRoles(), ","),
+		dryRun:               true,
 	})
 	require.NoError(t, err)
 
@@ -618,6 +754,7 @@ func TestRunGitHubSetupPerRepo_DryRun(t *testing.T) {
 func TestRunGitHubSetupPerRepo_ReusesExistingSecrets(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token")
 	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{{FullName: "acme/widget", DefaultBranch: "main"}}
 	client.TokenScopes = []string{"repo", "workflow"}
 	// Pre-populate secrets as if a previous run stored them.
 	client.Secrets = map[string]bool{
@@ -635,8 +772,8 @@ func TestRunGitHubSetupPerRepo_ReusesExistingSecrets(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Verify scaffold files were committed.
-	require.NotEmpty(t, client.CommittedFiles)
+	// Default mode delivers via PR — verify files were committed to the scaffold branch.
+	require.NotEmpty(t, client.CommittedFilesToBranch)
 
 	// Verify repo variables were set.
 	varNames := make(map[string]string)
@@ -654,6 +791,7 @@ func TestRunGitHubSetupPerRepo_ReusesExistingSecrets(t *testing.T) {
 func TestRunGitHubSetupPerRepo_PartialReuse_ProjectOnly(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token")
 	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{{FullName: "acme/widget", DefaultBranch: "main"}}
 	client.TokenScopes = []string{"repo", "workflow"}
 	// Only the project secret exists; WIF is provided via flag.
 	client.Secrets = map[string]bool{
@@ -662,11 +800,11 @@ func TestRunGitHubSetupPerRepo_PartialReuse_ProjectOnly(t *testing.T) {
 	printer := ui.New(&discardWriter{})
 
 	err := runGitHubSetupPerRepo(context.Background(), client, printer, githubSetupConfig{
-		target:              "acme/widget",
-		mintURL:             "https://mint-test-abc123.run.app",
-		inferenceRegion:     "global",
+		target:               "acme/widget",
+		mintURL:              "https://mint-test-abc123.run.app",
+		inferenceRegion:      "global",
 		inferenceWIFProvider: "projects/123456789/locations/global/workloadIdentityPools/fullsend-pool/providers/github-oidc",
-		agents:              strings.Join(config.PerRepoDefaultRoles(), ","),
+		agents:               strings.Join(config.PerRepoDefaultRoles(), ","),
 	})
 	require.NoError(t, err)
 
@@ -713,6 +851,7 @@ func TestRunGitHubSetupPerRepo_MissingWIFNoExistingSecret(t *testing.T) {
 func TestRunGitHubSetupPerRepo_PartialReuse_WIFOnly(t *testing.T) {
 	t.Setenv("GH_TOKEN", "test-token")
 	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{{FullName: "acme/widget", DefaultBranch: "main"}}
 	client.TokenScopes = []string{"repo", "workflow"}
 	// Only the WIF secret exists; project is provided via flag.
 	client.Secrets = map[string]bool{

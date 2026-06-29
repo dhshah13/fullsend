@@ -22,12 +22,17 @@ The agent runs in a read-only sandbox. It cannot modify issues, push code, or in
 |---------|-------|--------|
 | `/fs-triage` | Issue comment | Runs triage on the issue |
 
+Requires write-level repository permission (admin, maintain, or write).
+
 The `/fs-triage` command does not accept arguments — it re-evaluates the issue
 using current content, comments, and any prior triage analysis.
 
-Triage also runs automatically when a new issue is opened, when an issue is
-edited, and when someone comments on an issue labeled `needs-info` (to
-re-evaluate after the reporter provides clarification).
+Triage also runs automatically when a new issue is opened or edited by a
+repository owner, member, or collaborator, when the `ready-for-triage`
+label is applied to an issue (used by the [retro agent](retro.md) to
+route proposal issues into the triage pipeline), and when someone
+comments on an issue labeled `needs-info` (to re-evaluate after the
+reporter provides clarification).
 
 ## Control labels
 
@@ -40,13 +45,44 @@ outcome and the post-script applies the corresponding label.
 | `ready-to-code` | The issue is fully specified and low-risk (bug, documentation, performance). Triggers the [code agent](code.md). |
 | `triaged` | The issue is fully specified but is a feature or other category that requires human prioritization before coding. |
 | `duplicate` | The issue duplicates an existing one. The agent identified the original and the post-script closes the issue. |
-| `blocked` | The issue depends on another issue or external condition. The agent identified the blocker. |
+| `blocked` | The issue depends on prerequisites — existing issues/PRs or newly created upstream issues. The agent identified or created the blockers. |
 | `question` | The issue is a support request or question, not an actionable bug or feature. The agent attempted to answer it. |
 
 The `issue-labels` skill may also apply contextual labels (e.g., `area/api`,
 `kind/bug`) but these are informational — they do not control agent behavior.
 
 ## Configuration and extension
+
+### Cross-repo issue creation
+
+The triage agent can create prerequisite issues in other repositories when it
+identifies upstream dependencies that don't have tracking issues yet. This is
+controlled by the `create_issues` section in `config.yaml`:
+
+```yaml
+create_issues:
+  allow_targets:
+    orgs:
+      - my-org
+    repos:
+      - upstream-org/specific-repo
+```
+
+**Defaults:** At install time, fullsend populates this with your org (in org mode)
+or your repo (in per-repo mode), plus `fullsend-ai/fullsend` as an upstream target.
+
+**When to expand the allowlist:** If your project depends on libraries or services
+in other GitHub orgs and you want the triage agent to automatically file
+prerequisite issues there, add those orgs or repos to `allow_targets`.
+
+**When to restrict the allowlist:** If you don't want agents creating issues
+outside your org, remove entries. If `allow_targets` is empty, automatic
+prerequisite creation is disabled entirely — the agent will still identify
+the dependency and include a draft issue body in its comment for a human to
+file manually.
+
+The source repo (where triage is running) is always implicitly allowed
+regardless of the allowlist.
 
 ### Skill: `issue-labels`
 
@@ -123,6 +159,10 @@ This gives the triage agent the subtlety it needs to distinguish between
 `kind/bug` and `kind/flaky-test`, or to know that `area/operator` applies to
 controller-runtime code, without adding label documentation to `AGENTS.md`
 where every agent would pay the context cost.
+
+### Variables
+
+None.
 
 ## Source
 
