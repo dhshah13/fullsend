@@ -102,6 +102,164 @@ func TestDeleteRepo(t *testing.T) {
 	assert.True(t, called)
 }
 
+func TestFindExistingFork(t *testing.T) {
+	t.Run("returns fork owner when fork exists", func(t *testing.T) {
+		callNum := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callNum++
+			switch callNum {
+			case 1:
+				assert.Equal(t, "/user", r.URL.Path)
+				json.NewEncoder(w).Encode(map[string]any{"login": "contributor"})
+			case 2:
+				assert.Equal(t, "/repos/contributor/repo", r.URL.Path)
+				json.NewEncoder(w).Encode(map[string]any{
+					"fork": true,
+					"name": "repo",
+					"parent": map[string]any{
+						"full_name": "upstream/repo",
+					},
+				})
+			}
+		}))
+		defer srv.Close()
+
+		client := newTestClient(t, srv)
+		forkOwner, forkRepo, err := client.FindExistingFork(context.Background(), "upstream", "repo")
+		require.NoError(t, err)
+		assert.Equal(t, "contributor", forkOwner)
+		assert.Equal(t, "repo", forkRepo)
+	})
+
+	t.Run("returns fork with renamed repo", func(t *testing.T) {
+		callNum := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callNum++
+			switch callNum {
+			case 1:
+				json.NewEncoder(w).Encode(map[string]any{"login": "contributor"})
+			case 2:
+				json.NewEncoder(w).Encode(map[string]any{
+					"fork": true,
+					"name": "repo-1",
+					"parent": map[string]any{
+						"full_name": "upstream/repo",
+					},
+				})
+			}
+		}))
+		defer srv.Close()
+
+		client := newTestClient(t, srv)
+		forkOwner, forkRepo, err := client.FindExistingFork(context.Background(), "upstream", "repo")
+		require.NoError(t, err)
+		assert.Equal(t, "contributor", forkOwner)
+		assert.Equal(t, "repo-1", forkRepo)
+	})
+
+	t.Run("returns empty when no fork exists", func(t *testing.T) {
+		callNum := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callNum++
+			switch callNum {
+			case 1:
+				json.NewEncoder(w).Encode(map[string]any{"login": "contributor"})
+			case 2:
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]any{"message": "Not Found"})
+			}
+		}))
+		defer srv.Close()
+
+		client := newTestClient(t, srv)
+		forkOwner, forkRepo, err := client.FindExistingFork(context.Background(), "upstream", "repo")
+		require.NoError(t, err)
+		assert.Empty(t, forkOwner)
+		assert.Empty(t, forkRepo)
+	})
+
+	t.Run("returns empty when repo is not a fork of target", func(t *testing.T) {
+		callNum := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callNum++
+			switch callNum {
+			case 1:
+				json.NewEncoder(w).Encode(map[string]any{"login": "contributor"})
+			case 2:
+				json.NewEncoder(w).Encode(map[string]any{
+					"fork":   false,
+					"name":   "repo",
+					"parent": nil,
+				})
+			}
+		}))
+		defer srv.Close()
+
+		client := newTestClient(t, srv)
+		forkOwner, forkRepo, err := client.FindExistingFork(context.Background(), "upstream", "repo")
+		require.NoError(t, err)
+		assert.Empty(t, forkOwner)
+		assert.Empty(t, forkRepo)
+	})
+}
+
+func TestCreateFork(t *testing.T) {
+	t.Run("creates fork successfully", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "POST", r.Method)
+			assert.Equal(t, "/repos/upstream/repo/forks", r.URL.Path)
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]any{
+				"name": "repo",
+				"owner": map[string]any{
+					"login": "contributor",
+				},
+			})
+		}))
+		defer srv.Close()
+
+		client := newTestClient(t, srv)
+		forkOwner, forkRepo, err := client.CreateFork(context.Background(), "upstream", "repo")
+		require.NoError(t, err)
+		assert.Equal(t, "contributor", forkOwner)
+		assert.Equal(t, "repo", forkRepo)
+	})
+
+	t.Run("returns renamed fork repo", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]any{
+				"name": "repo-1",
+				"owner": map[string]any{
+					"login": "contributor",
+				},
+			})
+		}))
+		defer srv.Close()
+
+		client := newTestClient(t, srv)
+		forkOwner, forkRepo, err := client.CreateFork(context.Background(), "upstream", "repo")
+		require.NoError(t, err)
+		assert.Equal(t, "contributor", forkOwner)
+		assert.Equal(t, "repo-1", forkRepo)
+	})
+
+	t.Run("returns error on API failure", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{
+				"message": "Repository access blocked",
+			})
+		}))
+		defer srv.Close()
+
+		client := newTestClient(t, srv)
+		_, _, err := client.CreateFork(context.Background(), "upstream", "repo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "create fork")
+	})
+}
+
 func TestCreateFile(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "PUT", r.Method)
@@ -243,6 +401,36 @@ func TestCreateBranch(t *testing.T) {
 	client := newTestClient(t, srv)
 	err := client.CreateBranch(context.Background(), "owner", "repo", "feature-branch")
 	require.NoError(t, err)
+}
+
+func TestCreateBranch_Forbidden(t *testing.T) {
+	callNum := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callNum++
+		switch callNum {
+		case 1:
+			json.NewEncoder(w).Encode(map[string]any{
+				"default_branch": "main",
+			})
+		case 2:
+			json.NewEncoder(w).Encode(map[string]any{
+				"object": map[string]any{
+					"sha": "deadbeef1234567890",
+				},
+			})
+		case 3:
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{
+				"message": "Resource not accessible by integration",
+			})
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, srv)
+	err := client.CreateBranch(context.Background(), "owner", "repo", "feature-branch")
+	require.Error(t, err)
+	assert.True(t, forge.IsForbidden(err), "CreateBranch 403 should wrap ErrForbidden")
 }
 
 func TestCreateChangeProposal(t *testing.T) {
@@ -963,7 +1151,7 @@ func TestAPIError_Unwrap(t *testing.T) {
 			wantNil: true,
 		},
 		{
-			name:    "403 does not unwrap",
+			name:    "403 does not unwrap (context-dependent)",
 			apiErr:  &APIError{StatusCode: 403, Message: "Resource not accessible by integration"},
 			wantNil: true,
 		},

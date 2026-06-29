@@ -80,6 +80,12 @@ func (e *APIError) Error() string {
 // (PATCH /git/refs). Other 422s may coincidentally mention "protected" in
 // unrelated contexts. The wrapping happens in commitFilesTo where the
 // operation context is known.
+//
+// ErrForbidden is intentionally NOT mapped here either. HTTP 403 can
+// indicate secondary rate limits (handled by isRetryable), SAML SSO
+// enforcement, or other policy-based denials — not only permission
+// failures. The wrapping happens at call sites (e.g., CreateBranch)
+// where the operation context disambiguates the cause.
 func (e *APIError) Unwrap() error {
 	if e.StatusCode == http.StatusNotFound {
 		return forge.ErrNotFound
@@ -441,6 +447,73 @@ func (c *LiveClient) GetRepo(ctx context.Context, owner, repo string) (*forge.Re
 // DeleteRepo deletes a repository.
 func (c *LiveClient) DeleteRepo(ctx context.Context, owner, repo string) error {
 	return c.delete_(ctx, fmt.Sprintf("/repos/%s/%s", owner, repo))
+}
+
+// FindExistingFork checks whether the authenticated user already owns a
+// fork of owner/repo by fetching GET /repos/{user}/{repo} and verifying
+// the parent relationship. Returns the fork owner login and repo name
+// if found, or empty strings when no fork exists. The repo name may
+// differ from the upstream name when GitHub renamed it to avoid
+// collisions. Only real API errors are returned as err.
+func (c *LiveClient) FindExistingFork(ctx context.Context, owner, repo string) (string, string, error) {
+	user, err := c.GetAuthenticatedUser(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("find existing fork: %w", err)
+	}
+
+	resp, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s", user, repo), nil)
+	if err != nil {
+		return "", "", fmt.Errorf("find existing fork: %w", err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		resp.Body.Close()
+		return "", "", nil
+	}
+	if err := checkStatus(resp, http.StatusOK); err != nil {
+		return "", "", fmt.Errorf("find existing fork of %s/%s: %w", owner, repo, err)
+	}
+
+	var r struct {
+		Fork   bool   `json:"fork"`
+		Name   string `json:"name"`
+		Parent struct {
+			FullName string `json:"full_name"`
+		} `json:"parent"`
+	}
+	if err := decodeJSON(resp, &r); err != nil {
+		return "", "", fmt.Errorf("decode fork check response: %w", err)
+	}
+	if r.Fork && r.Parent.FullName == owner+"/"+repo {
+		return user, r.Name, nil
+	}
+	return "", "", nil
+}
+
+// CreateFork creates a fork of owner/repo under the authenticated user's
+// account. If a fork already exists, the GitHub API returns 202 with the
+// existing fork metadata, so this call is idempotent. Returns both the
+// fork owner login and the actual repo name. The repo name may differ
+// from the upstream when the user already has an unrelated repo with the
+// same name (GitHub appends a suffix like "-1").
+func (c *LiveClient) CreateFork(ctx context.Context, owner, repo string) (string, string, error) {
+	resp, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/forks", owner, repo), map[string]any{})
+	if err != nil {
+		return "", "", fmt.Errorf("create fork of %s/%s: %w", owner, repo, err)
+	}
+	if err := checkStatus(resp, http.StatusOK, http.StatusCreated, http.StatusAccepted); err != nil {
+		return "", "", fmt.Errorf("create fork of %s/%s: %w", owner, repo, err)
+	}
+
+	var fork struct {
+		Name  string `json:"name"`
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	}
+	if err := decodeJSON(resp, &fork); err != nil {
+		return "", "", fmt.Errorf("decode fork response: %w", err)
+	}
+	return fork.Owner.Login, fork.Name, nil
 }
 
 // CreateFile creates a new file on the repository's default branch.
@@ -1219,6 +1292,10 @@ func (c *LiveClient) CreateBranch(ctx context.Context, owner, repo, branchName s
 	}
 	resp, err := c.post(ctx, fmt.Sprintf("/repos/%s/%s/git/refs", owner, repo), payload)
 	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusForbidden {
+			return fmt.Errorf("%w: %w", forge.ErrForbidden, err)
+		}
 		return fmt.Errorf("create branch %s: %w", branchName, err)
 	}
 	resp.Body.Close()

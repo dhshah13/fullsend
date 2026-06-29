@@ -1043,7 +1043,7 @@ func applyPerRepoScaffold(ctx context.Context, client forge.Client, printer *ui.
 		"Merge this PR to activate fullsend workflows."
 	if _, err := layers.CommitScaffoldFiles(ctx, client, printer,
 		owner, repo, targetRepo.DefaultBranch,
-		commitMsg, "chore: initialize fullsend per-repo installation", prBody, files, direct); err != nil {
+		commitMsg, "chore: initialize fullsend per-repo installation", prBody, files, direct, os.Stdin); err != nil {
 		return err
 	}
 
