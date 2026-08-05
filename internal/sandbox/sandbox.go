@@ -1111,8 +1111,14 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 		if checkErr == nil {
 			switch phase := sandboxPhase(lastOutput); {
 			case phase == readySandboxPhase:
+				if err := verifyPolicy(name, lastOutput, policy); err != nil {
+					return err
+				}
 				return nil
 			case phase == "" && strings.Contains(lastOutput, readySandboxPhase):
+				if err := verifyPolicy(name, lastOutput, policy); err != nil {
+					return err
+				}
 				return nil
 			}
 			// Detect terminal phases and fail immediately instead of
@@ -1166,6 +1172,37 @@ func DeleteProvider(name string) error {
 		return fmt.Errorf("provider delete %q failed: %w (output: %s)", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// verifyPolicy checks that the active runtime policy reported by
+// openshell sandbox get matches the policy requested at creation time.
+// When no policy was requested (empty string), the check is skipped.
+func verifyPolicy(name, output, requestedPolicy string) error {
+	if requestedPolicy == "" {
+		return nil
+	}
+	active := parseSandboxPolicy(output)
+	if active == "" {
+		return fmt.Errorf("sandbox %q is ready but no runtime policy reported (expected %q)", name, requestedPolicy)
+	}
+	if active != requestedPolicy {
+		return fmt.Errorf("sandbox %q policy mismatch: active %q, expected %q", name, active, requestedPolicy)
+	}
+	return nil
+}
+
+// parseSandboxPolicy extracts the runtime policy value from openshell
+// sandbox get output. It looks for a "Runtime Policy:" line and returns
+// the value after the colon. Returns an empty string if the field is
+// not present or has no value.
+func parseSandboxPolicy(output string) string {
+	for line := range strings.SplitSeq(output, "\n") {
+		line = strings.TrimSpace(line)
+		if val, ok := strings.CutPrefix(line, "Runtime Policy:"); ok {
+			return strings.TrimSpace(val)
+		}
+	}
+	return ""
 }
 
 // Delete deletes a sandbox, returning any error for the caller to log.
