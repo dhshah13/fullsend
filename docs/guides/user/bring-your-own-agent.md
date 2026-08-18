@@ -1,8 +1,14 @@
 # Bring Your Own Agent
 
-Add a custom agent to fullsend — or change the configuration of an existing one — from harness file to CI.
+Add a custom agent to fullsend — from harness file to CI. This guide covers
+the end-to-end workflow for building, registering, and dispatching custom
+agents on GitHub.
 
-This guide covers the end-to-end workflow for building, registering, and dispatching custom agents on GitHub. For details on harness YAML structure and layered resolution, see [Configuring agent behavior](customizing-agents.md).
+To configure an existing agent (model, timeout, skills, env vars) without
+building from scratch, see
+[Configuring Agent Behavior](customizing-agents.md). For a quick overview of
+all customization options, see
+[Customizing Agents](customizing-overview.md).
 
 This guide uses the [fullsend-ai/agents](https://github.com/fullsend-ai/agents) triage agent as a running example.
 
@@ -35,25 +41,25 @@ Once registered, your agent runs automatically when a matching GitHub event arri
 
 ```
 GitHub event (issue opened, label added, PR comment, ...)
-        │
-        ▼
-┌── fullsend dispatch ──────────────────┐
-│  1. Normalize event → NormalizedEvent │
-│  2. Authorize                         │
-│  3. Enumerate registered harnesses    │
-│  4. Evaluate CEL triggers             │
-│  5. Launch matching agents            │
-└───────────────────────────────────────┘
-        │
-        ▼
-┌── harness/my-agent.yaml ────────────┐
-│  agent: agents/my-agent.md          │  ◄── prompt & tools
-│  trigger: "event.entity.kind == …"  │  ◄── when to run
-│  policy: policies/base.yaml         │  ◄── sandbox rules
-│  skills: [my-skill]                 │  ◄── domain knowledge
-│  pre_script: scripts/pre-...        │  ◄── fetch data (before sandbox)
-│  post_script: scripts/post-...      │  ◄── act on output (after sandbox)
-└─────────────────────────────────────┘
+        |
+        v
++-- fullsend dispatch ----------------------+
+|  1. Normalize event -> NormalizedEvent    |
+|  2. Authorize                            |
+|  3. Enumerate registered harnesses       |
+|  4. Evaluate CEL triggers                |
+|  5. Launch matching agents               |
++-------------------------------------------+
+        |
+        v
++-- harness/my-agent.yaml ------------------+
+|  agent: agents/my-agent.md               |  <-- prompt & tools
+|  trigger: "event.entity.kind == ..."     |  <-- when to run
+|  policy: policies/base.yaml             |  <-- sandbox rules
+|  skills: [my-skill]                      |  <-- domain knowledge
+|  pre_script: scripts/pre-...            |  <-- fetch data (before sandbox)
+|  post_script: scripts/post-...          |  <-- act on output (after sandbox)
++-------------------------------------------+
 ```
 
 You do not need to write a GitHub Actions workflow file for each custom agent. The dispatch workflow that `fullsend github setup` installs handles discovery and routing for all registered agents.
@@ -68,11 +74,11 @@ You need a harness, an agent definition, and supporting scaffold files. If your 
 
 ```
 .fullsend/
-├── harness/my-agent.yaml                  # Execution config (you create)
-├── agents/my-agent.md                     # Agent prompt (you create)
-├── providers/vertex-ai.yaml               # Provider definition (from scaffold)
-├── profiles/fullsend-vertex-ai.yaml       # Profile definition (from scaffold)
-└── policies/base.yaml                     # Sandbox policy (from scaffold)
++-- harness/my-agent.yaml                  # Execution config (you create)
++-- agents/my-agent.md                     # Agent prompt (you create)
++-- providers/vertex-ai.yaml               # Provider definition (from scaffold)
++-- profiles/fullsend-vertex-ai.yaml       # Profile definition (from scaffold)
++-- policies/base.yaml                     # Sandbox policy (from scaffold)
 ```
 
 **`harness/my-agent.yaml`:**
@@ -144,7 +150,7 @@ Do NOT push code, create issues, or modify anything directly.
 Your only output is the JSON result file.
 ````
 
-Network access (which APIs the agent can reach) is controlled by provider profiles or inline `network_policies`. The six built-in profiles (`vertex-ai`, `github`, `github-ro`, `github-artifacts`, `gitleaks`, `package-registries`) use framework-known `type` values (e.g. `fullsend-vertex-ai`, `fullsend-github`). To define a fully custom provider type, reference a remote provider definition together with a matching `openshell.profiles` entry (see [Remote Providers and Profiles](customizing-agents.md#remote-providers-and-profiles)). For endpoints not covered by providers, inline `network_policies` in the policy YAML also work. Providers are the pattern used by fullsend's built-in agents, but custom agents can use whichever approach fits.
+Network access (which APIs the agent can reach) is controlled by provider profiles or inline `network_policies`. The six built-in profiles (`vertex-ai`, `github`, `github-ro`, `github-artifacts`, `gitleaks`, `package-registries`) use framework-known `type` values (e.g. `fullsend-vertex-ai`, `fullsend-github`). To define a fully custom provider type, reference a remote provider definition together with a matching `openshell.profiles` entry (see [Remote providers and profiles](customizing-agents.md#remote-providers-and-profiles)). For endpoints not covered by providers, inline `network_policies` in the policy YAML also work. Providers are the pattern used by fullsend's built-in agents, but custom agents can use whichever approach fits.
 
 **Next steps:** [Register your agent](#registering-your-agent) so dispatch discovers it, then [write a CEL trigger](cel-triggers-reference.md#writing-cel-triggers) to control when it runs. To iterate on your agent locally before registering, see [Testing locally](#testing-locally).
 
@@ -206,8 +212,8 @@ Key patterns to note:
 - **`policy: policies/triage.yaml`** is a per-agent policy that includes filesystem, landlock, process, and network rules (via inline `network_policies`). This agent predates the provider-based pattern — new agents can use `providers:` instead (see [Minimum viable agent](#minimum-viable-agent)).
 - **`host_files`** copy credentials from the trusted runner into the sandbox. `expand: true` resolves `${VAR}` references before copying.
 - **`validation_loop.schema`** references the JSON schema file directly — the validation script checks agent output against it.
-- **`overlays`** uses CEL `when` expressions to conditionally apply scripts, skills, providers, openshell, host_files, and env vars. Resolution is first-match-wins: the first entry whose `when` evaluates to true is merged; remaining entries are skipped. The CEL environment exposes `event` (the triggering event), `runtime.forge` (the effective forge platform), and `config` (per-repo config from config.yaml). When running without an event context (e.g., `fullsend run` or `fullsend lock`), `event` is an empty map — use `has(event.source)` to guard event field access: `has(event.source) && event.source.system == "jira"` instead of just `event.source.system == "jira"` to avoid "no such key" errors.
-- **`common/env/gcp-vertex.env`** is referenced by relative path because both files live in the same repo. If your agent lives in a different repo, reference it by URL (see [Harness Field Reference — Referencing resources](../../reference/harness-reference.md#referencing-resources-local-vs-remote)) or copy it locally.
+- **`overlays`** uses CEL `when` expressions to conditionally apply scripts, skills, providers, openshell, host_files, and env vars. Resolution is first-match-wins: the first entry whose `when` evaluates to true is merged; remaining entries are skipped. The CEL environment exposes `event` (the triggering event), `runtime.forge` (the effective forge platform), and `config` (per-repo config from config.yaml). When running without an event context (e.g., `fullsend run` or `fullsend lock`), `event` is an empty map -- use `has(event.source)` to guard event field access: `has(event.source) && event.source.system == "jira"` instead of just `event.source.system == "jira"` to avoid "no such key" errors.
+- **`common/env/gcp-vertex.env`** is referenced by relative path because both files live in the same repo. If your agent lives in a different repo, reference it by URL (see [Harness Field Reference -- Referencing resources](../../reference/harness-reference.md#referencing-resources-local-vs-remote)) or copy it locally.
 
 For the complete list of harness fields, see the [Harness Field Reference](../../reference/harness-reference.md).
 
@@ -242,6 +248,9 @@ skills/issue-labels/
 
 Reference in the agent frontmatter by name (`skills: [issue-labels]`) and in the harness by path (`skills: [skills/issue-labels]`). Skills can also be URLs with integrity hashes. See [Configuring with Skills](customizing-with-skills.md) for details on creating and managing skills.
 
+For details on skill authoring, precedence, and extension points, see
+[Configuring with Skills](customizing-with-skills.md).
+
 ## Scripts
 
 Pre and post scripts run on the trusted runner outside the sandbox.
@@ -265,125 +274,13 @@ skills:
 timeout_minutes: 15
 ```
 
-Base chains support up to 5 levels (`MaxBaseDepth` in `internal/harness/compose.go`). Circular references are detected and rejected. Resolution order: base chain → child overrides → overlay resolution. See the [Harness Field Reference](../../reference/harness-reference.md#field-merge-rules-for-base-and-overlays) for how each field type combines.
+Base chains support up to 5 levels (`MaxBaseDepth` in `internal/harness/compose.go`). Circular references are detected and rejected. Resolution order: base chain, child overrides, overlay resolution. See the [Harness Field Reference](../../reference/harness-reference.md#field-merge-rules-for-base-and-overlays) for how each field type combines.
 
-> **Overlay precedence with `base:`:** Overlays are concatenated base-first, child-appended — the same ordering as `plugins`, `providers`, and `api_servers`. Because `ResolveOverlays` uses first-match-wins, a base overlay whose `when` matches will take precedence over a child overlay with the same condition. This is consistent with the trusted-base model (base URLs require an org-level allowlist).
+> **Overlay precedence with `base:`:** Overlays are concatenated base-first, child-appended -- the same ordering as `plugins`, `providers`, and `api_servers`. Because `ResolveOverlays` uses first-match-wins, a base overlay whose `when` matches will take precedence over a child overlay with the same condition. This is consistent with the trusted-base model (base URLs require an org-level allowlist).
 
-> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, and `max_runtime_fetches` are NOT inherited from base harnesses — the child must declare its own. This prevents a base harness from injecting arbitrary URL prefixes or enabling runtime fetching in the child.
+> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, and `max_runtime_fetches` are NOT inherited from base harnesses -- the child must declare its own. This prevents a base harness from injecting arbitrary URL prefixes or enabling runtime fetching in the child.
 
-## Configuring existing agents
-
-You don't need to build from scratch to change how a built-in agent behaves. Use `base` to inherit the built-in harness and override just the fields you want — then register your configured version so it takes precedence.
-
-### Example: add a skill to the code agent
-
-Create a thin harness that inherits from the upstream code agent and adds your skill:
-
-**`harness/code.yaml`:**
-```yaml
-base: https://raw.githubusercontent.com/fullsend-ai/agents/<sha>/harness/code.yaml#sha256=abc...
-
-skills:
-  - skills/my-custom-linting        # Merged with base skills (child overrides by basename)
-
-timeout_minutes: 45                 # Override timeout (scalar → child wins)
-```
-
-**`skills/my-custom-linting/SKILL.md`:**
-```markdown
----
-name: my-custom-linting
-description: Org-specific linting rules and conventions.
----
-
-# My Custom Linting
-
-[Your skill content...]
-```
-
-Test it locally first (see [Testing locally](#testing-locally) for all flags):
-```bash
-fullsend run code --fullsend-dir .fullsend --target-repo ./my-repo --env-file .env.local
-```
-
-Then register it:
-```bash
-fullsend agent add harness/code.yaml --name code --fullsend-dir .fullsend
-```
-
-Because config-registered agents take precedence over built-in agents on name collision, your `code` agent replaces the default — with all of the base agent's scripts, policies, host_files, and plugins still inherited.
-
-### Example: swap the model for review
-
-```yaml
-base: https://raw.githubusercontent.com/fullsend-ai/agents/<sha>/harness/review.yaml#sha256=abc...
-
-model: sonnet
-```
-
-### Example: add org-specific environment variables
-
-```yaml
-base: https://raw.githubusercontent.com/fullsend-ai/agents/<sha>/harness/code.yaml#sha256=abc...
-
-env:
-  runner:
-    JIRA_TOKEN: "${JIRA_TOKEN}"     # Merged with base env; child keys win
-  sandbox:
-    JIRA_PROJECT: "MYPROJ"
-```
-
-### What you can configure
-
-Any harness field can be overridden. The [Harness Field Reference](../../reference/harness-reference.md#field-merge-rules-for-base-and-overlays) describes how your overrides combine with the base:
-
-- **Change model, timeout, image, scripts** — scalars replace the base value.
-- **Add skills** — your entries are merged with the base's by basename; same-named skills override the base entry. **Add plugins or host_files** — your entries are concatenated with the base's.
-- **Add or override env vars** — maps are merged; your keys win on collision.
-- **Replace validation or security config** — child replaces the entire block.
-
-### Tuning agents with augmentation skills
-
-Before you fork a whole agent or replace a built-in skill, decide what you
-are actually changing:
-
-| Goal | Prefer |
-|------|--------|
-| Domain rules, linting, or constraints that sit *alongside* defaults | A **unique-named** augmentation skill (append via harness `skills:`) |
-| Shorter or reformatted human-facing output (comments, summaries) | Augmentation skill with **field ownership** and hard limits — not soft "be concise" |
-| New review dimension under an orchestrator (for example `pr-review`) | A **sub-agent** file under that skill's `sub-agents/`, plus whatever registration the current platform requires |
-| Replace most of a skill's procedure | Whole-skill override / derived harness — heavier; you stop inheriting upstream edits |
-
-**What to think about when authoring:**
-
-1. **Discover first** — read the target agent's harness, agent definition,
-   schema, post-script, and any shipped skills under
-   [fullsend-ai/agents](https://github.com/fullsend-ai/agents). Do not guess
-   field names or roster lists from memory.
-2. **Unique skill names** — a repo skill with the same directory name as a
-   built-in is ignored (see [skill precedence](customizing-with-skills.md#skill-precedence)).
-3. **Specificity wins** — vague augmentations lose to hard default
-   instructions. Own exact fields; use word limits and templates.
-4. **Sub-agents ≠ wrapper skills** — if you need a new review dimension,
-   ship `sub-agents/<name>.md` (and parent dispatch updates when the
-   orchestrator uses a fixed roster). Do not invent a parallel
-   `*/SKILL.md` that embeds the same content.
-5. **Prefer the lightest shipping path** the current docs support —
-   upstream contribution, file-level skill override when available, or
-   whole-skill fork only when that is still required.
-
-> **Planned:** File-level overrides inside a pinned skill directory (add or
-> replace a single `sub-agents/<name>.md` without vendoring the whole tree)
-> are tracked in [#6158](https://github.com/fullsend-ai/fullsend/issues/6158)
-> / [#6157](https://github.com/fullsend-ai/fullsend/issues/6157). Until that
-> lands, fixed-roster sub-agent changes usually need an upstream PR or a
-> whole-skill pin.
-
-**Authoring help:** the contributor skill
-[`author-fullsend-augmentations`](../../../skills/author-fullsend-augmentations/SKILL.md)
-walks this discovery and conflict analysis. Use it when writing or reviewing
-augmentation skills and sub-agents. Details also live in
-[Configuring with skills](customizing-with-skills.md#authoring-skills-that-augment-defaults).
+To configure an existing agent without building from scratch, see [Configuring Agent Behavior](customizing-agents.md#configuration-with-base-composition).
 
 ## Testing locally
 
@@ -406,11 +303,9 @@ Register agents in `config.yaml` so fullsend discovers them. Both per-repo (`.fu
 
 Authentication for CLI commands uses the `gh` CLI or `GH_TOKEN` environment variable. For URL agents, the CLI resolves GitHub blob URLs to `raw.githubusercontent.com` URLs automatically.
 
-The examples above show customizing built-in agents via `base`. If you've built an entirely new agent from scratch, register it the same way — just point to a local harness instead of a URL.
-
 > **Routing label convention:**
-> - **Per-repo installs** have no prefix constraint -- harness agents route via CEL triggers on arbitrary labels.
-> - **Per-org installs** use a managed `dispatch.yml` that routes through a fixed stage table. Custom harness agents are not routed by per-org dispatch. If your agent needs custom routing, use a per-repo install.
+> - **Per-repo installs** have no prefix constraint; harness agents route via CEL triggers on arbitrary labels.
+> - **Per-org installs** use a managed `dispatch.yml` that routes through a fixed stage table. Custom harness agents are not routed by per-org dispatch. If your agent needs custom routing, use a per-repo install. The workflow-call shim `if:` guard admits every `ready-`-prefixed label, of which only `ready-for-triage`, `ready-to-code`, and `ready-for-review` route to a stage; others such as `ready-for-merge` still reach `dispatch.yml` and exit early.
 
 ### CLI
 
@@ -488,6 +383,7 @@ repos:
 
 ## See also
 
+- [Customizing Agents](customizing-overview.md) — overview of all customization approaches
 - [fullsend-ai/agents](https://github.com/fullsend-ai/agents) — reference implementation used throughout this guide
 - [Harness Field Reference](../../reference/harness-reference.md) — complete harness YAML field reference, merge rules, and resource referencing
 - [Custom Agent Identity](custom-agent-identity.md) — using a standalone mint for custom GitHub App identity
@@ -495,7 +391,8 @@ repos:
 - [Configuring with Skills](customizing-with-skills.md) — creating and managing skills; [authoring augmentations](customizing-with-skills.md#authoring-skills-that-augment-defaults)
 - [`author-fullsend-augmentations` skill](../../../skills/author-fullsend-augmentations/SKILL.md) — discovery-driven guide for writing skills and sub-agents that complement shipped defaults
 - [Configuring with AGENTS.md](customizing-with-agents-md.md) — repo-level instructions for all agents
-- [Configuring agent behavior](customizing-agents.md) — harness configurations and `base:` composition
+- [Configuring Agent Behavior](customizing-agents.md) — harness configuration and `base:` composition
+- [Harness Field Reference](../../reference/harness-reference.md) — complete harness YAML field reference, merge rules, and resource referencing
 - [Default, derived, and custom agents](../../agents/topics/default-vs-custom.md) — when configuration crosses into custom agent territory
 - [Escalation ladder](../../agents/topics/escalation-ladder.md) — prove-it path before deriving or replacing a core agent
 - [Standalone mint](../infrastructure/standalone-mint.md) — custom agent roles and identity
