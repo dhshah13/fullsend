@@ -93,6 +93,32 @@ rest — endpoint host not allow-listed, secret redactor disabled — fails
 before the sandbox is created: content is never silently enabled, and a
 capture request never silently degrades.
 
+Setting 2 is the only one that touches a harness. A stock install has no
+harness files — first-party agents resolve from
+[fullsend-ai/agents](https://github.com/fullsend-ai/agents) at run time —
+so consenting for one means registering it in `config.yaml` with a local
+overlay harness that carries the flag:
+
+```yaml
+# .fullsend/config.yaml
+agents:
+  - name: code
+    source: harness/code-capture.yaml
+```
+
+```yaml
+# .fullsend/harness/code-capture.yaml
+base: https://raw.githubusercontent.com/fullsend-ai/agents/<commit-sha>/harness/code.yaml#sha256=<hex>
+telemetry:
+  content_capture: true
+```
+
+The pinned `base:` URL binds consent to the exact agent definition it was
+reviewed against: updating the agent means updating the pin — re-affirming
+consent — in the same diff. The flag never inherits through `base:`
+composition, so a remote harness cannot pre-consent for repos that compose
+from it.
+
 When active, spans include system prompts, user messages, per-turn assistant
 text, tool arguments, and tool results, all passed through secret redaction
 before export. Reasoning/thinking text is not captured. Content flows only

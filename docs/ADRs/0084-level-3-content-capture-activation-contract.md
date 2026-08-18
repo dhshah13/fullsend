@@ -51,6 +51,9 @@ rather than degrading silently:
    [ADR 0080](0080-config-yaml-vs-agent-env-var-scope.md)'s two placements
    (org-wide `config.yaml` fields, `{AGENT}_` env vars) do not cover;
    neither carries the per-agent review semantics this consent requires.
+   The flag never inherits through `base:` composition (the exemption
+   `allowed_remote_resources` already has), so an upstream harness cannot
+   pre-consent for repos that compose from it.
 3. **Allowlisted destination:** the resolved OTLP traces endpoint's host must
    appear in the comma-separated `FULLSEND_CONTENT_CAPTURE_ALLOWED_ENDPOINTS`
    org variable — `host` or `host:port`, matched exactly and
@@ -100,5 +103,7 @@ runtime-scoped behind the runtime interface (Claude first).
   stripped at export even when all gates pass.
 - The exporter stays backend-agnostic (generic GenAI attributes, no
   backend-specific coupling), and metadata-only Levels 1–2 are unchanged.
-- Legitimate enablement costs three configuration steps across two owners —
-  deliberate friction, documented in the operator guide.
+- Legitimate enablement is deliberately costly: env opt-in, org variable,
+  and — since a stock install has no harness files — an `agents:`
+  registration plus a pinned `base:` overlay carrying the flag; the recipe
+  is in the operator guide.
