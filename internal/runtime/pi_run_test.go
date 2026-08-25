@@ -24,6 +24,7 @@ func TestTranslatePiModel(t *testing.T) {
 	assert.Equal(t, "anthropic-vertex/claude-opus-4-6", translatePiModel("opus"))
 	assert.Equal(t, "anthropic-vertex/claude-sonnet-4-6", translatePiModel("sonnet"))
 	assert.Equal(t, "anthropic-vertex/claude-haiku-4-5", translatePiModel("haiku"))
+	assert.Equal(t, "anthropic-vertex/claude-fable-5", translatePiModel("fable"))
 	assert.Equal(t, "anthropic-vertex/claude-opus-4-6", translatePiModel(""), "empty falls back to the opus alias")
 	assert.Equal(t, "anthropic-vertex/claude-opus-4-8", translatePiModel("claude-opus-4-8"), "bare ids get the provider prefix")
 	assert.Equal(t, "anthropic/claude-sonnet-4-6", translatePiModel("anthropic/claude-sonnet-4-6"), "provider/id passes through")
@@ -577,6 +578,40 @@ func TestPiThinkingFor_DefaultAndUnknown(t *testing.T) {
 	params.Effort = "bogus"
 	cmd := buildPiRunCommand(params, &piManifest{AgentName: "triage", Model: "opus"})
 	assert.Contains(t, cmd, "--thinking 'high'", "unknown effort falls back to the default, not to pi's medium")
+}
+
+// TestPiModelAliases_CoversDocumentedAliases asserts that every alias in the
+// documented vocabulary has a piModelAliases entry that resolves to a
+// provider/id spec (not a bare passthrough). This catches a missing mapping
+// locally rather than in a live run where pi silently substitutes a fallback.
+func TestPiModelAliases_CoversDocumentedAliases(t *testing.T) {
+	t.Setenv(piProviderEnv, "")
+	for _, alias := range piDocumentedAliases {
+		t.Run(alias, func(t *testing.T) {
+			id, ok := piModelAliases[alias]
+			require.True(t, ok, "documented alias %q missing from piModelAliases", alias)
+			require.NotEmpty(t, id, "piModelAliases[%q] must not be empty", alias)
+			spec := translatePiModel(alias)
+			require.Contains(t, spec, "/", "translated spec must be provider/id")
+			require.NotEqual(t, piDefaultProvider+"/"+alias, spec,
+				"alias %q should not pass through as bare id", alias)
+		})
+	}
+}
+
+func TestValidatePiModel(t *testing.T) {
+	t.Setenv(piProviderEnv, "")
+	// All documented aliases pass validation (they are in piModelAliases).
+	for _, alias := range piDocumentedAliases {
+		assert.NoError(t, validatePiModel(alias), "documented alias %q should pass validation", alias)
+	}
+	// Empty model (defaults to piDefaultModel) passes.
+	assert.NoError(t, validatePiModel(""))
+	// Bare ids that are not documented aliases pass (they are catalog ids).
+	assert.NoError(t, validatePiModel("claude-opus-4-8"))
+	// Provider/id specs pass without alias checking.
+	assert.NoError(t, validatePiModel("anthropic/claude-sonnet-4-6"))
+	assert.NoError(t, validatePiModel("xai/grok-4.6"))
 }
 
 func TestBuildPiRunCommand_HonoursPromptOverride(t *testing.T) {

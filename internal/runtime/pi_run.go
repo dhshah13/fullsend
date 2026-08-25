@@ -48,6 +48,37 @@ var piModelAliases = map[string]string{
 	"opus":   "claude-opus-4-6",
 	"sonnet": "claude-sonnet-4-6",
 	"haiku":  "claude-haiku-4-5",
+	"fable":  "claude-fable-5",
+}
+
+// piDocumentedAliases lists the aliases documented in docs/runtimes/claude.md
+// and docs/runtimes.md that Claude Code resolves natively. Any alias in this
+// set must have an entry in piModelAliases; one that does not is a missing-
+// mapping bug — the bare alias is not a pi catalog id and will silently
+// substitute a fallback model with the wrong wire id.
+var piDocumentedAliases = []string{"opus", "sonnet", "haiku", "fable"}
+
+// validatePiModel returns an error if model is a documented alias that has
+// no entry in piModelAliases. Bare ids and provider/id specs pass through
+// without validation — only known aliases are checked, because those are the
+// names that cannot resolve as bare ids on pi.
+func validatePiModel(model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = piDefaultModel
+	}
+	if strings.Contains(model, "/") {
+		return nil
+	}
+	for _, alias := range piDocumentedAliases {
+		if model == alias {
+			if _, ok := piModelAliases[model]; !ok {
+				return fmt.Errorf("model alias %q is documented but has no pi mapping; add it to piModelAliases with a catalog id enabled in the fleet's Vertex project", model)
+			}
+			return nil
+		}
+	}
+	return nil
 }
 
 // translatePiModel resolves the harness/agent model (already overridden by
@@ -476,6 +507,15 @@ func (r PiRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printe
 		// pi has no built-in fallback chain; a fullsend extension for it is
 		// tracked on #6527. Say so rather than silently dropping the list.
 		printer.StepWarn(fmt.Sprintf("fallback models %s are not supported on pi yet and are ignored", sanitizeOutput(strings.Join(params.FallbackModels, ","))))
+	}
+	{
+		model := params.Model
+		if model == "" {
+			model = m.Model
+		}
+		if err := validatePiModel(model); err != nil {
+			return -1, err
+		}
 	}
 	cmd := buildPiRunCommand(params, m)
 
