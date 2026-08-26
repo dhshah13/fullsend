@@ -21,14 +21,12 @@ Building and deploying a custom agent takes four steps:
 3. **Test locally** — run your agent with `fullsend run` before deploying to CI. See [Testing locally](#testing-locally).
 4. **Register and deploy** — add your agent to `config.yaml` so dispatch discovers it. See [Registering your agent](#registering-your-agent).
 
-To configure an _existing_ agent instead, see [Configuring existing agents](#configuring-existing-agents).
-
 ## Before you begin
 
 - **fullsend CLI** installed and available on your PATH.
-- **Repository scaffolded.** Run [`fullsend github setup`](../getting-started/configuring-github.md) first -- it creates the `.fullsend/` directory with `policies/`, `providers/`, and `profiles/` from the scaffold. For a standalone agent repo, you can create these files manually (see [Minimum viable agent](#minimum-viable-agent)).
+- **Repository scaffolded.** Run [`fullsend github setup`](../getting-started/configuring-github.md) first — it creates the `.fullsend/` directory with `policies/`, `providers/`, and `profiles/` from the scaffold. For a standalone agent repo, you can create these files manually (see [Minimum viable agent](#minimum-viable-agent)).
 - **GCP inference provisioned (CI only).** For agents running in GitHub Actions, run [`fullsend inference provision`](../../cli/inference.md) to set up Workload Identity Federation.
-- **GitHub Apps installed (CI only).** Your org needs the fullsend GitHub Apps -- see [Configuring GitHub](../getting-started/configuring-github.md).
+- **GitHub Apps installed (CI only).** Your org needs the fullsend GitHub Apps — see [Configuring GitHub](../getting-started/configuring-github.md).
 
 ## How agents work
 
@@ -212,8 +210,8 @@ Key patterns to note:
 - **`policy: policies/triage.yaml`** is a per-agent policy that includes filesystem, landlock, process, and network rules (via inline `network_policies`). This agent predates the provider-based pattern — new agents can use `providers:` instead (see [Minimum viable agent](#minimum-viable-agent)).
 - **`host_files`** copy credentials from the trusted runner into the sandbox. `expand: true` resolves `${VAR}` references before copying.
 - **`validation_loop.schema`** references the JSON schema file directly — the validation script checks agent output against it.
-- **`overlays`** uses CEL `when` expressions to conditionally apply scripts, skills, providers, openshell, host_files, and env vars. Resolution is first-match-wins: the first entry whose `when` evaluates to true is merged; remaining entries are skipped. The CEL environment exposes `event` (the triggering event), `runtime.forge` (the effective forge platform), and `config` (per-repo config from config.yaml). When running without an event context (e.g., `fullsend run` or `fullsend lock`), `event` is an empty map -- use `has(event.source)` to guard event field access: `has(event.source) && event.source.system == "jira"` instead of just `event.source.system == "jira"` to avoid "no such key" errors.
-- **`common/env/gcp-vertex.env`** is referenced by relative path because both files live in the same repo. If your agent lives in a different repo, reference it by URL (see [Harness Field Reference -- Referencing resources](../../reference/harness-reference.md#referencing-resources-local-vs-remote)) or copy it locally.
+- **`overlays`** uses CEL `when` expressions to conditionally apply scripts, skills, providers, openshell, host_files, and env vars. Resolution is first-match-wins: the first entry whose `when` evaluates to true is merged; remaining entries are skipped. The CEL environment exposes `event` (the triggering event), `runtime.forge` (the effective forge platform), and `config` (per-repo config from config.yaml). When running without an event context (e.g., `fullsend run` or `fullsend lock`), `event` is an empty map — use `has(event.source)` to guard event field access: `has(event.source) && event.source.system == "jira"` instead of just `event.source.system == "jira"` to avoid "no such key" errors.
+- **`common/env/gcp-vertex.env`** is referenced by relative path because both files live in the same repo. If your agent lives in a different repo, reference it by URL (see [Harness Field Reference — Referencing resources](../../reference/harness-reference.md#referencing-resources-local-vs-remote)) or copy it locally.
 
 For the complete list of harness fields, see the [Harness Field Reference](../../reference/harness-reference.md).
 
@@ -232,7 +230,7 @@ The agent definition is Markdown with YAML frontmatter:
 
 When writing the agent body:
 - The agent writes a JSON result file; scripts handle all mutations.
-- Be specific -- define scoring dimensions, thresholds, output schemas.
+- Be specific — define scoring dimensions, thresholds, output schemas.
 - Include decision points (branch on confidence, clarity scores, etc.).
 
 ## Skills
@@ -276,9 +274,9 @@ timeout_minutes: 15
 
 Base chains support up to 5 levels (`MaxBaseDepth` in `internal/harness/compose.go`). Circular references are detected and rejected. Resolution order: base chain, child overrides, overlay resolution. See the [Harness Field Reference](../../reference/harness-reference.md#field-merge-rules-for-base-and-overlays) for how each field type combines.
 
-> **Overlay precedence with `base:`:** Overlays are concatenated base-first, child-appended -- the same ordering as `plugins`, `providers`, and `api_servers`. Because `ResolveOverlays` uses first-match-wins, a base overlay whose `when` matches will take precedence over a child overlay with the same condition. This is consistent with the trusted-base model (base URLs require an org-level allowlist).
+> **Overlay precedence with `base:`:** Overlays are concatenated base-first, child-appended — the same ordering as `plugins`, `providers`, and `api_servers`. Because `ResolveOverlays` uses first-match-wins, a base overlay whose `when` matches will take precedence over a child overlay with the same condition. This is consistent with the trusted-base model (base URLs require an org-level allowlist).
 
-> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, and `max_runtime_fetches` are NOT inherited from base harnesses -- the child must declare its own. This prevents a base harness from injecting arbitrary URL prefixes or enabling runtime fetching in the child.
+> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, and `max_runtime_fetches` are NOT inherited from base harnesses — the child must declare its own. This prevents a base harness from injecting arbitrary URL prefixes or enabling runtime fetching in the child.
 
 To configure an existing agent without building from scratch, see [Configuring Agent Behavior](customizing-agents.md#configuration-with-base-composition).
 
@@ -299,13 +297,11 @@ Most agents need additional flags for credentials and target repo — see [Runni
 
 ## Registering your agent
 
-Register agents in `config.yaml` so fullsend discovers them. Both per-repo (`.fullsend/config.yaml`) and per-org configs support the `agents:` list. Registration is what makes your agent visible to dispatch — without it, the agent can only be invoked via `fullsend run`.
+Register agents in `.fullsend/config.yaml` so fullsend discovers them. Registration is what makes your agent visible to dispatch — without it, the agent can only be invoked via `fullsend run`.
 
 Authentication for CLI commands uses the `gh` CLI or `GH_TOKEN` environment variable. For URL agents, the CLI resolves GitHub blob URLs to `raw.githubusercontent.com` URLs automatically.
 
-> **Routing label convention:**
-> - **Per-repo installs** have no prefix constraint; harness agents route via CEL triggers on arbitrary labels.
-> - **Per-org installs** use a managed `dispatch.yml` that routes through a fixed stage table. Custom harness agents are not routed by per-org dispatch. If your agent needs custom routing, use a per-repo install. The workflow-call shim `if:` guard admits every `ready-`-prefixed label, of which only `ready-for-triage`, `ready-to-code`, and `ready-for-review` route to a stage; others such as `ready-for-merge` still reach `dispatch.yml` and exit early.
+Harness agents route via CEL triggers on arbitrary labels — there is no prefix constraint.
 
 ### CLI
 
@@ -324,7 +320,7 @@ fullsend agent update triage <sha> --fullsend-dir .fullsend
 fullsend agent remove triage --fullsend-dir .fullsend
 ```
 
-### Per-repo config (`.fullsend/config.yaml`)
+### Config file (`.fullsend/config.yaml`)
 
 ```yaml
 version: "1"
@@ -336,26 +332,6 @@ agents:
 allowed_remote_resources:
   - https://raw.githubusercontent.com/fullsend-ai/fullsend/
   - https://raw.githubusercontent.com/fullsend-ai/agents/
-```
-
-### Per-org config
-
-```yaml
-version: "1"
-dispatch:
-  platform: github-actions
-defaults:
-  roles: [triage, coder, review]
-agents:
-  - https://raw.githubusercontent.com/fullsend-ai/agents/<sha>/harness/triage.yaml#sha256=abc...
-  - name: my-cool-agent
-    source: harness/my-cool-agent.yaml
-allowed_remote_resources:
-  - https://raw.githubusercontent.com/fullsend-ai/fullsend/
-  - https://raw.githubusercontent.com/fullsend-ai/agents/
-repos:
-  my-repo:
-    enabled: true
 ```
 
 **Notes:**
@@ -392,7 +368,6 @@ repos:
 - [`author-fullsend-augmentations` skill](../../../skills/author-fullsend-augmentations/SKILL.md) — discovery-driven guide for writing skills and sub-agents that complement shipped defaults
 - [Configuring with AGENTS.md](customizing-with-agents-md.md) — repo-level instructions for all agents
 - [Configuring Agent Behavior](customizing-agents.md) — harness configuration and `base:` composition
-- [Harness Field Reference](../../reference/harness-reference.md) — complete harness YAML field reference, merge rules, and resource referencing
 - [Default, derived, and custom agents](../../agents/topics/default-vs-custom.md) — when configuration crosses into custom agent territory
 - [Escalation ladder](../../agents/topics/escalation-ladder.md) — prove-it path before deriving or replacing a core agent
 - [Standalone mint](../infrastructure/standalone-mint.md) — custom agent roles and identity

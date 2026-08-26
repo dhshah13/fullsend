@@ -72,7 +72,7 @@ differs:
 
 ```yaml
 # .fullsend/harness/code.yaml
-base: "https://github.com/fullsend-ai/agents/tree/main/harness/code.yaml#sha256=..."
+base: https://raw.githubusercontent.com/fullsend-ai/agents/<sha>/harness/code.yaml#sha256=abc...
 
 model: sonnet
 timeout_minutes: 45

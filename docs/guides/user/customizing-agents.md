@@ -38,7 +38,7 @@ Create a thin harness that inherits from the upstream code agent and adds your s
 
 **`harness/code.yaml`:**
 ```yaml
-base: "https://github.com/fullsend-ai/agents/tree/main/harness/code.yaml#sha256=..."
+base: https://raw.githubusercontent.com/fullsend-ai/agents/<sha>/harness/code.yaml#sha256=abc...
 
 skills:
   - skills/my-custom-linting        # Merged with base skills (child overrides by basename)
@@ -78,7 +78,7 @@ See [Running agents locally](running-agents-locally.md) for prerequisites and tr
 ### Example: swap the model for review
 
 ```yaml
-base: "https://github.com/fullsend-ai/agents/tree/main/harness/review.yaml#sha256=..."
+base: https://raw.githubusercontent.com/fullsend-ai/agents/<sha>/harness/review.yaml#sha256=abc...
 
 model: sonnet
 ```
@@ -86,7 +86,7 @@ model: sonnet
 ### Example: add org-specific environment variables
 
 ```yaml
-base: "https://github.com/fullsend-ai/agents/tree/main/harness/code.yaml#sha256=..."
+base: https://raw.githubusercontent.com/fullsend-ai/agents/<sha>/harness/code.yaml#sha256=abc...
 
 env:
   runner:
@@ -106,7 +106,7 @@ Any harness field can be overridden. See the [field merge rules](../../reference
 
 Base chains support up to 5 levels. Circular references are detected and rejected. Resolution order: base chain, child overrides, overlay resolution.
 
-> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, and `max_runtime_fetches` are NOT inherited from base harnesses -- the child must declare its own.
+> **Note:** `allowed_remote_resources`, `allow_runtime_fetch`, and `max_runtime_fetches` are NOT inherited from base harnesses — the child must declare its own.
 
 ### Remote providers and profiles
 
@@ -291,19 +291,7 @@ Each agent role has its own identity, permissions, and purpose:
 
 ## Status notifications
 
-Agent workflows post status comments on issues and PRs when they start and complete. Control this with `status_notifications` in `config.yaml`.
-
-For per-org installs, nest it under `defaults`:
-
-```yaml
-defaults:
-  status_notifications:
-    comment:
-      start: enabled      # "enabled" (default) | "disabled"
-      completion: enabled  # "enabled" (default) | "on_failure" | "disabled"
-```
-
-For per-repo installs, set it at the top level of `.fullsend/config.yaml`:
+Agent workflows post status comments on issues and PRs when they start and complete. Control this with `status_notifications` in `.fullsend/config.yaml`:
 
 ```yaml
 status_notifications:
