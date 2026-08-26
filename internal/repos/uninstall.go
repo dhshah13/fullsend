@@ -12,30 +12,30 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/scaffold"
 )
 
-var uninstallVariables = slices.Concat([]string{forge.PerRepoGuardVar}, requiredVariables, []string{"FULLSEND_GCP_REGION", "FULLSEND_REVIEW_CLIENT_ID"})
+var uninstallVariables = slices.Concat([]string{forge.PerRepoGuardVar}, requiredVariables, []string{forge.VarGCPRegion, forge.VarReviewClientID})
 
 var uninstallSecrets = requiredSecrets
 
 var gitlabUninstallVars = []string{
 	forge.PerRepoGuardVar,
-	"FULLSEND_BOT_TOKEN_SECRET",
-	"FULLSEND_DISPATCHED_KEYS_FAST",
-	"FULLSEND_DISPATCHED_KEYS_FULL",
-	"FULLSEND_FAILED_KEYS_FAST",
-	"FULLSEND_FAILED_KEYS_FULL",
-	"FULLSEND_FORGE",
-	"FULLSEND_FORGE_TOKEN",
-	"FULLSEND_GCP_REGION",
-	"FULLSEND_LABEL_STATE",
-	"FULLSEND_LAST_POLL_AT_FAST",
-	"FULLSEND_LAST_POLL_AT_FULL",
-	"FULLSEND_SA",
-	"FULLSEND_WIF_PROVIDER",
+	forge.VarLegacyBotTokenSecret,
+	forge.VarDispatchedKeysFast,
+	forge.VarDispatchedKeysFull,
+	forge.VarFailedKeysFast,
+	forge.VarFailedKeysFull,
+	forge.VarLegacyForge,
+	forge.SecretForgeToken,
+	forge.VarGCPRegion,
+	forge.VarLabelState,
+	forge.VarLastPollAtFast,
+	forge.VarLastPollAtFull,
+	forge.VarLegacySA,
+	forge.VarLegacyWIFProvider,
 }
 
 var gitlabUninstallSecrets = []string{
-	"FULLSEND_GCP_PROJECT_ID",
-	"FULLSEND_GCP_WIF_PROVIDER",
+	forge.SecretGCPProjectID,
+	forge.SecretGCPWIFProvider,
 }
 
 var gitlabScaffoldPaths = []string{
