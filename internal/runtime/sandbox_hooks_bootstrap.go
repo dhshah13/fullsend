@@ -71,6 +71,11 @@ func appendEnvVar(buf *strings.Builder, key, value string) {
 // TIRITH_REQUIRED, FULLSEND_EGRESS_ALLOWLIST) to the sandbox workspace
 // .env so the scripts see it regardless of which runtime invokes them.
 // All env vars are written in a single sandbox exec call.
+//
+// When the CLI layer resolves a forge egress entry (e.g. the GitLab
+// forge host:port), it is automatically merged into the egress allowlist
+// so the SSRF pre-tool hook defers to the L7 proxy for the forge API
+// (internal DNS is unavailable inside the sandbox). See #6615.
 func appendHookEnv(sandboxName string, hooks security.SandboxHookConfig) error {
 	var buf strings.Builder
 	if failOn := hooks.TirithFailOn(); failOn != "" {
@@ -79,7 +84,20 @@ func appendHookEnv(sandboxName string, hooks security.SandboxHookConfig) error {
 	if hooks.TirithRequired() {
 		appendEnvVar(&buf, "TIRITH_REQUIRED", "1")
 	}
-	if allowlist := hooks.SSRFEgressAllowlist(); allowlist != "" {
+	allowlist := hooks.SSRFEgressAllowlist()
+	// Merge the forge egress entry (resolved by the CLI layer) into the
+	// allowlist so the SSRF pre-tool hook defers to the L7 proxy for the
+	// forge's API when DNS resolution fails inside the sandbox (#6615).
+	if entry := hooks.ForgeEgressEntry(); entry != "" {
+		if allowlist == "" {
+			allowlist = entry
+		} else {
+			// ParseEgressAllowlist deduplicates via map, so appending
+			// a duplicate entry from the user config is harmless.
+			allowlist = allowlist + "," + entry
+		}
+	}
+	if allowlist != "" {
 		appendEnvVar(&buf, "FULLSEND_EGRESS_ALLOWLIST", allowlist)
 	}
 	if buf.Len() == 0 {
