@@ -1174,35 +1174,56 @@ func DeleteProvider(name string) error {
 	return nil
 }
 
-// verifyPolicy checks that the active runtime policy reported by
-// openshell sandbox get matches the policy requested at creation time.
+// verifyPolicy checks that the sandbox has an active policy applied at the
+// sandbox level when one was requested at creation time. It parses the real
+// openshell sandbox get output which reports policy metadata as:
+//
+//	Policy source: sandbox|global
+//	Policy:
+//	  <yaml>
+//
 // When no policy was requested (empty string), the check is skipped.
 func verifyPolicy(name, output, requestedPolicy string) error {
 	if requestedPolicy == "" {
 		return nil
 	}
-	active := parseSandboxPolicy(output)
-	if active == "" {
-		return fmt.Errorf("sandbox %q is ready but no runtime policy reported (expected %q)", name, requestedPolicy)
+	source := parsePolicySource(output)
+	if source == "" {
+		return fmt.Errorf("sandbox %q is ready but no policy source reported (expected policy %q)", name, requestedPolicy)
 	}
-	if active != requestedPolicy {
-		return fmt.Errorf("sandbox %q policy mismatch: active %q, expected %q", name, active, requestedPolicy)
+	if source != "sandbox" {
+		return fmt.Errorf("sandbox %q policy source is %q, expected %q (requested policy %q)", name, source, "sandbox", requestedPolicy)
+	}
+	if !hasPolicySection(output) {
+		return fmt.Errorf("sandbox %q reports policy source %q but no policy content found (expected policy %q)", name, source, requestedPolicy)
 	}
 	return nil
 }
 
-// parseSandboxPolicy extracts the runtime policy value from openshell
-// sandbox get output. It looks for a "Runtime Policy:" line and returns
-// the value after the colon. Returns an empty string if the field is
-// not present or has no value.
-func parseSandboxPolicy(output string) string {
+// parsePolicySource extracts the "Policy source:" field value from
+// openshell sandbox get output. Returns "sandbox", "global", or ""
+// if the field is not present.
+func parsePolicySource(output string) string {
 	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSpace(line)
-		if val, ok := strings.CutPrefix(line, "Runtime Policy:"); ok {
+		if val, ok := strings.CutPrefix(line, "Policy source:"); ok {
 			return strings.TrimSpace(val)
 		}
 	}
 	return ""
+}
+
+// hasPolicySection checks whether the output contains a standalone
+// "Policy:" section header, indicating an active policy with YAML
+// content follows. This distinguishes the section header from the
+// "Policy source:" metadata field.
+func hasPolicySection(output string) bool {
+	for line := range strings.SplitSeq(output, "\n") {
+		if strings.TrimSpace(line) == "Policy:" {
+			return true
+		}
+	}
+	return false
 }
 
 // Delete deletes a sandbox, returning any error for the caller to log.

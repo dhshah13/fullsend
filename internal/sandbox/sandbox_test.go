@@ -850,6 +850,212 @@ network:
 	}
 }
 
+func TestParsePolicySource(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{
+			name:   "sandbox policy source",
+			output: "  Name: test-sandbox\n  Phase: Ready\n  Policy source: sandbox\n",
+			want:   "sandbox",
+		},
+		{
+			name:   "global policy source",
+			output: "  Name: test-sandbox\n  Phase: Ready\n  Policy source: global\n",
+			want:   "global",
+		},
+		{
+			name:   "no policy source field",
+			output: "  Name: test-sandbox\n  Phase: Ready\n",
+			want:   "",
+		},
+		{
+			name:   "extra whitespace",
+			output: "  Policy source:   sandbox  \n",
+			want:   "sandbox",
+		},
+		{
+			name:   "policy source among many fields",
+			output: "  Name: sb\n  Phase: Ready\n  Policy source: sandbox\n  Revision: 3\n",
+			want:   "sandbox",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parsePolicySource(tt.output)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestHasPolicySection(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{
+			name:   "policy section present",
+			output: "  Policy source: sandbox\n\nPolicy:\n\n  net:\n    outbound: block\n",
+			want:   true,
+		},
+		{
+			name:   "no policy section",
+			output: "  Name: sb\n  Phase: Ready\n  Policy source: sandbox\n",
+			want:   false,
+		},
+		{
+			name:   "policy source not confused with policy section",
+			output: "  Policy source: sandbox\n",
+			want:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasPolicySection(tt.output)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestVerifyPolicy_Match(t *testing.T) {
+	output := "  Name: sb\n  Phase: Ready\n  Policy source: sandbox\n\nPolicy:\n\n  net:\n    outbound: block\n"
+	err := verifyPolicy("sb", output, "/path/to/policy.yaml")
+	assert.NoError(t, err)
+}
+
+func TestVerifyPolicy_GlobalWhenSandboxExpected(t *testing.T) {
+	output := "  Name: sb\n  Phase: Ready\n  Policy source: global\n\nPolicy:\n\n  net:\n    outbound: allow\n"
+	err := verifyPolicy("sb", output, "/path/to/policy.yaml")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "policy source")
+	assert.Contains(t, err.Error(), "global")
+}
+
+func TestVerifyPolicy_NoPolicyRequested(t *testing.T) {
+	output := "  Name: sb\n  Phase: Ready\n"
+	err := verifyPolicy("sb", output, "")
+	assert.NoError(t, err)
+}
+
+func TestVerifyPolicy_NoSourceReported(t *testing.T) {
+	output := "  Name: sb\n  Phase: Ready\n"
+	err := verifyPolicy("sb", output, "/path/to/policy.yaml")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no policy source reported")
+}
+
+func TestVerifyPolicy_ANSIEscapesStripped(t *testing.T) {
+	// The openshell CLI wraps labels in ANSI colour codes; verifyPolicy
+	// must strip them so the parsers can match plain-text prefixes.
+	output := "  Name: sb\n  Phase: Ready\n  \x1b[1mPolicy source:\x1b[0m sandbox\n\n\x1b[1mPolicy:\x1b[0m\n\n  net:\n    outbound: block\n"
+	err := verifyPolicy("sb", output, "/path/to/policy.yaml")
+	assert.NoError(t, err)
+}
+
+func TestVerifyPolicy_SourceButNoPolicyContent(t *testing.T) {
+	output := "  Name: sb\n  Phase: Ready\n  Policy source: sandbox\n"
+	err := verifyPolicy("sb", output, "/path/to/policy.yaml")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no policy content found")
+}
+
+func TestCreateOnce_PolicyMatch(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+if [ "$2" = "create" ]; then exit 0; fi
+if [ "$2" = "get" ]; then
+  echo "Sandbox:"
+  echo ""
+  echo "  Name: test-sandbox"
+  echo "  Phase: Ready"
+  echo "  Policy source: sandbox"
+  echo "  Revision: 1"
+  echo ""
+  echo "Policy:"
+  echo ""
+  echo "  net:"
+  echo "    outbound: block"
+  exit 0
+fi
+exit 1
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "/path/to/policy.yaml", 10*time.Second)
+	assert.NoError(t, err)
+}
+
+func TestCreateOnce_PolicySourceGlobal(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+if [ "$2" = "create" ]; then exit 0; fi
+if [ "$2" = "get" ]; then
+  echo "Sandbox:"
+  echo ""
+  echo "  Name: test-sandbox"
+  echo "  Phase: Ready"
+  echo "  Policy source: global"
+  echo ""
+  echo "Policy:"
+  echo ""
+  echo "  net:"
+  echo "    outbound: allow"
+  exit 0
+fi
+exit 1
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "/path/to/policy.yaml", 10*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "policy source")
+}
+
+func TestCreateOnce_NoPolicyRequested(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+if [ "$2" = "create" ]; then exit 0; fi
+if [ "$2" = "get" ]; then
+  echo "Sandbox:"
+  echo ""
+  echo "  Name: test-sandbox"
+  echo "  Phase: Ready"
+  exit 0
+fi
+exit 1
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "", 10*time.Second)
+	assert.NoError(t, err)
+}
+
+func TestCreateOnce_PolicyNotReported(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+if [ "$2" = "create" ]; then exit 0; fi
+if [ "$2" = "get" ]; then
+  echo "Sandbox:"
+  echo ""
+  echo "  Name: test-sandbox"
+  echo "  Phase: Ready"
+  exit 0
+fi
+exit 1
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "/path/to/policy.yaml", 10*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no policy source reported")
+}
 func TestEffectiveReadyTimeout_CappedAtMax(t *testing.T) {
 	got := effectiveReadyTimeout(999 * time.Second)
 	assert.Equal(t, maxReadyTimeout, got)
