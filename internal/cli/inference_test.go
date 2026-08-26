@@ -550,3 +550,86 @@ func TestInferenceDeprovisionCmd_DoesNotRequireGitHubToken(t *testing.T) {
 	err := cmd.Execute()
 	require.NoError(t, err)
 }
+
+// --- conditionMatchesRepo tests ---
+
+func TestConditionMatchesRepo_ExactCase(t *testing.T) {
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'acme/widget'",
+		"acme/widget",
+	))
+}
+
+func TestConditionMatchesRepo_MixedCaseOrg(t *testing.T) {
+	// GitHub OIDC tokens preserve canonical display case.
+	// A provision with mixed-case input writes a mixed-case condition,
+	// and status should report it as healthy.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'RedHatProductSecurity/osidb-bindings'",
+		"RedHatProductSecurity/osidb-bindings",
+	))
+}
+
+func TestConditionMatchesRepo_CaseInsensitiveMatch(t *testing.T) {
+	// Condition was provisioned with mixed case; status queried with lowercase.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'RedHatProductSecurity/osidb-bindings'",
+		"redhatproductsecurity/osidb-bindings",
+	))
+	// Condition was provisioned with lowercase; status queried with mixed case.
+	assert.True(t, conditionMatchesRepo(
+		"assertion.repository == 'redhatproductsecurity/osidb-bindings'",
+		"RedHatProductSecurity/osidb-bindings",
+	))
+}
+
+func TestConditionMatchesRepo_Mismatch(t *testing.T) {
+	assert.False(t, conditionMatchesRepo(
+		"assertion.repository == 'acme/widget'",
+		"acme/other-repo",
+	))
+}
+
+// --- conditionMatchesOrg tests ---
+
+func TestConditionMatchesOrg_ExactCase(t *testing.T) {
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'acme'",
+		"acme",
+	))
+}
+
+func TestConditionMatchesOrg_MixedCaseOrg(t *testing.T) {
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'GoogleCloudPlatform'",
+		"GoogleCloudPlatform",
+	))
+}
+
+func TestConditionMatchesOrg_CaseInsensitiveMatch(t *testing.T) {
+	// Condition was provisioned with mixed case; status queried with lowercase.
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'GoogleCloudPlatform'",
+		"googlecloudplatform",
+	))
+	// Condition was provisioned with lowercase; status queried with mixed case.
+	assert.True(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'googlecloudplatform'",
+		"GoogleCloudPlatform",
+	))
+}
+
+func TestConditionMatchesOrg_MultiOrgPool(t *testing.T) {
+	condition := "assertion.repository_owner in ['acme', 'BigCorp']"
+	assert.True(t, conditionMatchesOrg(condition, "acme"))
+	assert.True(t, conditionMatchesOrg(condition, "BigCorp"))
+	assert.True(t, conditionMatchesOrg(condition, "bigcorp"))
+	assert.True(t, conditionMatchesOrg(condition, "ACME"))
+}
+
+func TestConditionMatchesOrg_Mismatch(t *testing.T) {
+	assert.False(t, conditionMatchesOrg(
+		"assertion.repository_owner == 'acme'",
+		"other-org",
+	))
+}
