@@ -110,6 +110,10 @@ func CollectPerRepoInstallFiles(vendored bool, upstreamRef, upstreamTag string) 
 // output/ themselves. When --output-dir sits inside --target-repo
 // (GitLab layout), fullsend run omits that top-level directory from the
 // sandbox tarball and .git/info/exclude via outputDirExcludeRel.
+// The root .gitlab-ci.yml is also excluded: the install flow merges
+// fullsend's include directive and workflow rules into the consumer's
+// existing file (or creates a minimal one) instead of overwriting it.
+// See MergeGitLabCI in internal/repos/gitlabci.go.
 // runnerTags specifies GitLab runner tags to inject into CI job definitions.
 // upstreamRef and upstreamTag control the version marker embedded in the
 // dispatch file for upgrade/status drift detection.
@@ -119,7 +123,7 @@ func CollectGitLabPerRepoInstallFiles(runnerTags []string, upstreamRef, upstream
 	fullsendVersion := ResolveFullsendVersion(upstreamRef, upstreamTag)
 	var files InstallFiles
 	err := WalkGitLabPerRepo(func(path string, content []byte) error {
-		if path == ".fullsend/config.yaml" || path == ".gitignore" {
+		if path == ".fullsend/config.yaml" || path == ".gitignore" || path == ".gitlab-ci.yml" {
 			return nil
 		}
 		rendered := strings.ReplaceAll(string(content), "__RUNNER_TAGS__", tagYAML)
