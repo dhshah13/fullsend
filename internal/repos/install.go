@@ -493,6 +493,8 @@ var requiredSecrets = []string{forge.SecretGCPProjectID, forge.SecretGCPWIFProvi
 
 var gitlabRequiredVariables = []string{
 	forge.VarLastPollAtFast, forge.VarLastPollAtFull, forge.VarLabelState,
+	forge.VarDispatchedKeysFast, forge.VarDispatchedKeysFull,
+	forge.VarFailedKeysFast, forge.VarFailedKeysFull,
 }
 
 func requiredVarsForForge(forgeName string) []string {

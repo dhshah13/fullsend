@@ -158,15 +158,14 @@ func CheckOrphanFiles(ctx context.Context, client forge.Client,
 }
 
 // OrphanVar describes a repository variable with the FULLSEND_ prefix
-// (or the guard variable) that exists on the forge but is not in the
-// current managed variable set.
+// that exists on the forge but is not in the current managed variable set.
 type OrphanVar struct {
 	Name string
 }
 
 // CheckOrphanVars lists all repository variables on the forge and
-// returns those with the FULLSEND_ prefix (or the guard variable name)
-// that are not in the managed variable set for the given forge. These
+// returns those with the FULLSEND_ prefix that are not in the managed
+// variable set for the given forge. These
 // are orphan variables — leftover from a previous installation or a
 // removed feature.
 //

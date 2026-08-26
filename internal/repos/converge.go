@@ -747,7 +747,9 @@ func initialVarValue(varName string) string {
 	switch varName {
 	case forge.VarLastPollAtFast, forge.VarLastPollAtFull:
 		return time.Now().UTC().Format(time.RFC3339)
-	case forge.VarLabelState:
+	case forge.VarLabelState,
+		forge.VarDispatchedKeysFast, forge.VarDispatchedKeysFull,
+		forge.VarFailedKeysFast, forge.VarFailedKeysFull:
 		return "{}"
 	default:
 		return ""
@@ -769,10 +771,14 @@ func convergeSecrets(ctx context.Context,
 		var actions []ComponentAction
 		for _, c := range components {
 			if strings.HasPrefix(c.Name, "secret:") {
+				detail := fmt.Sprintf("%s exists", DriftFieldName(c.Name))
+				if !c.Present {
+					detail = fmt.Sprintf("%s not present (not managed by convergence)", DriftFieldName(c.Name))
+				}
 				actions = append(actions, ComponentAction{
 					Component: c.Name,
 					Action:    "none",
-					Detail:    fmt.Sprintf("%s exists", DriftFieldName(c.Name)),
+					Detail:    detail,
 				})
 			}
 		}
