@@ -127,24 +127,26 @@ func (e *repoEnsurer) EnsureRepo(ctx context.Context, org, repoName string) erro
 func (e *repoEnsurer) doEnsure(ctx context.Context, org, repoName string) error {
 	target := org + "/" + repoName
 
-	// Step 1: create repo if it does not exist.
+	// Step 1: delete the existing repo to reset accumulated git history.
+	// Pool repos grow to GB scale from repeated test runs; the pre-review
+	// shallow-clone deepening step takes 12+ minutes fetching bloated
+	// history. Deleting and recreating gives a clean single-commit repo.
+	if err := e.resetRepo(ctx, org, repoName, target); err != nil {
+		return err
+	}
+
+	// Step 2: create repo (needed after reset, or if it never existed).
 	if err := e.ensureRepoExists(ctx, org, repoName, target); err != nil {
 		return err
 	}
 
-	// Step 2: check whether fullsend was previously installed. We always
-	// re-vendor (step 3), but skip the settle wait when the workflow file
-	// already exists — GitHub Actions already indexed it.
-	alreadyInstalled := ValidatePerRepoPostInstall(ctx, e.client, org, repoName) == nil
-	if alreadyInstalled {
-		e.logf("[ensure] %s already installed, re-vendoring to keep binary current", target)
-	} else {
-		e.logf("[ensure] %s needs install", target)
-	}
+	// Step 3: the repo is always freshly created (step 1 deleted any
+	// prior version), so fullsend is never pre-installed. Run the full
+	// install flow and settle for Actions readiness.
+	e.logf("[ensure] %s needs install (fresh repo)", target)
 
-	// Step 3: always run github setup --vendor to push the current binary.
-	// Use the mint URL from e2eCfg — the suite sets this from the install
-	// driver's result before creating the ensurer.
+	// Step 4: run github setup --vendor to install fullsend and push
+	// the current binary.
 	if err := e.installFullsend(ctx, org, repoName, target); err != nil {
 		return err
 	}
@@ -152,13 +154,37 @@ func (e *repoEnsurer) doEnsure(ctx context.Context, org, repoName string) error 
 		return fmt.Errorf("post-install validation for %s: %w", target, err)
 	}
 
-	// Step 4: wait for Actions to recognise the workflow file only on
-	// fresh installs. Re-vendors update the binary and workflow files
-	// but GitHub Actions already indexed the workflow on the prior install.
-	if !alreadyInstalled && e.settle != nil {
+	// Step 5: wait for Actions to recognise the workflow file.
+	if e.settle != nil {
 		if err := e.settle(ctx, e.client, org, repoName, PerRepoTriageWorkflow, e.logf); err != nil {
 			return fmt.Errorf("waiting for Actions readiness on %s: %w", target, err)
 		}
+	}
+
+	return nil
+}
+
+// resetRepo deletes an existing repo to clear accumulated git history.
+// Pool repos grow to gigabyte scale from repeated test runs; the
+// pre-review shallow-clone deepening step takes 12+ minutes fetching
+// the bloated history. A fresh repo starts with just the auto_init
+// commit. No-op when the repo does not exist.
+func (e *repoEnsurer) resetRepo(ctx context.Context, org, repoName, target string) error {
+	_, err := e.client.GetRepo(ctx, org, repoName)
+	if err != nil {
+		if forge.IsNotFound(err) {
+			e.logf("[ensure] %s does not exist, no history to reset", target)
+			return nil
+		}
+		return fmt.Errorf("checking repo %s for reset: %w", target, err)
+	}
+
+	e.logf("[ensure] deleting %s to reset accumulated git history", target)
+	if err := e.client.DeleteRepo(ctx, org, repoName); err != nil {
+		if forge.IsNotFound(err) {
+			return nil // race: deleted between check and delete
+		}
+		return fmt.Errorf("deleting repo %s for history reset: %w", target, err)
 	}
 
 	return nil

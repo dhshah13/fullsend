@@ -111,6 +111,9 @@ type stubClient struct {
 	createRepoErr    error
 	createRepoCalled atomic.Int32
 
+	deleteRepoErr    error
+	deleteRepoCalled atomic.Int32
+
 	// installed controls whether GetFileContent returns valid
 	// post-install files. When false, all paths return ErrNotFound.
 	installed bool
@@ -138,6 +141,14 @@ func (s *stubClient) CreateRepo(_ context.Context, _, _, _ string, _ bool) (*for
 		return nil, s.createRepoErr
 	}
 	return &forge.Repository{}, nil
+}
+
+func (s *stubClient) DeleteRepo(_ context.Context, _, _ string) error {
+	s.deleteRepoCalled.Add(1)
+	if s.deleteRepoErr != nil {
+		return s.deleteRepoErr
+	}
+	return nil
 }
 
 func (s *stubClient) GetFileContent(_ context.Context, _, _, path string) ([]byte, error) {
@@ -231,19 +242,23 @@ func TestEnsurer_CreatesRepoWhenMissing(t *testing.T) {
 	assert.Equal(t, int32(1), sc.createRepoCalled.Load())
 }
 
-func TestEnsurer_SkipsCreateWhenRepoExists(t *testing.T) {
+func TestEnsurer_DeletesAndRecreatesExistingRepo(t *testing.T) {
+	speedUpValidateRetries(t)
 	sc := &stubClient{installed: true}
 	e := &repoEnsurer{
-		e2eCfg:  e2etest.EnvConfig{},
+		e2eCfg:  e2etest.EnvConfig{MintURL: "https://mint.test"},
 		client:  sc,
+		binary:  "/usr/bin/fullsend",
+		token:   "tok",
 		runCLI:  noopCLI,
+		settle:  noopSettle,
 		logf:    t.Logf,
 		ensured: make(map[string]struct{}),
 	}
 
 	err := e.EnsureRepo(context.Background(), "org", "test-repo-03")
 	require.NoError(t, err)
-	assert.Equal(t, int32(0), sc.createRepoCalled.Load(), "should not create existing repo")
+	assert.Equal(t, int32(1), sc.deleteRepoCalled.Load(), "should delete existing repo to reset history")
 }
 
 func TestEnsurer_InstallsWhenValidationFails(t *testing.T) {
@@ -570,7 +585,8 @@ func TestDoEnsure_EnsureRepoExistsError_Propagated(t *testing.T) {
 	assert.Contains(t, err.Error(), "network timeout")
 }
 
-func TestDoEnsure_AlreadyInstalledReVendors(t *testing.T) {
+func TestDoEnsure_AlwaysInstallsAfterReset(t *testing.T) {
+	speedUpValidateRetries(t)
 	sc := &stubClient{installed: true}
 	cliCalled := false
 	e := &repoEnsurer{
@@ -582,13 +598,15 @@ func TestDoEnsure_AlreadyInstalledReVendors(t *testing.T) {
 			cliCalled = true
 			return "", nil
 		},
+		settle:  noopSettle,
 		logf:    t.Logf,
 		ensured: make(map[string]struct{}),
 	}
 
 	err := e.EnsureRepo(context.Background(), "org", "test-repo-revendor")
 	require.NoError(t, err)
-	assert.True(t, cliCalled, "CLI should be called to re-vendor even when validation passes")
+	assert.True(t, cliCalled, "CLI should be called to install after repo reset")
+	assert.Equal(t, int32(1), sc.deleteRepoCalled.Load(), "existing repo should be deleted for reset")
 }
 
 // --- awaitWorkflowReady unit tests ---
@@ -643,7 +661,8 @@ func TestDoEnsure_SettleCalledAfterInstall(t *testing.T) {
 	assert.True(t, settleCalled, "settle should be called after install")
 }
 
-func TestDoEnsure_SettleNotCalledWhenAlreadyInstalled(t *testing.T) {
+func TestDoEnsure_SettleAlwaysCalledAfterReset(t *testing.T) {
+	speedUpValidateRetries(t)
 	sc := &stubClient{installed: true}
 	settleCalled := false
 	e := &repoEnsurer{
@@ -662,9 +681,9 @@ func TestDoEnsure_SettleNotCalledWhenAlreadyInstalled(t *testing.T) {
 		ensured: make(map[string]struct{}),
 	}
 
-	err := e.EnsureRepo(context.Background(), "org", "test-repo-no-settle")
+	err := e.EnsureRepo(context.Background(), "org", "test-repo-settle-after-reset")
 	require.NoError(t, err)
-	assert.False(t, settleCalled, "settle should not be called when already installed")
+	assert.True(t, settleCalled, "settle should always be called after repo reset")
 }
 
 func TestDoEnsure_SettleError_Propagated(t *testing.T) {
@@ -692,4 +711,52 @@ func TestDoEnsure_SettleError_Propagated(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "waiting for Actions readiness")
 	assert.Contains(t, err.Error(), "Actions not ready")
+}
+
+// --- resetRepo unit tests ---
+
+func TestResetRepo_DeletesExistingRepo(t *testing.T) {
+	sc := &stubClient{} // GetRepo returns success (repo exists)
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), sc.deleteRepoCalled.Load(), "should delete existing repo")
+}
+
+func TestResetRepo_SkipsDeleteWhenRepoMissing(t *testing.T) {
+	sc := &stubClient{getRepoErr: forge.ErrNotFound}
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.NoError(t, err)
+	assert.Equal(t, int32(0), sc.deleteRepoCalled.Load(), "should not delete missing repo")
+}
+
+func TestResetRepo_PropagatesGetRepoError(t *testing.T) {
+	sc := &stubClient{getRepoErr: assert.AnError}
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checking repo")
+}
+
+func TestResetRepo_PropagatesDeleteError(t *testing.T) {
+	sc := &stubClient{deleteRepoErr: fmt.Errorf("permission denied")}
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "deleting repo")
+	assert.Contains(t, err.Error(), "permission denied")
+	assert.Equal(t, int32(1), sc.deleteRepoCalled.Load())
+}
+
+func TestResetRepo_DeleteNotFound_IsIdempotent(t *testing.T) {
+	sc := &stubClient{deleteRepoErr: forge.ErrNotFound}
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.NoError(t, err, "ErrNotFound from delete should be treated as success (race-safe)")
 }
