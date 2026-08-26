@@ -73,9 +73,9 @@ type GrantedScope struct {
 var canonicalRolePermissions = map[string]map[string]string{
 	"triage":     {"contents": "read", "issues": "write", "metadata": "read"},
 	"scribe":     {"contents": "read", "issues": "write", "metadata": "read"},
-	"coder":      {"contents": "write", "pull_requests": "write", "issues": "write", "checks": "read", "metadata": "read"},
+	"coder":      {"contents": "write", "packages": "read", "pull_requests": "write", "issues": "write", "checks": "read", "metadata": "read"},
 	"review":     {"contents": "read", "pull_requests": "write", "issues": "write", "checks": "read", "metadata": "read"},
-	"fix":        {"contents": "write", "pull_requests": "write", "issues": "write", "metadata": "read"},
+	"fix":        {"contents": "write", "packages": "read", "pull_requests": "write", "issues": "write", "metadata": "read"},
 	"retro":      {"actions": "read", "contents": "read", "pull_requests": "write", "issues": "write", "metadata": "read"},
 	"prioritize": {"contents": "read", "issues": "write", "organization_projects": "write", "metadata": "read"},
 	"fullsend":   {"actions": "write", "actions_variables": "read", "contents": "write", "pull_requests": "write", "workflows": "write", "metadata": "read"},

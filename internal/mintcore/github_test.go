@@ -290,6 +290,14 @@ func TestRolePermissions_Prioritize(t *testing.T) {
 	assert.Len(t, perms, 4, "prioritize role should have exactly 4 permissions")
 }
 
+func TestRolePermissions_CoderAndFixIncludePackagesRead(t *testing.T) {
+	for _, role := range []string{"coder", "fix"} {
+		perms := RolePermissionsFor(role)
+		require.NotNil(t, perms, "role %q should exist", role)
+		assert.Equal(t, "read", perms["packages"], "role %q: expected packages=read, got %q", role, perms["packages"])
+	}
+}
+
 func TestRolePermissions_ReturnsCopy(t *testing.T) {
 	// Mutating the returned map must not affect the canonical definitions.
 	perms := RolePermissions()
