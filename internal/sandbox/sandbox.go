@@ -1187,6 +1187,9 @@ func verifyPolicy(name, output, requestedPolicy string) error {
 	if requestedPolicy == "" {
 		return nil
 	}
+	// The openshell CLI emits ANSI colour codes unconditionally (even
+	// when stdout is not a terminal), so strip them before parsing.
+	output = stripANSI(output)
 	source := parsePolicySource(output)
 	if source == "" {
 		return fmt.Errorf("sandbox %q is ready but no policy source reported (expected policy %q)", name, requestedPolicy)
