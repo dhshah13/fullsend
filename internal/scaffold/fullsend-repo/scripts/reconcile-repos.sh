@@ -36,11 +36,10 @@ ENROLL_PR_TITLE="chore: connect to fullsend agent pipeline"
 UNENROLL_PR_TITLE="chore: disconnect from fullsend agent pipeline"
 UPDATE_PR_TITLE="chore: update fullsend shim workflow"
 
-ENROLL_PR_BODY="This PR adds a shim workflow that routes repository events to the fullsend agent dispatch workflow in the \`.fullsend\` config repo.
-
-Once merged, issues, PRs, and comments in this repo will be handled by the fullsend agent pipeline.
-
-## Getting started
+# Shared "Getting started" block appended to both enrollment and update PRs.
+# The update path is the first touchpoint for already-enrolled repos (see #2165),
+# so it must document the slash commands too.
+GETTING_STARTED_SECTION="## Getting started
 
 Once this PR is merged, interact with fullsend by commenting one of these slash commands. The supported target (issue and/or pull request) is shown for each:
 
@@ -50,12 +49,20 @@ Once this PR is merged, interact with fullsend by commenting one of these slash 
 - \`/fs-fix\` (PR only) — Invoke the [fix](https://github.com/fullsend-ai/agents/blob/main/docs/fix.md) agent to address review feedback on a pull request.
 - \`/fs-retro\` (issue or PR) — Invoke the [retro](https://github.com/fullsend-ai/agents/blob/main/docs/retro.md) agent to analyze completed work and propose improvements.
 - \`/fs-prioritize\` (issue or PR) — Invoke the [prioritize](https://github.com/fullsend-ai/agents/blob/main/docs/prioritize.md) agent to score an issue for project board ranking."
+
+ENROLL_PR_BODY="This PR adds a shim workflow that routes repository events to the fullsend agent dispatch workflow in the \`.fullsend\` config repo.
+
+Once merged, issues, PRs, and comments in this repo will be handled by the fullsend agent pipeline.
+
+${GETTING_STARTED_SECTION}"
 UNENROLL_PR_BODY="This PR removes the fullsend shim workflow. The repo has been set to \`enabled: false\` in the fullsend config.
 
 Once merged, this repo will no longer dispatch events to the fullsend agent pipeline."
 UPDATE_PR_BODY="This PR updates the fullsend shim workflow to match the current template in the \`.fullsend\` config repo.
 
-The shim content has drifted from the template — this brings it back in sync."
+The shim content has drifted from the template — this brings it back in sync.
+
+${GETTING_STARTED_SECTION}"
 
 UPDATE_COMMIT_MSG="chore: update fullsend shim workflow
 

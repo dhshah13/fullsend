@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -802,6 +803,45 @@ func TestReconcileReposContent(t *testing.T) {
 		"reconcile-repos.sh should not parse dispatch mode")
 	assert.Contains(t, s, "private repos cannot be enrolled",
 		"reconcile-repos.sh should skip private repos to prevent log exposure")
+
+	// The "Getting started" slash-command catalog (#2165) must appear in both the
+	// enrollment and update PR bodies. The update path is the first touchpoint for
+	// already-enrolled repos, which is the scenario the original incident hit.
+	assert.Contains(t, s, "## Getting started",
+		"reconcile-repos.sh PR bodies should include the Getting started section")
+	assert.Contains(t, s, `GETTING_STARTED_SECTION`,
+		"Getting started block should be shared so it appears in both enroll and update PRs")
+	assert.Contains(t, s, `ENROLL_PR_BODY=`)
+	assert.Contains(t, s, `UPDATE_PR_BODY=`)
+	// Both PR bodies interpolate the shared block.
+	assert.Equal(t, 2, strings.Count(s, `${GETTING_STARTED_SECTION}`),
+		"shared Getting started block should be appended to both the enroll and update PR bodies")
+}
+
+// TestReconcileReposSlashCommandCatalog guards against the onboarding PR body's
+// slash-command catalog drifting from dispatch.yml's routing. Every /fs-* command
+// that dispatch.yml routes on must be documented in reconcile-repos.sh's PR body,
+// so a command added/renamed in dispatch.yml without updating the catalog fails CI.
+func TestReconcileReposSlashCommandCatalog(t *testing.T) {
+	dispatch, err := FullsendRepoFile(".github/workflows/dispatch.yml")
+	require.NoError(t, err)
+	script, err := FullsendRepoFile("scripts/reconcile-repos.sh")
+	require.NoError(t, err)
+	scriptStr := string(script)
+
+	cmdRE := regexp.MustCompile(`/fs-[a-z]+`)
+	matches := cmdRE.FindAllString(string(dispatch), -1)
+	require.NotEmpty(t, matches, "expected dispatch.yml to route on /fs-* commands")
+
+	seen := map[string]bool{}
+	for _, cmd := range matches {
+		if seen[cmd] {
+			continue
+		}
+		seen[cmd] = true
+		assert.Contains(t, scriptStr, cmd,
+			"dispatch.yml routes on %s but reconcile-repos.sh onboarding PR body does not document it", cmd)
+	}
 }
 
 func TestPrioritizeWorkflowContent(t *testing.T) {
