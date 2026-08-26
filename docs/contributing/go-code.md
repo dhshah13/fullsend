@@ -284,6 +284,17 @@ See [`forge.IsTransient`](../../internal/forge/forge.go) for the canonical examp
 
 **When reviewing PRs:** Flag any `Timeout() bool` interface assertion without a preceding `errors.Is(err, context.DeadlineExceeded)` guard as a medium-severity finding. The fix is to add the context-error check before the `Timeout()` check.
 
+## Injectable function variables (test seams)
+
+Package-level variables that hold function values for test overriding must:
+
+- Use an `XxxFn` suffix (e.g., `BuildWASMFn`, `RetrySleepFn`, `WranglerWhoamiFn`)
+- Default to the real implementation
+- Include a doc comment starting with "Override in tests to..." that describes what the override achieves
+- Be restored in a `t.Cleanup` callback when overridden
+
+Examples: `internal/sandbox/sandbox.go` (`RetrySleepFn`), `internal/dispatch/cf/provisioner.go` (`BuildWASMFn`, `CopyWASMExecFn`).
+
 ## Running the fullsend CLI
 
 **Audience:** contributors and agents working from a **repo checkout**. Do not
