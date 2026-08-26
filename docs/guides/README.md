@@ -27,6 +27,7 @@ Advanced guides for platform operators who deploy and manage the GCP-side infras
 - [Standalone mint](infrastructure/standalone-mint.md) — Running the token mint as a standalone HTTP server without GCP
 - [Infrastructure reference](infrastructure/infrastructure-reference.md) — Token mint, WIF, and secrets deployment details
 - [Enabling fullsend on private repositories](infrastructure/private-repositories.md) — Additional guardrails and configuration for private repos
+- [Gate binaries](infrastructure/gate-binaries.md) — Building statically linked binaries for custom endpoint access constraints beyond L7 rules
 - [Tracing reference](infrastructure/distributed-tracing.md) — Telemetry levels, environment variables, span hierarchy, and attributes
 - [Eval measurements](infrastructure/eval-measurements.md) — Online trace scoring with `eval-measurements.jsonl` and measurement manifests
 
