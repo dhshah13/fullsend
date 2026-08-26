@@ -35,12 +35,115 @@ func newTestDriver(client forge.Client) *Driver {
 func TestDispatchDetectionWindow_AtLeast4Minutes(t *testing.T) {
 	t.Parallel()
 
-	// The dispatch detection window is dispatchMaxTry × dispatchPoll.
+	// The dispatch detection window is dispatchTimeout.
 	// It must be at least 4 minutes to tolerate slow GitHub webhook
-	// delivery. See issue #5503.
-	window := time.Duration(dispatchMaxTry) * dispatchPoll
-	assert.GreaterOrEqual(t, window, 4*time.Minute,
-		"dispatch detection window (%v) should be at least 4 minutes", window)
+	// delivery. See issues #5503 and #6668.
+	assert.GreaterOrEqual(t, dispatchTimeout, 4*time.Minute,
+		"dispatch detection window (%v) should be at least 4 minutes", dispatchTimeout)
+}
+
+func TestNextBackoff(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		current time.Duration
+		max     time.Duration
+		want    time.Duration
+	}{
+		{2 * time.Second, 30 * time.Second, 4 * time.Second},
+		{4 * time.Second, 30 * time.Second, 8 * time.Second},
+		{8 * time.Second, 30 * time.Second, 16 * time.Second},
+		{16 * time.Second, 30 * time.Second, 30 * time.Second},
+		{30 * time.Second, 30 * time.Second, 30 * time.Second},
+		{1 * time.Second, 1 * time.Second, 1 * time.Second},
+	}
+	for _, tt := range tests {
+		got := nextBackoff(tt.current, tt.max)
+		assert.Equal(t, tt.want, got,
+			"nextBackoff(%v, %v)", tt.current, tt.max)
+	}
+}
+
+// delayedRunsClient wraps FakeClient so ListWorkflowRuns returns no
+// runs for the first N calls, then returns the configured runs.
+// Used to verify exponential backoff intervals during dispatch polling.
+type delayedRunsClient struct {
+	*forge.FakeClient
+	mu       sync.Mutex
+	calls    int
+	delayFor int
+	runs     []forge.WorkflowRun
+}
+
+func (c *delayedRunsClient) ListWorkflowRuns(_ context.Context, _, _, _ string) ([]forge.WorkflowRun, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls <= c.delayFor {
+		return nil, nil
+	}
+	return append([]forge.WorkflowRun(nil), c.runs...), nil
+}
+
+func TestDispatchPollingBackoff(t *testing.T) {
+	t.Parallel()
+
+	// Track intervals passed to afterFunc to verify exponential growth.
+	var mu sync.Mutex
+	var intervals []time.Duration
+	recordingAfter := func(d time.Duration) <-chan time.Time {
+		mu.Lock()
+		intervals = append(intervals, d)
+		mu.Unlock()
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+
+	after := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	successRun := forge.WorkflowRun{
+		ID: 1, Status: "completed", Conclusion: "success",
+		CreatedAt: "2026-01-02T00:00:00Z", Event: "issues",
+	}
+	fake := forge.NewFakeClient()
+	// Seed GetWorkflowRun so the completion-wait loop succeeds.
+	fake.WorkflowRuns = map[string]*forge.WorkflowRun{
+		"org/repo/success": &successRun,
+	}
+	client := &delayedRunsClient{
+		FakeClient: fake,
+		delayFor:   4, // return no runs for first 4 calls
+		runs:       []forge.WorkflowRun{successRun},
+	}
+
+	d := &Driver{Client: client, afterFunc: recordingAfter}
+	run, err := d.WaitForWorkflow(context.Background(), "org", "repo", "test.yaml", after, "issues")
+	require.NoError(t, err)
+	require.NotNil(t, run)
+	assert.Equal(t, 1, run.ID)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// The dispatch detection phase runs 5 polls (4 empty + 1 successful).
+	// After detection the completion-wait loop uses pollInterval, so only
+	// check the first 5 intervals for exponential growth.
+	dispatchIntervals := intervals[:5]
+	assert.Equal(t, dispatchPollInit, dispatchIntervals[0],
+		"first interval should be dispatchPollInit")
+	for i := 1; i < len(dispatchIntervals); i++ {
+		assert.GreaterOrEqual(t, dispatchIntervals[i], dispatchIntervals[i-1],
+			"interval[%d] (%v) should be >= interval[%d] (%v)",
+			i, dispatchIntervals[i], i-1, dispatchIntervals[i-1])
+		assert.LessOrEqual(t, dispatchIntervals[i], dispatchPollMax,
+			"interval[%d] (%v) should be <= max (%v)",
+			i, dispatchIntervals[i], dispatchPollMax)
+	}
+	// Verify specific exponential progression: 2s, 4s, 8s, 16s, 30s.
+	assert.Equal(t, 2*time.Second, dispatchIntervals[0])
+	assert.Equal(t, 4*time.Second, dispatchIntervals[1])
+	assert.Equal(t, 8*time.Second, dispatchIntervals[2])
+	assert.Equal(t, 16*time.Second, dispatchIntervals[3])
+	assert.Equal(t, 30*time.Second, dispatchIntervals[4])
 }
 
 func TestSelectWorkflowRun_ReturnsFailedRun(t *testing.T) {
