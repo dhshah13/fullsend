@@ -84,9 +84,9 @@ func TestInstall_FreshInstall_Direct(t *testing.T) {
 		t.Error("expected scaffold commit function to be called")
 	}
 
-	// Verify repository variables were set (guard + mint URL + region).
-	if len(fc.Variables) != 3 {
-		t.Errorf("expected 3 variables, got %d", len(fc.Variables))
+	// Verify repository variables were set (mint URL + region).
+	if len(fc.Variables) != 2 {
+		t.Errorf("expected 2 variables, got %d", len(fc.Variables))
 	}
 	varMap := make(map[string]string)
 	for _, v := range fc.Variables {
@@ -624,6 +624,7 @@ func TestCheckInstallComponents_GitLab_FullyInstalled(t *testing.T) {
 	fc.VariableValues["acme/api/FULLSEND_LABEL_STATE"] = "{}"
 	fc.Secrets["acme/api/FULLSEND_GCP_PROJECT_ID"] = true
 	fc.Secrets["acme/api/FULLSEND_GCP_WIF_PROVIDER"] = true
+	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
 
 	installed, err := checkInstallComponents(context.Background(), fc, "acme", "api", ForgeGitLab, GitLabForgeConfig(), nil)
 	if err != nil {
@@ -691,17 +692,21 @@ func TestInstallVarsForForge_GitLab(t *testing.T) {
 		t.Fatalf("installVarsForForge(GitLab) error = %v", err)
 	}
 	requiredKeys := []string{
-		"FULLSEND_LAST_POLL_AT_FAST",
-		"FULLSEND_LAST_POLL_AT_FULL",
-		"FULLSEND_LABEL_STATE",
+		forge.VarLastPollAtFast,
+		forge.VarLastPollAtFull,
+		forge.VarLabelState,
+		forge.VarDispatchedKeysFast,
+		forge.VarDispatchedKeysFull,
+		forge.VarFailedKeysFast,
+		forge.VarFailedKeysFull,
 	}
 	for _, k := range requiredKeys {
 		if _, ok := vars[k]; !ok {
 			t.Errorf("missing required GitLab variable %q", k)
 		}
 	}
-	// GitLab vars should NOT include GitHub-specific or dead marker vars.
-	for _, k := range []string{"FULLSEND_MINT_URL", "FULLSEND_GCP_REGION", "FULLSEND_FORGE"} {
+	// GitLab vars should NOT include GitHub-specific, dead marker, or guard vars.
+	for _, k := range []string{forge.VarMintURL, forge.VarGCPRegion, forge.VarLegacyForge, forge.PerRepoGuardVar} {
 		if _, ok := vars[k]; ok {
 			t.Errorf("GitLab vars should not include %q", k)
 		}
@@ -836,7 +841,7 @@ func TestRequiredVarsForForge(t *testing.T) {
 }
 
 func TestRequiredSecretsForForge(t *testing.T) {
-	secrets := requiredSecretsForForge()
+	secrets := requiredSecretsForForge(ForgeGitHub)
 	if len(secrets) == 0 {
 		t.Fatal("expected non-empty required secrets")
 	}

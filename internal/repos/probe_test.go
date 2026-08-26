@@ -197,6 +197,7 @@ func TestProbeComponents_GitLab_SkipsThinCallers(t *testing.T) {
 	fc.VariableValues["acme/api/FULLSEND_LABEL_STATE"] = "{}"
 	fc.Secrets["acme/api/FULLSEND_GCP_PROJECT_ID"] = true
 	fc.Secrets["acme/api/FULLSEND_GCP_WIF_PROVIDER"] = true
+	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
 
 	components, err := ProbeComponents(context.Background(), fc, "acme", "api", ForgeGitLab, GitLabForgeConfig(), nil)
 	if err != nil {

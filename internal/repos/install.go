@@ -404,26 +404,28 @@ func managedVarsForForge(cfg InstallConfig, mintURL string) ([]ManagedVar, error
 	switch cfg.Forge {
 	case ForgeGitHub:
 		vars := []ManagedVar{
-			{Name: forge.PerRepoGuardVar, Value: "true"},
-			{Name: "FULLSEND_MINT_URL", Value: mintURL},
+			{Name: forge.VarMintURL, Value: mintURL},
 		}
 		if cfg.InferenceRegion != "" {
-			vars = append(vars, ManagedVar{Name: "FULLSEND_GCP_REGION", Value: cfg.InferenceRegion})
+			vars = append(vars, ManagedVar{Name: forge.VarGCPRegion, Value: cfg.InferenceRegion})
 		}
 		if cfg.ReviewAppClientID != "" {
-			vars = append(vars, ManagedVar{Name: "FULLSEND_REVIEW_CLIENT_ID", Value: cfg.ReviewAppClientID})
+			vars = append(vars, ManagedVar{Name: forge.VarReviewClientID, Value: cfg.ReviewAppClientID})
 		}
 		return vars, nil
 	case ForgeGitLab:
 		now := time.Now().UTC().Format(time.RFC3339)
 		vars := []ManagedVar{
-			{Name: forge.PerRepoGuardVar, Value: "true"},
-			{Name: "FULLSEND_LAST_POLL_AT_FAST", Value: now, Dynamic: true},
-			{Name: "FULLSEND_LAST_POLL_AT_FULL", Value: now, Dynamic: true},
-			{Name: "FULLSEND_LABEL_STATE", Value: "{}", Dynamic: true},
+			{Name: forge.VarLastPollAtFast, Value: now, Dynamic: true},
+			{Name: forge.VarLastPollAtFull, Value: now, Dynamic: true},
+			{Name: forge.VarLabelState, Value: "{}", Dynamic: true},
+			{Name: forge.VarDispatchedKeysFast, Value: "{}", Dynamic: true},
+			{Name: forge.VarDispatchedKeysFull, Value: "{}", Dynamic: true},
+			{Name: forge.VarFailedKeysFast, Value: "{}", Dynamic: true},
+			{Name: forge.VarFailedKeysFull, Value: "{}", Dynamic: true},
 		}
 		if cfg.InferenceRegion != "" {
-			vars = append(vars, ManagedVar{Name: "FULLSEND_GCP_REGION", Value: cfg.InferenceRegion})
+			vars = append(vars, ManagedVar{Name: forge.VarGCPRegion, Value: cfg.InferenceRegion})
 		}
 		return vars, nil
 	default:
@@ -471,8 +473,8 @@ func installSecretsForForge(cfg InstallConfig, wifProvider string) map[string]st
 	}
 
 	return map[string]string{
-		"FULLSEND_GCP_PROJECT_ID":   cfg.InferenceProject,
-		"FULLSEND_GCP_WIF_PROVIDER": wifProvider,
+		forge.SecretGCPProjectID:   cfg.InferenceProject,
+		forge.SecretGCPWIFProvider: wifProvider,
 	}
 }
 
@@ -481,14 +483,16 @@ func installSecretsForForge(cfg InstallConfig, wifProvider string) map[string]st
 // conditionally set (only when --inference-region is provided) and may
 // not be present when secrets are reused. Shared by install,
 // checkInstallComponents, and uninstall.
-var requiredVariables = []string{"FULLSEND_MINT_URL"}
+var requiredVariables = []string{forge.VarMintURL}
 
 // requiredSecrets lists the per-repo secrets that must exist for a
 // complete installation. Shared by install, checkInstallComponents,
 // and uninstall.
-var requiredSecrets = []string{"FULLSEND_GCP_PROJECT_ID", "FULLSEND_GCP_WIF_PROVIDER"}
+var requiredSecrets = []string{forge.SecretGCPProjectID, forge.SecretGCPWIFProvider}
 
-var gitlabRequiredVariables = []string{"FULLSEND_LAST_POLL_AT_FAST", "FULLSEND_LAST_POLL_AT_FULL", "FULLSEND_LABEL_STATE"}
+var gitlabRequiredVariables = []string{
+	forge.VarLastPollAtFast, forge.VarLastPollAtFull, forge.VarLabelState,
+}
 
 func requiredVarsForForge(forgeName string) []string {
 	if forgeName == ForgeGitLab {
@@ -497,7 +501,15 @@ func requiredVarsForForge(forgeName string) []string {
 	return requiredVariables
 }
 
-func requiredSecretsForForge() []string {
+// requiredSecretsForForge returns the secret names that must exist for
+// the given forge. On GitLab, FULLSEND_FORGE_TOKEN is included because
+// secrets are stored as masked CI/CD variables and ListRepoVariables
+// returns them — excluding them from the required set would cause
+// orphan detection to flag them as false positives.
+func requiredSecretsForForge(forgeName string) []string {
+	if forgeName == ForgeGitLab {
+		return append(requiredSecrets, forge.SecretForgeToken)
+	}
 	return requiredSecrets
 }
 

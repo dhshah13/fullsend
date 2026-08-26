@@ -197,6 +197,13 @@ func CheckOrphanVars(ctx context.Context, client forge.Client,
 		managedNames[v.Name] = true
 	}
 
+	// On GitLab, secrets are stored as masked CI/CD variables, so
+	// ListRepoVariables returns them. Exclude required secrets from
+	// orphan detection — they are not orphans.
+	for _, s := range requiredSecretsForForge(cfg.Forge) {
+		managedNames[s] = true
+	}
+
 	forgeVars, err := client.ListRepoVariables(ctx, owner, repo)
 	if err != nil {
 		return nil, fmt.Errorf("listing repo variables: %w", err)
@@ -204,7 +211,7 @@ func CheckOrphanVars(ctx context.Context, client forge.Client,
 
 	var orphans []OrphanVar
 	for name := range forgeVars {
-		if !strings.HasPrefix(name, "FULLSEND_") && name != forge.PerRepoGuardVar {
+		if !strings.HasPrefix(name, "FULLSEND_") {
 			continue
 		}
 		if managedNames[name] {
