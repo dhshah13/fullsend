@@ -320,6 +320,20 @@ Package-level variables that hold function values for test overriding must:
 
 Examples: `internal/sandbox/sandbox.go` (`RetrySleepFn`), `internal/dispatch/cf/provisioner.go` (`BuildWASMFn`, `CopyWASMExecFn`).
 
+## Secure HTTP clients
+
+Any new Go code that fetches a URL taken from configuration or user input is a potential SSRF vector. **Prefer the shared, SSRF-hardened fetcher `internal/fetch.FetchURL` over constructing a raw `http.Client`.** Pass it a `fetch.FetchPolicy` (see `fetch.DefaultPolicy` for the GitHub-content defaults) rather than re-implementing the protections. `internal/fetch/fetch.go` is the canonical reference; `internal/repos/manifest.go`'s `fetchManifestURL`/`safeDialContext` is a second worked example (from PR #3002, which needed two review rounds to add these by hand — the point of this guidance is to skip those rounds).
+
+When you genuinely cannot use `fetch.FetchURL` (e.g. you need streaming, or a client reused across many calls), the custom client **must** apply all of these properties:
+
+- **HTTPS only.** Reject `http://` inputs, and validate the scheme on redirects too — a `CheckRedirect` that allows an `https://` origin to bounce to `http://` reopens the hole.
+- **Reject internal/reserved IPs.** Resolve the host yourself and check every resolved IP with `netutil.CheckIP` / `netutil.IsInternal` before dialing, via a custom `DialContext`. This blocks loopback, link-local, and private ranges. Dial the pre-validated IP (not the hostname) so a second DNS lookup can't rebind to an internal address.
+- **Disable proxies.** Set `Transport.Proxy = nil` so `HTTP(S)_PROXY` env vars can't redirect the request.
+- **Bound the time.** Set an explicit timeout (30s is the repo default) via `context.WithTimeout` and/or `http.Client.Timeout`.
+- **Bound the size.** Wrap the response body in `io.LimitReader(body, max+1)` and error if the read exceeds `max` (1 MB is the manifest default; pick a limit appropriate to the payload). Never `io.ReadAll` an unbounded body.
+
+Consider constraining redirects (a small hop limit, or blocking them entirely as `fetch.FetchURL` does) and enforcing a domain allowlist when the set of legitimate hosts is known.
+
 ## Running the fullsend CLI
 
 **Audience:** contributors and agents working from a **repo checkout**. Do not
