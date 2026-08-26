@@ -161,8 +161,8 @@ func hasComponent(components []ComponentStatus, name string) bool {
 
 // secretsPresent returns true when both required inference secrets are present.
 func secretsPresent(components []ComponentStatus) bool {
-	return hasComponent(components, "secret:FULLSEND_GCP_PROJECT_ID") &&
-		hasComponent(components, "secret:FULLSEND_GCP_WIF_PROVIDER")
+	return hasComponent(components, "secret:"+forge.SecretGCPProjectID) &&
+		hasComponent(components, "secret:"+forge.SecretGCPWIFProvider)
 }
 
 // anyComponentPresent returns true when at least one probed component exists,
@@ -292,8 +292,8 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 
 			// Build expected values for all static variables so
 			// ProbeComponents can detect value drift — not just
-			// FULLSEND_MINT_URL but also FULLSEND_GCP_REGION,
-			// FULLSEND_REVIEW_CLIENT_ID, and the guard variable.
+			// FULLSEND_MINT_URL but also FULLSEND_GCP_REGION
+			// and FULLSEND_REVIEW_CLIENT_ID.
 			expectedVars, varValErr := staticExpectedVarValues(InstallConfig{
 				Forge:             resolved.Forge,
 				MintURL:           resolved.MintURL,
@@ -745,9 +745,9 @@ func convergeVariables(ctx context.Context,
 // to write initial values so the poll loop can start.
 func initialVarValue(varName string) string {
 	switch varName {
-	case "FULLSEND_LAST_POLL_AT_FAST", "FULLSEND_LAST_POLL_AT_FULL":
+	case forge.VarLastPollAtFast, forge.VarLastPollAtFull:
 		return time.Now().UTC().Format(time.RFC3339)
-	case "FULLSEND_LABEL_STATE":
+	case forge.VarLabelState:
 		return "{}"
 	default:
 		return ""
@@ -785,8 +785,8 @@ func convergeSecrets(ctx context.Context,
 
 	secrets := map[string]string{}
 	if cfg.InferenceProject != "" {
-		secrets["FULLSEND_GCP_PROJECT_ID"] = cfg.InferenceProject
-		secrets["FULLSEND_GCP_WIF_PROVIDER"] = wifProvider
+		secrets[forge.SecretGCPProjectID] = cfg.InferenceProject
+		secrets[forge.SecretGCPWIFProvider] = wifProvider
 	}
 
 	for _, c := range components {

@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
@@ -508,7 +509,7 @@ func requiredVarsForForge(forgeName string) []string {
 // orphan detection to flag them as false positives.
 func requiredSecretsForForge(forgeName string) []string {
 	if forgeName == ForgeGitLab {
-		return append(requiredSecrets, forge.SecretForgeToken)
+		return slices.Concat(requiredSecrets, []string{forge.SecretForgeToken})
 	}
 	return requiredSecrets
 }
