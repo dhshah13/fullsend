@@ -163,11 +163,10 @@ type OrphanVar struct {
 	Name string
 }
 
-// CheckOrphanVars lists all repository variables on the forge and
-// returns those with the FULLSEND_ prefix that are not in the managed
-// variable set for the given forge. These
-// are orphan variables — leftover from a previous installation or a
-// removed feature.
+// CheckOrphanVars lists all repository variables on the forge and returns
+// those with the FULLSEND_ prefix that are not in the managed variable set
+// for the given forge. These are orphan variables — leftover from a
+// previous installation or a removed feature.
 //
 // The managed set is computed using the FULL superset of possible
 // managed variables — conditional fields (InferenceRegion,

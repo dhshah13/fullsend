@@ -603,9 +603,13 @@ func TestCheckInstallComponents_SecretCheckError(t *testing.T) {
 func TestCheckInstallComponents_GitLab_MissingSecrets(t *testing.T) {
 	fc := forge.NewFakeClient()
 	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("include:")
-	fc.VariableValues["acme/api/FULLSEND_LAST_POLL_AT_FAST"] = "2026-01-01T00:00:00Z"
-	fc.VariableValues["acme/api/FULLSEND_LAST_POLL_AT_FULL"] = "2026-01-01T00:00:00Z"
-	fc.VariableValues["acme/api/FULLSEND_LABEL_STATE"] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFull] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFull] = "{}"
 
 	installed, err := checkInstallComponents(context.Background(), fc, "acme", "api", ForgeGitLab, GitLabForgeConfig(), nil)
 	if err != nil {
@@ -619,15 +623,15 @@ func TestCheckInstallComponents_GitLab_MissingSecrets(t *testing.T) {
 func TestCheckInstallComponents_GitLab_FullyInstalled(t *testing.T) {
 	fc := forge.NewFakeClient()
 	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("include:")
-	fc.VariableValues["acme/api/FULLSEND_LAST_POLL_AT_FAST"] = "2026-01-01T00:00:00Z"
-	fc.VariableValues["acme/api/FULLSEND_LAST_POLL_AT_FULL"] = "2026-01-01T00:00:00Z"
-	fc.VariableValues["acme/api/FULLSEND_LABEL_STATE"] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
 	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFast] = "{}"
 	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFull] = "{}"
 	fc.VariableValues["acme/api/"+forge.VarFailedKeysFast] = "{}"
 	fc.VariableValues["acme/api/"+forge.VarFailedKeysFull] = "{}"
-	fc.Secrets["acme/api/FULLSEND_GCP_PROJECT_ID"] = true
-	fc.Secrets["acme/api/FULLSEND_GCP_WIF_PROVIDER"] = true
+	fc.Secrets["acme/api/"+forge.SecretGCPProjectID] = true
+	fc.Secrets["acme/api/"+forge.SecretGCPWIFProvider] = true
 	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
 
 	installed, err := checkInstallComponents(context.Background(), fc, "acme", "api", ForgeGitLab, GitLabForgeConfig(), nil)
