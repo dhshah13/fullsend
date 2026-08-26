@@ -107,34 +107,44 @@ Build it:
 CGO_ENABLED=0 go build -o gate-push ./cmd/gate-push/
 ```
 
+> **Note:** The regex requires the explicit `src:dst` refspec form (e.g., `gate-push origin HEAD:refs/heads/agent/my-feature`). The common short form `gate-push origin agent/my-feature` does not include the `refs/heads/` prefix and will be rejected. Document the expected invocation syntax for agents using the gate binary.
+
 ## Configuring the sandbox policy
 
 The gate binary must be the **only** binary allowed to reach the endpoint it guards. If another binary (or a wildcard pattern) can also reach the same endpoint, the agent can bypass the gate by using that binary directly.
 
 ### Provider profile for the gate binary
 
-Create a provider profile that grants the gate binary access to the guarded endpoint. The profile's `binary` field restricts which executable can use the endpoint:
+Create a provider profile that grants the gate binary access to the guarded endpoint. The profile's top-level `binaries` field restricts which executables can use its endpoints — only binaries matching the glob patterns are allowed to connect:
 
 ```yaml
 # profiles/gate-push.yaml
+---
+id: gate-push
+display_name: Gate Push
+description: Restricted GitHub push access for the gate-push binary
+category: source_control
 endpoints:
-  - host: "github.com"
+  - host: github.com
     port: 443
-    methods: ["CONNECT"]
-    binary: "/sandbox/workspace/gate-push"
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - "/sandbox/workspace/gate-push"
 ```
 
 ### Provider definition
 
-Create a provider definition that references the profile:
+Create a provider definition that references the profile by its `id`:
 
 ```yaml
 # providers/gate-push.yaml
 name: gate-push
-type: custom
-profiles:
-  gate-push-access:
-    file: profiles/gate-push.yaml
+type: gate-push
+# Workaround: https://github.com/NVIDIA/OpenShell/issues/1978
+credentials:
+  _NOOP_GATE_PUSH: ""
 ```
 
 ### Harness configuration
@@ -147,18 +157,17 @@ providers:
   - providers/gate-push.yaml
 
 host_files:
-  - source: gate-push           # pre-built static binary
+  - src: gate-push              # pre-built static binary
     dest: /sandbox/workspace/gate-push
-    mode: "0755"
 ```
 
 ### Key policy rules
 
-1. **No overlapping access.** Ensure no other provider profile or inline network policy grants access to the guarded endpoint with a different binary or a wildcard. If `git` can also reach `github.com:443`, the gate binary is bypassed.
+1. **No overlapping access.** Ensure no other provider profile or inline network policy grants access to the guarded endpoint with a different `binaries` pattern or a wildcard. If `git` can also reach `github.com:443`, the gate binary is bypassed.
 
-2. **Binary path must be exact.** The `binary` field in the profile uses the full path as resolved via `/proc/pid/exe`. Use the absolute path where the binary is placed in the sandbox.
+2. **Binary path must be exact.** The `binaries` glob patterns in the profile are matched against the full path as resolved via `/proc/pid/exe`. Use the absolute path where the binary is placed in the sandbox.
 
-3. **Separate the guarded endpoint.** If the agent needs to reach `github.com` for other operations (e.g., API calls via `gh`), use separate profiles with different `binary` restrictions for each use case.
+3. **Separate the guarded endpoint.** If the agent needs to reach `github.com` for other operations (e.g., API calls via `gh`), use separate profiles with different `binaries` restrictions for each use case.
 
 ## What the proxy enforces vs. what the binary enforces
 
@@ -182,7 +191,7 @@ Before deploying a gate binary:
 - [ ] Provider profile restricts the guarded endpoint to the gate binary only
 - [ ] No other profile or network policy grants overlapping access to the same endpoint
 - [ ] Gate binary validates all relevant request fields (not just the obvious ones)
-- [ ] Gate binary is uploaded to the sandbox via `host_files` with mode `0755`
+- [ ] Gate binary is uploaded to the sandbox via `host_files`
 - [ ] Binary path in the profile matches the `dest` in `host_files`
 
 ## See also
