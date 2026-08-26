@@ -288,9 +288,9 @@ See [`forge.IsTransient`](../../internal/forge/forge.go) for the canonical examp
 
 Package-level variables that hold function values for test overriding must:
 
-- Use an `XxxFn` suffix (e.g., `BuildWASMFn`, `RetrySleepFn`, `WranglerWhoamiFn`)
+- Use an `XxxFn` suffix (e.g., `BuildWASMFn`, `RetrySleepFn`, `WranglerWhoamiFn`). Both exported (`XxxFn`) and unexported (`xxxFn`) variables follow this suffix pattern
 - Default to the real implementation
-- Include a doc comment starting with "Override in tests to..." that describes what the override achieves
+- Include a doc comment following Go convention (starting with the variable name) that contains an "Override in tests to..." sentence describing the override behavior
 - Be restored in a `t.Cleanup` callback when overridden
 
 Examples: `internal/sandbox/sandbox.go` (`RetrySleepFn`), `internal/dispatch/cf/provisioner.go` (`BuildWASMFn`, `CopyWASMExecFn`).
