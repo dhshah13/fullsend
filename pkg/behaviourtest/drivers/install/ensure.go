@@ -20,7 +20,18 @@ const (
 
 	// settlePoll is the delay between GetWorkflow polls.
 	settlePoll = 5 * time.Second
+
+	// resetMaxAttempts is the number of GetRepo polls to confirm
+	// deletion propagation or creation availability after a repo
+	// reset cycle. With exponential backoff (2×) and a 1s initial
+	// delay, 5 attempts cover up to ~1+2+4+8 = 15s of API lag.
+	resetMaxAttempts = 5
 )
+
+// resetRetryDelay is the initial delay for exponential backoff when
+// polling GetRepo after delete or create. Doubled on each retry.
+// Overridden in tests to avoid slow retry loops.
+var resetRetryDelay = time.Second
 
 // ensurer lazily creates and installs repos on demand for behaviour
 // scenarios. Results are cached by org/repo key so that a second scenario
@@ -187,6 +198,40 @@ func (e *repoEnsurer) resetRepo(ctx context.Context, org, repoName, target strin
 		return fmt.Errorf("deleting repo %s for history reset: %w", target, err)
 	}
 
+	// Wait for GitHub API to propagate the deletion. Without this,
+	// ensureRepoExists may see a stale cached response for the deleted
+	// repo, skip re-creation, and subsequent operations fail with 404.
+	return e.awaitDeletion(ctx, org, repoName, target)
+}
+
+// awaitDeletion polls GetRepo with exponential backoff until the repo
+// returns 404, confirming the deletion has propagated through the
+// GitHub API's eventual-consistency layer. If the repo is still
+// visible after all attempts the function returns nil anyway — the
+// subsequent ensureRepoExists call will handle the conflict.
+func (e *repoEnsurer) awaitDeletion(ctx context.Context, org, repoName, target string) error {
+	e.logf("[ensure] waiting for %s deletion to propagate", target)
+	delay := resetRetryDelay
+	for attempt := 1; attempt <= resetMaxAttempts; attempt++ {
+		_, err := e.client.GetRepo(ctx, org, repoName)
+		if err != nil {
+			if forge.IsNotFound(err) {
+				e.logf("[ensure] %s deletion confirmed after %d attempt(s)", target, attempt)
+				return nil
+			}
+			return fmt.Errorf("checking deletion of %s: %w", target, err)
+		}
+		if attempt < resetMaxAttempts {
+			e.logf("[ensure] %s still visible, attempt %d/%d — backing off %v", target, attempt, resetMaxAttempts, delay)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled while waiting for %s deletion: %w", target, ctx.Err())
+			case <-time.After(delay):
+			}
+			delay *= 2
+		}
+	}
+	e.logf("[ensure] %s still visible after %d attempts; proceeding", target, resetMaxAttempts)
 	return nil
 }
 
@@ -208,7 +253,39 @@ func (e *repoEnsurer) ensureRepoExists(ctx context.Context, org, repoName, targe
 		return fmt.Errorf("creating repo %s: %w", target, createErr)
 	}
 
-	return nil
+	// Wait for the newly created repo to be visible via the API.
+	// GitHub's eventual consistency means operations on a just-created
+	// repo can 404 until propagation completes.
+	return e.awaitCreation(ctx, org, repoName, target)
+}
+
+// awaitCreation polls GetRepo with exponential backoff until the
+// newly created repo is visible via the API. GitHub's eventual
+// consistency means operations on a just-created repo can return 404
+// until propagation completes.
+func (e *repoEnsurer) awaitCreation(ctx context.Context, org, repoName, target string) error {
+	e.logf("[ensure] waiting for %s creation to propagate", target)
+	delay := resetRetryDelay
+	for attempt := 1; attempt <= resetMaxAttempts; attempt++ {
+		_, err := e.client.GetRepo(ctx, org, repoName)
+		if err == nil {
+			e.logf("[ensure] %s creation confirmed after %d attempt(s)", target, attempt)
+			return nil
+		}
+		if !forge.IsNotFound(err) {
+			return fmt.Errorf("checking creation of %s: %w", target, err)
+		}
+		if attempt < resetMaxAttempts {
+			e.logf("[ensure] %s not yet visible, attempt %d/%d — backing off %v", target, attempt, resetMaxAttempts, delay)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled while waiting for %s creation: %w", target, ctx.Err())
+			case <-time.After(delay):
+			}
+			delay *= 2
+		}
+	}
+	return fmt.Errorf("repo %s not visible after %d attempts following creation", target, resetMaxAttempts)
 }
 
 // installFullsend runs inference provision (when a GCP project is
