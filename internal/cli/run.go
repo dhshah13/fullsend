@@ -35,6 +35,7 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/fetchsvc"
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
+	gl "github.com/fullsend-ai/fullsend/internal/forge/gitlab"
 	"github.com/fullsend-ai/fullsend/internal/gitfetch"
 	"github.com/fullsend-ai/fullsend/internal/harness"
 	"github.com/fullsend-ai/fullsend/internal/lock"
@@ -1090,6 +1091,23 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// Dedupe URL-resolved providers (last-wins) so shadowed entries from
 	// base composition don't trigger false integrity errors.
 	result.Providers = dedupResolvedProviders(result.Providers)
+
+	// Auto-generate a GitLab provider profile when running on a self-hosted
+	// GitLab instance (#6615). Prepended so that a user-defined profile
+	// with the same ID wins via last-wins dedup. Inserted before the
+	// integrity check so providers referencing this ID are valid.
+	if forgePlatform == "gitlab" {
+		if profilePath, cleanupProfile, err := generateGitLabForgeProfile(); err != nil {
+			printer.StepWarn("Failed to auto-generate GitLab forge profile: " + err.Error())
+		} else if profilePath != "" {
+			defer cleanupProfile()
+			result.Profiles = append([]resolve.ResolvedProfile{{
+				ID:        "fullsend-gitlab-forge",
+				LocalPath: profilePath,
+			}}, result.Profiles...)
+		}
+	}
+
 	dirProfileIDs, err := resolve.CollectProfileIDs(filepath.Join(absFullsendDir, "profiles"))
 	if err != nil {
 		return fmt.Errorf("scanning profiles directory: %w", err)
@@ -1527,7 +1545,19 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// 7. Bootstrap sandbox.
 	bootstrapStart := time.Now()
 	printer.StepStart("Bootstrapping sandbox")
-	boot := newHarnessBootstrap(h, sandboxName, agentName)
+	// Resolve the forge egress entry for the sandbox SSRF allowlist.
+	// The runtime layer consumes this via SandboxHookConfig without
+	// importing forge-specific packages (#6615).
+	// NOTE: gl.ResolveForgeHostPort() is also called in
+	// generateGitLabForgeProfile() for the L7 proxy profile; both
+	// calls are deterministic env-var reads.
+	var forgeEgressEntry string
+	if forgePlatform == "gitlab" {
+		if host, port := gl.ResolveForgeHostPort(); host != "" {
+			forgeEgressEntry = host + ":" + port
+		}
+	}
+	boot := newHarnessBootstrap(h, sandboxName, agentName, forgeEgressEntry)
 	if h.SecurityEnabled() {
 		// Scan all runtime content before upload so warnings surface together.
 		// Host files could change between scan and upload; the runner owns the host FS here.
