@@ -322,17 +322,27 @@ Examples: `internal/sandbox/sandbox.go` (`RetrySleepFn`), `internal/dispatch/cf/
 
 ## Secure HTTP clients
 
-Any new Go code that fetches a URL taken from configuration or user input is a potential SSRF vector. **Prefer the shared, SSRF-hardened fetcher `internal/fetch.FetchURL` over constructing a raw `http.Client`.** Pass it a `fetch.FetchPolicy` (see `fetch.DefaultPolicy` for the GitHub-content defaults) rather than re-implementing the protections. `internal/fetch/fetch.go` is the canonical reference; `internal/repos/manifest.go`'s `fetchManifestURL`/`safeDialContext` is a second worked example (from PR #3002, which needed two review rounds to add these by hand — the point of this guidance is to skip those rounds).
+**Scope.** These requirements apply to any client whose target URL is derived from **untrusted configuration, user input, or remote content** — that is where SSRF lives. A client that talks to a **fixed first-party endpoint supplied by the sandbox/runner bootstrap** is out of scope for the SSRF hardening below; for example `internal/cli/fetchskill.go` POSTs to the loopback fetch service at `FULLSEND_FETCH_URL` and is deliberately allowed to reach a private address. Such clients should still set a timeout and bound the response body, but do not need IP filtering, proxy disabling, or an HTTPS-only rule.
 
-When you genuinely cannot use `fetch.FetchURL` (e.g. you need streaming, or a client reused across many calls), the custom client **must** apply all of these properties:
+**Prefer the shared, SSRF-hardened fetcher `internal/fetch.FetchURL` over constructing a raw `http.Client`.** Pass it a `fetch.FetchPolicy` (see `fetch.DefaultPolicy` for the GitHub-content defaults) rather than re-implementing the protections. `internal/fetch/fetch.go` is the canonical reference.
 
-- **HTTPS only.** Reject `http://` inputs, and validate the scheme on redirects too — a `CheckRedirect` that allows an `https://` origin to bounce to `http://` reopens the hole.
-- **Reject internal/reserved IPs.** Resolve the host yourself and check every resolved IP with `netutil.CheckIP` / `netutil.IsInternal` before dialing, via a custom `DialContext`. This blocks loopback, link-local, and private ranges. Dial the pre-validated IP (not the hostname) so a second DNS lookup can't rebind to an internal address.
+`FetchURL` has a deliberately narrow envelope — reach for it only when all of these hold, otherwise it will reject the request or can't express what you need:
+
+- **The legitimate host set is known up front.** `FetchURL` requires a non-empty `AllowedDomains` allowlist — an empty allowlist rejects *every* URL (`isAllowedDomain` returns false), so the allowlist is mandatory, not optional.
+- **GET, HTTP 200, no custom headers.** It issues a `GET`, accepts only a 200 response, and sends no request headers — so it cannot carry authentication, use another method, or handle non-200 status codes.
+- **Whole body buffered, port 443.** It reads the entire body into memory and defaults `AllowedPorts` to `{"443"}`.
+
+When the fetch falls outside that envelope you must build a custom client. Common reasons: **the legitimate host set is not knowable up front** (e.g. `internal/repos/manifest.go`'s `LoadManifest` accepts any user-supplied `https://` host, so no allowlist covers it — this is why `fetchManifestURL`/`safeDialContext` exist and deliberately do *not* use `FetchURL`), authenticated requests, non-GET methods, non-200 handling, streaming, or a client reused across many calls. `internal/repos/manifest.go`'s `fetchManifestURL`/`safeDialContext` (from PR #3002, which needed two review rounds to get this right by hand) is the worked example to copy. A custom in-scope client **must** apply all of these properties:
+
+- **HTTPS only.** Reject `http://` inputs, and validate the scheme on redirects too — a `CheckRedirect` that lets an `https://` origin bounce to `http://` reopens the hole.
+- **Reject internal/reserved IPs, on every connection.** Inside a custom `DialContext`, resolve the host the transport actually asks for (split the `addr` it passes you, resolve it, check every IP with `netutil.CheckIP` / `netutil.IsInternal`), then dial a validated IP. Do this **per connection**, the way `safeDialContext` does — do **not** pre-resolve once and pin, because a redirect or DNS rebind can send a later hop to a host you never validated. `fetch.FetchURL`'s single up-front resolution is safe *only* because it blocks redirects outright (its `CheckRedirect` returns `http.ErrUseLastResponse`); never copy that pattern into a client that follows redirects.
+- **Keep the original hostname on the request.** Only the dial *address* changes to the validated IP — the `http.Request` URL, and therefore SNI and certificate verification, must still carry the original hostname, or TLS verification breaks. Build the request from the original URL and let `DialContext` swap the address, exactly as `fetch.FetchURL` does (`http.NewRequestWithContext(ctx, …, rawURL, …)` while its `DialContext` dials the IP). **Never** rewrite the request URL to the IP, and never reach for `InsecureSkipVerify` to paper over the resulting cert failure.
 - **Disable proxies.** Set `Transport.Proxy = nil` so `HTTP(S)_PROXY` env vars can't redirect the request.
 - **Bound the time.** Set an explicit timeout (30s is the repo default) via `context.WithTimeout` and/or `http.Client.Timeout`.
-- **Bound the size.** Wrap the response body in `io.LimitReader(body, max+1)` and error if the read exceeds `max` (1 MB is the manifest default; pick a limit appropriate to the payload). Never `io.ReadAll` an unbounded body.
+- **Bound the size.** Wrap the response body in `io.LimitReader(body, max+1)` and error if the read exceeds `max` (1 MB is the manifest default; pick a limit appropriate to the payload). Never `io.ReadAll` — or `json.NewDecoder` — an unbounded body.
+- **Constrain redirects.** Block them (as `fetch.FetchURL` does) or cap the hop count; and if you allow any hop, re-run the checks above against each redirect target — both the scheme check and, via per-connection dialing, the internal-IP check — not just the scheme.
 
-Consider constraining redirects (a small hop limit, or blocking them entirely as `fetch.FetchURL` does) and enforcing a domain allowlist when the set of legitimate hosts is known.
+When the set of legitimate hosts *is* known, add a domain allowlist too, even on the custom path.
 
 ## Running the fullsend CLI
 
