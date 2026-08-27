@@ -1,0 +1,233 @@
+// Package openaiwif exchanges a GitHub Actions OIDC JWT for an OpenAI
+// access token via OpenAI's Workload Identity Federation endpoint.
+//
+// The exchange is two HTTP calls:
+//
+//  1. GET the GitHub OIDC assertion with the configured audience.
+//  2. POST an RFC 8693 token-exchange request to OpenAI's token endpoint.
+//
+// The returned access token is opaque (never assume a prefix or structure),
+// short-lived (≤1 h), and scoped to api.model.request. No refresh token is
+// returned.
+package openaiwif
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+const (
+	// openAITokenEndpoint is the production OpenAI OAuth2 token endpoint.
+	openAITokenEndpoint = "https://auth.openai.com/oauth/token"
+
+	// defaultSubjectTokenType is the OAuth2 subject_token_type for a JWT.
+	// OpenAI also accepts "urn:ietf:params:oauth:token-type:id_token";
+	// the default here is jwt, overridable via Config.SubjectTokenType for
+	// a maintainer's live test.
+	defaultSubjectTokenType = "urn:ietf:params:oauth:token-type:jwt"
+
+	// maxResponseBytes bounds how many bytes we read from either endpoint.
+	// Both responses should be small JSON; this prevents a broken upstream
+	// from filling memory.
+	maxResponseBytes = 1 << 20 // 1 MiB
+
+	// httpTimeout is the per-request timeout for both the OIDC assertion
+	// request and the OpenAI exchange.
+	httpTimeout = 30 * time.Second
+)
+
+// Config holds the inputs for a WIF exchange. All fields except
+// SubjectTokenType and TokenEndpoint are required.
+type Config struct {
+	// Audience is the OIDC audience the GitHub assertion is minted for,
+	// e.g. "https://auth.openai.com".
+	Audience string
+
+	// IdentityProviderID is the OpenAI identity_provider_id.
+	IdentityProviderID string
+
+	// ServiceAccountID is the OpenAI service_account_id.
+	ServiceAccountID string
+
+	// OIDCRequestURL is the ACTIONS_ID_TOKEN_REQUEST_URL from the runner.
+	OIDCRequestURL string
+
+	// OIDCRequestToken is the ACTIONS_ID_TOKEN_REQUEST_TOKEN from the runner.
+	OIDCRequestToken string
+
+	// SubjectTokenType overrides the token-exchange subject_token_type.
+	// Defaults to "urn:ietf:params:oauth:token-type:jwt".
+	SubjectTokenType string
+
+	// TokenEndpoint overrides the OpenAI token endpoint URL.
+	// Defaults to "https://auth.openai.com/oauth/token".
+	TokenEndpoint string
+
+	// HTTPClient overrides the HTTP client used for both requests.
+	// Defaults to a client with httpTimeout.
+	HTTPClient *http.Client
+}
+
+// Token is the result of a successful exchange.
+type Token struct {
+	// Value is the opaque access token. Never log, print, or include
+	// in error messages.
+	Value string
+
+	// ExpiresAt is the absolute expiry derived from the response's
+	// expires_in field plus the exchange timestamp.
+	ExpiresAt time.Time
+}
+
+// oidcResponse is the GitHub OIDC endpoint's JSON shape.
+type oidcResponse struct {
+	Value string `json:"value"`
+}
+
+// tokenResponse is the OpenAI token endpoint's JSON shape.
+type tokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+// Exchange performs the two-step WIF exchange:
+//  1. Request a GitHub OIDC assertion with the configured audience.
+//  2. Exchange the assertion at the OpenAI token endpoint.
+//
+// Errors never include the assertion or the token value.
+func Exchange(ctx context.Context, cfg Config) (*Token, error) {
+	if cfg.Audience == "" {
+		return nil, fmt.Errorf("openaiwif: audience is required")
+	}
+	if cfg.IdentityProviderID == "" {
+		return nil, fmt.Errorf("openaiwif: identity_provider_id is required")
+	}
+	if cfg.ServiceAccountID == "" {
+		return nil, fmt.Errorf("openaiwif: service_account_id is required")
+	}
+	if cfg.OIDCRequestURL == "" {
+		return nil, fmt.Errorf("openaiwif: ACTIONS_ID_TOKEN_REQUEST_URL is required")
+	}
+	if cfg.OIDCRequestToken == "" {
+		return nil, fmt.Errorf("openaiwif: ACTIONS_ID_TOKEN_REQUEST_TOKEN is required")
+	}
+
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: httpTimeout}
+	}
+	subjectTokenType := cfg.SubjectTokenType
+	if subjectTokenType == "" {
+		subjectTokenType = defaultSubjectTokenType
+	}
+	tokenEndpoint := cfg.TokenEndpoint
+	if tokenEndpoint == "" {
+		tokenEndpoint = openAITokenEndpoint
+	}
+
+	// Step 1: fetch the GitHub OIDC assertion.
+	assertion, err := fetchAssertion(ctx, client, cfg.OIDCRequestURL, cfg.OIDCRequestToken, cfg.Audience)
+	if err != nil {
+		return nil, fmt.Errorf("openaiwif: assertion request failed: %w", err)
+	}
+
+	// Step 2: exchange the assertion for an OpenAI access token.
+	tok, err := exchangeToken(ctx, client, tokenEndpoint, assertion, cfg.IdentityProviderID, cfg.ServiceAccountID, subjectTokenType)
+	if err != nil {
+		return nil, fmt.Errorf("openaiwif: token exchange failed: %w", err)
+	}
+	return tok, nil
+}
+
+// fetchAssertion requests a GitHub OIDC JWT from the runner's token endpoint.
+func fetchAssertion(ctx context.Context, client *http.Client, oidcURL, oidcToken, audience string) (string, error) {
+	// The audience is appended as a query parameter; URL-encode it.
+	reqURL := oidcURL + "&audience=" + url.QueryEscape(audience)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Authorization", "bearer "+oidcToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return "", fmt.Errorf("reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("OIDC endpoint returned %d", resp.StatusCode)
+	}
+
+	var oidc oidcResponse
+	if err := json.Unmarshal(body, &oidc); err != nil {
+		return "", fmt.Errorf("parsing response: %w", err)
+	}
+	if oidc.Value == "" {
+		return "", fmt.Errorf("OIDC endpoint returned empty assertion")
+	}
+	return oidc.Value, nil
+}
+
+// exchangeToken performs the RFC 8693 token exchange at the OpenAI endpoint.
+func exchangeToken(ctx context.Context, client *http.Client, endpoint, assertion, identityProviderID, serviceAccountID, subjectTokenType string) (*Token, error) {
+	exchangeTime := time.Now()
+
+	payload := url.Values{
+		"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
+		"subject_token_type":   {subjectTokenType},
+		"subject_token":        {assertion},
+		"identity_provider_id": {identityProviderID},
+		"service_account_id":   {serviceAccountID},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(payload.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("token endpoint returned %d", resp.StatusCode)
+	}
+
+	var tok tokenResponse
+	if err := json.Unmarshal(body, &tok); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+	if tok.AccessToken == "" {
+		return nil, fmt.Errorf("token endpoint returned empty access_token")
+	}
+	if tok.ExpiresIn <= 0 {
+		return nil, fmt.Errorf("token endpoint returned invalid expires_in: %d", tok.ExpiresIn)
+	}
+
+	return &Token{
+		Value:     tok.AccessToken,
+		ExpiresAt: exchangeTime.Add(time.Duration(tok.ExpiresIn) * time.Second),
+	}, nil
+}

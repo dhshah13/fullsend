@@ -1,0 +1,26 @@
+---
+id: fullsend-openai
+display_name: Fullsend OpenAI
+description: OpenAI Responses API for the pi runtime (runner-exchanged, run-scoped access token)
+category: inference
+credentials:
+  - name: api_token
+    description: Short-lived OpenAI access token
+    env_vars: [OPENAI_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: external
+endpoints:
+  - host: api.openai.com
+    port: 443
+    path: /v1/responses
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow:
+          method: POST
+          path: /v1/responses
+binaries:
+  - "**/node"

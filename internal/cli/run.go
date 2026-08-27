@@ -2381,6 +2381,11 @@ var oidcDenyKeys = map[string]bool{
 	"ACTIONS_ID_TOKEN_REQUEST_TOKEN": true,
 	"FULLSEND_GCP_OIDC_URL":          true,
 	"FULLSEND_GCP_OIDC_AUTH_FILE":    true,
+	// OpenAI WIF configuration (#6689): non-secret but runner-controlled and
+	// useless inside the sandbox. Stripped like GCP OIDC vars.
+	"FULLSEND_OPENAI_AUDIENCE":             true,
+	"FULLSEND_OPENAI_IDENTITY_PROVIDER_ID": true,
+	"FULLSEND_OPENAI_SERVICE_ACCOUNT_ID":   true,
 }
 
 // reservedSandboxKeys are infrastructure env vars that env.sandbox must not

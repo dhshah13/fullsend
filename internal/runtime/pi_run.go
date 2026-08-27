@@ -29,6 +29,11 @@ const (
 	// used by translatePiModel to normalize short-form xai/ specs and by
 	// buildPiRunCommand to gate extension loading and env hygiene.
 	piXaiVertexProvider = "xai-vertex"
+	// piOpenAIProviderName is the lowercase provider name used as a gate in
+	// buildPiRunCommand. Unlike Vertex providers, OpenAI models use pi's
+	// built-in openai provider, which reads OPENAI_API_KEY from the env —
+	// the run-scoped OpenShell provider injects a short-lived placeholder.
+	piOpenAIProviderName = "openai"
 	// piProviderEnv replaces the provider prefix applied to bare model ids.
 	// The model itself is resolved once by the CLI (--model, FULLSEND_MODEL,
 	// or the FULLSEND_PI_MODEL alias on pi; #6526) and arrives in
@@ -204,6 +209,7 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 	provider, _, _ := strings.Cut(modelSpec, "/")
 	vertex := strings.EqualFold(provider, piDefaultProvider)
 	xaiVertex := strings.EqualFold(provider, piXaiVertexProvider)
+	openai := strings.EqualFold(provider, piOpenAIProviderName)
 	if vertex {
 		// Claude-on-Vertex: the bundled Anthropic SDK would send a stray
 		// ANTHROPIC_API_KEY to Google as X-Api-Key and honour
@@ -238,6 +244,26 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 			`&& export XAI_VERTEX_PROJECT_ID="${XAI_VERTEX_PROJECT_ID:-${ANTHROPIC_VERTEX_PROJECT_ID:-$GOOGLE_CLOUD_PROJECT}}"`,
 		)
 	}
+	if openai {
+		// OpenAI via runner-exchanged WIF or static OPENAI_API_KEY: the
+		// run-scoped OpenShell provider injects OPENAI_API_KEY as a
+		// placeholder; --api-key makes it outrank auth.json or env lookup.
+		// Unset OPENAI_BASE_URL and AZURE_OPENAI_API_KEY so a stray .env
+		// cannot redirect traffic or inject a different credential.
+		parts = append(parts,
+			"&& unset OPENAI_BASE_URL AZURE_OPENAI_API_KEY",
+			// Preflight: bail if OPENAI_API_KEY is empty in the sandbox
+			// (provider not attached) instead of pi's generic "No API key".
+			`&& [ -n "${OPENAI_API_KEY:-}" ] || { echo 'fullsend: OPENAI_API_KEY is empty in the sandbox (openai provider not attached)' >&2; exit 1; }`,
+		)
+		// Config-dir integrity guard: models.json is the only way to change
+		// pi's openai base URL (no env override exists), and auth.json could
+		// outrank --api-key in pi's resolution order. A redirect to another
+		// allowed REST host is the placeholder-leak vector; fail closed.
+		// This guard runs for the openai provider even when hooks are
+		// disabled, because the threat is credential leak, not tool misuse.
+		parts = append(parts, "&& "+piOpenAIConfigGuard(r.ConfigDir()))
+	}
 	parts = append(parts,
 		"&& pi",
 		"--print",
@@ -255,6 +281,13 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 	}
 	if xaiVertex {
 		parts = append(parts, "-e "+shellQuote(piXaiVertexExtensionPath))
+	}
+	if openai {
+		// pi's built-in openai provider handles this; no -e extension.
+		// --api-key outranks auth.json and env lookup in pi's resolution
+		// order, so a planted auth.json cannot supply a different key.
+		// The value is the placeholder, not a secret.
+		parts = append(parts, `--api-key "$OPENAI_API_KEY"`)
 	}
 	if hooksEnabled {
 		parts = append(parts, "-e "+shellQuote(hooksExt))
@@ -298,6 +331,22 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 
 // piManifestEnv tells the hook extension where the manifest is.
 const piManifestEnv = "FULLSEND_PI_MANIFEST"
+
+// piOpenAIConfigGuard is the POSIX sh fragment that fails closed when the
+// pi config directory contains auth.json or models.json. models.json is the
+// only way to change pi's openai base URL (no env override exists), and a
+// redirect to another allowed REST host is the placeholder-leak vector
+// described in ADR 0025. auth.json could outrank --api-key in pi's
+// resolution order. This guard runs for the openai provider even when hooks
+// are disabled, because the threat is credential leak, not tool misuse.
+func piOpenAIConfigGuard(configDir string) string {
+	return fmt.Sprintf(
+		`{ ! test -f %s && ! test -f %s || { echo 'fullsend: pi config dir contains auth.json or models.json; refusing to run openai provider (placeholder-leak risk)' >&2; exit %d; }; }`,
+		shellQuote(configDir+"/auth.json"),
+		shellQuote(configDir+"/models.json"),
+		piHooksMissingExit,
+	)
+}
 
 // piHooksGuard is the POSIX sh fragment run before pi when hooks are
 // expected: the adapter must exist and be byte-identical to the embedded

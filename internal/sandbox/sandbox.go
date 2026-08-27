@@ -913,6 +913,26 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 		name, timeout, createOutput, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
 }
 
+// DeleteProvider deletes a named provider from the gateway, returning any
+// error for the caller to log. Run-scoped providers (e.g. openai-<suffix>)
+// must be cleaned up regardless of --keep-sandbox so a live-token provider
+// does not outlive the run (#6689).
+func DeleteProvider(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), providerTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "openshell", "provider", "delete", name).CombinedOutput()
+	if err != nil {
+		outStr := string(out)
+		// Ignore "not found" — the provider may already be gone.
+		if strings.Contains(strings.ToLower(outStr), "not found") ||
+			strings.Contains(strings.ToLower(outStr), "does not exist") {
+			return nil
+		}
+		return fmt.Errorf("provider delete %q failed: %w (output: %s)", name, err, outStr)
+	}
+	return nil
+}
+
 // Delete deletes a sandbox, returning any error for the caller to log.
 func Delete(name string) error {
 	out, err := exec.Command("openshell", "sandbox", "delete", name).CombinedOutput()

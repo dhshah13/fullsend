@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -261,6 +262,111 @@ func TestTranslatePiModel_XaiVertexBareIDFromHarness(t *testing.T) {
 		assert.True(t, strings.EqualFold(provider, piXaiVertexProvider), "gate must fire for %s", bare)
 		assert.Equal(t, "xai/"+bare, piBareModelID(spec), "wire id keeps the publisher segment")
 	}
+}
+
+func TestBuildPiRunCommand_OpenAI(t *testing.T) {
+	t.Setenv("FULLSEND_PI_MODEL", "")
+	t.Setenv(piProviderEnv, "")
+	m := &piManifest{AgentName: "triage", Model: "opus", Tools: []string{"bash"}}
+	params := piTestParams()
+
+	// openai/gpt-5.6-luna passes through as a two-segment spec.
+	params.Model = "openai/gpt-5.6-luna"
+	cmd := buildPiRunCommand(params, m)
+
+	assert.Contains(t, cmd, "--model 'openai/gpt-5.6-luna'", "model spec")
+	assert.Contains(t, cmd, `--api-key "$OPENAI_API_KEY"`, "--api-key is passed so pi uses the placeholder")
+	assert.Contains(t, cmd, "&& unset OPENAI_BASE_URL AZURE_OPENAI_API_KEY", "stray env vars are cleared")
+	assert.Contains(t, cmd, `[ -n "${OPENAI_API_KEY:-}" ]`, "preflight check for OPENAI_API_KEY")
+	// Config-dir guard: auth.json and models.json must not exist.
+	assert.Contains(t, cmd, "auth.json", "config-dir guard checks auth.json")
+	assert.Contains(t, cmd, "models.json", "config-dir guard checks models.json")
+	assert.Contains(t, cmd, fmt.Sprintf("exit %d", piHooksMissingExit), "config-dir guard uses the same exit code")
+	// No Vertex hygiene or extensions.
+	assert.NotContains(t, cmd, "unset ANTHROPIC_API_KEY", "anthropic env hygiene does not fire for openai")
+	assert.NotContains(t, cmd, "unset XAI_API_KEY", "xai env hygiene does not fire for openai")
+	assert.NotContains(t, cmd, "-e '"+sandbox.SandboxPiExtensionsDir+"/anthropic-vertex'", "no vertex extension for openai")
+	assert.NotContains(t, cmd, "-e '"+sandbox.SandboxPiExtensionsDir+"/xai-vertex'", "no xai extension for openai")
+	// No -e extension for openai (built-in provider).
+	// The only -e should be the hooks extension if enabled.
+
+	// Case-insensitive gate: pi resolves providers case-insensitively.
+	for _, spec := range []string{"OpenAI/gpt-5.6-luna", "OPENAI/gpt-5.6-luna", "Openai/gpt-5.6-sol"} {
+		params.Model = spec
+		cmd = buildPiRunCommand(params, m)
+		assert.Contains(t, cmd, `--api-key "$OPENAI_API_KEY"`, "--api-key for %s", spec)
+		assert.Contains(t, cmd, "&& unset OPENAI_BASE_URL AZURE_OPENAI_API_KEY", "unset for %s", spec)
+	}
+
+	// unset and guard must run after the agent-writable .env is sourced.
+	params.Model = "openai/gpt-5.6-luna"
+	cmd = buildPiRunCommand(params, m)
+	envIdx := strings.Index(cmd, ". '"+sandbox.SandboxWorkspace+"/.env'")
+	unsetIdx := strings.Index(cmd, "&& unset OPENAI_BASE_URL")
+	assert.Less(t, envIdx, unsetIdx, "unset after .env sourced")
+	guardIdx := strings.Index(cmd, "auth.json")
+	assert.Less(t, envIdx, guardIdx, "config-dir guard after .env sourced")
+}
+
+func TestTranslatePiModel_OpenAI(t *testing.T) {
+	t.Setenv(piProviderEnv, "")
+	// openai/gpt-5.6-luna is a two-segment spec; it passes through.
+	assert.Equal(t, "openai/gpt-5.6-luna", translatePiModel("openai/gpt-5.6-luna"))
+	// Case variants pass through too (the gate in buildPiRunCommand is
+	// case-insensitive, so they are safe).
+	assert.Equal(t, "OpenAI/gpt-5.6-luna", translatePiModel("OpenAI/gpt-5.6-luna"))
+
+	// A bare id under FULLSEND_PI_PROVIDER=openai gets the prefix.
+	t.Setenv(piProviderEnv, piOpenAIProviderName)
+	assert.Equal(t, "openai/gpt-5.6-luna", translatePiModel("gpt-5.6-luna"))
+}
+
+func TestPiOpenAIConfigGuard(t *testing.T) {
+	t.Parallel()
+	if err := exec.Command("sh", "-c", "echo ok").Run(); err != nil {
+		t.Skip("sh not available")
+	}
+
+	dir := t.TempDir()
+
+	run := func() (int, string) {
+		cmd := exec.Command("sh", "-c", piOpenAIConfigGuard(dir)+" && echo RAN")
+		out, err := cmd.CombinedOutput()
+		code := 0
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return code, string(out)
+	}
+
+	// No auth.json or models.json: passes.
+	code, out := run()
+	assert.Equal(t, 0, code)
+	assert.Contains(t, out, "RAN")
+
+	// auth.json present: fails.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte("{}"), 0o644))
+	code, out = run()
+	assert.Equal(t, piHooksMissingExit, code, "auth.json present")
+	assert.NotContains(t, out, "RAN")
+	assert.Contains(t, out, "placeholder-leak risk")
+	require.NoError(t, os.Remove(filepath.Join(dir, "auth.json")))
+
+	// models.json present: fails.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "models.json"), []byte("{}"), 0o644))
+	code, out = run()
+	assert.Equal(t, piHooksMissingExit, code, "models.json present")
+	assert.NotContains(t, out, "RAN")
+	require.NoError(t, os.Remove(filepath.Join(dir, "models.json")))
+
+	// Both present: fails.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte("{}"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "models.json"), []byte("{}"), 0o644))
+	code, _ = run()
+	assert.Equal(t, piHooksMissingExit, code, "both present")
 }
 
 func TestBuildPiRunCommand_DirectProviderKeepsAnthropicEnv(t *testing.T) {
