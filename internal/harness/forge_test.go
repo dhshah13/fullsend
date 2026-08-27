@@ -1235,6 +1235,55 @@ func TestResolveOverlays_NonMatchingSkipped(t *testing.T) {
 	assert.Equal(t, "scripts/post-gh.sh", h.PostScript, "third matching overlay sets PostScript")
 }
 
+// TestResolveOverlays_ListFieldsAccumulate verifies that list fields
+// (Providers, OpenShell.Profiles) accumulate across multiple matching overlays
+// without deduplication, unlike Skills which deduplicates via mergeSkills.
+// This documents the current merge-all-matching behavior for list fields.
+func TestResolveOverlays_ListFieldsAccumulate(t *testing.T) {
+	h := &Harness{
+		Agent:     "agents/test.md",
+		Role:      "fix",
+		Providers: []string{"providers/base"},
+		OpenShell: &OpenShellConfig{
+			Profiles: []string{"profiles/base"},
+		},
+		Skills: []SkillEntry{
+			{Source: "skills/base"},
+		},
+		Overlays: []OverlayEntry{
+			{When: `runtime.forge == "github"`, ForgeConfig: ForgeConfig{
+				Providers: []string{"providers/gh", "providers/common"},
+				OpenShell: &OpenShellConfig{Profiles: []string{"profiles/gh"}},
+				Skills:    []SkillEntry{{Source: "skills/gh"}},
+			}},
+			{When: `runtime.forge == "github"`, ForgeConfig: ForgeConfig{
+				Providers: []string{"providers/common"},
+				OpenShell: &OpenShellConfig{Profiles: []string{"profiles/gh"}},
+				Skills:    []SkillEntry{{Source: "skills/gh"}, {Source: "skills/extra"}},
+			}},
+		},
+	}
+	err := h.ResolveOverlays(nil, "github", nil)
+	require.NoError(t, err)
+
+	// Providers accumulate without deduplication: base + overlay1 + overlay2
+	assert.Equal(t, []string{
+		"providers/base", "providers/gh", "providers/common",
+		"providers/common",
+	}, h.Providers, "providers accumulate across overlays without dedup")
+
+	// OpenShell.Profiles accumulate without deduplication
+	assert.Equal(t, []string{
+		"profiles/base", "profiles/gh", "profiles/gh",
+	}, h.OpenShell.Profiles, "openshell profiles accumulate across overlays without dedup")
+
+	// Skills are deduplicated via mergeSkills (by basename)
+	require.Len(t, h.Skills, 3, "skills are deduplicated by basename across overlays")
+	assert.Equal(t, "skills/base", h.Skills[0].Source)
+	assert.Equal(t, "skills/gh", h.Skills[1].Source)
+	assert.Equal(t, "skills/extra", h.Skills[2].Source)
+}
+
 func TestResolveOverlays_NoMatchUnchanged(t *testing.T) {
 	h := &Harness{
 		Agent:     "agents/test.md",
