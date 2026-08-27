@@ -75,6 +75,21 @@ The mint exchanges GitHub OIDC tokens for scoped GitHub App installation tokens.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Agent → Mint Role Mapping
+
+Each dispatch stage mints a token for a specific **mint role**. The `code` and `fix` agents both use the **coder** role (same GitHub App, same PEM, same permissions). All other built-in agents use the role matching their name. `scribe` is a mint role without a built-in dispatch stage.
+
+To change permissions for the `code` or `fix` agent, update the `coder` role.
+
+| Agent | Mint Role |
+|-------|-----------|
+| triage | triage |
+| code | coder |
+| fix | coder |
+| review | review |
+| retro | retro |
+| prioritize | prioritize |
+
 ### Role Permissions Matrix
 
 The mint enforces minimum permission sets per role. Tokens cannot exceed these scopes.
@@ -87,9 +102,11 @@ Custom roles can be registered via the standalone mint's `CUSTOM_ROLE_PERMISSION
 | **scribe** | read | — | write | — | — | — | — | — | read |
 | **coder** | write | write | write | — | read | — | — | — | read |
 | **review** | read | write | write | — | read | — | — | — | read |
-| **fix** | write | write | write | — | — | — | — | — | read |
 | **retro** | read | write | write | read | — | — | — | — | read |
 | **prioritize** | read | — | write | — | — | — | — | write | read |
+| **e2e** | write | write | write | write | — | write | write | — | read |
+
+The **e2e** role also grants: `administration` (write), `members` (write), `secrets` (write), `organization_actions_variables` (write), `organization_administration` (write). These permissions are omitted from the table above because no other role uses them.
 
 ### Mint Security Controls
 
