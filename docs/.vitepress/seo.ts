@@ -40,7 +40,7 @@ export function isNonContentPath(pageOrUrl: string): boolean {
     .filter(Boolean)
     .some((segment) => {
       const base = segment.replace(/\.(?:html|md)$/, "");
-      return /^0000-.*-template$/.test(base) || /^[A-Z][A-Z0-9_-]*$/.test(base);
+      return /^0000-.*-template/.test(base) || /^[A-Z][A-Z0-9_-]*$/.test(base);
     });
 }
 

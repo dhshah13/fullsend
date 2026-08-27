@@ -115,6 +115,13 @@ describe("isNonContentPath", () => {
     expect(isNonContentPath("experiments/example/RESULTS")).toBe(true);
     expect(isNonContentPath("experiments/example/results")).toBe(false);
   });
+
+  it("matches template names with suffixes, like the original isNonContent", () => {
+    // The predicate is unanchored (no trailing `$`) so a suffixed template such
+    // as `0000-foo-template-v2` classifies as non-content, matching the original
+    // sidebar-discovery regex rather than treating it as a content page.
+    expect(isNonContentPath("ADRs/0000-foo-template-v2.md")).toBe(true);
+  });
 });
 
 describe("isSitemapUrl", () => {

@@ -137,6 +137,11 @@ export default defineConfig({
   description: "Autonomous SDLC agents for your codebase",
 
   base: "/docs/",
+  // Required for SEO correctness, not cosmetic: Cloudflare Workers serves the
+  // extensionless URL with a 200 and 307-redirects the `.html` form. With
+  // cleanUrls the canonical/og:url/sitemap URLs match the 200-serving shape
+  // instead of pointing at redirecting `.html` URLs (search engines discard
+  // canonicals that redirect).
   cleanUrls: true,
 
   rewrites: {
