@@ -485,8 +485,58 @@ func TestExchange_RequiresHTTPS(t *testing.T) {
 	assert.Contains(t, err.Error(), "must use https")
 
 	bad = cfg
+	bad.OIDCRequestURL = "https://oidc.example.invalid/token"
+	_, err = Exchange(context.Background(), bad)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not GitHub's Actions token service")
+
+	bad = cfg
 	bad.TokenEndpoint = "http://auth.example.invalid/oauth/token"
 	_, err = Exchange(context.Background(), bad)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "token endpoint must use https")
+}
+
+func TestExchange_DoesNotFollowRedirects(t *testing.T) {
+	t.Parallel()
+	oidc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:1/elsewhere", http.StatusFound)
+	}))
+	t.Cleanup(oidc.Close)
+	cfg := Config{
+		Audience:           "aud",
+		IdentityProviderID: "idp",
+		ServiceAccountID:   "sa",
+		OIDCRequestURL:     oidc.URL + "/token?api-version=2",
+		OIDCRequestToken:   "runner-token",
+		TokenEndpoint:      "https://auth.example.invalid/oauth/token",
+	}
+	_, err := Exchange(context.Background(), cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "OIDC endpoint returned 302", "the redirect is reported, not followed")
+}
+
+func TestExchange_CapsLifetimeAndRejectsWhitespace(t *testing.T) {
+	t.Parallel()
+	_, _, cfg := newTestServers(t,
+		func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(oidcResponse{Value: "jwt"}) }, //nolint:errcheck
+		func(w http.ResponseWriter, _ *http.Request) {
+			json.NewEncoder(w).Encode(tokenResponse{AccessToken: "tok", TokenType: "Bearer", ExpiresIn: 86400}) //nolint:errcheck
+		},
+	)
+	before := time.Now()
+	tok, err := Exchange(context.Background(), cfg)
+	require.NoError(t, err)
+	assert.WithinDuration(t, before.Add(time.Hour), tok.ExpiresAt, 10*time.Second, "a claimed lifetime beyond an hour is capped")
+
+	_, _, cfg = newTestServers(t,
+		func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(oidcResponse{Value: "jwt"}) }, //nolint:errcheck
+		func(w http.ResponseWriter, _ *http.Request) {
+			json.NewEncoder(w).Encode(tokenResponse{AccessToken: "tok en", TokenType: "Bearer", ExpiresIn: 300}) //nolint:errcheck
+		},
+	)
+	_, err = Exchange(context.Background(), cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "whitespace")
+	assert.NotContains(t, err.Error(), "tok en")
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -254,6 +256,86 @@ func ImportProfile(ctx context.Context, id, profilePath string) error {
 	return nil
 }
 
+// ProfileExists reports whether the gateway lists a provider profile with
+// the given id (`openshell provider list-profiles`). ImportProfile trusts a
+// local content cache, which goes stale when the gateway is recreated or
+// the cache was written against another gateway; callers that must have
+// the profile present check here and ForgetProfileCache before importing
+// again.
+func ProfileExists(ctx context.Context, id string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "openshell", "provider", "list-profiles", "-o", "json").CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("listing provider profiles: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return profileListed(out, id), nil
+}
+
+// profileListed matches id against `provider list-profiles -o json` (an
+// array of objects with an "id" field at OpenShell 0.0.115). Output that is
+// not JSON is read as the human table, whose first column is the id.
+func profileListed(out []byte, id string) bool {
+	var profiles []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &profiles); err == nil {
+		for _, p := range profiles {
+			if p.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == id {
+			return true
+		}
+	}
+	return false
+}
+
+// EffectivePolicy returns the policy the sandbox is enforcing, as YAML, from
+// `openshell policy get <name> --full` (the composed policy, including the
+// gateway's provider entries). The CLI's metadata header is removed.
+func EffectivePolicy(ctx context.Context, name string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+	defer cancel()
+	// stdout only: the CLI prints the header and the YAML there, and a
+	// stray stderr line (an update notice, a gateway warning) must not end
+	// up inside the document.
+	cmd := exec.CommandContext(ctx, "openshell", "policy", "get", name, "--full")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("reading the effective policy of sandbox %q: %w (stderr: %s)", name, err, strings.TrimSpace(stderr.String()))
+	}
+	return StripPolicyHeader(out), nil
+}
+
+// StripPolicyHeader removes the `Version:/Hash:/Status:` metadata block that
+// `openshell policy get` prints before the first `---` document marker. Output
+// without a marker is returned unchanged.
+func StripPolicyHeader(out []byte) []byte {
+	for _, marker := range []string{"\n---\n", "\n---\r\n"} {
+		if i := bytes.Index(out, []byte(marker)); i >= 0 {
+			return out[i+len(marker):]
+		}
+	}
+	if bytes.HasPrefix(out, []byte("---\n")) {
+		return out[4:]
+	}
+	return out
+}
+
+// ForgetProfileCache drops ImportProfile's content cache for a profile id so
+// the next ImportProfile re-sends it.
+func ForgetProfileCache(id string) {
+	os.Remove(profileFileCachePath(id)) //nolint:errcheck
+}
+
 // reservedCredentialKeys are env var names that must not be used as provider
 // credential keys. Credential keys become env vars in the openshell child
 // process; allowing security-sensitive names would let a URL-fetched provider
@@ -341,9 +423,36 @@ func EnsureProvider(ctx context.Context, name, providerType string, credentials,
 // mangle the credential silently (#6689). Values still travel by bare-key
 // form in the child process environment, never on the command line.
 func EnsureProviderLiteral(ctx context.Context, name, providerType string, credentials map[string]string) error {
+	for k := range credentials {
+		if reservedCredentialKeys[strings.ToUpper(k)] {
+			return fmt.Errorf("provider %q: credential key %q is a reserved environment variable name", name, k)
+		}
+	}
 	args, extraEnv, secrets := buildProviderArgsLiteral(name, providerType, credentials)
 	updateArgs := buildProviderUpdateArgsLiteral(name, credentials)
 	return ensureProviderArgs(ctx, name, args, updateArgs, extraEnv, secrets)
+}
+
+// UpdateProviderLiteral replaces the credential values of an existing
+// provider with in-process values (no expansion), the refresh counterpart
+// of EnsureProviderLiteral. OpenShell propagates the new generation to
+// running sandboxes within seconds; old placeholders keep resolving by
+// credential key.
+func UpdateProviderLiteral(ctx context.Context, name string, credentials map[string]string) error {
+	_, extraEnv, secrets := literalCredentialArgs(credentials)
+	return updateProvider(ctx, name, buildProviderUpdateArgsLiteral(name, credentials), extraEnv, secrets)
+}
+
+// UpdateProviderLiteralWithExpiry replaces credential values and records
+// their expiry in one `provider update`, so the new value never carries the
+// old expiry between two calls.
+func UpdateProviderLiteralWithExpiry(ctx context.Context, name string, credentials map[string]string, expiresAt time.Time) error {
+	args := buildProviderUpdateArgsLiteral(name, credentials)
+	_, extraEnv, secrets := literalCredentialArgs(credentials)
+	for _, k := range sortedKeys(credentials) {
+		args = append(args, "--credential-expires-at", k+"="+expiresAt.UTC().Format(time.RFC3339))
+	}
+	return updateProvider(ctx, name, args, extraEnv, secrets)
 }
 
 // ensureProviderArgs runs the create-with-retry loop shared by
@@ -446,7 +555,7 @@ func buildProviderUpdateArgs(name string, credentials, config map[string]string,
 	args := []string{"provider", "update", name}
 	credKeys := sortedKeys(credentials)
 	for _, k := range credKeys {
-		expanded := os.ExpandEnv(credentials[k])
+		expanded := expandProviderValue(credentials[k])
 		if expanded != "" {
 			args = append(args, "--credential", k)
 		} else {
@@ -459,7 +568,7 @@ func buildProviderUpdateArgs(name string, credentials, config map[string]string,
 	for _, k := range cfgKeys {
 		v := config[k]
 		if !fromURL {
-			v = os.ExpandEnv(v)
+			v = expandProviderValue(v)
 		}
 		args = append(args, "--config", k+"="+v)
 	}
@@ -479,7 +588,7 @@ func buildProviderArgs(name, providerType string, credentials, config map[string
 
 	credKeys := sortedKeys(credentials)
 	for _, k := range credKeys {
-		expanded := os.ExpandEnv(credentials[k])
+		expanded := expandProviderValue(credentials[k])
 		if expanded != "" {
 			secrets = append(secrets, expanded)
 			extraEnv = append(extraEnv, fmt.Sprintf("%s=%s", k, expanded))
@@ -494,7 +603,7 @@ func buildProviderArgs(name, providerType string, credentials, config map[string
 	for _, k := range cfgKeys {
 		v := config[k]
 		if !fromURL {
-			v = os.ExpandEnv(v)
+			v = expandProviderValue(v)
 		}
 		args = append(args, "--config", k+"="+v)
 	}
@@ -552,6 +661,37 @@ func SetProviderCredentialExpiry(ctx context.Context, name, key string, expiresA
 		return fmt.Errorf("provider %q: setting credential expiry for %s failed: %w (output: %s)", name, key, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// deniedExpansionKeys are runner environment variables that a provider
+// definition's ${VAR} syntax must never expand — the runner's own
+// credentials (the CLI registers its oidcDenyKeys at start-up). Expansion
+// yields an empty string for them, the same outcome as an unset variable.
+var (
+	deniedExpansionMu   sync.RWMutex
+	deniedExpansionKeys = map[string]bool{}
+)
+
+// DenyExpansionKeys marks environment variable names that provider
+// definitions may not expand.
+func DenyExpansionKeys(keys ...string) {
+	deniedExpansionMu.Lock()
+	defer deniedExpansionMu.Unlock()
+	for _, k := range keys {
+		deniedExpansionKeys[k] = true
+	}
+}
+
+// expandProviderValue is os.ExpandEnv minus the denied keys.
+func expandProviderValue(v string) string {
+	deniedExpansionMu.RLock()
+	defer deniedExpansionMu.RUnlock()
+	return os.Expand(v, func(k string) string {
+		if deniedExpansionKeys[k] {
+			return ""
+		}
+		return os.Getenv(k)
+	})
 }
 
 func sortedKeys(m map[string]string) []string {
@@ -986,24 +1126,35 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 		name, timeout, createOutput, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
 }
 
-// DeleteProvider deletes a named provider from the gateway, returning any
-// error for the caller to log. Run-scoped providers (e.g. openai-<suffix>)
-// must be cleaned up regardless of --keep-sandbox so a live-token provider
-// does not outlive the run (#6689).
+// ErrProviderNotFound is returned by DeleteProvider when the gateway has no
+// provider of that name — already gone, which callers treat as done.
+var ErrProviderNotFound = errors.New("provider not found")
+
+// DeleteProvider deletes a named provider from the gateway. Run-scoped
+// providers (e.g. openai-<suffix>) must be cleaned up regardless of
+// --keep-sandbox so a live-token provider does not outlive the run (#6689).
+// The 0.0.115 CLI reports a missing provider as "! Provider <name> not
+// found" with exit 0; that and any non-zero "not found" variant surface as
+// ErrProviderNotFound. A provider a sandbox still references cannot be
+// deleted (FAILED_PRECONDITION) and is reported as an error.
 func DeleteProvider(name string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), providerTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "openshell", "provider", "delete", name).CombinedOutput()
-	if err != nil {
-		outStr := string(out)
-		// Defensive only: the 0.0.83 CLI reports a missing provider with
-		// "! Provider <name> not found" and exit 0, which already returns nil
-		// above. A future non-zero variant is still not a cleanup failure.
-		if strings.Contains(strings.ToLower(outStr), "not found") ||
-			strings.Contains(strings.ToLower(outStr), "does not exist") {
-			return nil
+	lower := strings.ToLower(string(out))
+	lname := strings.ToLower(name)
+	for _, form := range []string{
+		"provider " + lname + " not found",
+		"provider '" + lname + "' not found",
+		"provider " + lname + " does not exist",
+		"provider '" + lname + "' does not exist",
+	} {
+		if strings.Contains(lower, form) {
+			return ErrProviderNotFound
 		}
-		return fmt.Errorf("provider delete %q failed: %w (output: %s)", name, err, outStr)
+	}
+	if err != nil {
+		return fmt.Errorf("provider delete %q failed: %w (output: %s)", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

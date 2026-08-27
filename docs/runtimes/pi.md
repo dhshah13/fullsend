@@ -76,7 +76,7 @@ endpoints answer `FAILED_PRECONDITION` — so region variables are deliberately 
 | Unattended | No approval prompts, stdin closed, bounded retries; a missing credential exits 1 |
 | Artifacts | `output.jsonl`, `transcripts/<agent>-<ts>_<id>.jsonl`, `metrics.json` with `runtime: pi`, plus `pi-debug.log` with `--debug` |
 | Extra knobs | `FULLSEND_PI_PROVIDER` (prefix for bare ids), `FULLSEND_PI_BASH_ALLOWLIST=enforce` |
-| Not supported | Sub-agents, fallback chains, `plugins:`, Bedrock/Azure providers, OpenAI token refresh |
+| Not supported | Sub-agents, fallback chains, `plugins:`, Bedrock/Azure providers |
 
 ## Running it locally
 

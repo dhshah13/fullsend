@@ -489,7 +489,7 @@ The pinned `pi` CLI and the vendored Vertex extensions ship in every sandbox ima
 
 ### OpenAI via Workload Identity Federation
 
-GPT models run on pi's built-in `openai` provider with no OpenAI credential in the sandbox ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)): `fullsend run` exchanges the job's GitHub OIDC token for a ≤1 h access token (`internal/inference/openaiwif`, or `OPENAI_API_KEY` from the runner environment for local runs), creates a run-scoped OpenShell provider `openai-<sandbox suffix>` of type `fullsend-openai` carrying it, and deletes that provider when the run ends; the `fullsend-openai` profile allows only `POST /v1/responses` on `api.openai.com` for `**/node`. Expiry-driven refresh is a follow-up (the token outlives every fleet harness timeout).
+GPT models run on pi's built-in `openai` provider with no OpenAI credential in the sandbox ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)): `fullsend run` exchanges the job's GitHub OIDC token for a ≤1 h access token (`internal/inference/openaiwif`, or `OPENAI_API_KEY` from the runner environment for local runs), creates a run-scoped OpenShell provider `openai-<sandbox suffix>` of type `fullsend-openai` carrying it, and deletes that provider when the run ends; the `fullsend-openai` profile allows only `POST /v1/responses` on `api.openai.com` for `**/node`. A per-provider refresher re-exchanges a fresh assertion shortly before `expires_in` and hot-updates the provider (a static key only has its expiry pushed out), and is stopped before the deferred cleanup deletes — or, when a kept sandbox still references it, expires in place — the provider.
 
 ### Other clouds
 

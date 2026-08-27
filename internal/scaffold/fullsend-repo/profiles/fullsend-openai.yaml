@@ -12,6 +12,10 @@ credentials:
     header_name: authorization
     refresh:
       strategy: external
+# The endpoint uses explicit allow rules instead of an `access:` preset on
+# purpose: pi 0.84.3's openai provider only ever calls POST /v1/responses,
+# and a preset (read-only/read-write) would also admit GET /v1/models and
+# every other path on the host.
 endpoints:
   - host: api.openai.com
     port: 443

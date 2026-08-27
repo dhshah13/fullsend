@@ -11,9 +11,9 @@ func TestSecretRedactor_RuntimeSecrets(t *testing.T) {
 	t.Cleanup(resetRuntimeSecrets)
 
 	const token = "opaque-token-value-with-no-known-prefix-$1"
-	RegisterRuntimeSecret(token)
-	RegisterRuntimeSecret(token)   // idempotent
-	RegisterRuntimeSecret("short") // below the minimum length: ignored
+	assert.True(t, RegisterRuntimeSecret(token))
+	assert.True(t, RegisterRuntimeSecret(token), "idempotent")
+	assert.False(t, RegisterRuntimeSecret("short"), "below the minimum length: refused")
 	assert.Len(t, runtimeSecretSnapshot(), 1)
 
 	r := NewSecretRedactor()

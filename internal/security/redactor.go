@@ -21,19 +21,22 @@ var (
 )
 
 // RegisterRuntimeSecret adds an exact value to the process-wide redaction
-// set. Registering the same value twice is a no-op.
-func RegisterRuntimeSecret(value string) {
+// set and reports whether it is now registered. Registering the same value
+// twice is a no-op; a value below the minimum length is refused (false) so
+// the caller can decide not to use a credential it cannot redact.
+func RegisterRuntimeSecret(value string) bool {
 	if len(value) < minRuntimeSecretLen {
-		return
+		return false
 	}
 	runtimeSecretsMu.Lock()
 	defer runtimeSecretsMu.Unlock()
 	for _, v := range runtimeSecrets {
 		if v == value {
-			return
+			return true
 		}
 	}
 	runtimeSecrets = append(runtimeSecrets, value)
+	return true
 }
 
 func runtimeSecretSnapshot() []string {

@@ -93,10 +93,15 @@ risk ADR 0025 already documents. Accepted for the pilot because:
 
 - GPT models on pi are usable via `openai/<model-id>` with no OpenAI
   credential inside the sandbox.
-- A follow-up issue tracks expiry-driven refresh (re-exchange +
-  `provider update` before `expires_in`).
-- A follow-up tracks workflow changes to pass the three WIF IDs into
-  the runner environment.
+- The runner refreshes the credential for the life of the run: a WIF
+  token is re-exchanged from a fresh GitHub assertion shortly before
+  `expires_in` and hot-updated into the run-scoped provider; a static
+  key's provider expiry is pushed out on the same schedule. When the
+  bounded retries fail, the recorded expiry makes the gateway fail
+  closed rather than the run silently outliving its credential.
+- The reusable workflows pass the three `FULLSEND_OPENAI_*` repository
+  variables into the runner environment; they are not secrets and need
+  no forwarding hop.
 - Live end-to-end verification is gated on external access and run by
   a maintainer after merge.
 

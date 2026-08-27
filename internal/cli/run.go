@@ -1134,6 +1134,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// runScopedProviders maps a harness provider name to the run-scoped
 	// instance created for it; sandbox creation attaches the latter.
 	runScopedProviders := map[string]string{}
+	var openAIHandles []openAIProviderHandle
 	allProviderNames := append([]string{}, h.Providers...)
 	if len(h.Providers) > 0 || len(result.Providers) > 0 || len(result.Profiles) > 0 {
 		// Enable provider-backed policy composition on the gateway.
@@ -1177,6 +1178,11 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			return fmt.Errorf("loading provider definitions: %w", err)
 		}
 
+		// A bare provider name with no local or URL-resolved definition
+		// falls back to the definition the scaffold embeds in this binary
+		// (providers/<name>.yaml): workspace preparation layers providers/
+		// in CI, but a local per-repo checkout carries only a .gitkeep.
+		localDefs = appendEmbeddedProviderDefs(localDefs, result.Providers, h.Providers, printer)
 		allDefs, shadowedProviders := mergeProviderDefs(localDefs, result.Providers)
 		for _, name := range shadowedProviders {
 			printer.StepWarn(fmt.Sprintf("Local provider %q shadows URL-resolved provider of the same name", name))
@@ -1199,17 +1205,45 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		created := make(map[string]struct{}, len(allDefs))
 		sharedDefs := allDefs[:0:0]
 		for _, pd := range allDefs {
-			if pd.Type != openAIProviderType {
+			if !strings.EqualFold(pd.Type, openAIProviderType) {
 				sharedDefs = append(sharedDefs, pd)
 				continue
 			}
-			scopedName, scopedKeys, err := ensureOpenAIProvider(ctx, pd, sandboxName, printer)
+			// The profile id is the canonical, lowercase form regardless of
+			// how the definition spelled it.
+			pd.Type = openAIProviderType
+			// The profile is the security policy for the exchanged token and
+			// only the copy embedded in this binary is trusted: a repository
+			// or URL-resolved profile with the same id would be imported
+			// earlier in this function and could stand in for it.
+			if err := rejectReservedProfileID(openAIProviderType, result.Profiles, dirProfileIDs); err != nil {
+				return err
+			}
+			if err := ensureOpenAIProfile(ctx, pd.Type, printer); err != nil {
+				return err
+			}
+			handle, err := ensureOpenAIProvider(ctx, pd, sandboxName, openAIConfigIDs(runCfg), printer)
 			if err != nil {
 				return err
 			}
 			created[pd.Name] = struct{}{}
-			runScopedProviders[pd.Name] = scopedName
-			defer cleanupRunScopedProvider(scopedName, scopedKeys, printer)
+			runScopedProviders[pd.Name] = handle.name
+			openAIHandles = append(openAIHandles, handle)
+			// LIFO: the refresher is stopped (registered second) before the
+			// provider is deleted or expired (registered first), so a late
+			// refresh can never resurrect a credential after cleanup.
+			defer cleanupRunScopedProvider(handle.name, handle.keys, keepSandbox, printer)
+			refreshCtx, stopRefresh := context.WithCancel(context.Background())
+			var refreshWg sync.WaitGroup
+			refreshWg.Add(1)
+			go func(h openAIProviderHandle) {
+				defer refreshWg.Done()
+				runOpenAIRefresh(refreshCtx, h, printer)
+			}(handle)
+			defer func() {
+				stopRefresh()
+				refreshWg.Wait()
+			}()
 		}
 		allDefs = sharedDefs
 
@@ -1377,6 +1411,20 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		return fmt.Errorf("creating sandbox: %w", err)
 	}
 	finalizeSandboxSpan(sandboxSpan, nil)
+
+	if len(runScopedProviders) > 0 {
+		// The OpenAI credential only reaches api.openai.com through an
+		// inspected route; fail here, with the rule named, rather than
+		// after the agent has retried its first request.
+		if err := checkOpenAIEgressInspected(ctx, sandboxName); err != nil {
+			printer.StepFail("Sandbox policy cannot deliver the OpenAI credential")
+			return err
+		}
+		// From here a refresh must also re-seed the running pi.
+		for _, h := range openAIHandles {
+			h.sandboxUp.Store(true)
+		}
+	}
 
 	// repoExtractedOK tracks whether hostRepositoryDownloadDir is safe
 	// and corresponds to the validated iteration. It is false when:
@@ -2414,6 +2462,12 @@ var oidcDenyKeys = map[string]bool{
 	"FULLSEND_OPENAI_AUDIENCE":             true,
 	"FULLSEND_OPENAI_IDENTITY_PROVIDER_ID": true,
 	"FULLSEND_OPENAI_SERVICE_ACCOUNT_ID":   true,
+	// A static OpenAI key in the runner environment (local runs, ADR 0092)
+	// reaches the sandbox only as the run-scoped provider's placeholder.
+	// Listing it here makes every ${VAR} expansion site refuse it, so a
+	// harness cannot copy the real key under another name, and keeps it out
+	// of pre/post scripts.
+	"OPENAI_API_KEY": true,
 }
 
 // reservedSandboxKeys are infrastructure env vars that env.sandbox must not
@@ -2439,16 +2493,19 @@ var reservedSandboxKeys = map[string]bool{
 	"FULLSEND_TARGET_REPO_DIR": true,
 	"FULLSEND_ROLE":            true,
 	"FULLSEND_SLUG":            true,
-	// The openai provider's placeholder (#6689): the only sanctioned way for
-	// an OpenAI credential to reach the sandbox is the run-scoped OpenShell
-	// provider, so env.sandbox must not be able to export a real key over
-	// the placeholder.
-	"OPENAI_API_KEY": true,
+	// OPENAI_API_KEY is reserved through oidcDenyKeys (merged by init()).
 }
 
 func init() {
 	// Merge OIDC credential vars into reservedSandboxKeys so a future
-	// addition to oidcDenyKeys automatically blocks sandbox injection.
+	// addition to oidcDenyKeys automatically blocks sandbox injection, and
+	// tell the sandbox package so provider definitions cannot expand them
+	// either (#6689).
+	denied := make([]string, 0, len(oidcDenyKeys))
+	for k := range oidcDenyKeys {
+		denied = append(denied, k)
+	}
+	sandbox.DenyExpansionKeys(denied...)
 	for k := range oidcDenyKeys {
 		reservedSandboxKeys[k] = true
 	}
@@ -4837,6 +4894,65 @@ func mergeProviderDefs(localDefs []harness.ProviderDef, urlProviders []resolve.R
 	return allDefs, shadowed
 }
 
+// rejectReservedProfileID fails when the run resolved or found on disk a
+// provider profile whose id the runner reserves for its embedded copy.
+func rejectReservedProfileID(id string, resolved []resolve.ResolvedProfile, dirIDs []string) error {
+	for _, rp := range resolved {
+		if rp.ID == id {
+			return fmt.Errorf("provider profile %q is reserved for the copy built into fullsend; remove it from the harness/openshell profiles", id)
+		}
+	}
+	for _, d := range dirIDs {
+		if d == id {
+			return fmt.Errorf("provider profile %q is reserved for the copy built into fullsend; remove profiles/%s.yaml from the workspace", id, id)
+		}
+	}
+	return nil
+}
+
+// appendEmbeddedProviderDefs adds the scaffold's embedded definition for
+// every bare provider name the harness declares that neither the local
+// providers/ directory nor a URL-resolved entry defines.
+// openAIConfigIDs returns the committed inference.openai identifiers, or
+// a zero value when the run has no per-repo config.
+func openAIConfigIDs(rc runConfig) config.OpenAIWIFConfig {
+	if rc.perRepo == nil {
+		return config.OpenAIWIFConfig{}
+	}
+	return rc.perRepo.ConfigInferenceOpenAI()
+}
+
+func appendEmbeddedProviderDefs(localDefs []harness.ProviderDef, resolved []resolve.ResolvedProvider, declared []string, printer *ui.Printer) []harness.ProviderDef {
+	have := make(map[string]bool, len(localDefs)+len(resolved))
+	for _, d := range localDefs {
+		have[d.Name] = true
+	}
+	for _, rp := range resolved {
+		have[rp.Def.Name] = true
+	}
+	for _, name := range declared {
+		if have[name] || harness.IsURL(name) || harness.IsProviderPath(name) {
+			continue
+		}
+		data, err := scaffold.FullsendRepoFile("providers/" + name + ".yaml")
+		if err != nil {
+			continue // not a scaffold-shipped provider; the caller warns
+		}
+		def, err := harness.ParseProviderDef(data)
+		if err != nil || def.Name != name || !strings.EqualFold(def.Type, openAIProviderType) {
+			// Only the OpenAI definition is filled in: its credential is
+			// resolved by the runner, so the file carries no secret reference
+			// and the embedded copy is exactly what CI layers in. The other
+			// scaffold providers keep their existing "no definition" warning.
+			continue
+		}
+		printer.StepInfo(fmt.Sprintf("Provider %q: using the definition shipped with fullsend (no providers/%s.yaml in the workspace)", name, name))
+		localDefs = append(localDefs, def)
+		have[name] = true
+	}
+	return localDefs
+}
+
 // hasLocalProviders reports whether the harness has any provider entries that
 // are local file paths (not URLs and not bare provider names).
 func hasLocalProviders(h *harness.Harness) bool {
@@ -4935,6 +5051,12 @@ func checkProviderProfileIntegrity(providers []resolve.ResolvedProvider, profile
 	}
 	var mismatches []string
 	for _, rp := range providers {
+		// Profile types the runner imports from its embedded scaffold
+		// itself (ensureOpenAIProfile) are known even when nothing on disk
+		// declares them.
+		if strings.EqualFold(rp.Def.Type, openAIProviderType) {
+			continue
+		}
 		if !profileIDs[rp.Def.Type] {
 			mismatches = append(mismatches, fmt.Sprintf("%q (type %q)", rp.Def.Name, rp.Def.Type))
 		}

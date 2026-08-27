@@ -6,9 +6,10 @@
 //  1. GET the GitHub OIDC assertion with the configured audience.
 //  2. POST an RFC 8693 token-exchange request to OpenAI's token endpoint.
 //
-// The returned access token is opaque (never assume a prefix or structure),
-// short-lived (≤1 h), and scoped to api.model.request. No refresh token is
-// returned.
+// The returned access token is opaque (never assume a prefix or structure)
+// and short-lived: at most an hour, and never longer than the GitHub
+// assertion it was exchanged from (minutes). No refresh token is returned;
+// the caller re-exchanges a fresh assertion instead.
 //
 // Both URLs are trusted, fixed channels rather than user or remote
 // configuration — the OIDC endpoint is injected by GitHub into the job and
@@ -50,6 +51,13 @@ const (
 	// httpTimeout is the per-request timeout for both the OIDC assertion
 	// request and the OpenAI exchange.
 	httpTimeout = 30 * time.Second
+
+	// maxTokenLifetime is the documented ceiling on an exchanged token.
+	maxTokenLifetime = time.Hour
+
+	// oidcHostSuffix is where GitHub serves ACTIONS_ID_TOKEN_REQUEST_URL
+	// (github.com only; GHES is not supported by fullsend).
+	oidcHostSuffix = ".actions.githubusercontent.com"
 )
 
 // Config holds the inputs for a WIF exchange. All fields except
@@ -75,12 +83,15 @@ type Config struct {
 	// Defaults to "urn:ietf:params:oauth:token-type:jwt".
 	SubjectTokenType string
 
-	// TokenEndpoint overrides the OpenAI token endpoint URL.
-	// Defaults to "https://auth.openai.com/oauth/token".
+	// TokenEndpoint overrides the OpenAI token endpoint URL. Tests only:
+	// production callers leave it empty. Exposing it to user or harness
+	// configuration would turn this fixed-endpoint client into an SSRF
+	// surface (docs/contributing/go-code.md, "Secure HTTP clients").
 	TokenEndpoint string
 
-	// HTTPClient overrides the HTTP client used for both requests.
-	// Defaults to a client with httpTimeout.
+	// HTTPClient overrides the HTTP client used for both requests. Tests
+	// only, for the same reason: a caller-supplied client also bypasses the
+	// default redirect refusal.
 	HTTPClient *http.Client
 }
 
@@ -91,8 +102,14 @@ type Token struct {
 	Value string
 
 	// ExpiresAt is the absolute expiry derived from the response's
-	// expires_in field plus the exchange timestamp.
+	// expires_in field plus the exchange timestamp. OpenAI caps the token
+	// at one hour and never lets it outlive the GitHub assertion it was
+	// exchanged from, so in practice this is minutes, not an hour.
 	ExpiresAt time.Time
+
+	// Scope is the space-separated permission list the mapping granted
+	// (empty when the mapping does not narrow permissions). Not secret.
+	Scope string
 }
 
 // oidcResponse is the GitHub OIDC endpoint's JSON shape.
@@ -114,6 +131,7 @@ type tokenResponse struct {
 	AccessToken string `json:"access_token"`
 	TokenType   string `json:"token_type"`
 	ExpiresIn   int    `json:"expires_in"`
+	Scope       string `json:"scope"`
 }
 
 // Exchange performs the two-step WIF exchange:
@@ -140,7 +158,15 @@ func Exchange(ctx context.Context, cfg Config) (*Token, error) {
 
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: httpTimeout}
+		// Neither endpoint redirects on success; refusing to follow one
+		// turns an unexpected 3xx into a visible non-200 error instead of
+		// a request to a host we did not choose.
+		client = &http.Client{
+			Timeout: httpTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 	subjectTokenType := cfg.SubjectTokenType
 	if subjectTokenType == "" {
@@ -151,6 +177,9 @@ func Exchange(ctx context.Context, cfg Config) (*Token, error) {
 		tokenEndpoint = openAITokenEndpoint
 	}
 	if err := requireSecureURL("OIDC request URL", cfg.OIDCRequestURL); err != nil {
+		return nil, fmt.Errorf("openaiwif: %w", err)
+	}
+	if err := requireGitHubOIDCHost(cfg.OIDCRequestURL); err != nil {
 		return nil, fmt.Errorf("openaiwif: %w", err)
 	}
 	if err := requireSecureURL("token endpoint", tokenEndpoint); err != nil {
@@ -185,6 +214,22 @@ func requireSecureURL(what, raw string) error {
 		return nil
 	}
 	return fmt.Errorf("%s must use https (got scheme %q)", what, u.Scheme)
+}
+
+// requireGitHubOIDCHost rejects an assertion URL that does not point at
+// GitHub's Actions token service (loopback is allowed for tests). The URL
+// is runner-injected and deny-listed, so this is defence in depth against a
+// rewritten runner environment, not SSRF hardening.
+func requireGitHubOIDCHost(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parsing OIDC request URL: %w", err)
+	}
+	host := strings.ToLower(u.Hostname())
+	if isLoopback(host) || strings.HasSuffix(host, oidcHostSuffix) {
+		return nil
+	}
+	return fmt.Errorf("OIDC request URL host %q is not GitHub's Actions token service (*%s)", u.Hostname(), oidcHostSuffix)
 }
 
 func isLoopback(host string) bool {
@@ -306,9 +351,20 @@ func exchangeToken(ctx context.Context, client *http.Client, endpoint, assertion
 	if !strings.EqualFold(tok.TokenType, "Bearer") {
 		return nil, fmt.Errorf("token endpoint returned unsupported token_type %q (expected Bearer)", tok.TokenType)
 	}
+	// A header value with whitespace could not be masked per line by the
+	// Actions log filter nor sent as a Bearer token.
+	if strings.ContainsAny(tok.AccessToken, " \t\r\n") {
+		return nil, fmt.Errorf("token endpoint returned an access_token containing whitespace")
+	}
+	// OpenAI documents at most one hour; a longer claim is treated as an
+	// hour so the refresher never sleeps past the real lifetime.
+	if tok.ExpiresIn > int(maxTokenLifetime/time.Second) {
+		tok.ExpiresIn = int(maxTokenLifetime / time.Second)
+	}
 
 	return &Token{
 		Value:     tok.AccessToken,
 		ExpiresAt: exchangeTime.Add(time.Duration(tok.ExpiresIn) * time.Second),
+		Scope:     tok.Scope,
 	}, nil
 }
