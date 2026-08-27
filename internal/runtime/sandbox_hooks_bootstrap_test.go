@@ -174,6 +174,69 @@ func TestAppendHookEnv_EgressAllowlistEmpty(t *testing.T) {
 	assert.NotContains(t, log, "FULLSEND_EGRESS_ALLOWLIST")
 }
 
+func TestAppendHookEnv_AutoAddsForgeEgressEntry(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	sentinelPath := filepath.Join(t.TempDir(), "unused.tar.gz")
+	fakeOpenshellBootstrap(t, logPath, sentinelPath)
+
+	h := &harness.Harness{Security: &harness.SecurityConfig{SandboxHooks: &harness.SandboxHooks{}}}
+	hooks := security.SandboxHookConfigFromHarness(h).WithForgeEgressEntry("gitlab.cee.redhat.com:443")
+	require.NoError(t, appendHookEnv("sb", hooks))
+
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	log := string(logBytes)
+	assert.Contains(t, log, "FULLSEND_EGRESS_ALLOWLIST=gitlab.cee.redhat.com:443")
+}
+
+func TestAppendHookEnv_MergesForgeEgressEntryWithUserAllowlist(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	sentinelPath := filepath.Join(t.TempDir(), "unused.tar.gz")
+	fakeOpenshellBootstrap(t, logPath, sentinelPath)
+
+	h := &harness.Harness{Security: &harness.SecurityConfig{SandboxHooks: &harness.SandboxHooks{
+		SSRFEgressAllowlist: "registry.internal:443",
+	}}}
+	hooks := security.SandboxHookConfigFromHarness(h).WithForgeEgressEntry("gitlab.cee.redhat.com:443")
+	require.NoError(t, appendHookEnv("sb", hooks))
+
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	log := string(logBytes)
+	assert.Contains(t, log, "FULLSEND_EGRESS_ALLOWLIST=registry.internal:443,gitlab.cee.redhat.com:443")
+}
+
+func TestAppendHookEnv_NoForgeEgressEntryByDefault(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	sentinelPath := filepath.Join(t.TempDir(), "unused.tar.gz")
+	fakeOpenshellBootstrap(t, logPath, sentinelPath)
+
+	// No forge egress entry → no auto-append.
+	h := &harness.Harness{Security: &harness.SecurityConfig{SandboxHooks: &harness.SandboxHooks{}}}
+	require.NoError(t, appendHookEnv("sb", security.SandboxHookConfigFromHarness(h)))
+
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	log := string(logBytes)
+	// Without a forge egress entry, only tirith env should be set.
+	assert.NotContains(t, log, "FULLSEND_EGRESS_ALLOWLIST")
+}
+
+func TestAppendHookEnv_ForgeEgressEntryNonStandardPort(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	sentinelPath := filepath.Join(t.TempDir(), "unused.tar.gz")
+	fakeOpenshellBootstrap(t, logPath, sentinelPath)
+
+	h := &harness.Harness{Security: &harness.SecurityConfig{SandboxHooks: &harness.SandboxHooks{}}}
+	hooks := security.SandboxHookConfigFromHarness(h).WithForgeEgressEntry("gitlab.company.com:8443")
+	require.NoError(t, appendHookEnv("sb", hooks))
+
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	log := string(logBytes)
+	assert.Contains(t, log, "FULLSEND_EGRESS_ALLOWLIST=gitlab.company.com:8443")
+}
+
 func TestClaudeRuntime_Bootstrap_HooksChmodFailure(t *testing.T) {
 	// Agent upload happens first, so make only later steps fail: time out
 	// (exit 124, the only exec failure sandbox.Exec reports) on the chmod
