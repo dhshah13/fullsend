@@ -198,14 +198,20 @@ func (c *JiraClient) FindCommentByMarkerProperty(comments []jira.Comment, marker
 // caller should pass the body without the marker prefix.
 func (c *JiraClient) MigrateAndUpdateComment(ctx context.Context, project string, number int, commentID string, body Body, marker string) error {
 	key := issueKey(project, number)
-	if err := c.jira.UpdateComment(ctx, key, commentID, string(body)); err != nil {
-		return wrapNotFound(err)
-	}
-	// Set the property regardless — idempotent PUT. If it was already
-	// set (new-style comment), this is a no-op from Jira's perspective.
+	// Set the property first — idempotent PUT. If it was already set
+	// (new-style comment), this is a no-op from Jira's perspective.
 	// If it was absent (legacy comment), this completes migration.
+	//
+	// Property-before-body ordering is intentional: if the property
+	// write succeeds but the body update fails, the next run will
+	// still find the comment via its property and can retry. The
+	// reverse order risks losing the marker from both the body (which
+	// was just stripped) and the property (which was never set).
 	if err := c.jira.SetCommentProperty(ctx, key, commentID, stickyPropertyKey, marker); err != nil {
 		return fmt.Errorf("setting sticky marker property on comment %s of %s: %w", commentID, key, err)
+	}
+	if err := c.jira.UpdateComment(ctx, key, commentID, string(body)); err != nil {
+		return wrapNotFound(err)
 	}
 	return nil
 }

@@ -478,24 +478,6 @@ func validateTrackerName(name string) (string, error) {
 	return normalized, nil
 }
 
-// jiraUnsafeMarkerChars are the characters jira's mdEscaper backslash-
-// escapes when a Jira comment body is read back as Markdown
-// (ADFToMarkdown). A --marker containing one of them would come back
-// escaped (e.g. "post_review" as "post\_review"), so the substring match
-// in findMarkedTrackerComment would never match it again on a later run
-// — every run would create a new comment instead of updating in place.
-const jiraUnsafeMarkerChars = `\*_` + "`" + `[]&`
-
-// validateJiraMarker rejects a --marker value that contains a character
-// Jira's ADF round-trip would escape, since such a marker can never be
-// re-detected on a later run (see jiraUnsafeMarkerChars).
-func validateJiraMarker(marker string) error {
-	if i := strings.IndexAny(marker, jiraUnsafeMarkerChars); i != -1 {
-		return fmt.Errorf("--marker %q contains %q, which Jira's markdown round-trip escapes on read-back — this would break marker re-detection on later runs; avoid %s in --marker for --tracker jira", marker, marker[i:i+1], jiraUnsafeMarkerChars)
-	}
-	return nil
-}
-
 // findMarkedTrackerComment returns the first tracker comment whose body
 // contains the given marker string, or nil if none is found. This is
 // the tracker.Comment equivalent of sticky.FindMarkedComment.

@@ -545,34 +545,13 @@ func TestRunIssuesPostComment_NonJiraKeepsDefaultStickyMaxSize(t *testing.T) {
 	assert.Contains(t, string(comments[0].Body), "Previous run")
 }
 
-func TestValidateJiraMarker_RejectsEscapedChars(t *testing.T) {
-	unsafeChars := []string{`\`, "*", "_", "`", "[", "]", "&"}
-	for _, c := range unsafeChars {
-		marker := "<!-- fullsend:post" + c + "review -->"
-		err := validateJiraMarker(marker)
-		assert.Errorf(t, err, "validateJiraMarker(%q): want error, marker contains %q which Jira's ADFToMarkdown escapes", marker, c)
-	}
-}
-
-func TestValidateJiraMarker_AllowsSafeChars(t *testing.T) {
-	safeMarkers := []string{
-		"<!-- fullsend:post-review -->",
-		"<!-- fullsend:triage-agent -->",
-		"<!-- fullsend:post:review -->",
-	}
-	for _, marker := range safeMarkers {
-		assert.NoErrorf(t, validateJiraMarker(marker), "validateJiraMarker(%q): want no error", marker)
-	}
-}
-
 func TestRunIssuesPostComment_JiraAcceptsMarkerWithSpecialChars(t *testing.T) {
 	// Jira now stores markers in comment entity properties instead of
 	// the visible body, so marker character restrictions no longer
 	// apply — characters that Jira's ADF round-trip would escape are
 	// fine in a property value.
-	tc, fc, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
 	require.NoError(t, err)
-	_ = fc
 
 	cfg := &issuesPostCommentConfig{
 		trackerName: trackerJira,
