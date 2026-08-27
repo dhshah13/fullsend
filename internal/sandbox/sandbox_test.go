@@ -623,6 +623,113 @@ func TestCreateWithRetry_SleepsBetweenAttempts(t *testing.T) {
 	assert.Equal(t, []time.Duration{retryInitialBackoff, retryInitialBackoff * 2}, sleeps)
 }
 
+func TestCreateOnce_DetachedPersistentCommand(t *testing.T) {
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "args.log")
+
+	// Fake openshell: logs create args and always reports Ready on get.
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$2" = "create" ]; then
+  echo "$@" >> %s
+  exit 0
+fi
+if [ "$2" = "get" ]; then
+  echo "Phase: Ready"
+  exit 0
+fi
+exit 0
+`, argsLog)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "", 10*time.Second)
+	assert.NoError(t, err)
+
+	logged, readErr := os.ReadFile(argsLog)
+	require.NoError(t, readErr)
+	args := string(logged)
+	assert.Contains(t, args, "--detach",
+		"sandbox create must use --detach for persistent sandboxes")
+	assert.Contains(t, args, "sleep infinity",
+		"sandbox create must use 'sleep infinity' as the persistent command")
+	assert.NotContains(t, args, "-- true",
+		"sandbox create must not use 'true' as the command (breaks OpenShell 0.0.111+)")
+}
+
+func TestCreateOnce_TerminalPhaseFastFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	// Fake openshell: create succeeds, get always shows Error phase.
+	script := `#!/bin/sh
+if [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$2" = "get" ]; then
+  echo "Phase: Error"
+  exit 0
+fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	start := time.Now()
+	err := createOnce("test-sandbox", nil, "", "", 30*time.Second)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "terminal phase")
+	assert.Contains(t, err.Error(), "Error")
+	// Must detect the terminal phase and fail fast, well within the 30s timeout.
+	assert.Less(t, elapsed, 10*time.Second,
+		"terminal phase detection must short-circuit polling")
+}
+
+func TestCreateOnce_DiagnosticPreservation(t *testing.T) {
+	dir := t.TempDir()
+
+	// Fake openshell: create fails with diagnostics, get shows Error phase.
+	script := `#!/bin/sh
+if [ "$2" = "create" ]; then
+  echo "image pull timeout: registry.example.com/sandbox:latest" >&2
+  exit 1
+fi
+if [ "$2" = "get" ]; then
+  echo "Phase: Error"
+  exit 0
+fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "", 5*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "image pull timeout",
+		"error must include original sandbox create output for diagnostics")
+}
+
+func TestTerminalSandboxPhase(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{"ready is not terminal", "Phase: Ready", ""},
+		{"creating is not terminal", "Phase: Creating", ""},
+		{"error is terminal", "Phase: Error", "Error"},
+		{"dead is terminal", "Phase: Dead", "Dead"},
+		{"completed is terminal", "Phase: Completed", "Completed"},
+		{"empty output", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := terminalSandboxPhase(tt.output)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestEffectiveReadyTimeout_CappedAtMax(t *testing.T) {
 	got := effectiveReadyTimeout(999 * time.Second)
 	assert.Equal(t, maxReadyTimeout, got)

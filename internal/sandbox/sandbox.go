@@ -774,6 +774,24 @@ func CreateWithRetry(name string, providers []string, image, policy string, maxA
 	return fmt.Errorf("sandbox creation failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
+// terminalSandboxPhases lists sandbox phases that will never transition to
+// Ready. When detected during polling, createOnce returns immediately instead
+// of burning the full timeout. This covers the OpenShell 0.0.111+ behavior
+// where an exited main process makes the sandbox terminal ("Error"), as well
+// as other terminal states ("Dead", "Completed").
+var terminalSandboxPhases = []string{"Error", "Dead", "Completed"}
+
+// terminalSandboxPhase returns the first terminal phase found in the
+// sandbox get output, or "" if none is detected.
+func terminalSandboxPhase(output string) string {
+	for _, phase := range terminalSandboxPhases {
+		if strings.Contains(output, phase) {
+			return phase
+		}
+	}
+	return ""
+}
+
 // createOnce creates a persistent OpenShell sandbox and waits for it to be
 // ready. If providers are given, they are passed as --provider flags. If image
 // is non-empty, it is passed as --from to start the sandbox from a container
@@ -798,19 +816,26 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 	for _, p := range providers {
 		args = append(args, "--provider", p)
 	}
-	// Without a command, sandbox create starts an interactive shell and
-	// blocks until it exits. Pass `true` so it returns immediately.
-	args = append(args, "--", "true")
+	// Keep a long-running process inside the sandbox so it stays alive
+	// for subsequent sandbox exec calls. Prior to OpenShell 0.0.111 the
+	// `true` command worked because an exited main process left the
+	// sandbox Ready; starting with 0.0.111 an exited process makes the
+	// sandbox terminal. --detach returns immediately while sleep infinity
+	// continues running in the background.
+	args = append(args, "--detach", "--", "sleep", "infinity")
 
 	cmd := exec.CommandContext(ctx, "openshell", args...)
 	cmd.Stdin = nil
 	out, err := cmd.CombinedOutput()
+	createOutput := strings.TrimSpace(string(out))
 
 	if err != nil {
 		check := exec.CommandContext(ctx, "openshell", "sandbox", "get", name)
 		if checkErr := check.Run(); checkErr != nil {
 			return fmt.Errorf("sandbox create failed: %s", string(out))
 		}
+		// Sandbox exists despite the create error — continue to the
+		// polling loop, but preserve createOutput for diagnostics.
 	}
 
 	// Wait for sandbox to be fully ready (image pull can take a while).
@@ -827,6 +852,14 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 		if checkErr == nil && strings.Contains(lastOutput, "Ready") {
 			return nil
 		}
+		// Detect terminal phases and fail immediately instead of
+		// polling through the full timeout.
+		if checkErr == nil {
+			if phase := terminalSandboxPhase(lastOutput); phase != "" {
+				return fmt.Errorf("sandbox %q entered terminal phase %q (will not become Ready)\ncreate output: %s\nstdout: %s\nstderr: %s",
+					name, phase, createOutput, lastOutput, lastStderr)
+			}
+		}
 		time.Sleep(readyPoll)
 	}
 
@@ -836,8 +869,8 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 
 	containerLogs := collectPodmanLogs(name)
 
-	return fmt.Errorf("sandbox %q not ready after %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
-		name, timeout, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
+	return fmt.Errorf("sandbox %q not ready after %s\ncreate output: %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
+		name, timeout, createOutput, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
 }
 
 // Delete deletes a sandbox, returning any error for the caller to log.
