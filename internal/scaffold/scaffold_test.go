@@ -856,9 +856,14 @@ func extractGettingStartedSection(t *testing.T, scriptStr string) string {
 //     dispatch.yml, so a command removed from dispatch.yml but left in the
 //     user-facing catalog also fails CI.
 //
-// The command pattern permits digits and hyphens so a hyphenated command (e.g.
-// /fs-fix-stop) is matched in full rather than truncated to a prefix, and the
-// /fullsend alias form is matched explicitly.
+// The two surfaces render commands differently, so each is scoped to its own
+// form: dispatch.yml routes on bare tokens (e.g. /fs-triage), while the catalog
+// renders them as backtick-wrapped bullets (e.g. `/fs-triage`). Scoping catalog
+// extraction to the backtick form keeps URL hosts like https://fullsend.sh from
+// being mistaken for a /fullsend command. Membership is compared as exact tokens
+// (via sets) rather than substring containment so a hyphenated command (e.g.
+// /fs-fix-stop) cannot satisfy the guard against an unrelated prefix (/fs-fix),
+// and the allow-list is applied symmetrically in both directions.
 func TestReconcileReposSlashCommandCatalog(t *testing.T) {
 	dispatch, err := FullsendRepoFile(".github/workflows/dispatch.yml")
 	require.NoError(t, err)
@@ -868,32 +873,42 @@ func TestReconcileReposSlashCommandCatalog(t *testing.T) {
 
 	catalog := extractGettingStartedSection(t, string(script))
 
-	cmdRE := regexp.MustCompile(`/fs-[a-z0-9-]+|/fullsend\b`)
+	// dispatchCmdRE matches bare command tokens as they appear in dispatch.yml's
+	// case labels. catalogCmdRE matches only the rendered, backtick-wrapped bullet
+	// form (the backticks are backslash-escaped in the shell assignment), so a
+	// command name embedded in a docs URL is not extracted as a catalog command.
+	dispatchCmdRE := regexp.MustCompile(`/fs-[a-z0-9-]+|/fullsend\b`)
+	catalogCmdRE := regexp.MustCompile("\\\\?`(/fs-[a-z0-9-]+|/fullsend)\\\\?`")
+
+	dispatchCmds := map[string]bool{}
+	for _, cmd := range dispatchCmdRE.FindAllString(dispatchStr, -1) {
+		dispatchCmds[cmd] = true
+	}
+	require.NotEmpty(t, dispatchCmds, "expected dispatch.yml to route on /fs-* commands")
+
+	catalogCmds := map[string]bool{}
+	for _, m := range catalogCmdRE.FindAllStringSubmatch(catalog, -1) {
+		catalogCmds[m[1]] = true
+	}
+	require.NotEmpty(t, catalogCmds, "expected the onboarding catalog to document /fs-* commands")
 
 	// Forward: dispatch.yml commands must be documented (unless allow-listed).
-	dispatchCmds := cmdRE.FindAllString(dispatchStr, -1)
-	require.NotEmpty(t, dispatchCmds, "expected dispatch.yml to route on /fs-* commands")
-	seen := map[string]bool{}
-	for _, cmd := range dispatchCmds {
-		if seen[cmd] || commandsNotInOnboardingCatalog[cmd] {
+	for cmd := range dispatchCmds {
+		if commandsNotInOnboardingCatalog[cmd] {
 			continue
 		}
-		seen[cmd] = true
-		assert.Contains(t, catalog, cmd,
+		assert.True(t, catalogCmds[cmd],
 			"dispatch.yml routes on %s but the onboarding catalog does not document it "+
 				"(add it to GETTING_STARTED_SECTION, or to commandsNotInOnboardingCatalog if intentional)", cmd)
 	}
 
-	// Reverse: cataloged commands must actually be routed by dispatch.yml.
-	catalogCmds := cmdRE.FindAllString(catalog, -1)
-	require.NotEmpty(t, catalogCmds, "expected the onboarding catalog to document /fs-* commands")
-	seenCatalog := map[string]bool{}
-	for _, cmd := range catalogCmds {
-		if seenCatalog[cmd] {
+	// Reverse: cataloged commands must actually be routed by dispatch.yml (the
+	// allow-list is applied here too so it stays symmetric with the forward check).
+	for cmd := range catalogCmds {
+		if commandsNotInOnboardingCatalog[cmd] {
 			continue
 		}
-		seenCatalog[cmd] = true
-		assert.Contains(t, dispatchStr, cmd,
+		assert.True(t, dispatchCmds[cmd],
 			"onboarding catalog documents %s but dispatch.yml does not route on it", cmd)
 	}
 }

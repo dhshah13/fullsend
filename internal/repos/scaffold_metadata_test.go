@@ -2,12 +2,15 @@ package repos
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/scaffold"
 )
 
 func TestBuildScaffoldPRMetadata_FreshInstall(t *testing.T) {
@@ -168,6 +171,76 @@ func TestDetectExistingVersion(t *testing.T) {
 		v := detectExistingVersion(context.Background(), fc, "acme", "widget")
 		assert.Equal(t, "v1.0.0-alpha-1", v)
 	})
+}
+
+// commandsNotInPerRepoCatalog mirrors commandsNotInOnboardingCatalog in the
+// scaffold package: dispatch.yml routes these but they are deliberately omitted
+// from the user-facing per-repo onboarding catalog.
+//   - /fullsend: backward-compat alias for the /fs-retro form; /fs-retro is the
+//     primary command documented in the catalog.
+var commandsNotInPerRepoCatalog = map[string]bool{
+	"/fullsend": true,
+}
+
+// TestPerRepoOnboardingCatalog guards the per-repo install PR body's
+// slash-command catalog against drift from dispatch.yml's routing, in both
+// directions — the per-repo analogue of TestReconcileReposSlashCommandCatalog in
+// the scaffold package (which guards the per-org onboarding catalog). Pinning
+// both catalogs to the same source (dispatch.yml) keeps the two onboarding
+// surfaces from diverging.
+func TestPerRepoOnboardingCatalog(t *testing.T) {
+	dispatch, err := scaffold.FullsendRepoFile(".github/workflows/dispatch.yml")
+	require.NoError(t, err)
+	dispatchStr := string(dispatch)
+
+	// dispatch.yml routes on bare command tokens; the catalog renders them as
+	// backtick-wrapped bullets (e.g. `/fs-triage`). Scope each pattern to its form
+	// so a command name embedded in a docs URL is not mistaken for a command.
+	dispatchCmdRE := regexp.MustCompile(`/fs-[a-z0-9-]+|/fullsend\b`)
+	catalogCmdRE := regexp.MustCompile("`(/fs-[a-z0-9-]+|/fullsend)`")
+
+	dispatchCmds := map[string]bool{}
+	for _, cmd := range dispatchCmdRE.FindAllString(dispatchStr, -1) {
+		dispatchCmds[cmd] = true
+	}
+	require.NotEmpty(t, dispatchCmds, "expected dispatch.yml to route on /fs-* commands")
+
+	catalogCmds := map[string]bool{}
+	for _, m := range catalogCmdRE.FindAllStringSubmatch(gettingStartedCatalog, -1) {
+		catalogCmds[m[1]] = true
+	}
+	require.NotEmpty(t, catalogCmds, "expected the per-repo catalog to document /fs-* commands")
+
+	// Forward: dispatch.yml commands must be documented (unless allow-listed).
+	for cmd := range dispatchCmds {
+		if commandsNotInPerRepoCatalog[cmd] {
+			continue
+		}
+		assert.True(t, catalogCmds[cmd],
+			"dispatch.yml routes on %s but the per-repo onboarding catalog does not document it "+
+				"(add it to gettingStartedCatalog, or to commandsNotInPerRepoCatalog if intentional)", cmd)
+	}
+
+	// Reverse: cataloged commands must actually be routed by dispatch.yml (the
+	// allow-list is applied here too so it stays symmetric with the forward check).
+	for cmd := range catalogCmds {
+		if commandsNotInPerRepoCatalog[cmd] {
+			continue
+		}
+		assert.True(t, dispatchCmds[cmd],
+			"per-repo onboarding catalog documents %s but dispatch.yml does not route on it", cmd)
+	}
+}
+
+// TestFreshInstallBodyIncludesCatalog verifies the fresh-install PR body carries
+// the Getting started catalog, so dropping the append is caught by CI.
+func TestFreshInstallBodyIncludesCatalog(t *testing.T) {
+	fc := forge.NewFakeClient()
+	notInstalled := false
+	meta := BuildScaffoldPRMetadata(context.Background(), fc, "acme", "widget", "v0.28.0",
+		ScaffoldMetadataOpts{GuardInstalled: &notInstalled})
+	assert.Contains(t, meta.PRBody, "## Getting started")
+	assert.Contains(t, meta.PRBody, "`/fs-triage`")
 }
 
 func TestRuntimeSection(t *testing.T) {
