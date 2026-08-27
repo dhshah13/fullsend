@@ -142,8 +142,8 @@ unset (`""`) falls through to parent, then to code default
 
 **`inference`** groups inference backend settings under a single YAML key
 (`inference:`) using the `PerRepoInferenceConfig` struct. Each subfield
-(`provider`, `project`, `region`, `wif_provider`) resolves independently
-through scalar override semantics:
+(`provider`, `project`, `region`, `wif_provider`, and the three under
+`openai`) resolves independently through scalar override semantics:
 
 - **`inference.provider`**: Inference provider identifier (e.g. `"vertex"`).
   Unset (`""`) falls through to parent, then to code default `"vertex"`.
@@ -161,7 +161,7 @@ through scalar override semantics:
 
 The `inference` pointer itself (`*PerRepoInferenceConfig`) uses nil to mean
 "no local inference settings" — if the entire `inference:` key is omitted
-from YAML, all four subfields fall through to the parent layer. If the key
+from YAML, all subfields fall through to the parent layer. If the key
 is present, each subfield is checked independently.
 
 Example:

@@ -31,12 +31,23 @@ through fullsend's table, and a bare id gets the provider from `FULLSEND_PI_PROV
 > and a bare id under `FULLSEND_PI_PROVIDER=xai-vertex`, case-insensitively, so both land on the
 > canonical spec.
 
-> **GPT via OpenAI** uses a runner-exchanged short-lived access token (WIF via the runner, or a
-> static `OPENAI_API_KEY` in the runner env for local runs) delivered as a credential placeholder
-> through a run-scoped OpenShell provider. The `fullsend-openai` profile scopes egress to
-> `POST /v1/responses` on `api.openai.com`. No OpenAI credential exists inside the sandbox at all
-> — [ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md). **Not yet exercised:** no live run
-> is recorded; the live end-to-end check is gated on external access.
+> **GPT via OpenAI** needs no API key in CI: the runner exchanges the job's GitHub identity for a
+> short-lived OpenAI token (set three repository variables — see [OpenAI Workload
+> Identity](../guides/infrastructure/openai-workload-identity.md); GitHub Actions only) and keeps it
+> in a provider that belongs to this run, refreshed before it expires and removed when the run
+> ends. Locally, put `OPENAI_API_KEY` in an env file for the runner ([Running agents
+> locally](../guides/user/running-agents-locally.md#get-an-openai-key-gpt-on-pi-only)). Declare
+> `providers: [openai]` on the harness; the sandbox can then reach `api.openai.com` for the
+> Responses API and nothing else, and never sees the credential
+> ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)). A custom harness must carry a
+> `policy:` (the fleet's `policies/base.yaml`); without one the image's default policy leaves an
+> uninspected route to `api.openai.com` and the run stops before the agent starts. **Exercised so
+> far:** the local static-key path end to end on 2026-08-27 (OpenShell 0.0.115, pi 0.84.3,
+> `gpt-5.6-luna`: placeholder in the sandbox, pi reading it from the runner-seeded `auth.json`, tool
+> calls through the hook adapter, run-scoped provider deleted at the end, expired in place under
+> `--keep-sandbox`), plus the placeholder-generation experiments recorded in the ADR. The WIF path
+> has no live run yet; `features/runtime/pi-openai.feature` stays gated on `runtime-pi-openai`
+> until an OpenAI organization is mapped to the pool repositories.
 
 Harness `model:` and `agents:` entry `model:` values accept the `provider/id` form directly
 (`xai-vertex/xai/grok-4.6`); a harness can also select a provider with a bare `model:` plus
