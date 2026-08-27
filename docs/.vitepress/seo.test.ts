@@ -4,7 +4,10 @@ import {
   canonicalUrl,
   globalSeoHead,
   isIndexablePage,
+  isNonContentPath,
+  isSitemapUrl,
   pageOutputPath,
+  pageRobotsHead,
   pageSeoHead,
 } from "./seo";
 
@@ -41,17 +44,23 @@ describe("canonicalUrl", () => {
     }
   });
 
-  it("resolves the root to the docs base URL", () => {
-    expect(canonicalUrl("index.md")).toBe("https://fullsend.sh/docs/");
+  it("resolves the redirecting root to its content destination", () => {
+    expect(canonicalUrl("index.md")).toBe("https://fullsend.sh/docs/guides/getting-started/");
   });
 
   it("resolves a directory index to a trailing-slash URL", () => {
     expect(canonicalUrl("agents/index.md")).toBe("https://fullsend.sh/docs/agents/");
   });
 
-  it("resolves a content page to its .html URL", () => {
+  it("resolves a content page to its .html URL when clean URLs are off", () => {
     expect(canonicalUrl("guides/user/jira-integration.md")).toBe(
       "https://fullsend.sh/docs/guides/user/jira-integration.html",
+    );
+  });
+
+  it("resolves a content page to the URL shape served by Cloudflare", () => {
+    expect(canonicalUrl("guides/user/jira-integration.md", true)).toBe(
+      "https://fullsend.sh/docs/guides/user/jira-integration",
     );
   });
 });
@@ -61,10 +70,11 @@ describe("pageSeoHead", () => {
     page: "agents/triage.md",
     title: "Triage Agent | Fullsend",
     description: "How the triage agent works",
+    cleanUrls: true,
   });
 
   it("emits a canonical link and og:url with the full docs URL", () => {
-    const url = "https://fullsend.sh/docs/agents/triage.html";
+    const url = "https://fullsend.sh/docs/agents/triage";
     expect(head).toContainEqual(["link", { rel: "canonical", href: url }]);
     expect(head).toContainEqual(["meta", { property: "og:url", content: url }]);
   });
@@ -89,6 +99,43 @@ describe("isIndexablePage", () => {
   it("treats content pages as indexable", () => {
     expect(isIndexablePage("index.md")).toBe(true);
     expect(isIndexablePage("agents/triage.md")).toBe(true);
+  });
+
+  it("excludes template and repo-metadata pages from canonical metadata", () => {
+    expect(isIndexablePage("experiments/0000-experiment-template/index.md")).toBe(false);
+    expect(isIndexablePage("experiments/example/RESULTS.md")).toBe(false);
+    expect(isIndexablePage("experiments/example/skills/check/SKILL.md")).toBe(false);
+  });
+});
+
+describe("isNonContentPath", () => {
+  it("uses the same classification for source paths and clean URLs", () => {
+    expect(isNonContentPath("ADRs/0000-adr-template.md")).toBe(true);
+    expect(isNonContentPath("experiments/0000-experiment-template/")).toBe(true);
+    expect(isNonContentPath("experiments/example/RESULTS")).toBe(true);
+    expect(isNonContentPath("experiments/example/results")).toBe(false);
+  });
+});
+
+describe("isSitemapUrl", () => {
+  it("excludes the redirecting root and non-content URLs", () => {
+    expect(isSitemapUrl("")).toBe(false);
+    expect(isSitemapUrl("/")).toBe(false);
+    expect(isSitemapUrl("experiments/0000-experiment-template/")).toBe(false);
+    expect(isSitemapUrl("experiments/example/SKILL")).toBe(false);
+  });
+
+  it("keeps normal experiment pages in the public sitemap", () => {
+    expect(isSitemapUrl("experiments/0026-eval-statistical-significance/")).toBe(true);
+  });
+});
+
+describe("pageRobotsHead", () => {
+  it("marks the directly reachable 404 asset noindex", () => {
+    expect(pageRobotsHead("404.md")).toEqual([
+      ["meta", { name: "robots", content: "noindex" }],
+    ]);
+    expect(pageRobotsHead("agents/triage.md")).toEqual([]);
   });
 });
 

@@ -2,17 +2,18 @@ import { defineConfig } from "vitepress";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DOCS_URL_BASE, globalSeoHead, isIndexablePage, pageSeoHead } from "./seo";
+import {
+  DOCS_URL_BASE,
+  globalSeoHead,
+  isIndexablePage,
+  isNonContentPath,
+  isSitemapUrl,
+  pageRobotsHead,
+  pageSeoHead,
+} from "./seo";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const docsDir = path.resolve(__dirname, "..");
-
-/** Non-content entry: template placeholder or repo-metadata (ALL-CAPS) name. */
-function isNonContent(entry: string): boolean {
-  if (/^0000-.*-template/.test(entry)) return true;
-  const base = entry.replace(/\.md$/, "");
-  return /^[A-Z][A-Z0-9_-]*$/.test(base);
-}
 
 function getMarkdownFiles(dir: string, base: string): { text: string; link: string }[] {
   const fullDir = path.resolve(docsDir, dir);
@@ -20,7 +21,7 @@ function getMarkdownFiles(dir: string, base: string): { text: string; link: stri
   const items: { text: string; link: string }[] = [];
   for (const entry of fs.readdirSync(fullDir).sort()) {
     const entryPath = path.resolve(fullDir, entry);
-    if (entry.endsWith(".md") && entry !== "README.md" && !isNonContent(entry)) {
+    if (entry.endsWith(".md") && entry !== "README.md" && !isNonContentPath(entry)) {
       const slug = entry.replace(/\.md$/, "");
       const content = fs.readFileSync(entryPath, "utf-8");
       const fmTitleMatch = content.match(/^title:\s*["']?(.+?)["']?\s*$/m);
@@ -29,7 +30,7 @@ function getMarkdownFiles(dir: string, base: string): { text: string; link: stri
     } else if (
       fs.statSync(entryPath).isDirectory() &&
       !entry.startsWith(".") &&
-      !isNonContent(entry)
+      !isNonContentPath(entry)
     ) {
       const readme = path.resolve(entryPath, "README.md");
       if (fs.existsSync(readme)) {
@@ -136,6 +137,7 @@ export default defineConfig({
   description: "Autonomous SDLC agents for your codebase",
 
   base: "/docs/",
+  cleanUrls: true,
 
   rewrites: {
     "README.md": "index.md",
@@ -167,18 +169,20 @@ export default defineConfig({
   // trailing slash) because VitePress resolves base-less page paths against it.
   sitemap: {
     hostname: DOCS_URL_BASE,
+    transformItems: (items) => items.filter((item) => isSitemapUrl(item.url)),
   },
 
   // Per-page canonical + Open Graph tags derived from the resolved page data.
   transformHead({ page, title, description, siteConfig }) {
-    if (!isIndexablePage(page)) return [];
-    return pageSeoHead({ page, title, description, cleanUrls: siteConfig.cleanUrls });
+    const robotsHead = pageRobotsHead(page);
+    if (!isIndexablePage(page)) return robotsHead;
+    return [
+      ...robotsHead,
+      ...pageSeoHead({ page, title, description, cleanUrls: siteConfig.cleanUrls }),
+    ];
   },
 
-  // Keep template placeholders (mirrors `isNonContent`'s `0000-*-template`
-  // rule) out of the build entirely, so they never reach the sitemap or get
-  // canonical/OG metadata and are not offered to search engines.
-  srcExclude: ["**/agents/icons/**", "**/testing/**", "**/0000-*-template.md"],
+  srcExclude: ["**/agents/icons/**", "**/testing/**"],
 
   ignoreDeadLinks: true,
 

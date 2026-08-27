@@ -27,6 +27,23 @@ export const DOCS_URL_BASE = `${SITE_ORIGIN}${DOCS_BASE}`;
  */
 export const OG_IMAGE = `${DOCS_URL_BASE}img/logo.png`;
 
+/** Canonical destinations for pages that are redirects rather than content. */
+const CANONICAL_REDIRECTS: Record<string, string> = {
+  "index.md": "guides/getting-started/",
+};
+
+/** Non-content path: template placeholder or repo-metadata (ALL-CAPS) name. */
+export function isNonContentPath(pageOrUrl: string): boolean {
+  const pathOnly = pageOrUrl.split(/[?#]/, 1)[0];
+  return pathOnly
+    .split("/")
+    .filter(Boolean)
+    .some((segment) => {
+      const base = segment.replace(/\.(?:html|md)$/, "");
+      return /^0000-.*-template$/.test(base) || /^[A-Z][A-Z0-9_-]*$/.test(base);
+    });
+}
+
 /**
  * Convert a VitePress page path (the post-rewrite source path, e.g. "index.md",
  * "agents/index.md", "guides/user/jira-integration.md") into the site-relative
@@ -45,7 +62,8 @@ export function pageOutputPath(page: string, cleanUrls = false): string {
 
 /** Absolute canonical URL for a page, including the `/docs/` base. */
 export function canonicalUrl(page: string, cleanUrls = false): string {
-  return new URL(pageOutputPath(page, cleanUrls), DOCS_URL_BASE).href;
+  const outputPath = CANONICAL_REDIRECTS[page] ?? pageOutputPath(page, cleanUrls);
+  return new URL(outputPath, DOCS_URL_BASE).href;
 }
 
 export interface PageSeoInput {
@@ -79,12 +97,30 @@ export function pageSeoHead({
 }
 
 /**
- * Whether a page should advertise a self-canonical / OG URL to crawlers.
- * The 404 page is served for unknown paths and must not declare itself
- * canonical, or crawlers would treat the not-found page as indexable.
+ * Whether a page should advertise a canonical / OG URL to crawlers.
+ * VitePress emits `404.html` as a directly reachable asset, while the deployed
+ * Worker's SPA fallback handles unknown paths separately. The 404 asset and
+ * non-content files must not advertise canonical content URLs. Tag omission by
+ * itself is not a `noindex` signal; {@link pageRobotsHead} supplies that for 404.
  */
 export function isIndexablePage(page: string): boolean {
-  return page !== "404.md";
+  return page !== "404.md" && !isNonContentPath(page);
+}
+
+/** Robots metadata for pages that must not enter search indexes. */
+export function pageRobotsHead(page: string): HeadConfig[] {
+  return page === "404.md" ? [["meta", { name: "robots", content: "noindex" }]] : [];
+}
+
+/**
+ * Whether a generated sitemap URL represents public content.
+ * The root is a meta-refresh redirect, so advertise its canonical destination
+ * instead. Normal experiment pages remain public; only their templates and
+ * repo-metadata pages are filtered with the same rule used by navigation.
+ */
+export function isSitemapUrl(url: string): boolean {
+  const normalized = url.replace(/^\/+|\/+$/g, "");
+  return normalized !== "" && !isNonContentPath(normalized);
 }
 
 /** Site-wide SEO head tags that are identical on every page. */
