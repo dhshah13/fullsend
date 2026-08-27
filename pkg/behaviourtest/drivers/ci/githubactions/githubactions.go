@@ -15,10 +15,22 @@ import (
 )
 
 const (
-	pollInterval   = 15 * time.Second
-	dispatchWait   = 12 * time.Minute
-	dispatchPoll   = 5 * time.Second
-	dispatchMaxTry = 48
+	pollInterval = 15 * time.Second
+	dispatchWait = 12 * time.Minute
+
+	// Dispatch detection uses exponential backoff: the poll interval
+	// starts at dispatchPollInit, doubles each iteration up to
+	// dispatchPollMax, and the total detection window is dispatchTimeout.
+	// This replaces the previous fixed dispatchPoll × dispatchMaxTry
+	// window to tolerate transient GitHub Actions dispatch latency.
+	dispatchPollInit = 2 * time.Second
+	dispatchPollMax  = 30 * time.Second
+	dispatchTimeout  = 5 * time.Minute
+
+	// countSettlePoll is the fixed poll interval used by
+	// CountHarnessDispatches while waiting for in-progress runs to
+	// reach a terminal state.
+	countSettlePoll = 5 * time.Second
 
 	artifactRunPoll = 5 * time.Second
 	artifactRunWait = 5 * time.Minute
@@ -59,15 +71,27 @@ func (d *Driver) timerAfter(dur time.Duration) <-chan time.Time {
 	return time.After(dur)
 }
 
+// nextBackoff doubles current, capping at max.
+func nextBackoff(current, max time.Duration) time.Duration {
+	next := current * 2
+	if next > max {
+		return max
+	}
+	return next
+}
+
 func (d *Driver) WaitForWorkflow(ctx context.Context, owner, repo, workflowFile string, after time.Time, event string) (*forge.WorkflowRun, error) {
 	workflowFile = filepath.Base(workflowFile)
 	var triageRun *forge.WorkflowRun
-	for attempt := 0; attempt < dispatchMaxTry; attempt++ {
+	deadline := time.Now().Add(dispatchTimeout)
+	interval := dispatchPollInit
+	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-d.timerAfter(dispatchPoll):
+		case <-d.timerAfter(interval):
 		}
+		interval = nextBackoff(interval, dispatchPollMax)
 		runs, err := d.Client.ListWorkflowRuns(ctx, owner, repo, workflowFile)
 		if err != nil {
 			continue
@@ -87,7 +111,7 @@ func (d *Driver) WaitForWorkflow(ctx context.Context, owner, repo, workflowFile 
 		return nil, fmt.Errorf("workflow %s was not dispatched", workflowFile)
 	}
 
-	deadline := time.Now().Add(dispatchWait)
+	deadline = time.Now().Add(dispatchWait)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -530,12 +554,14 @@ func (d *Driver) runHasAgentJob(ctx context.Context, owner, repo string, runID i
 func (d *Driver) WaitForHarnessAgent(ctx context.Context, owner, repo, agent string, after time.Time) (*forge.WorkflowRun, error) {
 	artifactName := "fullsend-" + agent
 	deadline := time.Now().Add(dispatchWait)
+	interval := dispatchPollInit
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-d.timerAfter(dispatchPoll):
+		case <-d.timerAfter(interval):
 		}
+		interval = nextBackoff(interval, dispatchPollMax)
 
 		// Quick-success: check for the agent's artifact (a completed
 		// harness job uploads fullsend-{agent}).
@@ -597,13 +623,15 @@ func (d *Driver) WaitForHarnessAgent(ctx context.Context, owner, repo, agent str
 func (d *Driver) WaitForFailedHarnessAgent(ctx context.Context, owner, repo, agent string, after time.Time) (*forge.WorkflowRun, error) {
 	artifactName := "fullsend-" + agent
 	deadline := time.Now().Add(dispatchWait)
+	interval := dispatchPollInit
 	var lastJobErr error
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-d.timerAfter(dispatchPoll):
+		case <-d.timerAfter(interval):
 		}
+		interval = nextBackoff(interval, dispatchPollMax)
 
 		// Artifact-first: resolve the agent's run from its artifact and
 		// inspect the run conclusion.
@@ -695,7 +723,7 @@ func (d *Driver) CountHarnessDispatches(ctx context.Context, owner, repo, agent 
 		select {
 		case <-ctx.Done():
 			return 0, ctx.Err()
-		case <-time.After(dispatchPoll):
+		case <-time.After(countSettlePoll):
 		}
 	}
 }
