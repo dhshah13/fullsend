@@ -818,29 +818,83 @@ func TestReconcileReposContent(t *testing.T) {
 		"shared Getting started block should be appended to both the enroll and update PR bodies")
 }
 
+// commandsNotInOnboardingCatalog lists slash commands that dispatch.yml routes
+// on but that are deliberately omitted from the user-facing onboarding catalog,
+// so the omission is a recorded decision rather than a regex accident. Anything
+// routed by dispatch.yml and not listed here must appear in the catalog.
+//   - /fullsend: backward-compat alias for the /fs-retro form; /fs-retro is the
+//     primary command documented in the catalog.
+var commandsNotInOnboardingCatalog = map[string]bool{
+	"/fullsend": true,
+}
+
+// extractGettingStartedSection returns the body of the GETTING_STARTED_SECTION
+// shell assignment in reconcile-repos.sh — the exact block rendered into the
+// onboarding PR bodies. Assertions scope to this block rather than the whole
+// script so a command name appearing in an unrelated comment or code path cannot
+// satisfy the catalog guard.
+func extractGettingStartedSection(t *testing.T, scriptStr string) string {
+	t.Helper()
+	const marker = `GETTING_STARTED_SECTION="`
+	start := strings.Index(scriptStr, marker)
+	require.GreaterOrEqual(t, start, 0,
+		"expected GETTING_STARTED_SECTION assignment in reconcile-repos.sh")
+	rest := scriptStr[start+len(marker):]
+	// The block contains no embedded double quotes, so the next quote closes it.
+	end := strings.Index(rest, `"`)
+	require.GreaterOrEqual(t, end, 0,
+		"GETTING_STARTED_SECTION assignment should be closed with a double quote")
+	return rest[:end]
+}
+
 // TestReconcileReposSlashCommandCatalog guards against the onboarding PR body's
-// slash-command catalog drifting from dispatch.yml's routing. Every /fs-* command
-// that dispatch.yml routes on must be documented in reconcile-repos.sh's PR body,
-// so a command added/renamed in dispatch.yml without updating the catalog fails CI.
+// slash-command catalog drifting from dispatch.yml's routing, in both directions:
+//   - forward: every command dispatch.yml routes on (except deliberately-omitted
+//     aliases in commandsNotInOnboardingCatalog) must appear in the catalog, so a
+//     command added/renamed in dispatch.yml without updating the catalog fails CI.
+//   - reverse: every command documented in the catalog must actually be routed by
+//     dispatch.yml, so a command removed from dispatch.yml but left in the
+//     user-facing catalog also fails CI.
+//
+// The command pattern permits digits and hyphens so a hyphenated command (e.g.
+// /fs-fix-stop) is matched in full rather than truncated to a prefix, and the
+// /fullsend alias form is matched explicitly.
 func TestReconcileReposSlashCommandCatalog(t *testing.T) {
 	dispatch, err := FullsendRepoFile(".github/workflows/dispatch.yml")
 	require.NoError(t, err)
+	dispatchStr := string(dispatch)
 	script, err := FullsendRepoFile("scripts/reconcile-repos.sh")
 	require.NoError(t, err)
-	scriptStr := string(script)
 
-	cmdRE := regexp.MustCompile(`/fs-[a-z]+`)
-	matches := cmdRE.FindAllString(string(dispatch), -1)
-	require.NotEmpty(t, matches, "expected dispatch.yml to route on /fs-* commands")
+	catalog := extractGettingStartedSection(t, string(script))
 
+	cmdRE := regexp.MustCompile(`/fs-[a-z0-9-]+|/fullsend\b`)
+
+	// Forward: dispatch.yml commands must be documented (unless allow-listed).
+	dispatchCmds := cmdRE.FindAllString(dispatchStr, -1)
+	require.NotEmpty(t, dispatchCmds, "expected dispatch.yml to route on /fs-* commands")
 	seen := map[string]bool{}
-	for _, cmd := range matches {
-		if seen[cmd] {
+	for _, cmd := range dispatchCmds {
+		if seen[cmd] || commandsNotInOnboardingCatalog[cmd] {
 			continue
 		}
 		seen[cmd] = true
-		assert.Contains(t, scriptStr, cmd,
-			"dispatch.yml routes on %s but reconcile-repos.sh onboarding PR body does not document it", cmd)
+		assert.Contains(t, catalog, cmd,
+			"dispatch.yml routes on %s but the onboarding catalog does not document it "+
+				"(add it to GETTING_STARTED_SECTION, or to commandsNotInOnboardingCatalog if intentional)", cmd)
+	}
+
+	// Reverse: cataloged commands must actually be routed by dispatch.yml.
+	catalogCmds := cmdRE.FindAllString(catalog, -1)
+	require.NotEmpty(t, catalogCmds, "expected the onboarding catalog to document /fs-* commands")
+	seenCatalog := map[string]bool{}
+	for _, cmd := range catalogCmds {
+		if seenCatalog[cmd] {
+			continue
+		}
+		seenCatalog[cmd] = true
+		assert.Contains(t, dispatchStr, cmd,
+			"onboarding catalog documents %s but dispatch.yml does not route on it", cmd)
 	}
 }
 
