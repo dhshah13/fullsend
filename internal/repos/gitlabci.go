@@ -114,6 +114,12 @@ func UnmergeGitLabCI(existing []byte) ([]byte, error) {
 
 // newGitLabCI returns a minimal .gitlab-ci.yml for a repo that has no
 // existing CI config. This matches the embedded scaffold template.
+//
+// Note: newGitLabCI generates a workflow.name field, but MergeGitLabCI
+// intentionally does not add workflow.name when merging into an existing
+// file. New repos get a descriptive workflow name; existing repos keep
+// whatever name they already have (or none). This avoids overwriting
+// user-chosen pipeline names.
 func newGitLabCI() ([]byte, error) {
 	content := `---
 include:
