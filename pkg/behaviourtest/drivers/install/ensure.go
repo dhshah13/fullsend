@@ -180,7 +180,30 @@ func (e *repoEnsurer) doEnsure(ctx context.Context, org, repoName string) error 
 // pre-review shallow-clone deepening step takes 12+ minutes fetching
 // the bloated history. A fresh repo starts with just the auto_init
 // commit. No-op when the repo does not exist.
+//
+// Fork repos derived from the source (e.g. test-repo-01-fork) are
+// deleted first. When a source repo is deleted and recreated, existing
+// forks become orphaned — the fork creation step then fails because
+// the fork repo exists but isn't a valid fork of the new source.
 func (e *repoEnsurer) resetRepo(ctx context.Context, org, repoName, target string) error {
+	// Delete fork repos before the source so they don't become orphaned.
+	forkName := repoName + "-fork"
+	forkTarget := org + "/" + forkName
+	if _, forkErr := e.client.GetRepo(ctx, org, forkName); forkErr == nil {
+		e.logf("[ensure] deleting fork %s before source reset", forkTarget)
+		if err := e.client.DeleteRepo(ctx, org, forkName); err != nil {
+			if !forge.IsNotFound(err) {
+				return fmt.Errorf("deleting fork repo %s for reset: %w", forkTarget, err)
+			}
+		} else {
+			if err := e.awaitDeletion(ctx, org, forkName, forkTarget); err != nil {
+				return err
+			}
+		}
+	} else if !forge.IsNotFound(forkErr) {
+		return fmt.Errorf("checking fork repo %s for reset: %w", forkTarget, forkErr)
+	}
+
 	_, err := e.client.GetRepo(ctx, org, repoName)
 	if err != nil {
 		if forge.IsNotFound(err) {

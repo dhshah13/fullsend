@@ -114,6 +114,14 @@ type stubClient struct {
 	deleteRepoErr    error
 	deleteRepoCalled atomic.Int32
 
+	// forkExists controls whether GetRepo returns success for fork
+	// repos (names ending in "-fork"). When false (default), fork
+	// repos return ErrNotFound, preventing fork cleanup from
+	// interfering with source-repo-focused tests.
+	forkExists       bool
+	forkDeleteErr    error
+	forkDeleteCalled atomic.Int32
+
 	// installed controls whether GetFileContent returns valid
 	// post-install files. When false, all paths return ErrNotFound.
 	installed bool
@@ -128,9 +136,15 @@ type stubClient struct {
 	getWorkflowCalled atomic.Int32
 }
 
-func (s *stubClient) GetRepo(_ context.Context, _, _ string) (*forge.Repository, error) {
+func (s *stubClient) GetRepo(_ context.Context, _, repo string) (*forge.Repository, error) {
 	if s.ensureDelay > 0 {
 		time.Sleep(s.ensureDelay)
+	}
+	if strings.HasSuffix(repo, "-fork") {
+		if !s.forkExists {
+			return nil, forge.ErrNotFound
+		}
+		return &forge.Repository{}, nil
 	}
 	return &forge.Repository{}, s.getRepoErr
 }
@@ -146,7 +160,15 @@ func (s *stubClient) CreateRepo(_ context.Context, _, _, _ string, _ bool) (*for
 	return &forge.Repository{}, nil
 }
 
-func (s *stubClient) DeleteRepo(_ context.Context, _, _ string) error {
+func (s *stubClient) DeleteRepo(_ context.Context, _, repo string) error {
+	if strings.HasSuffix(repo, "-fork") {
+		s.forkDeleteCalled.Add(1)
+		if s.forkDeleteErr != nil {
+			return s.forkDeleteErr
+		}
+		s.forkExists = false
+		return nil
+	}
 	s.deleteRepoCalled.Add(1)
 	if s.deleteRepoErr != nil {
 		return s.deleteRepoErr
@@ -765,6 +787,56 @@ func TestResetRepo_DeleteNotFound_IsIdempotent(t *testing.T) {
 
 	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
 	require.NoError(t, err, "ErrNotFound from delete should be treated as success (race-safe)")
+}
+
+// --- resetRepo fork cleanup tests ---
+
+func TestResetRepo_DeletesForkBeforeSource(t *testing.T) {
+	speedUpResetRetries(t)
+	sc := &stubClient{forkExists: true}
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), sc.forkDeleteCalled.Load(), "fork should be deleted before source reset")
+	assert.Equal(t, int32(1), sc.deleteRepoCalled.Load(), "source should be deleted")
+}
+
+func TestResetRepo_SkipsForkDeleteWhenForkMissing(t *testing.T) {
+	sc := &stubClient{} // forkExists defaults to false
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.NoError(t, err)
+	assert.Equal(t, int32(0), sc.forkDeleteCalled.Load(), "fork should not be deleted when absent")
+	assert.Equal(t, int32(1), sc.deleteRepoCalled.Load(), "source should still be deleted")
+}
+
+func TestResetRepo_PropagatesForkDeleteError(t *testing.T) {
+	sc := &stubClient{
+		forkExists:    true,
+		forkDeleteErr: fmt.Errorf("permission denied"),
+	}
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "deleting fork repo")
+	assert.Contains(t, err.Error(), "permission denied")
+	assert.Equal(t, int32(1), sc.forkDeleteCalled.Load())
+}
+
+func TestResetRepo_ForkDeleteNotFound_ContinuesToSource(t *testing.T) {
+	speedUpResetRetries(t)
+	sc := &stubClient{
+		forkExists:    true,
+		forkDeleteErr: forge.ErrNotFound,
+	}
+	e := &repoEnsurer{client: sc, logf: t.Logf}
+
+	err := e.resetRepo(context.Background(), "org", "repo", "org/repo")
+	require.NoError(t, err, "ErrNotFound from fork delete should not block source reset")
+	assert.Equal(t, int32(1), sc.deleteRepoCalled.Load(), "source should still be deleted")
 }
 
 // speedUpResetRetries sets resetRetryDelay to zero for fast tests
