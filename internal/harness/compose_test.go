@@ -2612,6 +2612,12 @@ func TestIsFullsendCachePath(t *testing.T) {
 	cachePath, err := fetch.CachePath(workspaceRoot, strings.Repeat("a", 64))
 	require.NoError(t, err)
 
+	// Build a relative cache path as dispatch produces when WorkspaceRoot
+	// is "." (filepath.Dir(".fullsend") == ".").
+	relCachePath, err := fetch.CachePath(".", strings.Repeat("b", 64))
+	require.NoError(t, err)
+	relCacheContentPath := filepath.Join(relCachePath, "content")
+
 	tests := []struct {
 		name          string
 		path          string
@@ -2625,6 +2631,19 @@ func TestIsFullsendCachePath(t *testing.T) {
 		{"absolute path outside cache root", filepath.Join(string(filepath.Separator), "etc", "passwd"), workspaceRoot, false},
 		{"absolute path under an unrelated sibling directory", filepath.Join(workspaceRoot, "other", ".fullsend-cache", "x"), workspaceRoot, false},
 		{"absolute path with cache dir name as a prefix, not a parent", filepath.Join(workspaceRoot, ".fullsend-cache-evil", "x"), workspaceRoot, false},
+		// Relative WorkspaceRoot: cache paths from CachePath(".") are
+		// relative, e.g. ".fullsend-cache/resources/sha256/<hash>".
+		// isFullsendCachePath must still recognise them.
+		{"relative cache path with relative workspace root", relCacheContentPath, ".", true},
+		{"relative non-cache path with relative workspace root", "agents/triage.md", ".", false},
+		// Edge case: cache directory itself (rel == ".") — the directory is
+		// considered part of the cache tree, matching the existing guard
+		// (rel != ".." && !HasPrefix(rel, "../")).
+		{"cache directory itself", filepath.Join(workspaceRoot, ".fullsend-cache"), workspaceRoot, true},
+		{"relative cache directory itself", ".fullsend-cache", ".", true},
+		// Exact parent traversal: p is the workspace root itself, so
+		// filepath.Rel returns ".." which the guard rejects.
+		{"workspace root is not a cache path", workspaceRoot, workspaceRoot, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -4491,6 +4510,191 @@ func TestFetchBaseFile_FetchURLError(t *testing.T) {
 	assert.Contains(t, err.Error(), "fetching")
 }
 
+func TestFetchBaseFile_PreservesExtension(t *testing.T) {
+	tests := []struct {
+		name       string
+		relPath    string
+		wantSuffix string
+	}{
+		{"yaml extension", "profiles/vertex-ai.yaml", "content.yaml"},
+		{"yml extension", "profiles/vertex-ai.yml", "content.yml"},
+		{"no extension", "scripts/setup", "content"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name+" cache hit", func(t *testing.T) {
+			dir := t.TempDir()
+			cacheDir := filepath.Join(dir, "cache")
+
+			content := []byte("# test content")
+			fileURL := "https://example.com/" + tc.relPath
+			require.NoError(t, fetch.CachePut(cacheDir, fileURL, content))
+			hash := fetch.ComputeSHA256(content)
+			require.NoError(t, urlIndexPut(cacheDir, fileURL, hash))
+
+			_, cachePath, err := fetchBaseFile(context.Background(), "test", "https://example.com/",
+				tc.relPath, []string{"https://example.com/"}, ComposeOpts{
+					WorkspaceRoot: cacheDir,
+				}, "resource", false)
+			require.NoError(t, err)
+			assert.True(t, strings.HasSuffix(cachePath, tc.wantSuffix),
+				"cache path %q should end with %q", cachePath, tc.wantSuffix)
+
+			got, err := os.ReadFile(cachePath)
+			require.NoError(t, err)
+			assert.Equal(t, content, got, "content should be readable via returned path")
+		})
+
+		t.Run(tc.name+" fresh fetch", func(t *testing.T) {
+			content := []byte("# fresh content")
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(content)
+			}))
+			t.Cleanup(server.Close)
+
+			policy := fetch.NewTestPolicy(
+				server.Client().Transport.(*http.Transport).TLSClientConfig,
+				[]string{"127.0.0.1"},
+				[]string{server.Listener.Addr().String()[len("127.0.0.1:"):]},
+			)
+
+			dir := t.TempDir()
+			cacheDir := filepath.Join(dir, "cache")
+
+			_, cachePath, err := fetchBaseFile(context.Background(), "test", server.URL+"/",
+				tc.relPath, []string{server.URL + "/"}, ComposeOpts{
+					WorkspaceRoot: cacheDir,
+					FetchPolicy:   policy,
+				}, "resource", false)
+			require.NoError(t, err)
+			assert.True(t, strings.HasSuffix(cachePath, tc.wantSuffix),
+				"cache path %q should end with %q", cachePath, tc.wantSuffix)
+
+			got, err := os.ReadFile(cachePath)
+			require.NoError(t, err)
+			assert.Equal(t, content, got, "content should be readable via returned path")
+		})
+	}
+}
+
+func TestFetchBaseFile_SymlinkError(t *testing.T) {
+	t.Run("cache hit", func(t *testing.T) {
+		dir := t.TempDir()
+		cacheDir := filepath.Join(dir, "cache")
+
+		content := []byte("# test content")
+		relPath := "profiles/vertex-ai.yaml"
+		fileURL := "https://example.com/" + relPath
+		require.NoError(t, fetch.CachePut(cacheDir, fileURL, content))
+		hash := fetch.ComputeSHA256(content)
+		require.NoError(t, urlIndexPut(cacheDir, fileURL, hash))
+
+		hashDir, err := fetch.CachePath(cacheDir, hash)
+		require.NoError(t, err)
+		require.NoError(t, os.Chmod(hashDir, 0o555))
+		t.Cleanup(func() { os.Chmod(hashDir, 0o755) })
+
+		_, _, err = fetchBaseFile(context.Background(), "test", "https://example.com/",
+			relPath, []string{"https://example.com/"}, ComposeOpts{
+				WorkspaceRoot: cacheDir,
+			}, "resource", false)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "creating extension symlink")
+	})
+
+	t.Run("fresh fetch", func(t *testing.T) {
+		content := []byte("# fresh content")
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write(content)
+		}))
+		t.Cleanup(server.Close)
+
+		policy := fetch.NewTestPolicy(
+			server.Client().Transport.(*http.Transport).TLSClientConfig,
+			[]string{"127.0.0.1"},
+			[]string{server.Listener.Addr().String()[len("127.0.0.1:"):]},
+		)
+
+		dir := t.TempDir()
+		cacheDir := filepath.Join(dir, "cache")
+
+		relPath := "profiles/vertex-ai.yaml"
+		hash := fetch.ComputeSHA256(content)
+		hashDir, cpErr := fetch.CachePath(cacheDir, hash)
+		require.NoError(t, cpErr)
+
+		// Pre-populate content so CachePut succeeds, then delete the
+		// URL index so urlIndexLookup misses and the fresh-fetch path
+		// is taken. Place a directory at the symlink target so
+		// os.Rename in CacheNamedSymlink fails with EISDIR.
+		require.NoError(t, fetch.CachePut(cacheDir, server.URL+"/"+relPath, content))
+		os.Remove(urlIndexPath(cacheDir))
+		require.NoError(t, os.MkdirAll(filepath.Join(hashDir, "content.yaml", "blocker"), 0o755))
+
+		_, _, err := fetchBaseFile(context.Background(), "test", server.URL+"/",
+			relPath, []string{server.URL + "/"}, ComposeOpts{
+				WorkspaceRoot: cacheDir,
+				FetchPolicy:   policy,
+			}, "resource", false)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "creating extension symlink")
+	})
+}
+
+// TestLoadWithBase_URLBase_ProfilesPassValidateWithRelativeWorkspace verifies
+// that cached profile paths pass Validate() even when WorkspaceRoot is
+// relative — the scenario from #6348 where "content" (no extension) caused
+// Validate to reject openshell.profiles entries.
+func TestLoadWithBase_URLBase_ProfilesPassValidateWithRelativeWorkspace(t *testing.T) {
+	profileContent := []byte("id: claude-code\nnetwork:\n  egress:\n    - host: api.example.com\n")
+
+	baseContent := []byte(`
+agent: agents/triage.md
+role: test
+openshell:
+  profiles:
+  - profiles/claude-code.yaml
+`)
+
+	server, policy := setupScriptTestServer(t, baseContent, map[string][]byte{
+		"/profiles/claude-code.yaml": profileContent,
+	})
+
+	hash := computeHash(baseContent)
+
+	// Use a relative workspace root to reproduce the scenario where
+	// cache paths are relative and Validate() checks the extension.
+	origDir, err := os.Getwd()
+	require.NoError(t, err)
+	tmpDir := t.TempDir()
+	require.NoError(t, os.Chdir(tmpDir))
+	t.Cleanup(func() { os.Chdir(origDir) })
+
+	relCache := "rel-cache"
+	require.NoError(t, os.MkdirAll(relCache, 0o755))
+
+	baseURL := server.URL + "/harness/triage.yaml#sha256=" + hash
+	childYAML := fmt.Sprintf("role: test\nbase: %s\n", baseURL)
+	childPath := filepath.Join(tmpDir, "child.yaml")
+	require.NoError(t, os.WriteFile(childPath, []byte(childYAML), 0o644))
+
+	h, _, err := LoadWithBase(context.Background(), childPath, ComposeOpts{
+		WorkspaceRoot: relCache,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{server.URL + "/"},
+	})
+	require.NoError(t, err, "LoadWithBase should not fail — cached profile path should pass Validate()")
+
+	require.Len(t, h.OpenShellProfiles(), 1)
+	profilePath := h.OpenShellProfiles()[0]
+	assert.True(t, strings.HasSuffix(profilePath, ".yaml"),
+		"profile cache path %q should preserve .yaml extension", profilePath)
+
+	got, readErr := os.ReadFile(profilePath)
+	require.NoError(t, readErr)
+	assert.Equal(t, profileContent, got)
+}
+
 func TestFetchBaseSkill_CacheHit_AuditError(t *testing.T) {
 	dir := t.TempDir()
 	cacheDir := filepath.Join(dir, "cache")
@@ -5725,6 +5929,88 @@ role: review
 		"agent should be an absolute cache path from base resolution, got %q", h.Agent)
 	assert.True(t, filepath.IsAbs(h.PreScript),
 		"pre_script should be an absolute cache path from base resolution, got %q", h.PreScript)
+}
+
+func TestLoadWithBase_SourceURL_WithBase_RelativeWorkspaceRoot(t *testing.T) {
+	// Regression: dispatch sets WorkspaceRoot to filepath.Dir(configDir),
+	// which is "." when configDir is ".fullsend". CachePath then returns
+	// relative paths like ".fullsend-cache/resources/sha256/<hash>/content".
+	// The post-merge SourceURL resolution must skip these relative cache
+	// paths instead of trying to fetch them from the SourceURL host (which
+	// produced a 404 in CI for the remote-child variant).
+
+	agentContent := []byte("# base agent (resolved to cache path by base composition)")
+
+	baseContent := []byte(`
+agent: agents/base.md
+role: review
+model: opus
+`)
+	baseHash := computeHash(baseContent)
+
+	// t.Chdir changes the process's working directory to a temp dir and
+	// restores it when the test finishes. This lets us pass "." as the
+	// relative WorkspaceRoot — the same value dispatch produces.
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	// Track requests to detect spurious fetches of cache paths.
+	var requestedPaths []string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPaths = append(requestedPaths, r.URL.Path)
+		switch r.URL.Path {
+		case "/base.yaml":
+			w.Write(baseContent)
+		case "/agents/base.md":
+			w.Write(agentContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	policy := fetch.NewTestPolicy(
+		server.Client().Transport.(*http.Transport).TLSClientConfig,
+		[]string{"127.0.0.1"},
+		[]string{server.Listener.Addr().String()[len("127.0.0.1:"):]},
+	)
+
+	baseURL := server.URL + "/base.yaml#sha256=" + baseHash
+
+	// URL-sourced child referencing a URL base. The child declares no
+	// agent — it inherits from the base. This matches the remote-child
+	// variant that failed in CI.
+	childHarness := fmt.Sprintf(`
+base: %s
+role: review
+`, baseURL)
+
+	harnessPath := writeTestHarness(t, dir, "review.yaml", childHarness)
+	sourceURL := server.URL + "/harness/review.yaml"
+	allowlist := []string{server.URL + "/"}
+
+	// Key: pass "." as WorkspaceRoot, simulating dispatch where
+	// WorkspaceRoot = filepath.Dir(".fullsend") = ".". Cache paths will
+	// be relative (e.g. ".fullsend-cache/resources/sha256/<hash>/content")
+	// and isFullsendCachePath must still recognise them.
+	h, _, err := LoadWithBase(context.Background(), harnessPath, ComposeOpts{
+		WorkspaceRoot:      ".",
+		FetchPolicy:        policy,
+		OrgAllowlist:       allowlist,
+		SourceURL:          sourceURL,
+		allowSelfAllowlist: true,
+	})
+	require.NoError(t, err)
+
+	// The agent field should be a cache path (not re-fetched from the SourceURL).
+	assert.Contains(t, h.Agent, ".fullsend-cache",
+		"agent should be a cache path from base resolution, got %q", h.Agent)
+
+	// Verify that no request tried to fetch a .fullsend-cache path from the server.
+	for _, p := range requestedPaths {
+		assert.NotContains(t, p, ".fullsend-cache",
+			"server should not have received a request for a cache path, got %q", p)
+	}
 }
 
 func TestLoadWithBase_SourceURL_WithBase_ResolvesChildScripts(t *testing.T) {
@@ -8038,4 +8324,455 @@ base: `+baseURL+`
 		}
 	}
 	assert.True(t, foundPlugin, "should have plugin dependency")
+}
+
+func TestLoadWithBase_OverlayConcatBothHaveOverlays(t *testing.T) {
+	dir := t.TempDir()
+
+	// With first-match-wins, cross-concern scenarios need combined entries.
+	// Base overlays come first in the concatenated list; child appended after.
+	// The first matching entry wins — a child entry with a more-specific when
+	// shadows base entries.
+	baseContent := `
+agent: agents/test.md
+role: fix
+overlays:
+- when: 'event.source.system == "github"'
+  pre_script: scripts/base-gh.sh
+- when: 'event.source.system == "jira"'
+  pre_script: scripts/base-jira.sh
+`
+	childContent := `
+base: base.yaml
+overlays:
+- when: 'event.source.system == "github"'
+  pre_script: scripts/child-gh.sh
+  post_script: scripts/child-post.sh
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "base.yaml"), []byte(baseContent), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "child.yaml"), []byte(childContent), 0o644))
+
+	h, _, err := LoadWithBase(context.Background(), filepath.Join(dir, "child.yaml"), ComposeOpts{
+		WorkspaceRoot: dir,
+		Event:         map[string]any{"source": map[string]any{"system": "github"}},
+	})
+	require.NoError(t, err)
+	// Base overlay is first in concat order and matches → first-match-wins
+	assert.Equal(t, "scripts/base-gh.sh", h.PreScript)
+	// Child overlay not reached because base entry matched first
+	assert.Empty(t, h.PostScript)
+}
+
+func TestLoadWithBase_OverlayConcatOnlyBaseHasOverlays(t *testing.T) {
+	dir := t.TempDir()
+
+	baseContent := `
+agent: agents/test.md
+role: fix
+overlays:
+- when: 'event.source.system == "github"'
+  pre_script: scripts/gh.sh
+`
+	childContent := `
+base: base.yaml
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "base.yaml"), []byte(baseContent), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "child.yaml"), []byte(childContent), 0o644))
+
+	h, _, err := LoadWithBase(context.Background(), filepath.Join(dir, "child.yaml"), ComposeOpts{
+		WorkspaceRoot: dir,
+		Event:         map[string]any{"source": map[string]any{"system": "github"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/gh.sh", h.PreScript)
+}
+
+func TestLoadWithBase_OverlayConcatOnlyChildHasOverlays(t *testing.T) {
+	dir := t.TempDir()
+
+	baseContent := `
+agent: agents/test.md
+role: fix
+pre_script: scripts/base.sh
+`
+	childContent := `
+base: base.yaml
+overlays:
+- when: 'event.source.system == "github"'
+  pre_script: scripts/child-gh.sh
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "base.yaml"), []byte(baseContent), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "child.yaml"), []byte(childContent), 0o644))
+
+	h, _, err := LoadWithBase(context.Background(), filepath.Join(dir, "child.yaml"), ComposeOpts{
+		WorkspaceRoot: dir,
+		Event:         map[string]any{"source": map[string]any{"system": "github"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/child-gh.sh", h.PreScript)
+}
+
+func TestLoadWithBase_OverlayResolution(t *testing.T) {
+	dir := t.TempDir()
+
+	baseContent := `
+agent: agents/test.md
+role: fix
+pre_script: scripts/base.sh
+`
+	childContent := `
+base: base.yaml
+overlays:
+- when: 'event.source.system == "github"'
+  pre_script: scripts/gh.sh
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "base.yaml"), []byte(baseContent), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "child.yaml"), []byte(childContent), 0o644))
+
+	h, _, err := LoadWithBase(context.Background(), filepath.Join(dir, "child.yaml"), ComposeOpts{
+		WorkspaceRoot: dir,
+		Event:         map[string]any{"source": map[string]any{"system": "github"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "scripts/gh.sh", h.PreScript)
+	assert.Nil(t, h.Overlays)
+}
+
+func TestLoadWithBase_URLBase_OverlayScriptsFetched(t *testing.T) {
+	overlayPre := []byte("#!/bin/bash\necho overlay-pre")
+	overlayPost := []byte("#!/bin/bash\necho overlay-post")
+
+	baseContent := []byte(`
+agent: agents/triage.md
+role: test
+overlays:
+- when: 'runtime.forge == "github"'
+  pre_script: scripts/overlay-pre.sh
+  post_script: scripts/overlay-post.sh
+`)
+
+	server, policy := setupScriptTestServer(t, baseContent, map[string][]byte{
+		"/scripts/overlay-pre.sh":  overlayPre,
+		"/scripts/overlay-post.sh": overlayPost,
+	})
+
+	hash := computeHash(baseContent)
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	baseURL := server.URL + "/harness/triage.yaml#sha256=" + hash
+
+	path := writeTestHarness(t, dir, "child.yaml", `
+agent: agents/child.md
+role: test
+base: `+baseURL+`
+`)
+
+	h, deps, err := LoadWithBase(context.Background(), path, ComposeOpts{
+		WorkspaceRoot: cacheDir,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{server.URL + "/"},
+		ForgePlatform: "github",
+		Event:         map[string]any{},
+	})
+	require.NoError(t, err)
+
+	// After overlay resolution, scripts are promoted to top level
+	assert.True(t, filepath.IsAbs(h.PreScript))
+	assert.True(t, filepath.IsAbs(h.PostScript))
+
+	preContent, err := os.ReadFile(h.PreScript)
+	require.NoError(t, err)
+	assert.Equal(t, overlayPre, preContent)
+
+	postContent, err := os.ReadFile(h.PostScript)
+	require.NoError(t, err)
+	assert.Equal(t, overlayPost, postContent)
+
+	// Should have deps for: base, overlay pre_script, overlay post_script, agent
+	var overlayDeps int
+	for _, d := range deps {
+		if strings.HasPrefix(d.Field, "overlays[") {
+			overlayDeps++
+		}
+	}
+	assert.GreaterOrEqual(t, overlayDeps, 2, "expected at least 2 overlay script deps")
+}
+
+func TestLoadWithBase_URLBase_OverlayPolicyFetched(t *testing.T) {
+	policyContent := []byte("# test policy")
+
+	baseContent := []byte(`
+agent: agents/triage.md
+role: test
+overlays:
+- when: 'runtime.forge == "github"'
+  policy: policies/overlay-sandbox.yaml
+`)
+
+	server, policy := setupScriptTestServer(t, baseContent, map[string][]byte{
+		"/policies/overlay-sandbox.yaml": policyContent,
+	})
+
+	hash := computeHash(baseContent)
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	baseURL := server.URL + "/harness/triage.yaml#sha256=" + hash
+
+	path := writeTestHarness(t, dir, "child.yaml", `
+agent: agents/child.md
+role: test
+base: `+baseURL+`
+`)
+
+	h, deps, err := LoadWithBase(context.Background(), path, ComposeOpts{
+		WorkspaceRoot: cacheDir,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{server.URL + "/"},
+		ForgePlatform: "github",
+		Event:         map[string]any{},
+	})
+	require.NoError(t, err)
+
+	// After overlay resolution, policy is promoted to top level
+	assert.True(t, filepath.IsAbs(h.Policy))
+
+	var foundPolicyDep bool
+	for _, d := range deps {
+		if strings.HasPrefix(d.Field, "overlays[") && strings.HasSuffix(d.Field, ".policy") {
+			foundPolicyDep = true
+		}
+	}
+	assert.True(t, foundPolicyDep, "expected overlay policy dep")
+}
+
+func TestLoadWithBase_URLBase_OverlaySkillsFetchedFromBase(t *testing.T) {
+	skillContent := []byte("# Overlay skill\nThis is an overlay-specific skill.")
+
+	baseContent := []byte(`
+agent: agents/triage.md
+role: test
+overlays:
+- when: 'runtime.forge == "github"'
+  skills:
+    - skills/overlay-skill
+`)
+
+	server, policy := setupScriptTestServer(t, baseContent, map[string][]byte{
+		"/skills/overlay-skill/SKILL.md": skillContent,
+	})
+
+	hash := computeHash(baseContent)
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	baseURL := server.URL + "/harness/triage.yaml#sha256=" + hash
+
+	path := writeTestHarness(t, dir, "child.yaml", `
+base: `+baseURL+`
+allowed_remote_resources:
+  - `+server.URL+`/
+`)
+
+	// The test server URL is not a raw.githubusercontent.com URL, so skill
+	// directory resolution errors out (same as TestLoadWithBase_URLBase_ForgeSkillsFetchedFromBase).
+	// This confirms resolveBaseResources now iterates overlay-level skills.
+	_, _, err := LoadWithBase(context.Background(), path, ComposeOpts{
+		WorkspaceRoot: cacheDir,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{server.URL + "/"},
+		ForgePlatform: "github",
+		Event:         map[string]any{},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a raw.githubusercontent.com URL")
+	assert.Contains(t, err.Error(), "overlays[0].skills[0]")
+}
+
+func TestLoadWithBase_URLBase_OverlayProvidersFetched(t *testing.T) {
+	providerContent := []byte("name: test-provider\ntype: openai")
+
+	baseContent := []byte(`
+agent: agents/triage.md
+role: test
+overlays:
+- when: 'runtime.forge == "github"'
+  providers:
+    - providers/overlay-provider.yaml
+`)
+
+	server, policy := setupScriptTestServer(t, baseContent, map[string][]byte{
+		"/providers/overlay-provider.yaml": providerContent,
+	})
+
+	hash := computeHash(baseContent)
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	baseURL := server.URL + "/harness/triage.yaml#sha256=" + hash
+
+	path := writeTestHarness(t, dir, "child.yaml", `
+agent: agents/child.md
+role: test
+base: `+baseURL+`
+`)
+
+	h, deps, err := LoadWithBase(context.Background(), path, ComposeOpts{
+		WorkspaceRoot: cacheDir,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{server.URL + "/"},
+		ForgePlatform: "github",
+		Event:         map[string]any{},
+	})
+	require.NoError(t, err)
+
+	// After overlay resolution, providers are merged to top level
+	assert.GreaterOrEqual(t, len(h.Providers), 1, "expected at least 1 provider after overlay resolution")
+
+	var foundProviderDep bool
+	for _, d := range deps {
+		if strings.HasPrefix(d.Field, "overlays[") && strings.Contains(d.Field, ".providers[") {
+			foundProviderDep = true
+		}
+	}
+	assert.True(t, foundProviderDep, "expected overlay provider dep")
+}
+
+func TestLoadWithBase_URLBase_OverlayHostFilesFetched(t *testing.T) {
+	envContent := []byte("KEY=value")
+
+	baseContent := []byte(`
+agent: agents/triage.md
+role: test
+overlays:
+- when: 'runtime.forge == "github"'
+  host_files:
+    - src: env/overlay.env
+      dest: /run/secrets/overlay.env
+`)
+
+	server, policy := setupScriptTestServer(t, baseContent, map[string][]byte{
+		"/env/overlay.env": envContent,
+	})
+
+	hash := computeHash(baseContent)
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	baseURL := server.URL + "/harness/triage.yaml#sha256=" + hash
+
+	path := writeTestHarness(t, dir, "child.yaml", `
+agent: agents/child.md
+role: test
+base: `+baseURL+`
+`)
+
+	h, deps, err := LoadWithBase(context.Background(), path, ComposeOpts{
+		WorkspaceRoot: cacheDir,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{server.URL + "/"},
+		ForgePlatform: "github",
+		Event:         map[string]any{},
+	})
+	require.NoError(t, err)
+
+	// After overlay resolution, host files are merged to top level
+	assert.GreaterOrEqual(t, len(h.HostFiles), 1, "expected at least 1 host file after overlay resolution")
+
+	var foundHostFileDep bool
+	for _, d := range deps {
+		if strings.HasPrefix(d.Field, "overlays[") && strings.Contains(d.Field, ".host_files[") {
+			foundHostFileDep = true
+		}
+	}
+	assert.True(t, foundHostFileDep, "expected overlay host file dep")
+}
+
+func TestLoadWithBase_URLBase_OverlayProfilesFetched(t *testing.T) {
+	profileContent := []byte("id: test-profile\nshell: bash")
+
+	baseContent := []byte(`
+agent: agents/triage.md
+role: test
+overlays:
+- when: 'runtime.forge == "github"'
+  openshell:
+    profiles:
+      - profiles/overlay-profile.yaml
+`)
+
+	server, policy := setupScriptTestServer(t, baseContent, map[string][]byte{
+		"/profiles/overlay-profile.yaml": profileContent,
+	})
+
+	hash := computeHash(baseContent)
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	baseURL := server.URL + "/harness/triage.yaml#sha256=" + hash
+
+	path := writeTestHarness(t, dir, "child.yaml", `
+agent: agents/child.md
+role: test
+base: `+baseURL+`
+`)
+
+	h, _, err := LoadWithBase(context.Background(), path, ComposeOpts{
+		WorkspaceRoot: cacheDir,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{server.URL + "/"},
+		ForgePlatform: "github",
+		Event:         map[string]any{},
+	})
+	require.NoError(t, err)
+
+	// After overlay resolution, profiles are merged to top level
+	assert.NotNil(t, h.OpenShell, "expected openshell config after overlay resolution")
+	if h.OpenShell != nil {
+		assert.GreaterOrEqual(t, len(h.OpenShell.Profiles), 1, "expected at least 1 profile after overlay resolution")
+	}
+}
+
+func TestLoadWithBase_URLBase_OverlayValidationLoopFetched(t *testing.T) {
+	valScript := []byte("#!/bin/bash\necho validate")
+
+	baseContent := []byte(`
+agent: agents/triage.md
+role: test
+overlays:
+- when: 'runtime.forge == "github"'
+  validation_loop:
+    script: scripts/overlay-validate.sh
+`)
+
+	server, policy := setupScriptTestServer(t, baseContent, map[string][]byte{
+		"/scripts/overlay-validate.sh": valScript,
+	})
+
+	hash := computeHash(baseContent)
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	baseURL := server.URL + "/harness/triage.yaml#sha256=" + hash
+
+	path := writeTestHarness(t, dir, "child.yaml", `
+agent: agents/child.md
+role: test
+base: `+baseURL+`
+`)
+
+	h, deps, err := LoadWithBase(context.Background(), path, ComposeOpts{
+		WorkspaceRoot: cacheDir,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{server.URL + "/"},
+		ForgePlatform: "github",
+		Event:         map[string]any{},
+	})
+	require.NoError(t, err)
+
+	// After overlay resolution, validation loop is promoted to top level
+	require.NotNil(t, h.ValidationLoop)
+	assert.True(t, filepath.IsAbs(h.ValidationLoop.Script))
+
+	var foundValDep bool
+	for _, d := range deps {
+		if strings.HasPrefix(d.Field, "overlays[") && strings.Contains(d.Field, "validation_loop") {
+			foundValDep = true
+		}
+	}
+	assert.True(t, foundValDep, "expected overlay validation_loop dep")
 }

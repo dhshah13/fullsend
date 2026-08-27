@@ -87,6 +87,17 @@ var (
 	errTooLarge       = errors.New("fetch: response body exceeds size limit")
 )
 
+// HTTPStatusError is returned when FetchURL gets a non-200 response.
+type HTTPStatusError struct {
+	Status int
+}
+
+func (e HTTPStatusError) Error() string {
+	return fmt.Sprintf("%s: got %d", errNonOK.Error(), e.Status)
+}
+
+func (e HTTPStatusError) Unwrap() error { return errNonOK }
+
 // FetchURL retrieves the content at rawURL subject to the given policy.
 // It returns the response body bytes or an error describing why the fetch
 // was rejected or failed.
@@ -193,7 +204,7 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 
 	// 9. Only accept 200 OK.
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: got %d", errNonOK, resp.StatusCode)
+		return nil, HTTPStatusError{Status: resp.StatusCode}
 	}
 
 	// 10. Size limit: read one extra byte to detect overflow.

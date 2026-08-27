@@ -29,6 +29,19 @@ input, and **Jira poll** input:
   is the production GitLab adapter ([ADR 0067](../../../ADRs/0067-gitlab-cron-polling-event-dispatch.md));
   `jira-poll` is the production Jira poll adapter; `json` supports tests and
   replay.
+- `entity.kind: conversation` covers GitHub Discussions and future chat
+  systems ([ADR 0086](../../../ADRs/0086-conversation-surface-for-agent-participation.md)).
+  A conversation is the container (Discussion / Slack channel). Threading is
+  expressed on the message via `transition.comment.id` and
+  `transition.comment.parent_id` (always the thread-root id; equal to `id` for
+  top-level messages). GitHub Discussion adapters are planned under
+  `gha-event`; additional `source.system` values (e.g. Slack) are non-breaking
+  enum additions when those drivers land.
+- Conversations carry **`state.conversation.category`** (exactly one; 1:M
+  category→conversation) separately from **`state.labels`** (M:M tags on the
+  conversation). Threads and messages carry neither category nor labels;
+  `comment_added` events still snapshot the parent conversation's category and
+  labels and MUST include `transition.comment.id` and `parent_id`.
 
 ## Versioning
 
@@ -48,7 +61,7 @@ Input drivers map native forge events into this struct:
 
 | Driver | Source | v1 status |
 |--------|--------|-----------|
-| `gha-event` | `GITHUB_EVENT_PATH` + `gh` snapshot for labels and change-proposal metadata | Production |
+| `gha-event` | `GITHUB_EVENT_PATH` + `gh` snapshot for labels and change-proposal metadata | Production; Discussions → `entity.kind: conversation` planned ([ADR 0086](../../../ADRs/0086-conversation-surface-for-agent-participation.md)) |
 | `gitlab-poll` | GitLab CI event payload (cron-polled; [ADR 0067](../../../ADRs/0067-gitlab-cron-polling-event-dispatch.md)) | Production (poll) |
 | `jira-poll` | Jira issue search + changelog/comments since `lastCheck` ([jira-poll-adapter.md](jira-poll-adapter.md), [ADR 0063](../../../ADRs/0063-polling-based-work-discovery.md)) | Production (poll) |
 | `json` | stdin or `--input-file` | Tests, replay |
@@ -56,6 +69,11 @@ Input drivers map native forge events into this struct:
 Adapters must populate:
 
 - `state.labels` when routing guards or label-based triggers apply.
+- `state.conversation` (with `category.name` at minimum) whenever
+  `entity.kind` is `conversation` — including message/`comment_added` events.
+  Do not encode the category as a synthetic label. On comment transitions,
+  also set `transition.comment.id` and `parent_id` (`parent_id == id` for
+  thread-root messages; otherwise the root id).
 - `state.change_proposal` (including `head_ref`, `base_ref`, and `head_sha` when
   known) whenever a matched harness needs change-proposal execution context.
   Webhook payloads are often incomplete — adapters should fill gaps via GitHub
@@ -168,6 +186,14 @@ event.transition.kind == "review_submitted"
 event.transition.kind == "comment_added"
   && event.transition.comment.command == "/fs-fix"
   && !event.state.change_proposal.is_fork
+
+// Conversation-native agent on Discussion slash command (ADR 0086)
+event.entity.kind == "conversation"
+  && event.transition.kind == "comment_added"
+  && has(event.transition.comment.command)
+  && event.transition.comment.command == "/fs-vouch"
+  && has(event.state.conversation.category.slug)
+  && event.state.conversation.category.slug == "vouch-request"
 ```
 
 See [`examples/`](examples/) for matching `NormalizedEvent` fixtures.

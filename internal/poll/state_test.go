@@ -13,10 +13,12 @@ func newTestPoller(client GitLabClient, opts Options) *Poller {
 		opts.PipelineRef = "main"
 	}
 	return &Poller{
-		client: client,
-		owner:  "testgroup",
-		repo:   "testrepo",
-		opts:   opts,
+		client:      client,
+		projectPath: "testgroup/testrepo",
+		owner:       "testgroup",
+		repo:        "testrepo",
+		gitlabURL:   "https://gitlab.example.com",
+		opts:        opts,
 	}
 }
 

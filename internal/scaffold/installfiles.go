@@ -43,6 +43,23 @@ func CollectInstallFiles(opts CollectInstallFilesOptions) (InstallFiles, error) 
 	return files, nil
 }
 
+// perRepoThinCallers lists thin stage caller workflows installed directly
+// into per-repo repos (in addition to the per-repo shim). These are
+// workflows that receive workflow_dispatch events from external schedulers
+// rather than being routed through the dispatch shim.
+var perRepoThinCallers = []string{
+	".github/workflows/prioritize.yml",
+}
+
+// PerRepoThinCallerPaths returns the workflow paths installed as thin
+// callers during per-repo installation. Used by uninstall and remote
+// scaffold to keep lifecycle operations in sync with install.
+func PerRepoThinCallerPaths() []string {
+	out := make([]string, len(perRepoThinCallers))
+	copy(out, perRepoThinCallers)
+	return out
+}
+
 // CollectPerRepoInstallFiles gathers files for per-repo installation.
 func CollectPerRepoInstallFiles(vendored bool, upstreamRef, upstreamTag string) (InstallFiles, error) {
 	opts := RenderOptionsForInstall(vendored, true, upstreamRef, upstreamTag)
@@ -62,24 +79,60 @@ func CollectPerRepoInstallFiles(vendored bool, upstreamRef, upstreamTag string) 
 		Mode:    "100644",
 	}}
 
+	// Install thin caller workflows that are dispatched externally
+	// (e.g. prioritize.yml receives dispatches from the org-level
+	// scheduler rather than through the dispatch shim).
+	for _, path := range perRepoThinCallers {
+		raw, readErr := FullsendRepoFile(path)
+		if readErr != nil {
+			return nil, fmt.Errorf("loading per-repo thin caller %s: %w", path, readErr)
+		}
+		rendered, renderErr := RenderTemplate(path, raw, opts)
+		if renderErr != nil {
+			return nil, fmt.Errorf("rendering per-repo thin caller %s: %w", path, renderErr)
+		}
+		files = append(files, InstallFile{
+			Path:    path,
+			Content: PrependManagedHeader(path, rendered),
+			Mode:    "100644",
+		})
+	}
+
 	return files, nil
 }
 
 // CollectGitLabPerRepoInstallFiles gathers CI template files for GitLab
-// per-repo installation. The embedded .fullsend/config.yaml is excluded —
-// callers generate a config with roles and forge field instead.
+// per-repo installation.
+//
+// The embedded .fullsend/config.yaml is excluded — callers generate a
+// config with roles and forge field instead.
+//
+// The embedded root .gitignore is also excluded: installing it would
+// overwrite a consumer's existing ignore file with a one-line fragment.
+// The embed still ships for docs/tests; adopters (and the guide) add
+// output/ themselves. When --output-dir sits inside --target-repo
+// (GitLab layout), fullsend run omits that top-level directory from the
+// sandbox tarball and .git/info/exclude via outputDirExcludeRel.
+//
+// The root .gitlab-ci.yml is also excluded: the install flow merges
+// fullsend's include directive and workflow rules into the consumer's
+// existing file (or creates a minimal one) instead of overwriting it.
+// See MergeGitLabCI in internal/repos/gitlabci.go.
+//
 // runnerTags specifies GitLab runner tags to inject into CI job definitions.
 // upstreamRef and upstreamTag control the version marker embedded in the
 // dispatch file for upgrade/status drift detection.
 func CollectGitLabPerRepoInstallFiles(runnerTags []string, upstreamRef, upstreamTag string) (InstallFiles, error) {
 	tagYAML := FormatRunnerTags(runnerTags)
 	versionMarker := FormatVersionMarker(upstreamRef, upstreamTag)
+	fullsendVersion := ResolveFullsendVersion(upstreamRef, upstreamTag)
 	var files InstallFiles
 	err := WalkGitLabPerRepo(func(path string, content []byte) error {
-		if path == ".fullsend/config.yaml" {
+		if path == ".fullsend/config.yaml" || path == ".gitignore" || path == ".gitlab-ci.yml" {
 			return nil
 		}
 		rendered := strings.ReplaceAll(string(content), "__RUNNER_TAGS__", tagYAML)
+		rendered = strings.ReplaceAll(rendered, "__FULLSEND_VERSION__", fullsendVersion)
 		// Embed a version marker in the dispatch file so that
 		// extractWorkflowRef (via glWorkflowRefPattern) can detect
 		// the installed version for status and upgrade operations.
@@ -142,6 +195,24 @@ func FormatRunnerTags(tags []string) string {
 		quoted[i] = fmt.Sprintf("%q", t)
 	}
 	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+// ResolveFullsendVersion returns the version string for the
+// __FULLSEND_VERSION__ placeholder in GitLab CI templates. The templates'
+// before_script uses this to install the fullsend CLI at runtime: version
+// tags (v0.42.0) trigger a pre-built binary download from GitHub Releases;
+// commit SHAs trigger a clone-and-build from source. Dev builds (both
+// inputs empty) return "latest" so the before_script resolves the newest
+// release — the before_script always installs the pinned version,
+// overwriting any default binary in the runner image.
+func ResolveFullsendVersion(upstreamRef, upstreamTag string) string {
+	if upstreamTag != "" {
+		return upstreamTag
+	}
+	if upstreamRef != "" {
+		return upstreamRef
+	}
+	return "latest"
 }
 
 // ManagedPaths returns embed-derived scaffold paths for analyze/sync.

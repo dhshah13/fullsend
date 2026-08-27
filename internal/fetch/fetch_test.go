@@ -151,6 +151,10 @@ func TestFetchURL(t *testing.T) {
 		if !errors.Is(err, errNonOK) {
 			t.Fatalf("expected errNonOK, got: %v", err)
 		}
+		var httpErr HTTPStatusError
+		if !errors.As(err, &httpErr) || httpErr.Status != http.StatusNotFound {
+			t.Fatalf("expected HTTPStatusError 404, got: %v", err)
+		}
 	})
 
 	t.Run("Success", func(t *testing.T) {

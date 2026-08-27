@@ -1,5 +1,5 @@
 {
-  "extends": ["stylelint-config-standard", "stylelint-config-html/svelte", "stylelint-config-html/vue"],
+  "extends": ["stylelint-config-standard", "stylelint-config-html/vue"],
   "rules": {
     "custom-property-pattern": null,
     "selector-class-pattern": null

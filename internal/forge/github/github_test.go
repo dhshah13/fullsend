@@ -2749,6 +2749,34 @@ func TestIsTransientStatus(t *testing.T) {
 	}
 }
 
+func TestAPIError_IsTransient(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		code int
+		want bool
+	}{
+		{name: "429 rate limit", code: 429, want: true},
+		{name: "500 internal server error", code: 500, want: true},
+		{name: "502 bad gateway", code: 502, want: true},
+		{name: "503 service unavailable", code: 503, want: true},
+		{name: "504 gateway timeout", code: 504, want: true},
+		{name: "200 OK", code: 200, want: false},
+		{name: "401 unauthorized", code: 401, want: false},
+		{name: "403 forbidden", code: 403, want: false},
+		{name: "404 not found", code: 404, want: false},
+		{name: "422 unprocessable entity", code: 422, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := &APIError{StatusCode: tt.code, Message: http.StatusText(tt.code)}
+			assert.Equal(t, tt.want, err.IsTransient())
+		})
+	}
+}
+
 func TestIsRetryable_PrimaryRateLimitAs403(t *testing.T) {
 	// GitHub sometimes returns primary rate limits as 403 with body
 	// containing "API rate limit exceeded" instead of 429. This must

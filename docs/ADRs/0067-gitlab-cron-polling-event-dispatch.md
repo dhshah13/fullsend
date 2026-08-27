@@ -46,7 +46,8 @@ Accepted
 > artifact — only the poller could produce them. With API-triggered pipelines,
 > any user with pipeline-create access on the protected branch can POST
 > arbitrary variables (STAGE, EVENT_TYPE, EVENT_PAYLOAD_B64, RESOURCE_KEY,
-> IS_FORK, MR_AUTHOR_ID, ACTOR_ID, STATUS_IID, FULLSEND_POLL_JOB_URL). The
+> IS_FORK, MR_AUTHOR_ID, ACTOR_ID, STATUS_IID, FULLSEND_POLL_JOB_URL,
+> ORIGINATING_URL, REPO_FULL_NAME). The
 > in-job authorization gate and fork
 > protection read these attacker-supplied variables. Mitigation #1 is
 > implemented: the agent job uses the Pipelines API

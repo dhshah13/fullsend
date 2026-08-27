@@ -1,8 +1,0 @@
-version: "1"
-dispatch:
-  platform: github-actions
-defaults:
-  roles: [fullsend]
-  max_implementation_retries: 2
-  auto_merge: false
-repos: {}

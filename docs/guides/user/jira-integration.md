@@ -55,6 +55,15 @@ This means the person who commented `/fs-triage` on a Jira issue will not see th
 | `JIRA_USER_EMAIL` | Email associated with the token |
 | `JIRA_BASE_URL` | Jira instance URL, e.g. `https://myteam.atlassian.net` |
 
+### Sandbox credentials and network access
+
+The fullsend scaffold includes an OpenShell credential provider (`providers/atlassian-cloud.yaml`) and network profile (`profiles/fullsend-atlassian-cloud.yaml`) that grant sandboxed agents access to Jira Cloud. These are layered content — they are provided at runtime by reusable workflows, not written to the `.fullsend` directory:
+
+- **Provider** (`atlassian-cloud`) — declares the `atlassian-cloud` credential provider using the `fullsend-atlassian-cloud` profile type. Jira Cloud Basic auth requires a base64-encoded `email:api-token` string; because OpenShell does not yet support composite credential injection, provide a single pre-encoded token (generate with `printf 'you@example.com:your-api-token' | base64`).
+- **Profile** (`fullsend-atlassian-cloud`) — allows outbound HTTPS to `*.atlassian.net:443` with read-write access and endpoint enforcement. Permitted binaries are `curl` and `node`.
+
+The wildcard host (`*.atlassian.net`) permits egress to any Atlassian Cloud tenant. Per-tenant scoping is not yet supported by OpenShell; this is an accepted risk for now.
+
 ## Repo configuration
 
 No special harness or config changes are needed to *receive* Jira-sourced dispatches: the Jira poller produces the same [NormalizedEvents](../../normative/normalized-event/v1/) that GitHub and GitLab do, so routing and triggers work unchanged. However, built-in agent output is currently written to GitHub only — the CLI primitive for posting to Jira exists (`fullsend issues post-comment --tracker jira`), but the agent pipeline does not use it yet. See [Event semantics — input only](#event-semantics--input-only) for details. Additionally, the built-in agents' pre/post scripts do not yet understand Jira work-item payloads (they expect a GitHub issue number, not a Jira key — [#2264](https://github.com/fullsend-ai/fullsend/issues/2264)), so dispatched agent runs will not complete successfully until that follow-up lands. See the Troubleshooting section below.
@@ -75,7 +84,11 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
+  id-token: write
+  issues: write
+  packages: read
+  pull-requests: write
 
 jobs:
   poll:
@@ -83,6 +96,8 @@ jobs:
     concurrency:
       group: fullsend-jira-poll
       cancel-in-progress: false
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
 
@@ -98,82 +113,56 @@ jobs:
           JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
           JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          TARGET_REPO: ${{ github.repository }}
         run: |
           fullsend poll \
             --input-driver jira-poll \
             --jira-url "${JIRA_BASE_URL}" \
             --jira-project PROJ \
-            --target-repo "${{ github.repository }}" \
+            --target-repo "${TARGET_REPO}" \
             --output dispatches.json \
             --fullsend-dir .fullsend
 
-      - name: Dispatch agent workflows
-        env:
-          GH_TOKEN: ${{ github.token }}
-          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+      - name: Build dispatch matrix
+        id: build-matrix
         run: |
           set -euo pipefail
-
           if ! jq -e 'length > 0' dispatches.json > /dev/null 2>&1; then
-            echo "No dispatches to process."
+            echo "No dispatches."
+            echo 'matrix={"include":[]}' >> "${GITHUB_OUTPUT}"
             exit 0
           fi
+          MATRIX=$(jq -c '{include: .}' dispatches.json)
+          DELIM="MATRIX_$(openssl rand -hex 8)"
+          {
+            echo "matrix<<${DELIM}"
+            printf '%s' "${MATRIX}"
+            echo
+            echo "${DELIM}"
+          } >> "${GITHUB_OUTPUT}"
 
-          dispatched=0
-          count=$(jq 'length' dispatches.json)
-
-          for i in $(seq 0 $((count - 1))); do
-            record=$(jq -c ".[$i]" dispatches.json)
-            STAGE=$(echo "$record" | jq -r '.stage')
-            RESOURCE_KEY=$(echo "$record" | jq -r '.resource_key')
-            EVENT_TYPE=$(echo "$record" | jq -r '.event_type')
-            ISSUE_ID=$(echo "$record" | jq -r '.iid // 0')
-
-            # Extract the Jira issue key from the resource key (e.g. "issue-PROJ-101" → "PROJ-101").
-            ISSUE_KEY="${RESOURCE_KEY#issue-}"
-            ISSUE_URL="${JIRA_BASE_URL}/browse/${ISSUE_KEY}"
-
-            # Build a minimal event payload compatible with the scaffold agent workflows.
-            # The concurrency group uses fromJSON(event_payload).issue.number, so it must
-            # stay a number — per the adapter spec, that's entity.id (here, the record's
-            # own numeric .iid), not the Jira key string. This is a stopgap projection,
-            # not the spec's full FULLSEND_WORK_ITEM_* execution-ref projection (deferred
-            # to the tracked "real output driver" follow-up — see the KNOWN LIMITATION
-            # note in internal/jirapoll/poller.go).
-            EVENT_PAYLOAD=$(jq -nc \
-              --argjson number "$ISSUE_ID" \
-              --arg url "$ISSUE_URL" \
-              '{issue: {number: $number, html_url: $url}}')
-
-            # Find the workflow file for this stage by scanning for the
-            # "# fullsend-stage: <stage>" marker in workflow files.
-            WORKFLOW_NAME=""
-            for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
-              [[ -f "$wf" ]] || continue
-              if grep -qxF "# fullsend-stage: ${STAGE}" "$wf"; then
-                WORKFLOW_NAME=$(basename "$wf")
-                break
-              fi
-            done
-            if [[ -z "$WORKFLOW_NAME" ]]; then
-              echo "::warning::No workflow found for stage ${STAGE}, skipping ${RESOURCE_KEY}"
-              continue
-            fi
-
-            echo "Dispatching ${WORKFLOW_NAME} for ${ISSUE_KEY} (${STAGE})"
-            gh workflow run "$WORKFLOW_NAME" \
-              -f event_type="$EVENT_TYPE" \
-              -f source_repo="${{ github.repository }}" \
-              -f event_payload="$EVENT_PAYLOAD"
-
-            dispatched=$((dispatched + 1))
-          done
-
-          echo "::notice::Dispatched ${dispatched} agent workflow(s)"
+  harness:
+    name: Harness
+    needs: poll
+    uses: fullsend-ai/fullsend/.github/workflows/reusable-dispatch.yml@v0
+    with:
+      matrix: ${{ needs.poll.outputs.matrix }}
+      mint_url: ${{ vars.FULLSEND_MINT_URL }}
+      gcp_region: ${{ vars.FULLSEND_GCP_REGION }}
+      jira_base_url: ${{ vars.JIRA_BASE_URL }}
+    secrets:
+      FULLSEND_GCP_WIF_PROVIDER: ${{ secrets.FULLSEND_GCP_WIF_PROVIDER }}
+      FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}
+      OTEL_EXPORTER_OTLP_TRACES_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_TRACES_HEADERS }}
+      OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+      JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+      JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
 ```
 
 2. Replace `PROJ` with your Jira project key.
 3. Commit and push the workflow file.
+
+**How this works:** The `poll` job queries Jira and builds a dispatch matrix in the format expected by `reusable-dispatch.yml`. When the `matrix` input is provided, `reusable-dispatch.yml` skips its routing and dispatch steps and goes directly to running harness agents with the pre-computed matrix. This approach maintains ADR 62's inlining decision (no version skew) while enabling custom pollers to reuse fullsend's harness infrastructure. See [Custom Poller Example](custom-poller-example.md) for more details on this pattern.
 
 **`concurrency.cancel-in-progress: false`** ensures overlapping poll cycles queue rather than cancel each other, which is the primary defense against concurrent runs — the GitHub Actions concurrency group means only one poll cycle for this workflow ever runs at a time in the common case. The poller's own Jira entity-property locking is a secondary guard for cases outside that group (e.g. a manually triggered run overlapping a scheduled one): it re-checks for a live lock immediately before writing, narrowing the race to the jitter window between that check and the write, but Jira entity properties have no compare-and-swap, so a lock created in that narrow window can still be clobbered by a genuinely concurrent poller. Treat the GHA concurrency group as the real safety mechanism, not the lock.
 
@@ -241,19 +230,20 @@ jq '.' dispatches.json
 # Count dispatches
 jq 'length' dispatches.json
 
-# Show stage and resource key for each dispatch
-jq '.[] | {stage, resource_key, event_type}' dispatches.json
+# Show agent and event type for each dispatch
+jq '.[] | {agent, event_type, status_number}' dispatches.json
 ```
 
 Key fields in each dispatch record:
 
 | Field | Description |
 |---|---|
-| `stage` | Agent stage to dispatch (e.g., `triage`, `code`) |
+| `agent` | Agent to dispatch (e.g., `triage`, `code`) |
 | `event_type` | What triggered the dispatch (e.g., `comment_added`, `label_changed`) |
-| `resource_key` | Identifies the Jira issue (e.g., `issue-PROJ-101`) |
-| `iid` | Numeric issue ID used for concurrency grouping |
-| `event_payload_b64` | Base64-encoded [NormalizedEvent](../../normative/normalized-event/v1/) — decode with `jq -r '.event_payload_b64' | base64 -d | jq '.'` |
+| `event_payload` | JSON-encoded [NormalizedEvent](../../normative/normalized-event/v1/) — inspect with `jq -r '.event_payload \| fromjson' dispatches.json` |
+| `source_repo` | GitHub repo slug where the agent runs |
+| `status_repo` | GitHub repo slug for status tracking |
+| `status_number` | Entity identifier as a string (Jira numeric issue ID) |
 
 ### Dry-run tip
 
@@ -265,20 +255,22 @@ If you want to avoid advancing Jira checkpoints during testing, poll against a d
 
 > **Implementation detail.** Once Jira support is stabilized, users will not need to know this dispatch format — it will be an internal detail between the poll job and the `fullsend run` workflows. This section is documented now because the integration is pre-alpha and operators may need to debug or inspect dispatch records directly.
 
-The poll step writes an array of dispatch records to `dispatches.json`. Each record has the following fields:
+The poll step writes an array of dispatch records to `dispatches.json`. Each record is an execution ref compatible with the `workflow_call` shim (`reusable-dispatch.yml`). Fields:
 
 | Field | Type | Description |
 |---|---|---|
-| `stage` | string | Agent stage to run (e.g., `"triage"`, `"code"`). Determined by routing rules. |
+| `agent` | string | Agent to run (e.g., `"triage"`, `"code"`). Determined by CEL trigger evaluation. |
+| `role` | string | Harness role for this agent. |
 | `event_type` | string | Jira event type that triggered the dispatch (e.g., `"comment_added"`, `"label_changed"`, `"opened"`, `"reopened"`, `"edited"`, `"closed"`). |
-| `event_payload_b64` | string | Base64-encoded JSON [NormalizedEvent](../../normative/normalized-event/v1/). Decoded example below. |
-| `resource_key` | string | Stable entity key for concurrency control, in the format `issue-{JIRA_KEY}` (e.g., `"issue-PROJ-101"` for Jira key `PROJ-101`). |
-| `is_fork` | boolean | Whether the source is a fork. Always `false` for Jira dispatches (Jira issues are work items, not change proposals). |
-| `iid` | integer | Jira's internal numeric issue ID (not the human-readable key). Used by the downstream dispatch step to set `issue.number` in the compatibility payload. |
+| `event_payload` | string | JSON-encoded [NormalizedEvent](../../normative/normalized-event/v1/). Example below. |
+| `source_repo` | string | GitHub repo slug where the agent workflow runs. |
+| `trigger_source` | string | (Optional) Trigger source identifier. |
+| `status_repo` | string | GitHub repo slug for status tracking. |
+| `status_number` | string | Entity identifier as a string (Jira's numeric issue ID). |
 
-### Decoded `event_payload_b64` example
+### `event_payload` example
 
-The `event_payload_b64` field is a base64-encoded [NormalizedEvent](../../normative/normalized-event/v1/) — the same forge-neutral struct that GitHub and GitLab input drivers produce. A decoded example for a `/fs-triage` comment on `PROJ-101`:
+The `event_payload` field is a JSON-encoded [NormalizedEvent](../../normative/normalized-event/v1/) — the same forge-neutral struct that GitHub and GitLab input drivers produce. An example for a `/fs-triage` comment on `PROJ-101`:
 
 ```json
 {
@@ -314,7 +306,7 @@ The `event_payload_b64` field is a base64-encoded [NormalizedEvent](../../normat
 }
 ```
 
-The `entity.key` field is required when `source.system` is `"jira"` — it carries the human-readable Jira key (e.g., `PROJ-101`) that the `resource_key` is derived from. See the [NormalizedEvent spec](../../normative/normalized-event/v1/) for the full schema.
+The `entity.key` field is required when `source.system` is `"jira"` — it carries the human-readable Jira key (e.g., `PROJ-101`). See the [NormalizedEvent spec](../../normative/normalized-event/v1/) for the full schema.
 
 ## Actor role resolution
 
@@ -354,9 +346,10 @@ These properties are namespaced per target repo, so multiple repos can poll the 
 
 > **Security note — coordination state is tamperable by any project editor.** Writing an issue entity property requires only Jira's **Edit Issues** permission, which is typically far broader than the project roles this driver maps to `write`. That means anyone who can edit a polled issue can write its `lastCheck` and lock properties. The driver treats both as untrusted: a `lastCheck` dated in the future is ignored (it would otherwise suppress all detection on the issue), and one rewound before the backfill window is clamped to the window's start, so a rewind can replay at most one backfill window of history rather than the whole issue — but within that window it can still re-surface old comments. Per-issue dispatch is capped to bound the blast radius. Even so, **treat Edit-Issues on a polled project as part of the trust boundary**: prefer scoping the poll to a project whose editors you trust, and remember that the authorization gate keys on the *comment's* Jira role, so who can edit issues (and comments) matters as much as who holds `write`.
 
-Two edge cases of checkpoint tracking are worth knowing:
+Three edge cases of checkpoint tracking are worth knowing:
 
 - **First enable on an existing backlog.** Every issue starts with an unset `lastCheck`, so on the first poll of an issue the poller has no checkpoint to filter by. Activity is instead bounded by a fixed 24-hour backfill window (not currently configurable): an `opened` event is emitted only for issues created within the window, and only comments and changelog entries from within the window produce events. Backlog issues with no activity (including comment edits) inside the window are silently checkpointed without dispatching. If you want the initial rollout scoped even tighter, narrow the candidate set with a custom `--jql`.
+- **Resuming after a gap longer than 24 hours permanently drops events in the gap.** The same 24-hour backfill window that bounds a first poll also bounds resumption. When the poller reads a stored `lastCheck` older than `now − 24h`, it clamps the checkpoint forward to `now − 24h` — the clamping is a security control (it prevents a rewound `lastCheck` from replaying an issue's entire history), but it cannot distinguish a malicious rewind from a legitimate long stop. Any Jira activity between the true checkpoint and the clamped value is silently skipped. The cycle succeeds, the only evidence is a `WARNING: lastCheck for <KEY> ("<timestamp>") predates the backfill window; clamping to <floor>` line in the run log — treat this as an alert, not noise. Because detection is checkpoint-based, ordinary cron jitter and occasional skipped ticks are harmless (schedule accuracy affects latency, not correctness); the guarantee simply ends at 24 hours. A realistic trigger: **GitHub disables scheduled workflows after 60 days of repository inactivity**, which stops the poller with no error anywhere. After a long gap, the starvation limit (M = 50, see below) compounds the problem — many issues may have accumulated new activity simultaneously, and there is no rotation across cycles to reach issues beyond the top M. If your deployment cannot tolerate the 24-hour bound, [ADR 0063](../../ADRs/0063-polling-based-work-discovery.md) treats the scheduler as pluggable: an external cron or Kubernetes CronJob that runs independently of GitHub Actions avoids the auto-disable risk.
 - **Comment edits count as new activity, and are attributed to the editor.** The poller filters comments on the later of their created and updated timestamps, so editing a comment (for example, adding a slash command to an old comment) is detected on the next cycle. Jira bumps a comment's updated timestamp on modifications other than body edits too (such as visibility changes), and any such bump counts as activity. The flip side: modifying a comment whose slash command was already dispatched makes it look new again and can re-dispatch it. An edit-detected comment is attributed to the account that last modified it (Jira's `updateAuthor`), not the original author — so a user who edits someone else's comment to inject a command is authorized on *their own* role, not the original author's.
 
 Because each cron run is a fresh process, per-cycle Jira API cost is worth sizing for: every cycle that selects at least one issue makes one call to load the project's role structure (a role-list call plus one detail call per role), then one additional call for each distinct actor below the highest role priority the first time they're seen that cycle, to check their group memberships (cached per actor for the rest of the cycle, but not across cron runs). Cost scales with the number of distinct commenting actors per cycle rather than the size of the groups backing a role.
@@ -417,6 +410,7 @@ However, more pollers against the same Jira project means more API calls per cyc
 | Slash commands silently ignored when using `--jql` | `--jira-project` not provided — all actors resolve to `external` and fail the role gate | Add `--jira-project PROJ` alongside `--jql` in your workflow file |
 | Duplicate dispatches | `lastCheck` was cleared or missing | The poller treats a missing `lastCheck` as "never polled" and processes all recent changes. This is self-correcting — the next cycle advances `lastCheck` past the duplicates |
 | Old comment or label change on a newly polled issue never dispatches | Activity predates the first-poll backfill window | On an issue's first poll, activity older than the 24-hour backfill window is permanently skipped (the checkpoint advances past it). To pick up older activity, scope the initial `--jql` to recently updated issues and widen it gradually, or have someone re-trigger by commenting again |
+| Activity during a long outage or disabled workflow is missing after resume | Poller gap exceeded the 24-hour backfill window | The same 24-hour window that bounds a first poll also bounds resumption — any `lastCheck` older than 24 hours is clamped forward. Check the run log for `predates the backfill window` — if present, events in the gap are permanently lost. Have affected users re-trigger by commenting again. See [Poll coordination](#poll-coordination) |
 | Dispatched agent workflow fails immediately | Agent pre/post scripts don't understand Jira-keyed payloads yet | Known limitation, tracked in [#2264](https://github.com/fullsend-ai/fullsend/issues/2264). The dispatch step above still runs the workflow and produces a `NormalizedEvent`, but built-in agent scripts expect a GitHub issue number, not a Jira key |
 
 ## See also

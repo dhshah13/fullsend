@@ -26,9 +26,10 @@ Set when starting the suite (not in feature files):
 BEHAVIOUR_SCM=github              # future: gitlab, forgejo
 BEHAVIOUR_CI=githubactions        # future: tekton, gitlabci
 BEHAVIOUR_INSTALL_MODE=per-repo   # v1 default and only supported value
+ENVIRONMENT=dev                   # mint/infra target: dev (default) or stage
 ```
 
-The suite in `e2e/behaviour/suite_test.go` (or an external runner) acquires a pool org via `pkg/e2etest`, runs pre-install cleanup, calls an `install.Factory` (e.g. `install.NewRepoPoolCFMintPreviews(...)`) to get a unified `install.Driver` that owns mint deploy, pool allocation, repo ensure, and teardown. The suite constructs SCM and CI drivers, then runs godog with `pkg/behaviourtest/suite.InitScenario`. `InitScenario` clones a template `*world.World` per scenario. When a scenario calls "Given the enrolled test repository", `Driver.AllocateRepo` leases a unique repo name and ensures it is created and installed. `Driver.DeallocateRepo` returns the name in the After hook. `Driver.Finalize` tears down suite-scoped resources (e.g. preview mint) and reclaims outstanding leases. Unsupported `BEHAVIOUR_INSTALL_MODE` values fail at suite startup.
+The suite in `e2e/behaviour/suite_test.go` (or an external runner) acquires a pool org via `pkg/e2etest`, runs pre-install cleanup, calls an `install.Factory` (e.g. `install.NewRepoPoolCFMintPreviews(...)`) to get a unified `install.Driver` that owns mint deploy, pool allocation, repo ensure, and teardown. The suite constructs SCM and CI drivers, then runs godog with `pkg/behaviourtest/suite.InitScenario`. `InitScenario` clones a template `*world.World` per scenario. When a scenario calls "Given the enrolled test repository", `Driver.AllocateRepo` leases a unique repo name and ensures it is created and installed. `Driver.DeallocateRepo` returns the name in the After hook. `Driver.Finalize` tears down suite-scoped resources (e.g. preview mint) and reclaims outstanding leases. Unsupported `BEHAVIOUR_INSTALL_MODE` or `ENVIRONMENT` values fail at suite startup. `ENVIRONMENT` is `dev` or `stage` (empty defaults to `dev`).
 
 ### Install driver (unified)
 

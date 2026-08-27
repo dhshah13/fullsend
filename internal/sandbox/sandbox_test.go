@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -30,6 +32,7 @@ func TestEnsureAvailable_OpenshellNotInPath(t *testing.T) {
 func TestConstants(t *testing.T) {
 	assert.Equal(t, "/sandbox/workspace", SandboxWorkspace)
 	assert.Equal(t, "/sandbox/claude-config", SandboxClaudeConfig)
+	assert.Equal(t, "/sandbox/pi-config", SandboxPiConfig)
 }
 
 func TestBuildProviderArgs_BareKeyCredentials(t *testing.T) {
@@ -673,6 +676,40 @@ func TestUploadDir_TarIncludesCopyfileDisable(t *testing.T) {
 	assert.Equal(t, "1", strings.TrimSpace(string(data)), "COPYFILE_DISABLE should be set to 1")
 }
 
+func TestUploadDir_ExcludesPatternsFromTarball(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("keep"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "output", "agent-x-1-1"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "output", "agent-x-1-1", "run-telemetry.jsonl"), []byte("telem\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "sub", "output"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sub", "output", "keep.txt"), []byte("nested\n"), 0o644))
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "openshell.log")
+	sentinelPath := filepath.Join(binDir, "uploaded.tar.gz")
+	fakeOpenshell(t, binDir, logPath, sentinelPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	require.NoError(t, UploadDir("test-sandbox", dir, "/sandbox/workspace/repo", "output/"))
+
+	extracted := extractTar(t, sentinelPath)
+	_, err := os.Stat(filepath.Join(extracted, "keep.txt"))
+	require.NoError(t, err, "keep.txt should be in the tarball")
+	_, err = os.Stat(filepath.Join(extracted, "output"))
+	assert.True(t, os.IsNotExist(err), "root output/ must be excluded from the sandbox tarball")
+	got, err := os.ReadFile(filepath.Join(extracted, "sub", "output", "keep.txt"))
+	require.NoError(t, err, "nested sub/output/ must survive (bsdtar --exclude would drop it)")
+	assert.Equal(t, "nested\n", string(got))
+}
+
+func TestTarRootMembers_RejectsNestedExclude(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("x"), 0o644))
+	_, err := tarRootMembers(dir, "build/output")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "top-level")
+}
+
 // fakeOpenshell writes a script that logs every invocation's full argv to
 // logPath, and — when invoked as "sandbox upload <name> <local> <remote>" —
 // copies <local> to sentinelPath so the test can inspect exactly what bytes
@@ -1013,15 +1050,23 @@ func TestBuildProviderUpdateArgs(t *testing.T) {
 }
 
 func TestImportProfile_OpenshellNotInPath(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "profile.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: test-profile"), 0o644))
 	t.Setenv("PATH", t.TempDir())
 
-	err := ImportProfile(context.Background(), "test-profile", "/some/profile.yaml")
+	cachePath := profileFileCachePath("test-profile")
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	err := ImportProfile(context.Background(), "test-profile", profilePath)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "openshell")
 }
 
 func TestImportProfile_Success(t *testing.T) {
 	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "my-profile.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: my-profile"), 0o644))
 
 	script := `#!/bin/sh
 exit 0
@@ -1030,12 +1075,17 @@ exit 0
 	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
 	t.Setenv("PATH", dir)
 
-	err := ImportProfile(context.Background(), "my-profile", "/some/my-profile.yaml")
+	cachePath := profileFileCachePath("my-profile")
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	err := ImportProfile(context.Background(), "my-profile", profilePath)
 	assert.NoError(t, err)
 }
 
 func TestImportProfile_UsesFileFlag(t *testing.T) {
 	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "my-profile.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: my-profile"), 0o644))
 	argsFile := filepath.Join(dir, "args.log")
 
 	// Fake openshell that logs args on "import" invocations and exits 0.
@@ -1049,17 +1099,22 @@ exit 0
 	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
 	t.Setenv("PATH", dir)
 
-	err := ImportProfile(context.Background(), "my-profile", "/some/my-profile.yaml")
+	cachePath := profileFileCachePath("my-profile")
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	err := ImportProfile(context.Background(), "my-profile", profilePath)
 	require.NoError(t, err)
 
 	logged, err := os.ReadFile(argsFile)
 	require.NoError(t, err)
-	assert.Contains(t, string(logged), "--file /some/my-profile.yaml",
+	assert.Contains(t, string(logged), "--file "+profilePath,
 		"ImportProfile must pass --file flag to openshell provider profile import")
 }
 
 func TestImportProfile_AlreadyExists(t *testing.T) {
 	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "my-profile.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: my-profile"), 0o644))
 
 	script := `#!/bin/sh
 echo "profile already exists" >&2
@@ -1069,12 +1124,17 @@ exit 1
 	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
 	t.Setenv("PATH", dir)
 
-	err := ImportProfile(context.Background(), "my-profile", "/some/my-profile.yaml")
+	cachePath := profileFileCachePath("my-profile")
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	err := ImportProfile(context.Background(), "my-profile", profilePath)
 	assert.NoError(t, err, "idempotent import should not return an error")
 }
 
 func TestImportProfile_OtherError(t *testing.T) {
 	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "my-profile.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: my-profile"), 0o644))
 
 	script := `#!/bin/sh
 echo "connection refused" >&2
@@ -1084,10 +1144,165 @@ exit 1
 	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
 	t.Setenv("PATH", dir)
 
-	err := ImportProfile(context.Background(), "my-profile", "/some/my-profile.yaml")
+	cachePath := profileFileCachePath("my-profile")
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	err := ImportProfile(context.Background(), "my-profile", profilePath)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "my-profile.yaml")
 	assert.Contains(t, err.Error(), "connection refused")
+}
+
+func TestImportProfile_SkipsWhenCacheMatches(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: test-profile\nname: test"), 0o644))
+
+	hash, err := hashProfileFile(profilePath)
+	require.NoError(t, err)
+
+	cachePath := profileFileCachePath("test-profile")
+	require.NoError(t, os.WriteFile(cachePath, []byte(hash), 0o600))
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	// openshell is not in PATH — if ImportProfile tries to run it, it will fail.
+	// A successful return means the cache short-circuited the import.
+	t.Setenv("PATH", "")
+	err = ImportProfile(context.Background(), "test-profile", profilePath)
+	assert.NoError(t, err, "should skip import when cache hash matches")
+}
+
+func TestImportProfile_ReimportsWhenCacheDiffers(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: test-profile\nname: test"), 0o644))
+
+	cachePath := profileFileCachePath("test-profile")
+	require.NoError(t, os.WriteFile(cachePath, []byte("stale-hash"), 0o600))
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	// With openshell missing, reimport will fail — proving the cache miss path runs.
+	t.Setenv("PATH", t.TempDir())
+	err := ImportProfile(context.Background(), "test-profile", profilePath)
+	assert.Error(t, err, "should attempt reimport when cache hash differs")
+}
+
+func TestImportProfile_WritesCacheOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: cached\nname: test"), 0o644))
+
+	script := "#!/bin/sh\nexit 0\n"
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	cachePath := profileFileCachePath("cached")
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	err := ImportProfile(context.Background(), "cached", profilePath)
+	require.NoError(t, err)
+
+	// Cache file should now contain the profile hash.
+	cached, readErr := os.ReadFile(cachePath)
+	require.NoError(t, readErr, "cache file should exist after successful import")
+
+	expectedHash, _ := hashProfileFile(profilePath)
+	assert.Equal(t, expectedHash, string(cached))
+}
+
+func TestImportProfile_WritesCacheOnAlreadyExists(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "test.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: exists\nname: test"), 0o644))
+
+	script := `#!/bin/sh
+echo "profile already exists" >&2
+exit 1
+`
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	cachePath := profileFileCachePath("exists")
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	err := ImportProfile(context.Background(), "exists", profilePath)
+	require.NoError(t, err, "already-exists should not be an error")
+
+	// Cache should be written even on already-exists (parallel import).
+	cached, readErr := os.ReadFile(cachePath)
+	require.NoError(t, readErr, "cache file should exist after already-exists import")
+
+	expectedHash, _ := hashProfileFile(profilePath)
+	assert.Equal(t, expectedHash, string(cached))
+}
+
+func TestImportProfile_ConcurrentAccess(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "concurrent.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: concurrent\nname: test"), 0o644))
+
+	script := "#!/bin/sh\nexit 0\n"
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	cachePath := profileFileCachePath("concurrent")
+	t.Cleanup(func() { os.Remove(cachePath) })
+
+	const goroutines = 12
+	errs := make([]error, goroutines)
+	var wg sync.WaitGroup
+	for i := range goroutines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = ImportProfile(context.Background(), "concurrent", profilePath)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.NoError(t, err, "goroutine %d should succeed", i)
+	}
+}
+
+func TestHashProfileFile_Deterministic(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "profile.yaml")
+	require.NoError(t, os.WriteFile(f, []byte("id: test\nname: profile"), 0o644))
+
+	h1, err := hashProfileFile(f)
+	require.NoError(t, err)
+	h2, err := hashProfileFile(f)
+	require.NoError(t, err)
+	assert.Equal(t, h1, h2, "hash must be deterministic for same content")
+}
+
+func TestHashProfileFile_ChangesOnContentChange(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "profile.yaml")
+	require.NoError(t, os.WriteFile(f, []byte("id: test"), 0o644))
+
+	h1, err := hashProfileFile(f)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(f, []byte("id: test-modified"), 0o644))
+
+	h2, err := hashProfileFile(f)
+	require.NoError(t, err)
+	assert.NotEqual(t, h1, h2, "hash must change when file content changes")
+}
+
+func TestProfileFileCachePath_DeterministicAndUnique(t *testing.T) {
+	p1 := profileFileCachePath("profile-a")
+	p2 := profileFileCachePath("profile-a")
+	p3 := profileFileCachePath("profile-b")
+
+	assert.Equal(t, p1, p2, "same id must produce same cache path")
+	assert.NotEqual(t, p1, p3, "different ids must produce different cache paths")
+	assert.True(t, strings.HasPrefix(p1, os.TempDir()), "cache path must be in temp dir")
 }
 
 // TestEnsureProvider_AlreadyExists_FallsBackToUpdate uses a fake openshell
@@ -1292,4 +1507,393 @@ func TestBuildProviderUpdateArgs_ConfigNotExpandedForURL(t *testing.T) {
 		assert.NotContains(t, arg, "leaked-secret",
 			"URL-fetched provider config must not expand env vars on update")
 	}
+}
+
+func TestProfileFileLockPath_DeterministicAndUnique(t *testing.T) {
+	p1 := profileFileLockPath("profile-a")
+	p2 := profileFileLockPath("profile-a")
+	p3 := profileFileLockPath("profile-b")
+
+	assert.Equal(t, p1, p2, "same id must produce same lock path")
+	assert.NotEqual(t, p1, p3, "different ids must produce different lock paths")
+	assert.True(t, strings.HasPrefix(p1, os.TempDir()), "lock path must be in temp dir")
+	assert.True(t, strings.HasSuffix(p1, ".lock"), "lock path must end with .lock")
+}
+
+// TestImportProfile_FlockSerializesConcurrent verifies that the flock in
+// ImportProfile serializes concurrent access. The fake openshell import
+// handler uses a marker file to detect overlapping executions: it creates
+// the marker at entry and removes it at exit, failing if the marker
+// already exists. Without the flock, concurrent goroutines would enter
+// the import section simultaneously and the marker-already-present check
+// would trigger a failure, proving the lock is load-bearing.
+func TestImportProfile_FlockSerializesConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "flock-test.yaml")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: flock-test\nname: test"), 0o644))
+
+	// Marker file used by the fake openshell to detect concurrent imports.
+	// The script creates the marker on entry and removes it on exit. If the
+	// marker already exists at entry, another import is running concurrently
+	// and the script fails — proving the flock was needed to serialize access.
+	markerFile := filepath.Join(dir, "import-active")
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$3" = "import" ]; then
+  if [ -f "%s" ]; then
+    echo "concurrent import detected" >&2
+    exit 1
+  fi
+  echo $$ > "%s"
+  sleep 0.05
+  rm -f "%s"
+fi
+exit 0
+`, markerFile, markerFile, markerFile)
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	cachePath := profileFileCachePath("flock-test")
+	lockPath := profileFileLockPath("flock-test")
+	t.Cleanup(func() {
+		os.Remove(cachePath)
+		os.Remove(lockPath)
+	})
+
+	const goroutines = 12
+	errs := make([]error, goroutines)
+	var wg sync.WaitGroup
+	for i := range goroutines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = ImportProfile(context.Background(), "flock-test", profilePath)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.NoError(t, err, "goroutine %d should succeed under flock serialization", i)
+	}
+}
+
+// TestEnsureProvider_RetriesUnsupportedProvider verifies that
+// EnsureProvider retries when openshell returns the transient
+// "unsupported provider type or profile" error.
+func TestEnsureProvider_RetriesUnsupportedProvider(t *testing.T) {
+	dir := t.TempDir()
+	markerDir := filepath.Join(dir, "markers")
+	require.NoError(t, os.MkdirAll(markerDir, 0o755))
+
+	// Fake openshell: each create call creates a marker file. Once 3
+	// markers exist the script succeeds. Uses only shell builtins to
+	// avoid PATH issues (ls is replaced by glob counting).
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$2" = "create" ]; then
+  # Create a unique marker file for this attempt.
+  echo x > "%s/attempt.$$"
+  count=0
+  for f in "%s"/attempt.*; do
+    [ -e "$f" ] && count=$((count + 1))
+  done
+  if [ "$count" -lt 3 ]; then
+    echo "Error: × unsupported provider type or profile: fullsend-vertex-ai" >&2
+    exit 1
+  fi
+  exit 0
+fi
+exit 0
+`, markerDir, markerDir)
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := EnsureProvider(context.Background(), "vertex-ai", "vertex-ai", nil, nil, false)
+	assert.NoError(t, err, "should succeed after retries")
+
+	// Verify that 3 attempts were made.
+	entries, readErr := os.ReadDir(markerDir)
+	require.NoError(t, readErr)
+	assert.Len(t, entries, 3, "should have made 3 attempts")
+}
+
+// TestEnsureProvider_RetriesConcurrentUpdateConflict verifies that when the
+// provider already exists and the gateway rejects the update because another
+// run modified it concurrently, EnsureProvider retries the create+update
+// cycle instead of failing the run.
+func TestEnsureProvider_RetriesConcurrentUpdateConflict(t *testing.T) {
+	dir := t.TempDir()
+	markerDir := filepath.Join(dir, "markers")
+	require.NoError(t, os.MkdirAll(markerDir, 0o755))
+
+	// Fake openshell: create always reports the provider exists; update
+	// fails with the optimistic-concurrency error until the 3rd attempt.
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$2" = "create" ]; then
+  echo "Error: × code: 'Some entity that we attempted to create already exists', message: \"provider already exists\"" >&2
+  exit 1
+fi
+if [ "$2" = "update" ]; then
+  echo x > "%s/attempt.$$"
+  count=0
+  for f in "%s"/attempt.*; do
+    [ -e "$f" ] && count=$((count + 1))
+  done
+  if [ "$count" -lt 3 ]; then
+    echo "Error:   × code: 'The operation was aborted', message: \"provider was modified" >&2
+    echo "  │ concurrently (current resource_version: 2)\"" >&2
+    exit 1
+  fi
+  exit 0
+fi
+exit 0
+`, markerDir, markerDir)
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := EnsureProvider(context.Background(), "vertex-ai", "vertex-ai", nil, nil, false)
+	assert.NoError(t, err, "should succeed after retrying the conflicting update")
+
+	entries, readErr := os.ReadDir(markerDir)
+	require.NoError(t, readErr)
+	assert.Len(t, entries, 3, "should have retried the update 3 times")
+}
+
+func TestIsTransientProviderErr(t *testing.T) {
+	t.Parallel()
+	wrapped := "provider update \"vertex-ai\" failed: exit status 1 (output: Error:   × code: 'The operation was aborted', message: \"provider was modified\n  │ concurrently (current resource_version: 2)\"\n)"
+	assert.False(t, isTransientProviderErr(nil))
+	assert.True(t, isTransientProviderErr(fmt.Errorf("x: unsupported provider type or profile: p")))
+	assert.True(t, isTransientProviderErr(errors.New(wrapped)), "must match across the CLI's line wrap")
+	assert.True(t, isTransientProviderErr(errors.New("provider was modified concurrently")))
+	assert.False(t, isTransientProviderErr(fmt.Errorf("status: PermissionDenied")))
+	assert.False(t, isTransientProviderErr(fmt.Errorf("provider was modified by an operator")))
+}
+
+// TestEnsureProvider_NoRetryOnOtherErrors verifies that non-transient
+// errors are not retried.
+func TestEnsureProvider_NoRetryOnOtherErrors(t *testing.T) {
+	dir := t.TempDir()
+	markerDir := filepath.Join(dir, "markers")
+	require.NoError(t, os.MkdirAll(markerDir, 0o755))
+
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$2" = "create" ]; then
+  echo x > "%s/attempt.$$"
+  echo "status: PermissionDenied" >&2
+  exit 1
+fi
+exit 0
+`, markerDir)
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := EnsureProvider(context.Background(), "p", "custom", nil, nil, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "provider create")
+
+	// Should have only attempted once — no retry on non-transient errors.
+	entries, readErr := os.ReadDir(markerDir)
+	require.NoError(t, readErr)
+	assert.Len(t, entries, 1, "should not retry on non-transient errors")
+}
+
+// TestEnsureProvider_RetryCancelledByContext verifies that context
+// cancellation during the retry backoff sleep causes EnsureProvider to
+// return the context error instead of continuing to retry.
+func TestEnsureProvider_RetryCancelledByContext(t *testing.T) {
+	dir := t.TempDir()
+	markerDir := filepath.Join(dir, "markers")
+	require.NoError(t, os.MkdirAll(markerDir, 0o755))
+
+	// Fake openshell: always fails with the transient error so the
+	// retry loop never succeeds on its own.
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$2" = "create" ]; then
+  echo x > "%s/attempt.$$"
+  echo "Error: × unsupported provider type or profile: test" >&2
+  exit 1
+fi
+exit 0
+`, markerDir)
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	// Cancel the context shortly after the first attempt so the select
+	// picks up ctx.Done() during the backoff sleep.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	err := EnsureProvider(ctx, "p", "custom", nil, nil, false)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded, "should return context error when cancelled during retry sleep")
+
+	// Should have made only 1 attempt before the context expired during
+	// the backoff sleep.
+	entries, readErr := os.ReadDir(markerDir)
+	require.NoError(t, readErr)
+	assert.Len(t, entries, 1, "should stop retrying when context is cancelled")
+}
+
+func TestResolvedBasename(t *testing.T) {
+	t.Run("regular file", func(t *testing.T) {
+		dir := t.TempDir()
+		f := filepath.Join(dir, "hello.txt")
+		require.NoError(t, os.WriteFile(f, []byte("hi"), 0o644))
+		assert.Equal(t, "hello.txt", resolvedBasename(f))
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "content")
+		require.NoError(t, os.WriteFile(target, []byte("data"), 0o644))
+		link := filepath.Join(dir, "content.md")
+		require.NoError(t, os.Symlink(target, link))
+		assert.Equal(t, "content", resolvedBasename(link))
+	})
+
+	t.Run("nonexistent path", func(t *testing.T) {
+		assert.Equal(t, "gone.txt", resolvedBasename("/no/such/gone.txt"))
+	})
+}
+
+func TestProfileDirLockPath_DeterministicAndUnique(t *testing.T) {
+	p1 := profileDirLockPath("/some/profiles")
+	p2 := profileDirLockPath("/some/profiles")
+	p3 := profileDirLockPath("/other/profiles")
+
+	assert.Equal(t, p1, p2, "same dir must produce same lock path")
+	assert.NotEqual(t, p1, p3, "different dirs must produce different lock paths")
+	assert.True(t, strings.HasPrefix(p1, os.TempDir()), "lock path must be in temp dir")
+	assert.True(t, strings.HasSuffix(p1, ".lock"), "lock path must end with .lock")
+}
+
+// TestImportProfiles_FlockSerializesConcurrent verifies that the flock in
+// ImportProfiles serializes concurrent access. The fake openshell import
+// handler uses a marker file to detect overlapping executions: it creates
+// the marker at entry and removes it at exit, failing if the marker
+// already exists. Without the flock, concurrent goroutines would enter
+// the import section simultaneously and the marker-already-present check
+// would trigger a failure, proving the lock is load-bearing.
+func TestImportProfiles_FlockSerializesConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "p1.yaml"), []byte("id: p1\nname: profile-one"), 0o644))
+
+	// Marker file used by the fake openshell to detect concurrent imports.
+	markerFile := filepath.Join(dir, "import-active")
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$3" = "import" ]; then
+  if [ -f "%s" ]; then
+    echo "concurrent import detected" >&2
+    exit 1
+  fi
+  echo $$ > "%s"
+  sleep 0.05
+  rm -f "%s"
+fi
+exit 0
+`, markerFile, markerFile, markerFile)
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	cachePath := profileCachePath(dir)
+	lockPath := profileDirLockPath(dir)
+	t.Cleanup(func() {
+		os.Remove(cachePath)
+		os.Remove(lockPath)
+	})
+
+	const goroutines = 12
+	errs := make([]error, goroutines)
+	var wg sync.WaitGroup
+	for i := range goroutines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = ImportProfiles(dir)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.NoError(t, err, "goroutine %d should succeed under flock serialization", i)
+	}
+}
+
+// TestImportProfiles_DoubleCheckCacheHit verifies the double-check pattern:
+// after acquiring the lock, ImportProfiles re-reads the cache and returns early
+// if another process already imported the profiles while we were waiting.
+func TestImportProfiles_DoubleCheckCacheHit(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "p1.yaml"), []byte("id: p1\nname: profile-one"), 0o644))
+
+	// Set up a no-op openshell so the test doesn't need a real one.
+	// If the double-check cache hit works, openshell import is never called.
+	script := `#!/bin/sh
+if [ "$3" = "import" ]; then
+  echo "import should not be called" >&2
+  exit 1
+fi
+exit 0
+`
+	fakePath := filepath.Join(dir, "openshell")
+	require.NoError(t, os.WriteFile(fakePath, []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	cachePath := profileCachePath(dir)
+	lockPath := profileDirLockPath(dir)
+	t.Cleanup(func() {
+		os.Remove(cachePath)
+		os.Remove(lockPath)
+	})
+
+	// Compute the expected hash so we can pre-populate the cache.
+	currentHash, err := hashProfileDir(dir)
+	require.NoError(t, err)
+
+	// Acquire the lock before starting ImportProfiles so it blocks.
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	require.NoError(t, err)
+	defer lockFile.Close()
+	require.NoError(t, syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX))
+
+	// No cache file → fast-path will miss. Start ImportProfiles in a
+	// goroutine; it will block waiting for our lock.
+	var importErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		importErr = ImportProfiles(dir)
+	}()
+
+	// Give ImportProfiles time to pass the fast-path check and block on the lock.
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate the "other process" having written the cache while we held the lock.
+	require.NoError(t, os.WriteFile(cachePath, []byte(currentHash), 0o600))
+
+	// Release the lock — ImportProfiles should now hit the double-check,
+	// see the cache, and return nil without calling openshell import.
+	require.NoError(t, syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN))
+
+	<-done
+	assert.NoError(t, importErr, "double-check cache hit should succeed without importing")
+}
+
+// TestImportProfiles_LockOpenFailure verifies that ImportProfiles returns a
+// clear error when the lock file cannot be created (e.g., temp dir missing).
+func TestImportProfiles_LockOpenFailure(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "p1.yaml"), []byte("id: p1\nname: profile-one"), 0o644))
+
+	// Point TMPDIR to a non-existent directory so lock file creation fails.
+	t.Setenv("TMPDIR", filepath.Join(dir, "nonexistent"))
+
+	err := ImportProfiles(dir)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "opening profiles lock")
 }

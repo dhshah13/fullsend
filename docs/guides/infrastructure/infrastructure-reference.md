@@ -75,6 +75,21 @@ The mint exchanges GitHub OIDC tokens for scoped GitHub App installation tokens.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Agent → Mint Role Mapping
+
+Each dispatch stage mints a token for a specific **mint role**. The `code` and `fix` agents both use the **coder** role (same GitHub App, same PEM, same permissions). All other built-in agents use the role matching their name. `scribe` is a mint role without a built-in dispatch stage.
+
+To change permissions for the `code` or `fix` agent, update the `coder` role.
+
+| Agent | Mint Role |
+|-------|-----------|
+| triage | triage |
+| code | coder |
+| fix | coder |
+| review | review |
+| retro | retro |
+| prioritize | prioritize |
+
 ### Role Permissions Matrix
 
 The mint enforces minimum permission sets per role. Tokens cannot exceed these scopes.
@@ -87,9 +102,11 @@ Custom roles can be registered via the standalone mint's `CUSTOM_ROLE_PERMISSION
 | **scribe** | read | — | write | — | — | — | — | — | read |
 | **coder** | write | write | write | — | read | — | — | — | read |
 | **review** | read | write | write | — | read | — | — | — | read |
-| **fix** | write | write | write | — | — | — | — | — | read |
 | **retro** | read | write | write | read | — | — | — | — | read |
 | **prioritize** | read | — | write | — | — | — | — | write | read |
+| **e2e** | write | write | write | write | — | write | write | — | read |
+
+The **e2e** role also grants: `administration` (write), `members` (write), `secrets` (write), `organization_actions_variables` (write), `organization_administration` (write). These permissions are omitted from the table above because no other role uses them.
 
 ### Mint Security Controls
 
@@ -113,7 +130,7 @@ Mode is inferred from `ALLOWED_ORGS` — there is no separate trust-mode flag.
 - **WORKFLOW_HOST_REPOS**: Same semantics as tight mode — controls which repos may host workflows. Defaults to `fullsend-ai/fullsend` when unset
 - **mint enroll**: Succeeds without changing mint configuration (org registration is unnecessary); **mint unenroll** for individual orgs is rejected
 
-**GCF mint (STS verification) only:** The hosted Cloud Function uses `STSVerifier`, which exchanges each OIDC JWT with GCP STS against `WIF_PROVIDER_NAME`. A permissive WIF provider (CEL that does not enumerate orgs/repos) must back that env var, or STS will reject tokens from orgs outside the provider's `attributeCondition` even when `mintcore` prevalidation passes. Use `mint deploy --public` to provision `ALLOWED_ORGS=*` and permissive WIF together; tight-mode `mint deploy` (default) and `mint enroll` continue to use org-scoped WIF. Redeploys must match the mint mode (`--public` for public, omit for tight).
+**GCF mint (STS verification) only:** The hosted Cloud Function uses `STSVerifier`, which exchanges each OIDC JWT with GCP STS against `WIF_PROVIDER_NAME`. A permissive WIF provider (CEL that does not enumerate orgs/repos) must back that env var, or STS will reject tokens from orgs outside the provider's `attributeCondition` even when `mintcore` prevalidation passes. Use `mint deploy --public` to provision `PER_REPO_WIF_REPOS=*` and permissive WIF together; tight-mode `mint deploy` (default) and `mint enroll` continue to use org-scoped WIF. Redeploys must match the mint mode (`--public` for public, omit for tight).
 
 **Standalone mint (JWKS verification):** `cmd/mint` uses `JWKSVerifier` — direct GitHub JWKS signature checks with no STS or WIF. Public mode is fully determined by `ALLOWED_ORGS` and workflow provenance in `mintcore`; WIF provisioning is not applicable.
 
@@ -124,22 +141,27 @@ Mode is inferred from `ALLOWED_ORGS` — there is no separate trust-mode flag.
 A single mint instance can serve multiple orgs:
 
 - **Tight mode:** `EnsureOrgInMint()` additively appends orgs to `ALLOWED_ORGS`
-- **Public mode:** `ALLOWED_ORGS=*` — no per-org registration required; rollback to tight mode is config-only (replace `*` with an explicit org list)
+- **Public mode:** `PER_REPO_WIF_REPOS=*` — no per-org registration required; rollback to tight mode is config-only (clear `PER_REPO_WIF_REPOS=*` and set an explicit org list)
 - `ROLE_APP_IDS` maps `{role}` to GitHub App IDs (shared across all enrolled orgs)
 - Org isolation at token issuance uses the OIDC `repository_owner` claim and GitHub App installation lookup — not per-org app ID entries
 
 ### Status Endpoint
 
-`GET /v1/status` returns the configured roles available for the authenticated caller's org.
+`GET /v1/status` returns the configured roles and version information.
 
-- **Authentication:** Bearer OIDC JWT (same as `/v1/token`)
-- **Authorization:** Any valid OIDC token from an allowed org — no role restriction
-- **Response:**
+- **Authentication:** Bearer token. OIDC is always tried first. When optional status validators are compiled in (e.g. GitHub user token via the `github` build tag), they are tried if OIDC fails. First successful auth wins.
+- **Authorization:** Any valid credential from the auth pipeline — no role restriction.
+- **OIDC response:** Scoped to the authenticating workflow's org.
   ```json
   {"org": "my-org", "roles": ["coder", "review", "triage"]}
   ```
-- **Use case:** Workflow diagnostics — discover which roles are available before requesting a token
-- **Security:** Returns only the requesting org and its role names (not app IDs, not other orgs' roles)
+- **Non-OIDC response** (e.g. GitHub user token): Reports all configured allowed orgs.
+  ```json
+  {"allowed_orgs": ["org-a", "org-b"], "roles": ["coder", "review", "triage"]}
+  ```
+- **Use case:** Workflow diagnostics — discover which roles are available before requesting a token. Non-OIDC auth enables status checks from outside GitHub Actions (e.g. `gh` CLI, OAuth login).
+- **Security:** OIDC returns only the requesting org. Non-OIDC returns allowed orgs (not individual role app IDs).
+- **Enabling optional validators:** Pass `--status-auth=github` to `mint deploy` along with `--status-github-group=ORG/TEAM`. This compiles the GitHub validator via the `github` build tag. Without these flags, OIDC is the only auth path.
 
 ---
 
@@ -228,7 +250,7 @@ Secrets and variables are deployed at different scopes depending on the installa
 - `FULLSEND_GCP_WIF_PROVIDER` — WIF provider resource name
 
 **.fullsend repo variables (inference):**
-- `FULLSEND_GCP_REGION` — GCP region for inference (install-time only, not managed by sync)
+- `FULLSEND_GCP_REGION` — GCP region for inference (value drift is detected and repaired by convergence)
 
 **.fullsend repo variable (dot-repo fix):**
 - `FULLSEND_MINT_URL` — Duplicate of org variable (dot-prefixed repos can't read org-level variables)
@@ -243,19 +265,21 @@ Secrets and variables are deployed at different scopes depending on the installa
 
 **Target repo variables:**
 - `FULLSEND_MINT_URL`
-- `FULLSEND_GCP_REGION` (install-time only, not managed by sync)
-- `FULLSEND_PER_REPO_INSTALL` — Flag indicating per-repo mode (set to "true")
+- `FULLSEND_GCP_REGION` (value drift is detected and repaired by convergence)
+- `FULLSEND_REVIEW_CLIENT_ID` — OAuth client ID of the review agent's GitHub App (best-effort, conditional on successful lookup)
 
 #### GitLab
 
 **Target repo CI/CD variables (protected):**
 - `FULLSEND_FORGE_TOKEN` — Project access token for bot identity (stored as protected CI/CD variable)
-- `FULLSEND_FORGE` — Set to `"gitlab"`
-- `FULLSEND_PER_REPO_INSTALL` — Flag indicating per-repo mode (set to `"true"`)
 - `FULLSEND_LAST_POLL_AT_FAST` — Timestamp of last slash poll run (name predates the slash/events terminology split; used by the slash-command schedule)
 - `FULLSEND_LAST_POLL_AT_FULL` — Timestamp of last event poll run (name predates the slash/events terminology split; used by the event-discovery schedule)
 - `FULLSEND_POLL_MODE` — Pipeline schedule variable (`"slash"` or `"events"`); set automatically per schedule during install, not a project-level CI/CD variable
 - `FULLSEND_LABEL_STATE` — JSON object tracking label sync state
+- `FULLSEND_DISPATCHED_KEYS_FAST` — JSON map of recently dispatched event keys (slash-command schedule)
+- `FULLSEND_DISPATCHED_KEYS_FULL` — JSON map of recently dispatched event keys (event-discovery schedule)
+- `FULLSEND_FAILED_KEYS_FAST` — JSON map of event keys to failure counts (slash-command schedule)
+- `FULLSEND_FAILED_KEYS_FULL` — JSON map of event keys to failure counts (event-discovery schedule)
 
 **Inference variables (required when inference is configured):**
 - `FULLSEND_GCP_PROJECT_ID` — GCP project ID for inference (stored as a CI/CD secret, protected + masked)

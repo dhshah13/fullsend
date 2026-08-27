@@ -13,6 +13,18 @@ topics:
 
 Date: 2026-04-15
 
+> **Note (2026-08-20):** The admin installation SPA described in points 1 and 3 was
+> removed. `web/` now holds only the static landing page and document graph under
+> `web/public/`; there is no Vite build. Point 1's principle still holds — Node tooling
+> stays at the repository root — but its example scripts are stale: `npm run dev` and
+> `npm run build` no longer exist. The root scripts today are `npm test`,
+> `npm run dev:worker`, and `npm run docs:*`. The site Worker
+> under `cloudflare_site/worker/` is a static-asset passthrough — its OAuth BFF was
+> removed with the SPA. The `web/` vs `cloudflare_site/` split this ADR decided is
+> unchanged, as is the Build Site / Deploy Site artifact contract. The public mint
+> Worker (`internal/dispatch/cf/workersrc/`, `mint.fullsend.sh`) is a separate
+> deployment and was never covered by this ADR.
+
 ## Status
 
 Accepted

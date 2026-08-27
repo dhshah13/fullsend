@@ -1,8 +1,6 @@
 .env.local
 node_modules/
 .vite/
-web/dist
-web/admin/dist
 .dev.vars
 .wrangler
 .worktrees/

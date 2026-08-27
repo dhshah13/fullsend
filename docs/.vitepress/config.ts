@@ -207,6 +207,7 @@ export default defineConfig({
             { text: "fullsend inference", link: "/cli/inference" },
             { text: "fullsend mint", link: "/cli/mint" },
             { text: "fullsend repos", link: "/cli/repos" },
+            { text: "fullsend run", link: "/cli/run" },
           ],
         },
       ],
@@ -217,10 +218,20 @@ export default defineConfig({
           link: "/guides/getting-started/",
           items: [
             { text: "Getting Inference", link: "/guides/getting-started/getting-inference" },
+            { text: "Choose a Runtime", link: "/guides/getting-started/choosing-a-runtime" },
             { text: "Configuring GitHub", link: "/guides/getting-started/configuring-github" },
             { text: "Per-Org Mode", link: "/guides/getting-started/org-mode" },
             { text: "Repo Management", link: "/guides/getting-started/repo-management" },
             { text: "Operations", link: "/guides/getting-started/operations" },
+          ],
+        },
+        {
+          text: "Runtimes",
+          collapsed: true,
+          link: "/runtimes",
+          items: [
+            { text: "Claude Code", link: "/runtimes/claude" },
+            { text: "Pi", link: "/runtimes/pi" },
           ],
         },
         {
@@ -243,18 +254,36 @@ export default defineConfig({
           collapsed: true,
           link: "/guides/",
           items: [
-            { text: "Bring Your Own Agent", link: "/guides/user/bring-your-own-agent" },
-            { text: "CEL Triggers Reference", link: "/guides/user/cel-triggers-reference" },
             { text: "Bugfix Workflow", link: "/guides/user/bugfix-workflow" },
-            { text: "Configuring Agent Behavior", link: "/guides/user/customizing-agents" },
-            { text: "Configuring with AGENTS.md", link: "/guides/user/customizing-with-agents-md" },
-            { text: "Configuring with Skills", link: "/guides/user/customizing-with-skills" },
+            { text: "Issue Commands", link: "/guides/user/issues-commands" },
             {
-              text: "Building custom agents from scratch (deprecated)",
-              link: "/guides/user/building-custom-agents",
+              text: "Customizing Agents",
+              collapsed: true,
+              items: [
+                { text: "Overview", link: "/guides/user/customizing-overview" },
+                {
+                  text: "Configuring with AGENTS.md",
+                  link: "/guides/user/customizing-with-agents-md",
+                },
+                { text: "Configuring with Skills", link: "/guides/user/customizing-with-skills" },
+                {
+                  text: "Configuring Agent Behavior",
+                  link: "/guides/user/customizing-agents",
+                },
+                { text: "Bring Your Own Agent", link: "/guides/user/bring-your-own-agent" },
+                {
+                  text: "Custom Agent Identity",
+                  link: "/guides/user/custom-agent-identity",
+                },
+                { text: "Harness Field Reference", link: "/reference/harness-reference" },
+                { text: "CEL Triggers Reference", link: "/guides/user/cel-triggers-reference" },
+                {
+                  text: "Building custom agents (deprecated)",
+                  link: "/guides/user/building-custom-agents",
+                },
+              ],
             },
             { text: "Running Agents Locally", link: "/guides/user/running-agents-locally" },
-            { text: "Issue Commands", link: "/guides/user/issues-commands" },
             { text: "Jira Integration", link: "/guides/user/jira-integration" },
             { text: "How To Emit Traces", link: "/guides/user/how-to-emit-traces" },
             { text: "Tracing with MLflow", link: "/guides/user/tracing-with-mlflow" },
@@ -266,8 +295,14 @@ export default defineConfig({
           items: [
             { text: "Vision", link: "/vision" },
             { text: "Architecture", link: "/architecture" },
-            { text: "Runtimes", link: "/runtimes" },
             { text: "Glossary", link: "/glossary" },
+          ],
+        },
+        {
+          text: "Reference",
+          collapsed: true,
+          items: [
+            { text: "Harness Field Reference", link: "/reference/harness-reference" },
           ],
         },
         {
@@ -282,6 +317,7 @@ export default defineConfig({
             { text: "Standalone Mint", link: "/guides/infrastructure/standalone-mint" },
             { text: "Private Repositories", link: "/guides/infrastructure/private-repositories" },
             { text: "Tracing Reference", link: "/guides/infrastructure/distributed-tracing" },
+            { text: "Eval Measurements", link: "/guides/infrastructure/eval-measurements" },
             { text: "Advanced Setup", link: "/guides/infrastructure/advanced-setup" },
             {
               text: "Layered Config Reference",
@@ -334,13 +370,8 @@ export default defineConfig({
               items: getMarkdownFiles("experiments", "experiments"),
             },
             { text: "Doc Site", link: "/doc-site" },
-            { text: "Web Admin (On Hold)", link: "/web-admin-deployment" },
+            { text: "Site Deployment", link: "/site-deployment" },
           ],
-        },
-        {
-          text: "Internals",
-          collapsed: true,
-          items: [{ text: "Admin OAuth Worker", link: "/admin-oauth-worker" }],
         },
       ],
     },
@@ -356,7 +387,7 @@ export default defineConfig({
       provider: "local",
       options: {
         scopes: [
-          { label: "Guides", prefixes: ["/docs/guides/", "/docs/agents/", "/docs/cli/"] },
+          { label: "Guides", prefixes: ["/docs/guides/", "/docs/agents/", "/docs/cli/", "/docs/runtimes"] },
           {
             label: "Design Docs",
             prefixes: ["/docs/problems/", "/docs/ADRs/", "/docs/normative/", "/docs/spikes/"],

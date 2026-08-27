@@ -1,6 +1,6 @@
 ---
 title: "45. Forge-portable harness schema"
-status: Accepted
+status: Superseded
 relates_to:
   - agent-architecture
   - agent-infrastructure
@@ -17,7 +17,17 @@ Date: 2026-05-27
 
 ## Status
 
-Accepted
+Superseded by [ADR-0088](0088-cel-guarded-overlays.md) (CEL-guarded overlays)
+
+> **Living reference:** The field classification tables, `ForgeConfig` struct
+> definition, and merge rules in this ADR reflect the state at the time of
+> acceptance. For the current authoritative version, see
+> [Harness Field Reference](../contributing/harness-fields.md).
+
+> **Note:** The `forge:` section introduced by this ADR is deprecated in favor
+> of CEL-guarded `overlays:` — see [ADR 0088](0088-cel-guarded-overlays.md).
+> The rest of this ADR (role, slug, base composition, merge rules) remains
+> current.
 
 ## Context
 
@@ -761,3 +771,4 @@ forge-specific artifact. The harness and agent definition are portable.
 - [Issue #322](https://github.com/fullsend-ai/fullsend/issues/322): Platform-specific component identification
 - [Issue #1986](https://github.com/fullsend-ai/fullsend/issues/1986): Default agents should use the same delivery mechanism as custom agents
 - [ADR 0058](0058-agent-registration.md): Agent registration — re-adds `agents` config key with URL/path semantics (supersedes the role/name/slug schema removed in Phase 4)
+- [ADR 0088](0088-cel-guarded-overlays.md): CEL-guarded overlays — deprecates the `forge:` section in favor of `overlays:` with CEL `when` expressions

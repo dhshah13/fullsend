@@ -1,14 +1,14 @@
 // Package repos provides reusable per-repo installation logic for fullsend.
-// It decouples the core install flow (guard check, scaffold commit,
-// variable/secret writes) from CLI concerns (prompts, spinners, flag parsing)
-// so that both the interactive CLI and future bulk-install commands can share
-// the same logic.
+// It decouples the core install flow (scaffold commit, variable/secret writes)
+// from CLI concerns (prompts, spinners, flag parsing) so that both the
+// interactive CLI and future bulk-install commands can share the same logic.
 package repos
 
 import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
@@ -47,10 +47,9 @@ type InstallConfig struct {
 	UpstreamTag string
 
 	// Skip flags control which install steps are executed. Set by callers
-	// that handle specific steps externally (e.g., admin.go handles guard
-	// checks and mint setup before calling Install).
-	SkipAppSetup   bool
-	SkipGuardCheck bool
+	// that handle specific steps externally (e.g., admin.go handles mint
+	// setup before calling Install).
+	SkipAppSetup bool
 
 	// SkipScaffoldAndConfig skips scaffold file delivery and variable/secret
 	// writes. The caller handles these steps externally (e.g., vendor mode
@@ -67,7 +66,18 @@ type InstallConfig struct {
 	// over org config fields into the per-repo config.
 	PerRepoConfig config.PerRepoConfigWriter
 
+	// Runtime, when set, is written as the per-repo `runtime:` of the
+	// generated config (`fullsend admin install <owner>/<repo> --runtime`).
+	// Empty keeps the code default; ignored when PerRepoConfig is set.
+	Runtime string
+
 	VendorBinary bool
+
+	// ReviewAppClientID is the OAuth client ID of the review agent's
+	// GitHub App. When set, it is written as the FULLSEND_REVIEW_CLIENT_ID
+	// repo variable so that pre-fetch-prior-review.sh can validate
+	// provenance of prior review comments.
+	ReviewAppClientID string
 
 	// RunnerTags is a list of GitLab CI runner tags to embed in scaffold
 	// pipeline YAML so that agent jobs are routed to specific runners.
@@ -95,9 +105,8 @@ type InstallResult struct {
 	Owner string
 	Repo  string
 
-	Success          bool
-	Error            error
-	AlreadyInstalled bool
+	Success bool
+	Error   error
 
 	// WIFProvider is the WIF provider resource name, either pre-existing
 	// (from InstallConfig) or newly provisioned.
@@ -107,23 +116,28 @@ type InstallResult struct {
 // ScaffoldCommitFunc delivers scaffold files to a repository and returns
 // any error encountered.
 //
+// The installed parameter indicates whether this repo already had fullsend
+// components before this operation (true = upgrade, false = fresh install).
+// CLI implementations use this to select the appropriate commit message and
+// PR title without making extra API calls.
+//
 // The CLI layer provides an implementation wrapping layers.CommitScaffoldFiles,
 // which adds retry on non-fast-forward errors, branch-protection fallback to
 // PR delivery, and fork-based PR support for non-owner users.
 type ScaffoldCommitFunc func(ctx context.Context, owner, repo string,
-	files []forge.TreeFile, direct bool) error
+	files []forge.TreeFile, direct bool, installed bool) error
 
 // ProgressFunc is a callback for reporting installation progress. The caller
 // maps this to spinner output, structured logs, or whatever UI is appropriate.
 //
 // Parameters:
 //   - repo: the "owner/repo" being installed
-//   - phase: a machine-readable phase name (e.g., "guard", "scaffold", "vars", "secrets")
+//   - phase: a machine-readable phase name (e.g., "scaffold", "vars", "secrets")
 //   - message: a human-readable status message
 type ProgressFunc func(repo, phase, message string)
 
-// Install performs a per-repo fullsend installation. It checks for an existing
-// installation, generates and commits scaffold files, and writes repository
+// Install performs a per-repo fullsend installation. It generates and commits
+// scaffold files, and writes repository
 // variables and secrets. The caller is responsible for computing the WIF
 // provider resource name (via InstallConfig.WIFProvider) before calling this
 // function — GCP provisioning is handled separately by `inference provision`
@@ -141,38 +155,6 @@ func Install(ctx context.Context, cfg InstallConfig,
 	result := &InstallResult{
 		Owner: cfg.Owner,
 		Repo:  cfg.Repo,
-	}
-
-	// Step 1: Check guard variable and all installation components to
-	// detect existing installations. A repo is only considered "already
-	// installed" when every component is present: guard variable,
-	// workflow file, variables, and secrets. If the guard is set but
-	// other components are missing (partial install), we proceed with
-	// repair instead of skipping. Bulk-install callers use this to skip
-	// already-installed repos. Interactive CLI callers set
-	// SkipGuardCheck=true because they handle the guard check themselves
-	// (and always proceed with updates). Fails closed: a guard-check
-	// error returns an error rather than proceeding with a potentially
-	// duplicate install.
-	if !cfg.SkipGuardCheck {
-		progress(repoFullName, "guard", "Checking installation status")
-		guardVal, guardExists, guardErr := client.GetRepoVariable(ctx, cfg.Owner, cfg.Repo, forge.PerRepoGuardVar)
-		if guardErr != nil {
-			return result, fmt.Errorf("checking guard variable: %w", guardErr)
-		}
-		if guardExists && guardVal == "true" {
-			fullyInstalled, checkErr := checkInstallComponents(ctx, client, cfg.Owner, cfg.Repo, cfg.Forge, ForgeConfigFor(cfg.Forge))
-			if checkErr != nil {
-				return result, fmt.Errorf("checking installation components: %w", checkErr)
-			}
-			if fullyInstalled {
-				result.AlreadyInstalled = true
-				result.Success = true
-				progress(repoFullName, "guard", "Already installed (per-repo mode)")
-				return result, nil
-			}
-			progress(repoFullName, "guard", "Partial installation detected, repairing")
-		}
 	}
 
 	mintURL := cfg.MintURL
@@ -215,6 +197,22 @@ func Install(ctx context.Context, cfg InstallConfig,
 		return result, fmt.Errorf("generating scaffold files: %w", err)
 	}
 
+	// Step 4b: For GitLab, merge fullsend's include and workflow rules
+	// into the existing .gitlab-ci.yml instead of overwriting it. The
+	// static scaffold skips .gitlab-ci.yml; we generate it dynamically
+	// by reading the existing file and merging fullsend entries.
+	if cfg.Forge == ForgeGitLab {
+		mergedRoot, mergeErr := mergeGitLabRootCI(ctx, client, cfg.Owner, cfg.Repo)
+		if mergeErr != nil {
+			return result, fmt.Errorf("merging .gitlab-ci.yml: %w", mergeErr)
+		}
+		files = append(files, forge.TreeFile{
+			Path:    ".gitlab-ci.yml",
+			Content: mergedRoot,
+			Mode:    "100644",
+		})
+	}
+
 	// Step 5: Write repository variables. Variables and secrets are
 	// written before the scaffold commit so the workflow's required
 	// secrets exist by the time an event triggers a run. This
@@ -249,7 +247,7 @@ func Install(ctx context.Context, cfg InstallConfig,
 	// Moved after variable and secret writes to ensure the workflow's
 	// required credentials exist before the workflow file goes live.
 	progress(repoFullName, "scaffold", "Committing scaffold files")
-	if commitErr := commitScaffold(ctx, cfg.Owner, cfg.Repo, files, cfg.Direct); commitErr != nil {
+	if commitErr := commitScaffold(ctx, cfg.Owner, cfg.Repo, files, cfg.Direct, false); commitErr != nil {
 		return result, fmt.Errorf("committing scaffold: %w", commitErr)
 	}
 	progress(repoFullName, "scaffold", "Scaffold files committed")
@@ -257,6 +255,95 @@ func Install(ctx context.Context, cfg InstallConfig,
 	result.Success = true
 	progress(repoFullName, "done", "Installation complete")
 	return result, nil
+}
+
+// DriftConfig holds additional fields beyond ResolvedConfig that are
+// needed to build a complete InstallConfig for drift detection. These
+// fields come from the manifest or CLI flags and are not part of the
+// per-repo resolved config.
+type DriftConfig struct {
+	// InferenceRegion is the GCP region for inference. Only available
+	// from CLI flags on repos install; empty on the status path.
+	InferenceRegion string
+
+	// ReviewAppClientID is the OAuth client ID of the review agent's
+	// GitHub App. Only available from CLI flags on repos install.
+	ReviewAppClientID string
+
+	// RunnerTags is a list of GitLab CI runner tags from the manifest's
+	// GitLab platform section.
+	RunnerTags []string
+}
+
+// driftInstallConfig constructs the InstallConfig used by both the
+// status and converge paths for content drift checking. This is the
+// single source of truth for input construction — callers may overlay
+// converge-specific fields (resolved ref, PrebuiltScaffoldFiles) on
+// the returned value but must not build InstallConfig from scratch.
+func driftInstallConfig(resolved ResolvedConfig, dcfg DriftConfig) InstallConfig {
+	ref := resolved.FullsendRef
+	return InstallConfig{
+		Owner:             resolved.Owner,
+		Repo:              resolved.Repo,
+		Forge:             resolved.Forge,
+		Roles:             defaultRoles(nil),
+		MintURL:           resolved.MintURL,
+		UpstreamRef:       ref,
+		UpstreamTag:       ref,
+		Runtime:           resolved.Runtime,
+		InferenceRegion:   dcfg.InferenceRegion,
+		ReviewAppClientID: dcfg.ReviewAppClientID,
+		RunnerTags:        dcfg.RunnerTags,
+	}
+}
+
+// ExpectedScaffoldContent renders the scaffold files that a fresh install
+// would produce for the given resolved config. The status path uses this
+// to compare against installed files for content drift detection — when
+// the rendered template differs from the installed file, the repo's
+// scaffold is stale even if the ref string matches.
+//
+// When fullsend_ref pins a version that differs from the running binary,
+// the refResolver fetches remote scaffold templates from the pinned ref
+// so the baseline matches the pinned version, not the embedded templates.
+// This mirrors the converge path's FetchRemoteScaffold logic. Both paths
+// share driftInstallConfig as the underlying input builder and
+// BuildScaffoldFiles as the renderer.
+//
+// Returns (nil, nil) when FullsendRef is empty — there is no expected
+// ref to compare against.
+func ExpectedScaffoldContent(ctx context.Context, resolved ResolvedConfig, dcfg DriftConfig, refResolver *RefResolver) ([]forge.TreeFile, error) {
+	if resolved.FullsendRef == "" {
+		return nil, nil
+	}
+	installCfg := driftInstallConfig(resolved, dcfg)
+
+	// When the manifest pins a fullsend_ref, fetch remote scaffold
+	// templates so the baseline matches the pinned version's templates
+	// rather than the running binary's embedded templates. This is the
+	// same logic the converge path uses in convergeContentDriftFiles.
+	manifestRef := resolved.FullsendRef
+	if manifestRef != "" && refResolver != nil {
+		ref := manifestRef
+		if isSemver(manifestRef) {
+			if sha := refResolver.Resolve(ctx, manifestRef); sha != manifestRef {
+				ref = sha
+				installCfg.UpstreamRef = ref
+			}
+		}
+		scaffoldFiles, fetchErr := FetchRemoteScaffold(
+			ctx, refResolver.client,
+			manifestRef, ref, resolved.Forge,
+			dcfg.RunnerTags,
+		)
+		if fetchErr == nil {
+			installCfg.PrebuiltScaffoldFiles = scaffoldFiles
+		}
+		// On fetch failure, fall back to embedded templates — same
+		// best-effort semantics as the converge path.
+	}
+
+	return BuildScaffoldFiles(installCfg)
 }
 
 // BuildScaffoldFiles generates the scaffold tree files for a per-repo install.
@@ -267,7 +354,11 @@ func BuildScaffoldFiles(cfg InstallConfig) ([]forge.TreeFile, error) {
 	if cfg.PerRepoConfig != nil {
 		perRepoCfg = cfg.PerRepoConfig
 	} else {
-		perRepoCfg = config.NewPerRepoConfig(cfg.Roles, cfg.Owner+"/"+cfg.Repo)
+		generated := config.NewPerRepoConfig(cfg.Roles, cfg.Owner+"/"+cfg.Repo)
+		if cfg.Runtime != "" {
+			generated.SetRuntime(cfg.Runtime)
+		}
+		perRepoCfg = generated
 	}
 	if err := perRepoCfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -311,28 +402,47 @@ func BuildScaffoldFiles(cfg InstallConfig) ([]forge.TreeFile, error) {
 	return files, nil
 }
 
-func installVarsForForge(cfg InstallConfig, mintURL string) (map[string]string, error) {
+// ManagedVar describes a repository variable with its expected value and
+// whether it is dynamic (mutated at runtime). Static variables are
+// value-checked during drift detection; dynamic variables are
+// presence-checked only.
+type ManagedVar struct {
+	Name    string
+	Value   string
+	Dynamic bool // true = presence-only (value mutated at runtime)
+}
+
+// managedVarsForForge returns the managed variables for a given forge,
+// each annotated with whether the variable is dynamic. This is the
+// single source of truth for variable classification — callers use the
+// Dynamic flag to decide whether to compare values during drift
+// detection, without maintaining a separate hardcoded list.
+func managedVarsForForge(cfg InstallConfig, mintURL string) ([]ManagedVar, error) {
 	switch cfg.Forge {
 	case ForgeGitHub:
-		vars := map[string]string{
-			"FULLSEND_MINT_URL":   mintURL,
-			forge.PerRepoGuardVar: "true",
+		vars := []ManagedVar{
+			{Name: forge.VarMintURL, Value: mintURL},
 		}
 		if cfg.InferenceRegion != "" {
-			vars["FULLSEND_GCP_REGION"] = cfg.InferenceRegion
+			vars = append(vars, ManagedVar{Name: forge.VarGCPRegion, Value: cfg.InferenceRegion})
+		}
+		if cfg.ReviewAppClientID != "" {
+			vars = append(vars, ManagedVar{Name: forge.VarReviewClientID, Value: cfg.ReviewAppClientID})
 		}
 		return vars, nil
 	case ForgeGitLab:
 		now := time.Now().UTC().Format(time.RFC3339)
-		vars := map[string]string{
-			"FULLSEND_FORGE":             "gitlab",
-			"FULLSEND_LAST_POLL_AT_FAST": now,
-			"FULLSEND_LAST_POLL_AT_FULL": now,
-			"FULLSEND_LABEL_STATE":       "{}",
-			forge.PerRepoGuardVar:        "true",
+		vars := []ManagedVar{
+			{Name: forge.VarLastPollAtFast, Value: now, Dynamic: true},
+			{Name: forge.VarLastPollAtFull, Value: now, Dynamic: true},
+			{Name: forge.VarLabelState, Value: "{}", Dynamic: true},
+			{Name: forge.VarDispatchedKeysFast, Value: "{}", Dynamic: true},
+			{Name: forge.VarDispatchedKeysFull, Value: "{}", Dynamic: true},
+			{Name: forge.VarFailedKeysFast, Value: "{}", Dynamic: true},
+			{Name: forge.VarFailedKeysFull, Value: "{}", Dynamic: true},
 		}
 		if cfg.InferenceRegion != "" {
-			vars["FULLSEND_GCP_REGION"] = cfg.InferenceRegion
+			vars = append(vars, ManagedVar{Name: forge.VarGCPRegion, Value: cfg.InferenceRegion})
 		}
 		return vars, nil
 	default:
@@ -340,8 +450,38 @@ func installVarsForForge(cfg InstallConfig, mintURL string) (map[string]string, 
 	}
 }
 
+// staticExpectedVarValues returns a map of variable names to expected
+// values for all static (non-dynamic) managed variables. This is used
+// by the converge and status discovery phases to pass expected values
+// to ProbeComponents for value-level drift detection.
+func staticExpectedVarValues(cfg InstallConfig, mintURL string) (map[string]string, error) {
+	managed, err := managedVarsForForge(cfg, mintURL)
+	if err != nil {
+		return nil, err
+	}
+	vals := make(map[string]string)
+	for _, v := range managed {
+		if !v.Dynamic && v.Value != "" {
+			vals[v.Name] = v.Value
+		}
+	}
+	return vals, nil
+}
+
+func installVarsForForge(cfg InstallConfig, mintURL string) (map[string]string, error) {
+	managed, err := managedVarsForForge(cfg, mintURL)
+	if err != nil {
+		return nil, err
+	}
+	vars := make(map[string]string, len(managed))
+	for _, v := range managed {
+		vars[v.Name] = v.Value
+	}
+	return vars, nil
+}
+
 // installSecretsForForge returns the inference secrets to write.
-// Returns nil when InferenceProject is not set (the batch_install
+// Returns nil when InferenceProject is not set (the convergence
 // layer validates that InferenceProject is provided for repos
 // without existing secrets).
 func installSecretsForForge(cfg InstallConfig, wifProvider string) map[string]string {
@@ -350,24 +490,28 @@ func installSecretsForForge(cfg InstallConfig, wifProvider string) map[string]st
 	}
 
 	return map[string]string{
-		"FULLSEND_GCP_PROJECT_ID":   cfg.InferenceProject,
-		"FULLSEND_GCP_WIF_PROVIDER": wifProvider,
+		forge.SecretGCPProjectID:   cfg.InferenceProject,
+		forge.SecretGCPWIFProvider: wifProvider,
 	}
 }
 
-// requiredVariables lists the per-repo variables (excluding the guard)
-// that must exist for a complete installation. FULLSEND_GCP_REGION is
-// excluded because it is install-time-only and may not be present when
-// secrets are reused. Shared by install, checkInstallComponents, and
-// uninstall.
-var requiredVariables = []string{"FULLSEND_MINT_URL"}
+// requiredVariables lists the per-repo variables that must exist for a
+// complete installation. FULLSEND_GCP_REGION is excluded because it is
+// conditionally set (only when --inference-region is provided) and may
+// not be present when secrets are reused. Shared by install,
+// checkInstallComponents, and uninstall.
+var requiredVariables = []string{forge.VarMintURL}
 
 // requiredSecrets lists the per-repo secrets that must exist for a
 // complete installation. Shared by install, checkInstallComponents,
 // and uninstall.
-var requiredSecrets = []string{"FULLSEND_GCP_PROJECT_ID", "FULLSEND_GCP_WIF_PROVIDER"}
+var requiredSecrets = []string{forge.SecretGCPProjectID, forge.SecretGCPWIFProvider}
 
-var gitlabRequiredVariables = []string{"FULLSEND_FORGE"}
+var gitlabRequiredVariables = []string{
+	forge.VarLastPollAtFast, forge.VarLastPollAtFull, forge.VarLabelState,
+	forge.VarDispatchedKeysFast, forge.VarDispatchedKeysFull,
+	forge.VarFailedKeysFast, forge.VarFailedKeysFull,
+}
 
 func requiredVarsForForge(forgeName string) []string {
 	if forgeName == ForgeGitLab {
@@ -376,54 +520,26 @@ func requiredVarsForForge(forgeName string) []string {
 	return requiredVariables
 }
 
-func requiredSecretsForForge() []string {
+// requiredSecretsForForge returns the secret names that must exist for
+// the given forge. On GitLab, FULLSEND_FORGE_TOKEN is included because
+// secrets are stored as masked CI/CD variables and ListRepoVariables
+// returns them — excluding them from the required set would cause
+// orphan detection to flag them as false positives.
+func requiredSecretsForForge(forgeName string) []string {
+	if forgeName == ForgeGitLab {
+		return slices.Concat(requiredSecrets, []string{forge.SecretForgeToken})
+	}
 	return requiredSecrets
 }
 
 // checkInstallComponents verifies that all per-repo installation
-// components beyond the guard variable are present: workflow file,
-// variables, and secrets. The caller has already confirmed the guard
-// variable is set. Returns true only when every component exists.
-func checkInstallComponents(ctx context.Context, client forge.Client, owner, repo, forgeName string, fc ForgeConfig) (bool, error) {
-	// Workflow file (try forge-appropriate extensions).
-	workflowFound := false
-	for _, path := range fc.WorkflowPaths {
-		_, err := client.GetFileContent(ctx, owner, repo, path)
-		if err != nil {
-			if forge.IsNotFound(err) {
-				continue
-			}
-			return false, fmt.Errorf("checking workflow file: %w", err)
-		}
-		workflowFound = true
-		break
+// components are present (and, when expectedVarValues is provided,
+// that variable values match). Returns true only when every component
+// matches.
+func checkInstallComponents(ctx context.Context, client forge.Client, owner, repo, forgeName string, fc ForgeConfig, expectedVarValues map[string]string) (bool, error) {
+	components, err := ProbeComponents(ctx, client, owner, repo, forgeName, fc, expectedVarValues)
+	if err != nil {
+		return false, err
 	}
-	if !workflowFound {
-		return false, nil
-	}
-
-	// Variables (forge-specific).
-	for _, varName := range requiredVarsForForge(forgeName) {
-		_, exists, err := client.GetRepoVariable(ctx, owner, repo, varName)
-		if err != nil {
-			return false, fmt.Errorf("checking variable %s: %w", varName, err)
-		}
-		if !exists {
-			return false, nil
-		}
-	}
-
-	// Secrets (existence check only — values cannot be read back).
-	// Inference secrets are always required.
-	for _, secretName := range requiredSecretsForForge() {
-		exists, err := client.RepoSecretExists(ctx, owner, repo, secretName)
-		if err != nil {
-			return false, fmt.Errorf("checking secret %s: %w", secretName, err)
-		}
-		if !exists {
-			return false, nil
-		}
-	}
-
-	return true, nil
+	return AllMatch(components), nil
 }

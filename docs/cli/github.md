@@ -40,6 +40,15 @@ fullsend github setup <owner/repo> \
   --inference-wif-provider "<WIF_PROVIDER>"
 ```
 
+**Re-running per-repo setup** (for example after a fullsend upgrade) refreshes the managed
+workflow files but never rewrites an existing `.fullsend/config.yaml` on its own: `agents:` entries and
+their per-agent settings, allowlists and hand-written comments stay as they are, the runtime prompt is skipped,
+and the setup PR reports the runtime the file already selects. Passing a flag that targets a
+config key — `--runtime`, `--agents`, `--mint-url`, `--inference-*` — changes that key on the
+existing file and keeps the rest (the file is re-serialized, so comments are not preserved in
+that case). `--config` rewrites `config.base.yaml` and keeps the existing overlay. A
+`config.yaml` that no longer parses fails the re-run rather than being regenerated.
+
 ### Flags
 
 | Flag | Default | Description |
@@ -53,7 +62,7 @@ fullsend github setup <owner/repo> \
 | `--app-set` | `fullsend-ai` | App set name prefix for GitHub Apps |
 | `--agents` | `fullsend,triage,coder,review,retro,prioritize` | Agent roles to provision |
 | `--direct` | `false` | Push scaffold directly instead of creating a PR |
-| `--runtime` | `claude` | Agent runtime backend (`claude` or `dummy`; `dummy` is for behaviour test orgs only) |
+| `--runtime` | `claude` | Agent runtime backend (`claude`, `pi` or `dummy`; `dummy` is for behaviour test orgs only — see [runtimes.md](../runtimes.md)) |
 | `--config` | | Local file path or HTTPS URL to a vendor preset (committed as `.fullsend/config.base.yaml`; per-repo only) |
 | `--config-hash` | | SHA-256 hex digest to validate the preset content (requires `--config`) |
 

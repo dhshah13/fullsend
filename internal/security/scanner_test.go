@@ -1,6 +1,7 @@
 package security
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -234,6 +235,102 @@ func TestSecretRedactor(t *testing.T) {
 		assert.True(t, hasFinding(result, "json_field"))
 		assert.NotContains(t, result.Sanitized, "my-super-secret-pass-1234")
 	})
+
+	t.Run("auth header no false positive on conceptual discussion", func(t *testing.T) {
+		// Short technical references like "token_value" should not trigger
+		// the auth_header pattern — they are not real secrets.
+		input := `{"approach": "use Authorization: Bearer token_value to authenticate"}`
+		result := r.Scan(input)
+		assert.True(t, result.Safe || !hasFinding(result, "auth_header"),
+			"short technical reference should not trigger auth_header pattern")
+	})
+
+	t.Run("auth header preserves JSON structure", func(t *testing.T) {
+		// Even when the auth_header pattern fires, the output must
+		// remain valid JSON — the capture group must not consume the
+		// closing quote of a JSON string value.
+		input := `{"analysis": "Set Authorization: Bearer ghp_FAKEtesttoken000000000000000000000000 header"}`
+		result := r.Scan(input)
+		// The token is long enough to match and has a known prefix,
+		// so it should be redacted by the prefix pattern.
+		assert.False(t, result.Safe)
+		// Regardless of which pattern fires, the output must be valid JSON.
+		assert.True(t, json.Valid([]byte(result.Sanitized)),
+			"output is not valid JSON: %s", result.Sanitized)
+	})
+
+	t.Run("auth header still detects real secrets", func(t *testing.T) {
+		// A real auth header with a long token should still be detected.
+		input := "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature"
+		result := r.Scan(input)
+		assert.False(t, result.Safe)
+		assert.True(t, hasFinding(result, "auth_header"))
+		assert.NotContains(t, result.Sanitized, "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9")
+	})
+
+	t.Run("env assignment YAML flow list preserves bracket", func(t *testing.T) {
+		// Regression: [^\s'"]{8,} previously consumed ] in YAML flow sequences.
+		// The closing bracket must survive redaction.
+		input := "items: [export API_TOKEN=abcdefghijklmnop]"
+		result := r.Scan(input)
+		assert.False(t, result.Safe)
+		assert.True(t, hasFinding(result, "env_assignment"))
+		assert.NotContains(t, result.Sanitized, "abcdefghijklmnop")
+		assert.Contains(t, result.Sanitized, "]",
+			"YAML flow closing bracket must not be consumed by env_assignment capture")
+	})
+
+	t.Run("env assignment YAML flow map preserves brace", func(t *testing.T) {
+		// Regression: [^\s'"]{8,} previously consumed } in YAML flow mappings.
+		// The closing brace must survive redaction.
+		input := "{cmd: export API_TOKEN=abcdefghijklmnop}"
+		result := r.Scan(input)
+		assert.False(t, result.Safe)
+		assert.True(t, hasFinding(result, "env_assignment"))
+		assert.NotContains(t, result.Sanitized, "abcdefghijklmnop")
+		assert.Contains(t, result.Sanitized, "}",
+			"YAML flow closing brace must not be consumed by env_assignment capture")
+	})
+
+	t.Run("db connection truncated URL does not span JSON fields", func(t *testing.T) {
+		// Regression: (.{4,}) previously spanned past " into sibling JSON
+		// fields when the URL was truncated (no @ before the closing quote)
+		// and a later field contained @.
+		input := `{"url":"postgres://user:secret_value_12","email":"admin@example.com"}`
+		result := r.Scan(input)
+		// The bounded capture should stop at the closing ", so the
+		// db_connection_password pattern should NOT match (no @ reachable
+		// within the bounded charset).
+		assert.True(t, json.Valid([]byte(result.Sanitized)) || result.Sanitized == "",
+			"output must be valid JSON if modified: %s", result.Sanitized)
+		// The email field must survive intact.
+		if result.Sanitized != "" {
+			assert.Contains(t, result.Sanitized, "admin@example.com",
+				"sibling JSON field must not be swallowed by db_connection_password")
+		}
+	})
+
+	t.Run("db connection well-formed URL in JSON still redacts", func(t *testing.T) {
+		// A complete postgres://user:password@host URL inside JSON must
+		// still be detected — the @ is inside the bounded charset.
+		input := `{"db":"postgres://admin:hunter2_hunter2@db.example.com:5432/app"}`
+		result := r.Scan(input)
+		assert.False(t, result.Safe)
+		assert.True(t, hasFinding(result, "db_connection_password"))
+		assert.True(t, json.Valid([]byte(result.Sanitized)),
+			"output must be valid JSON: %s", result.Sanitized)
+	})
+
+	t.Run("auth header does not eat past JSON closing quote", func(t *testing.T) {
+		// Regression test: \S{8,} previously consumed the closing " of
+		// a JSON string, breaking JSON validity after mask().
+		input := `{"value": "X-Api-Key: testvalue_testvalue_testvalue_1"}`
+		result := r.Scan(input)
+		assert.False(t, result.Safe)
+		assert.True(t, hasFinding(result, "auth_header"))
+		assert.True(t, json.Valid([]byte(result.Sanitized)),
+			"output is not valid JSON: %s", result.Sanitized)
+	})
 }
 
 func TestSSRFValidator(t *testing.T) {
@@ -456,4 +553,143 @@ func hasFinding(r ScanResult, name string) bool {
 		}
 	}
 	return false
+}
+
+// unresolvableTestHost is a hostname guaranteed not to resolve, used across
+// egress-allowlist tests to trigger the DNS-failure code path.
+const unresolvableTestHost = "this-host-does-not-exist-fullsend-test.invalid"
+
+func TestParseEgressAllowlist(t *testing.T) {
+	t.Run("empty string", func(t *testing.T) {
+		m := ParseEgressAllowlist("")
+		assert.Empty(t, m)
+	})
+
+	t.Run("single entry", func(t *testing.T) {
+		m := ParseEgressAllowlist("host.internal:443")
+		assert.True(t, m["host.internal:443"])
+	})
+
+	t.Run("multiple entries", func(t *testing.T) {
+		m := ParseEgressAllowlist("a.internal:443,b.internal:8443")
+		assert.True(t, m["a.internal:443"])
+		assert.True(t, m["b.internal:8443"])
+	})
+
+	t.Run("trailing dot stripped", func(t *testing.T) {
+		m := ParseEgressAllowlist("host.internal.:443")
+		assert.True(t, m["host.internal:443"])
+	})
+
+	t.Run("host only no port", func(t *testing.T) {
+		m := ParseEgressAllowlist("host.internal")
+		assert.True(t, m["host.internal:0"])
+	})
+
+	t.Run("whitespace trimmed", func(t *testing.T) {
+		m := ParseEgressAllowlist(" a.internal:443 , b.internal:8443 ")
+		assert.True(t, m["a.internal:443"])
+		assert.True(t, m["b.internal:8443"])
+	})
+
+	t.Run("case insensitive", func(t *testing.T) {
+		m := ParseEgressAllowlist("Host.Internal:443")
+		assert.True(t, m["host.internal:443"])
+	})
+
+	t.Run("ipv6 brackets stripped", func(t *testing.T) {
+		m := ParseEgressAllowlist("[::1]:443")
+		assert.True(t, m["::1:443"])
+		assert.False(t, m["[::1]:443"])
+	})
+
+	t.Run("ipv6 full address brackets stripped", func(t *testing.T) {
+		m := ParseEgressAllowlist("[2001:db8::1]:8443")
+		assert.True(t, m["2001:db8::1:8443"])
+	})
+
+	t.Run("wildcard entries skipped", func(t *testing.T) {
+		m := ParseEgressAllowlist("*.internal:443,host.ok:8443")
+		assert.False(t, m["*.internal:443"])
+		assert.False(t, m[".internal:443"])
+		assert.True(t, m["host.ok:8443"])
+	})
+}
+
+func TestSSRFValidator_EgressAllowlist(t *testing.T) {
+	t.Run("allowlisted host with DNS failure is allowed", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist(unresolvableTestHost + ":443")
+		r := v.ValidateURL("https://"+unresolvableTestHost+"/api", true)
+		assert.True(t, r.Safe)
+		assert.Empty(t, r.Findings)
+	})
+
+	t.Run("non-allowlisted host DNS failure still blocks", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist("other.host:443")
+		r := v.ValidateURL("https://"+unresolvableTestHost+"/", true)
+		assert.False(t, r.Safe)
+		assert.True(t, hasFinding(r, "dns_failure"))
+	})
+
+	t.Run("allowlisted host wrong port still blocks", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist(unresolvableTestHost + ":8443")
+		r := v.ValidateURL("https://"+unresolvableTestHost+"/api", true)
+		assert.False(t, r.Safe)
+		assert.True(t, hasFinding(r, "dns_failure"))
+	})
+
+	t.Run("allowlisted host wildcard port", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist(unresolvableTestHost)
+		r := v.ValidateURL("https://"+unresolvableTestHost+":8080/api", true)
+		assert.True(t, r.Safe)
+	})
+
+	t.Run("allowlisted host blocked scheme still blocks", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist("internal.host:443")
+		r := v.ValidateURL("file:///etc/passwd", true)
+		assert.False(t, r.Safe)
+	})
+
+	t.Run("allowlisted host blocked hostname still blocks", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist("metadata.google.internal:443")
+		r := v.ValidateURL("https://metadata.google.internal/something", true)
+		assert.False(t, r.Safe)
+	})
+
+	t.Run("empty allowlist does not change behavior", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist("")
+		r := v.ValidateURL("https://"+unresolvableTestHost+"/", true)
+		assert.False(t, r.Safe)
+		assert.True(t, hasFinding(r, "dns_failure"))
+	})
+
+	t.Run("allowlist does not skip DNS check when DNS succeeds", func(t *testing.T) {
+		// localhost resolves to 127.0.0.1 — still blocked even if allowlisted.
+		v := NewSSRFValidatorWithAllowlist("localhost:80")
+		r := v.ValidateURL("http://localhost/secret", true)
+		assert.False(t, r.Safe)
+	})
+
+	t.Run("raw private IP still caught with allowlist", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist("10.0.0.1:80")
+		r := v.ValidateURL("http://10.0.0.1/internal", false)
+		assert.False(t, r.Safe)
+		assert.True(t, hasFinding(r, "blocked_ip"))
+	})
+
+	t.Run("ipv6 bracket allowlist entry matches url.Hostname", func(t *testing.T) {
+		// url.Parse().Hostname() strips brackets from IPv6 addresses, so
+		// allowlist entries with brackets must also be stored without them.
+		v := NewSSRFValidatorWithAllowlist("[" + unresolvableTestHost + "]:443")
+		r := v.ValidateURL("https://"+unresolvableTestHost+"/api", true)
+		assert.True(t, r.Safe)
+		assert.Empty(t, r.Findings)
+	})
+
+	t.Run("allowlisted host wildcard port is allowed", func(t *testing.T) {
+		v := NewSSRFValidatorWithAllowlist(unresolvableTestHost)
+		r := v.ValidateURL("https://"+unresolvableTestHost+":8080/api", true)
+		assert.True(t, r.Safe)
+		assert.Empty(t, r.Findings)
+	})
 }

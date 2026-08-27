@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -554,6 +555,10 @@ func (f *fakeCleanupSCM) CreateForkChangeProposal(context.Context, string, strin
 	return nil, nil
 }
 
+func (f *fakeCleanupSCM) ListIssueReactions(context.Context, string, string, int) ([]forge.Reaction, error) {
+	return nil, nil
+}
+
 // --- Issue cleanup tests ---
 
 func TestCleanupScenario_ClosesIssue(t *testing.T) {
@@ -718,6 +723,118 @@ func TestCleanupScenario_DeactivateKillSwitch_Error(t *testing.T) {
 	assert.Contains(t, logged[0], "deactivate kill switch")
 }
 
+// --- Allowed remote resources cleanup tests ---
+
+func TestCleanupScenario_RestoresAllowedResources(t *testing.T) {
+	t.Parallel()
+
+	scmDriver := &fakeCleanupSCM{
+		fileContent: []byte("version: \"1\"\nallowed_remote_resources:\n  - \"https://raw.githubusercontent.com/org/host/\"\nroles:\n  - triage\n"),
+	}
+	w := &world.World{
+		Org:                        "org",
+		RepoOwner:                  "org",
+		RepoName:                   "repo",
+		AllowedResourcesOverridden: true,
+		AllowedResourcesOriginal:   []string{"https://raw.githubusercontent.com/fullsend-ai/fullsend/"},
+		SCM:                        scmDriver,
+	}
+	CleanupScenario(w)
+	assert.True(t, scmDriver.commitFileCalled, "should commit config to restore allowed_remote_resources")
+}
+
+func TestCleanupScenario_SkipsAllowedResourcesWhenNotOverridden(t *testing.T) {
+	t.Parallel()
+
+	scmDriver := &fakeCleanupSCM{}
+	w := &world.World{
+		RepoOwner:                  "org",
+		RepoName:                   "repo",
+		AllowedResourcesOverridden: false,
+		SCM:                        scmDriver,
+	}
+	CleanupScenario(w)
+	assert.False(t, scmDriver.commitFileCalled, "should not commit when allowed resources were not overridden")
+}
+
+func TestCleanupScenario_RestoreAllowedResources_Error(t *testing.T) {
+	t.Parallel()
+
+	var logged []string
+	scmDriver := &fakeCleanupSCM{
+		fileContent:   []byte("version: \"1\"\nallowed_remote_resources:\n  - \"https://example.com/\"\nroles:\n  - triage\n"),
+		commitFileErr: fmt.Errorf("commit failed"),
+	}
+	w := &world.World{
+		Org:                        "org",
+		RepoOwner:                  "org",
+		RepoName:                   "repo",
+		AllowedResourcesOverridden: true,
+		AllowedResourcesOriginal:   []string{},
+		SCM:                        scmDriver,
+		Logf:                       func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+	CleanupScenario(w)
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "restore allowed_remote_resources")
+}
+
+// --- Agents cleanup tests ---
+
+func TestCleanupScenario_RestoresAgents(t *testing.T) {
+	t.Parallel()
+
+	scmDriver := &fakeCleanupSCM{
+		fileContent: []byte("version: \"1\"\nagents:\n  - name: custom\n    source: harness/custom.yaml\nroles:\n  - triage\n"),
+	}
+	w := &world.World{
+		Org:              "org",
+		RepoOwner:        "org",
+		RepoName:         "repo",
+		AgentsOverridden: true,
+		AgentsOriginal:   nil, // restore to empty (install-time default)
+		SCM:              scmDriver,
+	}
+	CleanupScenario(w)
+	assert.True(t, scmDriver.commitFileCalled, "should commit config to restore agents")
+}
+
+func TestCleanupScenario_SkipsAgentsWhenNotOverridden(t *testing.T) {
+	t.Parallel()
+
+	scmDriver := &fakeCleanupSCM{}
+	w := &world.World{
+		RepoOwner:        "org",
+		RepoName:         "repo",
+		AgentsOverridden: false,
+		SCM:              scmDriver,
+	}
+	CleanupScenario(w)
+	assert.False(t, scmDriver.commitFileCalled, "should not commit when agents were not overridden")
+}
+
+func TestCleanupScenario_RestoreAgents_Error(t *testing.T) {
+	t.Parallel()
+
+	var logged []string
+	scmDriver := &fakeCleanupSCM{
+		fileContent:   []byte("version: \"1\"\nagents:\n  - name: custom\n    source: harness/custom.yaml\nroles:\n  - triage\n"),
+		commitFileErr: fmt.Errorf("commit failed"),
+	}
+	w := &world.World{
+		Org:              "org",
+		RepoOwner:        "org",
+		RepoName:         "repo",
+		AgentsOverridden: true,
+		AgentsOriginal:   nil,
+		SCM:              scmDriver,
+		Logf:             func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+	CleanupScenario(w)
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "restore agents")
+}
+
 func TestCleanupScenario_BranchScenarioSweep(t *testing.T) {
 	t.Parallel()
 
@@ -809,4 +926,246 @@ func TestCleanupScenario_BranchScenarioSweep_RunsWithoutBranchSteps(t *testing.T
 		closed = append(closed, rec.number)
 	}
 	assert.Contains(t, closed, 71)
+}
+
+// --- Retry helper tests ---
+
+func TestCleanupRetry_SucceedsImmediately(t *testing.T) {
+	speedUpCleanupRetries(t)
+
+	calls := 0
+	err := cleanupRetry(nil, "test-op", func() error {
+		calls++
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, calls)
+}
+
+func TestCleanupRetry_TransientThenSuccess(t *testing.T) {
+	speedUpCleanupRetries(t)
+
+	calls := 0
+	transientErr := &fakeTransientError{msg: "503 service unavailable"}
+	err := cleanupRetry(nil, "test-op", func() error {
+		calls++
+		if calls < 3 {
+			return transientErr
+		}
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, 3, calls)
+}
+
+func TestCleanupRetry_TransientExhausted(t *testing.T) {
+	speedUpCleanupRetries(t)
+
+	transientErr := &fakeTransientError{msg: "503 service unavailable"}
+	calls := 0
+	var logged []string
+	logf := func(format string, args ...any) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	err := cleanupRetry(logf, "test-op", func() error {
+		calls++
+		return transientErr
+	})
+	assert.ErrorIs(t, err, transientErr)
+	assert.Equal(t, 3, calls) // default cleanupMaxAttempts
+	// Should have logged retry attempts (attempts 1 and 2, but not the last)
+	assert.Len(t, logged, 2)
+	assert.Contains(t, logged[0], "transient error")
+	assert.Contains(t, logged[0], "attempt 1/3")
+}
+
+func TestCleanupRetry_NonTransientNoRetry(t *testing.T) {
+	speedUpCleanupRetries(t)
+
+	nonTransientErr := fmt.Errorf("401 unauthorized")
+	calls := 0
+	err := cleanupRetry(nil, "test-op", func() error {
+		calls++
+		return nonTransientErr
+	})
+	assert.ErrorIs(t, err, nonTransientErr)
+	assert.Equal(t, 1, calls, "non-transient error should not be retried")
+}
+
+func TestCleanupScenario_RetriesTransientCloseIssue(t *testing.T) {
+	speedUpCleanupRetries(t)
+
+	calls := 0
+	transientErr := &fakeTransientError{msg: "503"}
+	scm := &fakeRetryCleanupSCM{
+		closeIssueFn: func(_ context.Context, _, _ string, _ int) error {
+			calls++
+			if calls == 1 {
+				return transientErr
+			}
+			return nil
+		},
+	}
+	w := &world.World{
+		RepoOwner:   "org",
+		RepoName:    "repo",
+		IssueNumber: 42,
+		SCM:         scm,
+	}
+	CleanupScenario(w)
+	assert.Equal(t, 2, calls, "should have retried on transient error")
+}
+
+func TestCleanupScenario_RetriesTransientCommitFile(t *testing.T) {
+	speedUpCleanupRetries(t)
+
+	calls := 0
+	transientErr := &fakeTransientError{msg: "503"}
+	scm := &fakeRetryCleanupSCM{
+		commitFileFn: func(_ context.Context, _, _, _, _ string, _ []byte) error {
+			calls++
+			if calls == 1 {
+				return transientErr
+			}
+			return nil
+		},
+	}
+	w := &world.World{
+		Org:       "org",
+		RepoOwner: "org",
+		RepoName:  "repo",
+		DummyOps:  []runtime.BehaviourOperation{{Op: "echo", Args: "hello"}},
+		SCM:       scm,
+	}
+	CleanupScenario(w)
+	assert.Equal(t, 2, calls, "should have retried commit on transient error")
+}
+
+// speedUpCleanupRetries sets cleanupBaseDelay to 1ms for the duration
+// of the test so retries don't slow down the test suite.
+func speedUpCleanupRetries(t *testing.T) {
+	t.Helper()
+	origDelay := cleanupBaseDelay
+	cleanupBaseDelay = 1 * time.Millisecond
+	t.Cleanup(func() { cleanupBaseDelay = origDelay })
+}
+
+// fakeTransientError implements the transientReporter interface
+// that forge.IsTransient checks, making it report as transient.
+type fakeTransientError struct {
+	msg string
+}
+
+func (e *fakeTransientError) Error() string     { return e.msg }
+func (e *fakeTransientError) IsTransient() bool { return true }
+
+// fakeRetryCleanupSCM is an scm.Driver implementation that uses
+// function callbacks for methods exercised in retry tests. Methods
+// without callbacks return nil.
+type fakeRetryCleanupSCM struct {
+	closeIssueFn func(ctx context.Context, owner, repo string, number int) error
+	commitFileFn func(ctx context.Context, owner, repo, path, msg string, content []byte) error
+	deleteRepoFn func(ctx context.Context, owner, repo string) error
+}
+
+func (f *fakeRetryCleanupSCM) CloseIssue(ctx context.Context, owner, repo string, number int) error {
+	if f.closeIssueFn != nil {
+		return f.closeIssueFn(ctx, owner, repo, number)
+	}
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) CommitFile(ctx context.Context, owner, repo, path, msg string, content []byte) error {
+	if f.commitFileFn != nil {
+		return f.commitFileFn(ctx, owner, repo, path, msg, content)
+	}
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) DeleteRepo(ctx context.Context, owner, repo string) error {
+	if f.deleteRepoFn != nil {
+		return f.deleteRepoFn(ctx, owner, repo)
+	}
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) DeleteBranch(context.Context, string, string, string) error {
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) ListOpenChangeProposals(context.Context, string, string) ([]forge.ChangeProposal, error) {
+	return nil, nil
+}
+
+func (f *fakeRetryCleanupSCM) CreateIssue(context.Context, string, string, string, string, ...string) (*forge.Issue, error) {
+	return nil, nil
+}
+
+func (f *fakeRetryCleanupSCM) AddIssueLabels(context.Context, string, string, int, ...string) error {
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) AddComment(context.Context, string, string, int, string) (*forge.IssueComment, error) {
+	return nil, nil
+}
+
+func (f *fakeRetryCleanupSCM) GetIssue(context.Context, string, string, int) (*forge.Issue, error) {
+	return nil, nil
+}
+
+func (f *fakeRetryCleanupSCM) GetFileContent(context.Context, string, string, string) ([]byte, error) {
+	return nil, nil
+}
+
+func (f *fakeRetryCleanupSCM) CreateBranch(context.Context, string, string, string) error {
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) CommitFileToBranch(context.Context, string, string, string, string, string, []byte) error {
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) CreateChangeProposal(context.Context, string, string, string, string, string, string) (*forge.ChangeProposal, error) {
+	return nil, nil
+}
+
+func (f *fakeRetryCleanupSCM) SubmitPullRequestReview(context.Context, string, string, int, string) error {
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) CreateRepo(context.Context, string, string, string) error {
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) ListComments(context.Context, string, string, int) ([]forge.IssueComment, error) {
+	return nil, nil
+}
+
+func (f *fakeRetryCleanupSCM) ListIssueReactions(context.Context, string, string, int) ([]forge.Reaction, error) {
+	return nil, nil
+}
+
+func (f *fakeRetryCleanupSCM) EnsureRepoPublic(context.Context, string, string) error {
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) GetDefaultBranch(context.Context, string, string) (string, error) {
+	return "main", nil
+}
+
+func (f *fakeRetryCleanupSCM) GetBranchRef(context.Context, string, string, string) (string, error) {
+	return "abc123", nil
+}
+
+func (f *fakeRetryCleanupSCM) CreateFork(context.Context, string, string, string) (string, error) {
+	return "", nil
+}
+
+func (f *fakeRetryCleanupSCM) CommitFileToFork(context.Context, string, string, string, string, string, []byte) error {
+	return nil
+}
+
+func (f *fakeRetryCleanupSCM) CreateForkChangeProposal(context.Context, string, string, string, string, string, string, string, string) (*forge.ChangeProposal, error) {
+	return nil, nil
 }

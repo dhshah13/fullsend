@@ -431,6 +431,10 @@ func TestOTELVariableForwarding(t *testing.T) {
 		"OTEL_EXPORTER_OTLP_CERTIFICATE",
 		"OTEL_RESOURCE_ATTRIBUTES",
 		"OTEL_SDK_DISABLED",
+		// Level 3 content-capture gate: a non-secret toggle, forwarded on
+		// the vars channel exactly like OTEL_SDK_DISABLED so orgs on managed
+		// workflows can enable it (ADR 0050 Level 3).
+		"OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
 	}
 
 	forwardLine := func(v string) string {
@@ -558,6 +562,29 @@ func TestReusableDispatchWorkflowContent(t *testing.T) {
 	s := string(content)
 	assert.Regexp(t, `(?s)/fs-review\)\s*\n\s+if \[\[ "\$\{ISSUE_IS_PR\}"`, s)
 	assert.Regexp(t, `(?s)ready-for-review"\s*\]\];\s*then\s*\n\s+if \[\[ "\$\{ISSUE_IS_PR\}"`, s)
+}
+
+// TestDispatchPunctuationStrip ensures both dispatch files strip trailing
+// punctuation clusters (not just a single char) from COMMAND and SECOND_WORD.
+// See #5582.
+func TestDispatchPunctuationStrip(t *testing.T) {
+	type workflowCase struct {
+		name    string
+		content func(t *testing.T) []byte
+	}
+	cases := []workflowCase{
+		{"reusable-dispatch.yml", loadRepoFile(".github/workflows/reusable-dispatch.yml")},
+		{"scaffold/dispatch.yml", loadScaffoldFile(".github/workflows/dispatch.yml")},
+	}
+	for _, wc := range cases {
+		t.Run(wc.name, func(t *testing.T) {
+			s := string(wc.content(t))
+			assert.Contains(t, s, `sed 's/[.,;:!?]*$//'`,
+				"COMMAND/SECOND_WORD must strip punctuation clusters via sed with * quantifier")
+			assert.NotContains(t, s, `sed 's/[.,;:!?]$//'`,
+				"single-char strip (without *) should not appear — it misses clusters like ...")
+		})
+	}
 }
 
 // TestDispatchPerStageAuthorization ensures triage-role users can trigger
@@ -782,6 +809,66 @@ func TestReusableDispatchPRHeadSHAPassthrough(t *testing.T) {
 	})
 }
 
+// TestReusableDispatchStatusCommentPassthrough validates that all agent jobs in
+// reusable-dispatch.yml pass run-url, status-repo, and status-number to the
+// action, enabling status comments for every stage (#6397).
+func TestReusableDispatchStatusCommentPassthrough(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "reusable-dispatch.yml"))
+	require.NoError(t, err)
+	s := string(content)
+
+	stages := []string{"triage", "code", "review", "fix", "retro", "prioritize"}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			marker := fmt.Sprintf("Run %s agent", stage)
+			section := extractStepSection(t, s, marker)
+			assert.Contains(t, section, "run-url:",
+				"%s agent step must pass run-url to action.yml", stage)
+			assert.Contains(t, section, "status-repo:",
+				"%s agent step must pass status-repo to action.yml", stage)
+			assert.Contains(t, section, "status-number:",
+				"%s agent step must pass status-number to action.yml", stage)
+		})
+	}
+
+	t.Run("harness-run", func(t *testing.T) {
+		marker := "Run harness agent"
+		section := extractStepSection(t, s, marker)
+		assert.Contains(t, section, "run-url:",
+			"harness-run agent step must pass run-url to action.yml")
+		assert.Contains(t, section, "status-repo:",
+			"harness-run agent step must pass status-repo to action.yml")
+		assert.Contains(t, section, "status-number:",
+			"harness-run agent step must pass status-number to action.yml")
+	})
+}
+
+// TestShimPerRepoProjectNumberPassthrough validates that the per-repo shim
+// template passes project_number to reusable-dispatch.yml (#6397).
+func TestShimPerRepoProjectNumberPassthrough(t *testing.T) {
+	content := loadScaffoldFile("templates/shim-per-repo.yaml")(t)
+	s := string(content)
+	assert.Contains(t, s, "project_number:",
+		"per-repo shim must pass project_number to reusable-dispatch.yml")
+	assert.Contains(t, s, "vars.FULLSEND_PROJECT_NUMBER",
+		"per-repo shim project_number must read from vars.FULLSEND_PROJECT_NUMBER")
+}
+
+// TestPrioritizeThinCallerThreadsProjectNumber validates that the prioritize
+// thin caller template accepts project_number as a workflow_dispatch input
+// and forwards it to the reusable workflow using an input-first fallback
+// expression (#6490).
+func TestPrioritizeThinCallerThreadsProjectNumber(t *testing.T) {
+	content := loadScaffoldFile(".github/workflows/prioritize.yml")(t)
+	s := string(content)
+	assert.Contains(t, s, "project_number:",
+		"prioritize thin caller must declare project_number input")
+	assert.Contains(t, s, "inputs.project_number",
+		"prioritize thin caller must forward inputs.project_number to the reusable workflow")
+	assert.Contains(t, s, "inputs.project_number || vars.FULLSEND_PROJECT_NUMBER",
+		"prioritize thin caller must fall back to vars.FULLSEND_PROJECT_NUMBER when input is empty")
+}
+
 // TestShimLabeledEventFiltering validates that shim workflows use the ready-
 // prefix filter at the if: guard level and label-aware concurrency keys so
 // routing labels don't cancel each other (#2452).
@@ -796,7 +883,7 @@ func TestShimLabeledEventFiltering(t *testing.T) {
 	}
 
 	cases := []shimCase{
-		{"fullsend.yaml", loadRepoFile(".github/workflows/fullsend.yaml"), true},
+		{"fullsend.yaml", loadRepoFile(".github/workflows/fullsend.yaml"), false},
 		{"scaffold/shim-workflow-call.yaml", loadScaffoldFile("templates/shim-workflow-call.yaml"), true},
 		{"scaffold/shim-per-repo.yaml", loadScaffoldFile("templates/shim-per-repo.yaml"), false},
 	}

@@ -13,8 +13,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/resolve"
@@ -25,6 +27,19 @@ const (
 	SandboxWorkspace = "/sandbox/workspace" //nolint:gosec // not a credential
 	// SandboxClaudeConfig is the Claude config directory inside the sandbox.
 	SandboxClaudeConfig = "/sandbox/claude-config" //nolint:gosec // not a credential
+	// SandboxPiConfig is the pi config directory inside the sandbox.
+	// Exported as PI_CODING_AGENT_DIR. Outside the cloned repo tree, like
+	// SandboxClaudeConfig, so repo contents cannot pre-seed it and workspace
+	// resets do not clear it. It is not a permission boundary: the agent
+	// process runs as the same user, and pi loads extensions from
+	// <dir>/extensions/, so Bootstrap must pass --no-extensions plus the
+	// runner-supplied adapter explicitly.
+	SandboxPiConfig = "/sandbox/pi-config" //nolint:gosec // not a credential
+	// SandboxPiExtensionsDir holds runner-vetted pi extensions baked into the
+	// sandbox image (images/sandbox/Containerfile), root-owned and outside
+	// PI_CODING_AGENT_DIR so pi never auto-loads them; PiRuntime.Run passes
+	// each one explicitly with -e.
+	SandboxPiExtensionsDir = "/usr/local/share/pi-extensions"
 
 	readyTimeout    = 120 * time.Second
 	readyPoll       = 2 * time.Second
@@ -36,6 +51,15 @@ const (
 	DefaultMaxCreateAttempts = 3
 	retryInitialBackoff      = 5 * time.Second
 	retryMaxBackoff          = 15 * time.Second
+
+	// providerRetries is the number of times EnsureProvider retries on
+	// transient errors caused by concurrent fullsend runs sharing a
+	// gateway: "unsupported provider type or profile" (a concurrent
+	// ImportProfile deleting and reimporting a changed profile) and the
+	// gateway's optimistic-concurrency rejection of a provider update
+	// ("provider was modified concurrently").
+	providerRetries      = 3
+	providerRetryBackoff = 500 * time.Millisecond
 )
 
 // RetrySleepFn is the function called between retry attempts in
@@ -149,9 +173,65 @@ func inGitDir(path, root string) bool {
 
 // ImportProfile imports a single openshell provider profile from a YAML
 // file. The profile defines a provider type schema (credentials, endpoints).
-// To ensure content changes propagate on persistent gateways, the profile
-// is deleted by id before re-importing (mirroring the ImportProfiles flow).
+//
+// Idempotency is hash-based: the function computes a SHA-256 digest of the
+// profile file and compares it against a cached value in a temp file keyed
+// by the profile id. When the hash matches (content unchanged), the import
+// is skipped entirely. This makes parallel fullsend run invocations safe —
+// only the first process imports, and subsequent processes see the cache hit.
+//
+// Concurrency safety: the delete+reimport critical section is protected by
+// a cross-process file lock (flock) keyed by profile id. This prevents the
+// race where a concurrent process deletes a profile between another
+// process's import and provider creation. Processes that block on the lock
+// re-check the cache after acquiring it (double-check pattern) and skip
+// the import if the winner already wrote the cache.
+//
+// When content has changed (hash mismatch or no cache), the existing profile
+// is deleted and reimported. If the reimport fails because a parallel process
+// already imported it, the error is treated as success.
 func ImportProfile(ctx context.Context, id, profilePath string) error {
+	currentHash, err := hashProfileFile(profilePath)
+	if err != nil {
+		return fmt.Errorf("hashing profile %q: %w", filepath.Base(profilePath), err)
+	}
+
+	// Fast path: check cache before acquiring the lock.
+	cachePath := profileFileCachePath(id)
+	if cached, readErr := os.ReadFile(cachePath); readErr == nil {
+		if strings.TrimSpace(string(cached)) == currentHash {
+			return nil
+		}
+	}
+
+	// Acquire a cross-process file lock so only one process at a time
+	// performs the non-atomic delete+reimport sequence for this profile.
+	lockPath := profileFileLockPath(id)
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening profile lock for %q: %w", id, err)
+	}
+	defer lockFile.Close()
+
+	// NOTE: LOCK_EX blocks without respecting ctx cancellation. This is
+	// acceptable because the lock holder's critical section is short: just
+	// a delete + reimport, each bounded by providerTimeout (30 s), so the
+	// worst-case wait is ~60 s. If stricter context-awareness is ever
+	// needed, switch to LOCK_NB in a poll loop that checks ctx.Done()
+	// between attempts.
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("acquiring profile lock for %q: %w", id, err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	// Double-check: the process that held the lock before us may have
+	// already imported this profile and written the cache.
+	if cached, readErr := os.ReadFile(cachePath); readErr == nil {
+		if strings.TrimSpace(string(cached)) == currentHash {
+			return nil
+		}
+	}
+
 	// Best-effort delete so content changes propagate (same pattern as ImportProfiles).
 	delCtx, delCancel := context.WithTimeout(ctx, providerTimeout)
 	exec.CommandContext(delCtx, "openshell", "provider", "profile", "delete", id).CombinedOutput() //nolint:errcheck
@@ -164,10 +244,13 @@ func ImportProfile(ctx context.Context, id, profilePath string) error {
 	if err != nil {
 		outStr := strings.ToLower(string(out))
 		if strings.Contains(outStr, "already exists") {
+			// A parallel process imported the profile — safe to continue.
+			os.WriteFile(cachePath, []byte(currentHash), 0o600) //nolint:errcheck
 			return nil
 		}
 		return fmt.Errorf("profile import %q failed: openshell: %w\noutput: %s", filepath.Base(profilePath), err, bytes.TrimSpace(out))
 	}
+	os.WriteFile(cachePath, []byte(currentHash), 0o600) //nolint:errcheck
 	return nil
 }
 
@@ -229,6 +312,13 @@ var reservedCredentialKeys = map[string]bool{
 // never appear on the process command line. The expanded values are injected
 // into the child process environment, where openshell reads them directly.
 // See https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers#bare-key-form
+//
+// Transient errors from concurrent runs on the same gateway are retried with
+// short backoff: "unsupported provider type or profile" occurs when a
+// concurrent ImportProfile process temporarily removes a profile during its
+// delete+reimport cycle, and "provider was modified concurrently" when two
+// runs update the same provider at once (the gateway rejects the stale
+// resource_version; the update is idempotent, so retrying is safe).
 func EnsureProvider(ctx context.Context, name, providerType string, credentials, config map[string]string, fromURL bool) error {
 	if fromURL {
 		for k := range credentials {
@@ -240,6 +330,55 @@ func EnsureProvider(ctx context.Context, name, providerType string, credentials,
 
 	args, extraEnv, secrets := buildProviderArgs(name, providerType, credentials, config, fromURL)
 
+	var lastErr error
+	for attempt := range providerRetries {
+		lastErr = tryCreateProvider(ctx, name, args, extraEnv, secrets, credentials, config, fromURL)
+		if lastErr == nil {
+			return nil
+		}
+		// Retry only on the transient concurrency errors.
+		if !isTransientProviderErr(lastErr) {
+			return lastErr
+		}
+		if attempt < providerRetries-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(providerRetryBackoff):
+			}
+		}
+	}
+	return fmt.Errorf("retries exhausted after %d attempts: %w", providerRetries, lastErr)
+}
+
+// isTransientProviderErr reports whether err is one of the openshell
+// errors produced by concurrent runs racing on the same gateway: a missing
+// or not-yet-reimported profile, or an optimistic-concurrency rejection of
+// a provider update ("provider was modified concurrently (current
+// resource_version: N)").
+//
+// NOTE: This matches literal text from the openshell CLI's stderr output.
+// If openshell changes its error wording in a future version, this check
+// will silently stop matching and retries will no longer trigger. Update
+// the substrings if the upstream messages change.
+func isTransientProviderErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported provider type or profile") ||
+		providerModifiedConcurrentlyRe.MatchString(msg)
+}
+
+// providerModifiedConcurrentlyRe matches openshell's optimistic-concurrency
+// error. The CLI wraps the message across lines with a box-drawing gutter
+// (`"provider was modified` / `│ concurrently (current resource_version: 2)"`),
+// so the two words are matched across any non-word characters.
+var providerModifiedConcurrentlyRe = regexp.MustCompile(`provider was modified\W+concurrently`)
+
+// tryCreateProvider performs a single attempt to create (or update) a
+// provider via openshell. Extracted from EnsureProvider to support retry.
+func tryCreateProvider(ctx context.Context, name string, args, extraEnv, secrets []string, credentials, config map[string]string, fromURL bool) error {
 	createCtx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(createCtx, "openshell", args...)
@@ -396,6 +535,13 @@ func CheckGateway() error {
 // entirely. This makes parallel fullsend run invocations safe — only the
 // first process imports, and subsequent processes see the cache hit.
 //
+// Concurrency safety: the delete+reimport critical section is protected by
+// a cross-process file lock (flock) keyed by directory path. This prevents the
+// race where a concurrent process deletes profiles between another process's
+// import and provider creation. Processes that block on the lock re-check the
+// cache after acquiring it (double-check pattern) and skip the import if the
+// winner already wrote the cache.
+//
 // When profiles have changed (hash mismatch or no cache), existing profiles
 // are deleted and reimported. If the reimport fails because a parallel process
 // already imported them, the error is treated as success.
@@ -412,7 +558,30 @@ func ImportProfiles(dir string) error {
 		return fmt.Errorf("hashing profiles directory %s: %w", dir, err)
 	}
 
+	// Fast path: check cache before acquiring the lock.
 	cachePath := profileCachePath(dir)
+	if cached, readErr := os.ReadFile(cachePath); readErr == nil {
+		if strings.TrimSpace(string(cached)) == currentHash {
+			return nil
+		}
+	}
+
+	// Acquire a cross-process file lock so only one process at a time
+	// performs the non-atomic delete+reimport sequence for this directory.
+	lockPath := profileDirLockPath(dir)
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening profiles lock for %q: %w", dir, err)
+	}
+	defer lockFile.Close()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("acquiring profiles lock for %q: %w", dir, err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	// Double-check: the process that held the lock before us may have
+	// already imported these profiles and written the cache.
 	if cached, readErr := os.ReadFile(cachePath); readErr == nil {
 		if strings.TrimSpace(string(cached)) == currentHash {
 			return nil
@@ -468,16 +637,66 @@ func hashProfileDir(dir string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// profileCachePath returns a temp file path for caching the profile directory
-// hash. The path is keyed to the absolute directory path so that different
-// fullsend-dir values get separate caches.
-func profileCachePath(dir string) string {
+// profileDirTempPath returns a temp file path keyed by the absolute directory
+// path with the given extension. Used by profileCachePath and profileDirLockPath
+// to derive deterministic, per-directory paths without duplicating the hashing
+// logic. This mirrors profileTempPath for single-profile paths.
+func profileDirTempPath(dir, ext string) string {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		absDir = dir
 	}
 	dirHash := sha256.Sum256([]byte(absDir))
-	return filepath.Join(os.TempDir(), "fullsend-profiles-"+hex.EncodeToString(dirHash[:8])+".sha256")
+	return filepath.Join(os.TempDir(), "fullsend-profiles-"+hex.EncodeToString(dirHash[:8])+"."+ext)
+}
+
+// profileCachePath returns a temp file path for caching the profile directory
+// hash. The path is keyed to the absolute directory path so that different
+// fullsend-dir values get separate caches.
+func profileCachePath(dir string) string {
+	return profileDirTempPath(dir, "sha256")
+}
+
+// profileDirLockPath returns a temp file path used as a cross-process flock
+// for serializing the delete+reimport critical section in ImportProfiles.
+// Keyed by directory path so different profile directories lock independently.
+func profileDirLockPath(dir string) string {
+	return profileDirTempPath(dir, "lock")
+}
+
+// hashProfileFile computes a SHA-256 digest of a single profile file's
+// contents. This is the single-file analog of hashProfileDir.
+func hashProfileFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// profileTempPath returns a temp file path keyed by profile id with the
+// given extension. Used by profileFileCachePath and profileFileLockPath to
+// derive deterministic, per-profile paths without duplicating the hashing
+// logic.
+func profileTempPath(id, ext string) string {
+	idHash := sha256.Sum256([]byte(id))
+	return filepath.Join(os.TempDir(), "fullsend-profile-"+hex.EncodeToString(idHash[:8])+"."+ext)
+}
+
+// profileFileCachePath returns a temp file path for caching the hash of a
+// single profile file. The path is keyed to the profile id so that
+// different profiles get separate caches.
+func profileFileCachePath(id string) string {
+	return profileTempPath(id, "sha256")
+}
+
+// profileFileLockPath returns a temp file path used as a cross-process
+// flock for serializing the delete+reimport critical section in
+// ImportProfile. Keyed by profile id so different profiles lock
+// independently.
+func profileFileLockPath(id string) string {
+	return profileTempPath(id, "lock")
 }
 
 // EnableProvidersV2 enables the providers_v2_enabled setting globally in the
@@ -824,7 +1043,7 @@ func UploadFile(sandboxName, localPath, remotePath string) error {
 	}
 
 	if exitCode != 0 {
-		wrongPath := fmt.Sprintf("%s/%s", remotePath, filepath.Base(localPath))
+		wrongPath := fmt.Sprintf("%s/%s", remotePath, resolvedBasename(localPath))
 		_, _, exitCode, err := Exec(sandboxName, fmt.Sprintf("test -f %s", shellQuote(wrongPath)), 1*time.Second)
 		if err != nil {
 			return err
@@ -862,6 +1081,16 @@ func UploadFile(sandboxName, localPath, remotePath string) error {
 	return nil
 }
 
+// resolvedBasename returns filepath.Base of the symlink-resolved path.
+// Upload resolves symlinks before handing the path to openshell, so the
+// file inside the sandbox has the resolved basename, not the symlink name.
+func resolvedBasename(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Base(resolved)
+	}
+	return filepath.Base(path)
+}
+
 // UploadDir uploads the contents of a local directory into a sandbox,
 // preserving symlinks. It builds a local tar archive (tar preserves symlinks
 // by default), uploads it, and extracts it in the sandbox at remotePath.
@@ -875,7 +1104,7 @@ func UploadFile(sandboxName, localPath, remotePath string) error {
 // same remotePath overwrite deterministically rather than merging files
 // from both. Do not point two different, unrelated sources at the same
 // remotePath expecting their content to coexist.
-func UploadDir(sandboxName, localPath, remotePath string) error {
+func UploadDir(sandboxName, localPath, remotePath string, excludes ...string) error {
 	tmp, err := os.CreateTemp("", "openshell-upload-*.tar.gz")
 	if err != nil {
 		return fmt.Errorf("creating temp tarball: %w", err)
@@ -884,7 +1113,21 @@ func UploadDir(sandboxName, localPath, remotePath string) error {
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	tarCmd := exec.Command("tar", "-czf", tmpPath, "-C", localPath, ".")
+	members, err := tarRootMembers(localPath, excludes...)
+	if err != nil {
+		return fmt.Errorf("listing %q for upload: %w", localPath, err)
+	}
+	tarArgs := []string{"-czf", tmpPath, "-C", localPath}
+	if len(members) == 0 {
+		// Everything at the root was excluded (or the dir is empty). An
+		// empty --files-from list yields an empty archive on GNU tar and
+		// bsdtar alike; do not fall back to "." (that would re-include
+		// excluded names).
+		tarArgs = append(tarArgs, "--files-from", os.DevNull)
+	} else {
+		tarArgs = append(tarArgs, members...)
+	}
+	tarCmd := exec.Command("tar", tarArgs...)
 	// Suppress macOS AppleDouble (._*) files in the tarball. On macOS,
 	// bsdtar generates ._* companion files for any file with extended
 	// attributes. These corrupt .git after a sandbox round-trip.
@@ -919,6 +1162,39 @@ func UploadDir(sandboxName, localPath, remotePath string) error {
 		return fmt.Errorf("extracting tarball in sandbox %q: exit %d: %s", sandboxName, exitCode, stderr)
 	}
 	return nil
+}
+
+// tarRootMembers lists top-level archive members under localPath, omitting
+// excludes. Matching is by top-level entry name only (nested path components
+// in an exclude are ignored beyond the first segment), so nested directories
+// like sub/output/ are never dropped — unlike tar --exclude on bsdtar,
+// which matches the basename at any depth.
+func tarRootMembers(localPath string, excludes ...string) ([]string, error) {
+	skip := make(map[string]struct{}, len(excludes))
+	for _, ex := range excludes {
+		name := strings.Trim(ex, `/\`)
+		if name == "" {
+			continue
+		}
+		// Top-level basenames only. Rejecting nested paths avoids silently
+		// truncating "build/output" to "build" and dropping an entire tree.
+		if strings.ContainsAny(name, `/\`) {
+			return nil, fmt.Errorf("upload exclude %q must be a top-level name", ex)
+		}
+		skip[name] = struct{}{}
+	}
+	entries, err := os.ReadDir(localPath)
+	if err != nil {
+		return nil, err
+	}
+	members := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if _, ok := skip[e.Name()]; ok {
+			continue
+		}
+		members = append(members, "./"+e.Name())
+	}
+	return members, nil
 }
 
 // Download copies a file or directory from a sandbox to the local machine.

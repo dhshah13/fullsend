@@ -61,7 +61,7 @@ const EnvVar = "FULLSEND_PRESCRIPT_OUTPUT"
 // ExitCodeNeutral is the exit code a pre-script uses to signal "nothing to
 // do, skip cleanly" (issue #582). When fullsend run sees this exit code it
 // treats the run as skipped/neutral — no sandbox is created, no LLM is
-// invoked, and the run reports a ⏭️ skipped status. The code follows the
+// invoked, and the run reports a skipped status. The code follows the
 // CI convention for "neutral" (used by GitHub Actions and others).
 //
 // Exit 78 is complementary to the file-based skip protocol (skipped=true).

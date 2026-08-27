@@ -1,0 +1,39 @@
+{
+  "repo": "fullsend-ai/fullsend",
+  "entity": {
+    "kind": "conversation",
+    "id": 5182,
+    "url": "https://github.com/fullsend-ai/fullsend/discussions/5182"
+  },
+  "actor": {
+    "id": "contributor",
+    "kind": "human",
+    "role": "write",
+    "is_entity_author": true
+  },
+  "transition": {
+    "kind": "comment_added",
+    "comment": {
+      "id": "DC_kwDOExampleComment",
+      "parent_id": "DC_kwDOExampleComment",
+      "command": "/fs-vouch",
+      "body": "/fs-vouch please review my request",
+      "instruction": "please review my request"
+    }
+  },
+  "state": {
+    "labels": ["needs-triage"],
+    "conversation": {
+      "category": {
+        "id": "DIC_kwDOExample",
+        "name": "Vouch Request",
+        "slug": "vouch-request"
+      }
+    }
+  },
+  "source": {
+    "system": "github",
+    "raw_type": "discussion_comment",
+    "raw_action": "created"
+  }
+}

@@ -73,11 +73,6 @@ jobs:
           cp -a _bundle/public/. cloudflare_site/public/
           cp -a _bundle/worker/. cloudflare_site/worker/
 
-      - name: Patch wrangler.toml for CI (worker name + rate limit namespaces)
-        env:
-          CLOUDFLARE_PROJECT_NAME: ${{ vars.CLOUDFLARE_PROJECT_NAME }}
-        run: node cloudflare_site/scripts/patch-wrangler-rate-limit-namespace-ids.mjs
-
       - name: Resolve preview context (PR number + preview alias)
         id: preview-context
         if: success()
@@ -122,17 +117,7 @@ jobs:
             core.setOutput('preview_alias', previewAlias);
             core.setOutput('pr_number', prNumber != null ? String(prNumber) : '');
 
-      # Same 10214 issue as previews: wrangler-action runs script-level `wrangler secret bulk`
-      # before `deploy` when `secrets:` is set. Use `wrangler versions secret bulk` in preCommands
-      # instead (cloudflare/wrangler-action#374).
-      # preCommands run under `/bin/sh` (dash on Ubuntu): no `pipefail` (bash-only).
-      # Each newline in preCommands is a separate shell invocation — no line continuations or
-      # multi-line printf; keep the secret bulk prep on one line so mktemp and the file path match.
-      # Bare `wrangler` in preCommands doesn't work: wrangler-action's execCommands() only
-      # rewrites a line to `npx wrangler ...` when it starts with the literal "wrangler"
-      # (verified against wrangler-action@9acf94a dist/index.mjs — re-check if pin is bumped).
-      # This compound line starts with `set`, so use `npx --no-install wrangler` to invoke
-      # the copy already installed by wranglerVersion (see #4861).
+      # The site Worker is a static-asset passthrough: no vars or secrets are required.
       - name: Deploy to production (Workers + static assets)
         id: cf-prod
         if: github.event.workflow_run.event == 'push'
@@ -143,24 +128,8 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           packageManager: npm
-          preCommands: set -eu; secrets_file="$(mktemp)"; trap 'rm -f "$secrets_file"' EXIT; printf '%s\n' "GITHUB_APP_CLIENT_SECRET=${GITHUB_APP_CLIENT_SECRET}" "TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY}" >"$secrets_file"; npx --no-install wrangler versions secret bulk "$secrets_file" --message "Production secrets (workflow-run ${{ github.event.workflow_run.id }})"
           command: deploy --name="${{ vars.CLOUDFLARE_PROJECT_NAME }}"
-          vars: |
-            GITHUB_APP_CLIENT_ID
-            TURNSTILE_SITE_KEY
-        env:
-          GITHUB_APP_CLIENT_ID: ${{ vars.FULLSEND_GITHUB_APP_CLIENT_ID }}
-          GITHUB_APP_CLIENT_SECRET: ${{ secrets.FULLSEND_GITHUB_APP_CLIENT_SECRET }}
-          TURNSTILE_SITE_KEY: ${{ vars.FULLSEND_TURNSTILE_SITE_KEY }}
-          TURNSTILE_SECRET_KEY: ${{ secrets.FULLSEND_TURNSTILE_SECRET_KEY }}
 
-      # PR previews: wrangler-action runs script-level `wrangler secret bulk` *before* the main command.
-      # That conflicts with `versions upload` (API 10214: latest version isn't deployed). Apply secrets
-      # with `wrangler versions secret bulk` in preCommands instead (cloudflare/wrangler-action#374).
-      # Plain `vars` are only auto-injected for deploy/publish, so pass `--var` on `versions upload`.
-      # preCommands run under `/bin/sh` (dash on Ubuntu): no `pipefail` (bash-only).
-      # Each newline in preCommands is a separate shell invocation — keep secret bulk prep on one line.
-      # Bare `wrangler` in preCommands doesn't work — see the prod deploy step above for why (#4861).
       - name: Upload preview version (Workers + static assets)
         id: cf-preview
         if: github.event.workflow_run.event == 'pull_request'
@@ -171,16 +140,10 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           packageManager: npm
-          preCommands: set -eu; secrets_file="$(mktemp)"; trap 'rm -f "$secrets_file"' EXIT; printf '%s\n' "GITHUB_APP_CLIENT_SECRET=${GITHUB_APP_CLIENT_SECRET}" "TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY}" >"$secrets_file"; npx --no-install wrangler versions secret bulk "$secrets_file" --message "PR preview secrets (workflow-run ${{ github.event.workflow_run.id }})"
           command: >-
             versions upload
             --name="${{ vars.CLOUDFLARE_PROJECT_NAME }}"
             --preview-alias ${{ steps.preview-context.outputs.preview_alias }}
-            --var GITHUB_APP_CLIENT_ID:${{ vars.FULLSEND_GITHUB_APP_CLIENT_ID }}
-            --var TURNSTILE_SITE_KEY:${{ vars.FULLSEND_TURNSTILE_SITE_KEY }}
-        env:
-          GITHUB_APP_CLIENT_SECRET: ${{ secrets.FULLSEND_GITHUB_APP_CLIENT_SECRET }}
-          TURNSTILE_SECRET_KEY: ${{ secrets.FULLSEND_TURNSTILE_SECRET_KEY }}
 
       - name: Resolve deployment URL
         id: meta

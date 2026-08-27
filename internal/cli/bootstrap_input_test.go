@@ -18,9 +18,9 @@ func TestNewHarnessBootstrap_WithoutSecurity(t *testing.T) {
 			Enabled: &disabled,
 		},
 	}
-	boot := newHarnessBootstrap(h, "sandbox-1", "test")
+	boot := newHarnessBootstrap(h, "sandbox-1", "test", "")
 
-	_, ok := boot.(agentruntime.ClaudeHooksBootstrap)
+	_, ok := boot.(agentruntime.SandboxHooksBootstrap)
 	assert.False(t, ok)
 	assert.Equal(t, "sandbox-1", boot.SandboxName())
 	assert.Equal(t, "agents/test.md", boot.AgentPath())
@@ -29,13 +29,36 @@ func TestNewHarnessBootstrap_WithoutSecurity(t *testing.T) {
 
 func TestNewHarnessBootstrap_WithSecurity(t *testing.T) {
 	h := &harness.Harness{
+		Agent:   "agents/test.md",
+		Skills:  []harness.SkillEntry{{Source: "skills/a"}},
+		Plugins: []string{"plugins/p"},
+		Security: &harness.SecurityConfig{
+			SandboxHooks: &harness.SandboxHooks{
+				Tirith: &harness.TirithConfig{FailOn: "critical"},
+			},
+		},
+	}
+	boot := newHarnessBootstrap(h, "sandbox-1", "test", "")
+
+	hooksBoot, ok := boot.(agentruntime.SandboxHooksBootstrap)
+	require.True(t, ok)
+	// The harness sandbox_hooks block is carried through unchanged.
+	assert.Equal(t, "critical", hooksBoot.SandboxHookConfig().TirithFailOn())
+	assert.True(t, hooksBoot.SandboxHookConfig().TirithRequired())
+	assert.Equal(t, []string{"plugins/p"}, boot.PluginDirs())
+	assert.Equal(t, harness.SkillSources(h.Skills), boot.SkillDirs())
+}
+
+func TestNewHarnessBootstrap_WithForgeEgressEntry(t *testing.T) {
+	h := &harness.Harness{
 		Agent: "agents/test.md",
 		Security: &harness.SecurityConfig{
 			SandboxHooks: &harness.SandboxHooks{},
 		},
 	}
-	boot := newHarnessBootstrap(h, "sandbox-1", "test")
+	boot := newHarnessBootstrap(h, "sandbox-1", "test", "gitlab.company.com:443")
 
-	_, ok := boot.(agentruntime.ClaudeHooksBootstrap)
+	hooksBoot, ok := boot.(agentruntime.SandboxHooksBootstrap)
 	require.True(t, ok)
+	assert.Equal(t, "gitlab.company.com:443", hooksBoot.SandboxHookConfig().ForgeEgressEntry())
 }

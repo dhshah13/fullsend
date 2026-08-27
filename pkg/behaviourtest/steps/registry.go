@@ -8,11 +8,14 @@ import (
 // World from the godog context via world.FromContext.
 func Register(sc *godog.ScenarioContext) {
 	registerDummyAgentSteps(sc)
+	registerRuntimeSteps(sc)
 	registerTriageSteps(sc)
 	registerDispatchSteps(sc)
 	registerDispatchCountSteps(sc)
 	registerURLDispatchSteps(sc)
+	registerBaseDispatchSteps(sc)
 	registerForkSteps(sc)
 	registerJiraPollSteps(sc)
 	registerBranchSteps(sc)
+	registerReactionSteps(sc)
 }

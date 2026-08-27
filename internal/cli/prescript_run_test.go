@@ -92,8 +92,8 @@ func TestRunAgent_PreScriptSkip_ReturnsBeforeSandboxCreation(t *testing.T) {
 		`echo "reason=open PR exists" >> "${FULLSEND_PRESCRIPT_OUTPUT}"`+"\n")
 
 	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
-	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", rFlags,
-		statusOpts{}, ui.New(io.Discard), false)
+	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "", rFlags,
+		statusOpts{}, ui.New(io.Discard), false, runOverrideFlags{})
 	require.NoError(t, err)
 }
 
@@ -109,8 +109,8 @@ func TestRunAgent_PreScriptNoSkip_ProceedsToSandboxAndRelaysFalse(t *testing.T) 
 	dir := newSkipHarnessDir(t, "true\n")
 
 	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
-	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", rFlags,
-		statusOpts{}, ui.New(io.Discard), false)
+	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "", rFlags,
+		statusOpts{}, ui.New(io.Discard), false, runOverrideFlags{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "creating sandbox")
 
@@ -130,8 +130,8 @@ func TestRunAgent_NoPreScript_StillRelaysSkippedFalse(t *testing.T) {
 	dir := newSkipHarnessDir(t, "")
 
 	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
-	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", rFlags,
-		statusOpts{}, ui.New(io.Discard), false)
+	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "", rFlags,
+		statusOpts{}, ui.New(io.Discard), false, runOverrideFlags{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "creating sandbox")
 
@@ -151,8 +151,8 @@ func TestRunAgent_PreScriptSkip_RelaysSkippedTrue(t *testing.T) {
 		`echo "reason=open PR exists" >> "${FULLSEND_PRESCRIPT_OUTPUT}"`+"\n")
 
 	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
-	require.NoError(t, runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "",
-		rFlags, statusOpts{}, ui.New(io.Discard), false))
+	require.NoError(t, runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "",
+		rFlags, statusOpts{}, ui.New(io.Discard), false, runOverrideFlags{}))
 
 	data, err := os.ReadFile(out)
 	require.NoError(t, err)
@@ -169,8 +169,8 @@ func TestRunAgent_PreScriptRelayFailureIsHardError(t *testing.T) {
 	dir := newSkipHarnessDir(t, `echo "skipped=true" >> "${FULLSEND_PRESCRIPT_OUTPUT}"`+"\n")
 
 	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
-	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", rFlags,
-		statusOpts{}, ui.New(io.Discard), false)
+	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "", rFlags,
+		statusOpts{}, ui.New(io.Discard), false, runOverrideFlags{})
 	require.ErrorContains(t, err, "relaying pre-script outputs")
 }
 
@@ -333,8 +333,8 @@ func TestRunAgent_PreScriptExit78_RelaysSkippedTrue(t *testing.T) {
 	dir := newSkipHarnessDir(t, "echo \"Nothing to do\"\nexit 78\n")
 
 	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
-	require.NoError(t, runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "",
-		rFlags, statusOpts{}, ui.New(io.Discard), false))
+	require.NoError(t, runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "",
+		rFlags, statusOpts{}, ui.New(io.Discard), false, runOverrideFlags{}))
 
 	data, err := os.ReadFile(out)
 	require.NoError(t, err)

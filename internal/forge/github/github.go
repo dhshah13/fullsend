@@ -15,6 +15,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -86,6 +87,15 @@ func (e *APIError) Error() string {
 		}
 	}
 	return s
+}
+
+// IsTransient reports whether the API error represents a transient
+// failure that may succeed on retry: server errors (500–504) and
+// rate limits (429). This method satisfies the transientReporter
+// interface used by forge.IsTransient.
+func (e *APIError) IsTransient() bool {
+	return e.StatusCode == http.StatusTooManyRequests ||
+		(e.StatusCode >= 500 && e.StatusCode <= 504)
 }
 
 // Unwrap returns sentinel errors for well-known API responses.
@@ -198,7 +208,7 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body any) (*ht
 				half := base / 2
 				delay := half + time.Duration(rand.Int64N(int64(half)+1))
 				select {
-				case <-time.After(delay):
+				case <-c.afterFunc(delay):
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				}
@@ -2793,6 +2803,89 @@ func (c *LiveClient) MinimizeComment(ctx context.Context, nodeID, reason string)
 	return nil
 }
 
+// validReactionContent lists the emoji reaction values accepted by the
+// GitHub reactions API.
+var validReactionContent = []string{"+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"}
+
+// AddIssueReaction adds an emoji reaction to an issue or pull request.
+func (c *LiveClient) AddIssueReaction(ctx context.Context, owner, repo string, number int, content string) (int64, error) {
+	if !slices.Contains(validReactionContent, content) {
+		return 0, fmt.Errorf("add issue reaction: invalid content %q", content)
+	}
+	resp, err := c.post(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/reactions", owner, repo, number), map[string]string{"content": content})
+	if err != nil {
+		return 0, fmt.Errorf("add issue reaction on #%d: %w", number, err)
+	}
+	var result struct {
+		ID int64 `json:"id"`
+	}
+	if err := decodeJSON(resp, &result); err != nil {
+		return 0, fmt.Errorf("decode issue reaction: %w", err)
+	}
+	return result.ID, nil
+}
+
+// DeleteIssueReaction removes a previously added reaction by ID.
+func (c *LiveClient) DeleteIssueReaction(ctx context.Context, owner, repo string, number int, reactionID int64) error {
+	return c.delete_(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/reactions/%d", owner, repo, number, reactionID))
+}
+
+// AddIssueCommentReaction adds an emoji reaction to an issue/PR comment.
+func (c *LiveClient) AddIssueCommentReaction(ctx context.Context, owner, repo string, commentID int, content string) (int64, error) {
+	if !slices.Contains(validReactionContent, content) {
+		return 0, fmt.Errorf("add issue comment reaction: invalid content %q", content)
+	}
+	resp, err := c.post(ctx, fmt.Sprintf("/repos/%s/%s/issues/comments/%d/reactions", owner, repo, commentID), map[string]string{"content": content})
+	if err != nil {
+		return 0, fmt.Errorf("add issue comment reaction on comment %d: %w", commentID, err)
+	}
+	var result struct {
+		ID int64 `json:"id"`
+	}
+	if err := decodeJSON(resp, &result); err != nil {
+		return 0, fmt.Errorf("decode issue comment reaction: %w", err)
+	}
+	return result.ID, nil
+}
+
+// DeleteIssueCommentReaction removes a previously added comment reaction by ID.
+func (c *LiveClient) DeleteIssueCommentReaction(ctx context.Context, owner, repo string, commentID int, reactionID int64) error {
+	return c.delete_(ctx, fmt.Sprintf("/repos/%s/%s/issues/comments/%d/reactions/%d", owner, repo, commentID, reactionID))
+}
+
+// ListIssueReactions returns the emoji reactions on an issue or pull request.
+func (c *LiveClient) ListIssueReactions(ctx context.Context, owner, repo string, number int) ([]forge.Reaction, error) {
+	var result []forge.Reaction
+
+	for page := 1; page <= 100; page++ {
+		resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/reactions?per_page=100&page=%d", owner, repo, number, page))
+		if err != nil {
+			return nil, fmt.Errorf("list issue reactions on #%d page %d: %w", number, page, err)
+		}
+		var items []struct {
+			ID      int64  `json:"id"`
+			Content string `json:"content"`
+			User    struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if err := decodeJSON(resp, &items); err != nil {
+			return nil, fmt.Errorf("decode issue reactions page %d: %w", page, err)
+		}
+		for _, item := range items {
+			result = append(result, forge.Reaction{
+				ID:      item.ID,
+				Content: item.Content,
+				User:    item.User.Login,
+			})
+		}
+		if len(items) < 100 {
+			break
+		}
+	}
+	return result, nil
+}
+
 // GetPullRequestInfo returns branch/repo context for a pull request.
 func (c *LiveClient) GetPullRequestInfo(ctx context.Context, owner, repo string, number int) (*forge.PullRequestInfo, error) {
 	resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number))
@@ -3087,14 +3180,14 @@ func (c *LiveClient) UpdatePullRequestBranch(ctx context.Context, owner, repo st
 // through so the caller can retry the merge (which will get another 409 if
 // the update still hasn't landed).
 func (c *LiveClient) awaitBranchUpdate(ctx context.Context, owner, repo string, number int, oldSHA string) error {
-	deadline := time.After(mergeRetryPollTimeout)
+	deadline := c.afterFunc(mergeRetryPollTimeout)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
 			return nil // timed out; let the caller retry the merge
-		case <-time.After(mergeRetryPollInterval):
+		case <-c.afterFunc(mergeRetryPollInterval):
 			newSHA, err := c.GetPullRequestHeadSHA(ctx, owner, repo, number)
 			if err != nil {
 				continue // transient error; keep polling

@@ -202,6 +202,29 @@ fullsend run code \
   --env-file fullsend-code.env
 ```
 
+### Choosing the runtime
+
+<a id="run-a-minimal-agent-on-the-pi-runtime"></a><a id="troubleshooting-pi-runtime"></a><a id="platform-notes-pi"></a>
+
+Every example above runs on **Claude Code**, the default runtime. Fullsend
+also has an opt-in **pi** runtime, and any example on this page runs on it
+by adding one flag to the same command:
+
+```bash
+fullsend run triage \
+  --fullsend-dir /tmp/fullsend-agents/ \
+  --target-repo /tmp/target-repo/ \
+  --env-file fullsend-gcp.env \
+  --env-file fullsend-triage.env \
+  --runtime pi
+```
+
+Everything else about runtimes lives in one place: [Agent
+runtimes](../../runtimes.md) for selecting and overriding the runtime,
+model and effort — per run, or per agent in `config.yaml` — and
+[Pi › Running it locally](../../runtimes/pi.md#running-it-locally) for
+what a local pi run needs, its models and its troubleshooting.
+
 ### Remote resource flags
 
 When your harness references URL-based skills with transitive dependencies,
@@ -530,3 +553,10 @@ curl -sf https://api.example.com/healthz
   diff <(grep DENIED run-1/logs/openshell-sandbox.log) \
        <(grep DENIED run-2/logs/openshell-sandbox.log)
   ```
+
+## See also
+
+- [Agent runtimes](../../runtimes.md) — choosing a runtime and overriding runtime, model and effort per run or per agent
+- [Pi › Running it locally](../../runtimes/pi.md#running-it-locally) — what a local pi run needs, its models and troubleshooting
+- [fullsend run](../../cli/run.md) — the full flag reference
+- [Configuring agent behavior](customizing-agents.md) — harness configuration and `base:` composition

@@ -5,18 +5,17 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	"github.com/fullsend-ai/fullsend/internal/urlutil"
 )
 
 var (
 	validAgentName    = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-	validModelName    = regexp.MustCompile(`^[a-zA-Z0-9_.@-]+$`)
 	validPluginName   = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	validProviderName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	// validRoleName mirrors mintcore.RolePattern — duplicated to avoid coupling harness→mintcore.
@@ -26,17 +25,15 @@ var (
 )
 
 // validEffortLevels are the reasoning effort levels accepted by the claude
-// CLI's --effort flag, verified against @anthropic-ai/claude-code 2.1.226
-// (the version pinned in images/sandbox/Containerfile). The CLI also accepts
-// the undocumented "ultracode" keyword, which is deliberately excluded here:
-// it opts sessions into multi-agent workflow orchestration rather than
-// selecting a reasoning effort level.
-var validEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
+// CLI's --effort flag. The canonical list lives in config.ValidEffortLevels
+// so harness effort:, per-run --effort/FULLSEND_EFFORT and agents: entry
+// effort all validate identically.
+var validEffortLevels = config.ValidEffortLevels()
 
 // validEffortLevel reports whether level is a recognized reasoning effort level
 // for the claude CLI's --effort flag.
 func validEffortLevel(level string) bool {
-	return slices.Contains(validEffortLevels, level)
+	return config.ValidEffort(level)
 }
 
 // ValidPluginBasename reports whether name matches the allowed plugin name pattern.
@@ -160,9 +157,15 @@ type HostScanners struct {
 	LLMGuard          *LLMGuardConfig `yaml:"llm_guard,omitempty"`
 }
 
-// LLMGuardConfig configures the LLM Guard ML-based prompt injection scanner.
-// Runs in Path A (GHA workflow pre-step) and Path B (sandbox) when the base
-// sandbox image includes the pre-installed LLM Guard and DeBERTa-v3 model.
+// LLMGuardConfig configures the ML-based prompt injection scanner. As of
+// #6522 the scanner ships enabled only in the runner image; the release
+// binaries are built CGO_ENABLED=0 with no -tags ORT, so it is compiled out
+// of those. Neither Path A (scanRepoContextFiles) nor Path B (fullsend scan
+// context) ever called it; the sole call site is `fullsend scan input`.
+//
+// These fields are validated but never read: the scanner is constructed with
+// zero values and hardcodes 0.92/sentence, and the call is gated on
+// MLScanAvailable() rather than on Enabled. See #6506.
 type LLMGuardConfig struct {
 	Enabled   *bool   `yaml:"enabled,omitempty"`    // default: true
 	Threshold float64 `yaml:"threshold,omitempty"`  // default: 0.92
@@ -174,6 +177,7 @@ type LLMGuardConfig struct {
 type SandboxHooks struct {
 	Tirith                  *TirithConfig        `yaml:"tirith,omitempty"`
 	SSRFPreTool             *bool                `yaml:"ssrf_pretool,omitempty"`              // default: true
+	SSRFEgressAllowlist     string               `yaml:"ssrf_egress_allowlist,omitempty"`     // comma-separated host:port entries
 	SecretRedactPostTool    *bool                `yaml:"secret_redact_posttool,omitempty"`    // default: true
 	UnicodePostTool         *bool                `yaml:"unicode_posttool,omitempty"`          // default: true
 	ContextSuppressPostTool *bool                `yaml:"context_suppress_posttool,omitempty"` // default: true
@@ -333,7 +337,11 @@ type Harness struct {
 	AllowRuntimeFetch      bool                    `yaml:"allow_runtime_fetch,omitempty"` // opt-in to runtime skill fetching (default: false)
 	MaxRuntimeFetches      *int                    `yaml:"max_runtime_fetches,omitempty"` // per-run fetch cap; nil = default (10), valid range 1-1000
 	Forge                  map[string]*ForgeConfig `yaml:"forge,omitempty"`
-	Trigger                string                  `yaml:"trigger,omitempty"` // optional CEL boolean over normevent (ADR 0061)
+	Overlays               []OverlayEntry          `yaml:"overlays,omitempty"` // CEL-guarded conditional config (ADR 0088)
+	Trigger                string                  `yaml:"trigger,omitempty"`  // optional CEL boolean over normevent (ADR 0061)
+
+	// Runtime-only fields (not serialized to YAML)
+	hadForgeBeforeResolve bool `yaml:"-"` // true if Forge was non-nil before ResolveForge; used by Lint()
 }
 
 // Load reads a harness YAML file from path, unmarshals it, and validates it.
@@ -355,9 +363,11 @@ func Load(path string) (*Harness, error) {
 	return &h, nil
 }
 
-// LoadOpts configures forge-aware harness loading.
+// LoadOpts configures forge-aware and overlay-aware harness loading.
 type LoadOpts struct {
 	ForgePlatform string
+	Event         map[string]any // event data for CEL overlay resolution (ADR 0088)
+	Config        map[string]any // per-repo config for CEL overlay resolution (ADR 0088)
 }
 
 // LoadWithOpts reads a harness YAML file and applies forge resolution before
@@ -375,8 +385,21 @@ func LoadWithOpts(path string, opts LoadOpts) (*Harness, error) {
 		return nil, fmt.Errorf("invalid harness: %w", err)
 	}
 
+	if err := h.validateOverlays(); err != nil {
+		return nil, fmt.Errorf("invalid harness: %w", err)
+	}
+
+	// Capture whether forge was present before ResolveForge nils it out,
+	// so Lint() can emit the deprecation warning even when the forge
+	// platform is set (which is always the case in CI).
+	h.hadForgeBeforeResolve = h.Forge != nil
+
 	if err := h.ResolveForge(opts.ForgePlatform); err != nil {
 		return nil, fmt.Errorf("resolving forge config: %w", err)
+	}
+
+	if err := h.ResolveOverlays(opts.Event, opts.ForgePlatform, opts.Config); err != nil {
+		return nil, fmt.Errorf("resolving overlays: %w", err)
 	}
 
 	if err := h.Validate(); err != nil {
@@ -429,8 +452,8 @@ func (h *Harness) Validate() error {
 			return fmt.Errorf("agent name %q contains invalid characters (allowed: a-z, A-Z, 0-9, _, -)", agentBase)
 		}
 	}
-	if h.Model != "" && !validModelName.MatchString(h.Model) {
-		return fmt.Errorf("model %q contains invalid characters (allowed: a-z, A-Z, 0-9, _, -, ., @)", h.Model)
+	if h.Model != "" && !config.ValidModelRef(h.Model) {
+		return fmt.Errorf("model %q contains invalid characters (allowed: segments of a-z, A-Z, 0-9, _, -, ., @ joined by /)", h.Model)
 	}
 	if h.Effort != "" && !validEffortLevel(h.Effort) {
 		return fmt.Errorf("effort %q is not valid (allowed: %s)", h.Effort, strings.Join(validEffortLevels, ", "))
@@ -481,6 +504,14 @@ func (h *Harness) Validate() error {
 	if h.ValidationLoop != nil && h.ValidationLoop.Script == "" {
 		return fmt.Errorf("validation_loop.script is required when validation_loop is set")
 	}
+	if h.ValidationLoop != nil {
+		switch h.ValidationLoop.FeedbackMode {
+		case "", "none", "append":
+			// valid
+		default:
+			return fmt.Errorf("validation_loop.feedback_mode must be \"none\" or \"append\", got %q", h.ValidationLoop.FeedbackMode)
+		}
+	}
 	if err := h.validateSecurity(); err != nil {
 		return err
 	}
@@ -499,6 +530,9 @@ func (h *Harness) Validate() error {
 		}
 	}
 	if err := h.validateForge(); err != nil {
+		return err
+	}
+	if err := h.validateOverlays(); err != nil {
 		return err
 	}
 	if err := ValidateTriggerExpression(h.Trigger); err != nil {

@@ -142,6 +142,15 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("jira api: %d %s", e.StatusCode, e.Message)
 }
 
+// IsTransient reports whether the API error represents a transient
+// failure that may succeed on retry: server errors (500–504) and
+// rate limits (429). This method satisfies the transientReporter
+// interface used by forge.IsTransient.
+func (e *APIError) IsTransient() bool {
+	return e.StatusCode == http.StatusTooManyRequests ||
+		(e.StatusCode >= 500 && e.StatusCode <= 504)
+}
+
 func (e *APIError) Unwrap() error {
 	if e.StatusCode == http.StatusNotFound {
 		return forge.ErrNotFound

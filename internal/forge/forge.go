@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -17,6 +18,47 @@ const ConfigRepoName = ".fullsend"
 // PerRepoGuardVar is the repo variable set by per-repo install to prevent
 // per-org enrollment from overriding a per-repo installation.
 const PerRepoGuardVar = "FULLSEND_PER_REPO_INSTALL"
+
+// Repo management variable and secret names.
+//
+// These constants cover every FULLSEND_* name used by repos install,
+// repos status, repos converge, uninstall, and the GitLab poller.
+// Using constants instead of bare string literals ensures that
+// additions, renames, or typos are caught at compile time.
+const (
+	// Managed variables — GitHub.
+	VarMintURL        = "FULLSEND_MINT_URL"
+	VarGCPRegion      = "FULLSEND_GCP_REGION"
+	VarReviewClientID = "FULLSEND_REVIEW_CLIENT_ID"
+
+	// Managed variables — GitLab.
+	VarLastPollAtFast     = "FULLSEND_LAST_POLL_AT_FAST"
+	VarLastPollAtFull     = "FULLSEND_LAST_POLL_AT_FULL"
+	VarLabelState         = "FULLSEND_LABEL_STATE"
+	VarDispatchedKeysFast = "FULLSEND_DISPATCHED_KEYS_FAST"
+	VarDispatchedKeysFull = "FULLSEND_DISPATCHED_KEYS_FULL"
+	VarFailedKeysFast     = "FULLSEND_FAILED_KEYS_FAST"
+	VarFailedKeysFull     = "FULLSEND_FAILED_KEYS_FULL"
+
+	// Secrets — both forges.
+	SecretGCPProjectID   = "FULLSEND_GCP_PROJECT_ID"
+	SecretGCPWIFProvider = "FULLSEND_GCP_WIF_PROVIDER"
+
+	// Secrets — GitLab only.
+	SecretForgeToken = "FULLSEND_FORGE_TOKEN"
+
+	// Legacy uninstall-only variables — GitLab.
+	VarLegacyBotTokenSecret = "FULLSEND_BOT_TOKEN_SECRET"
+	VarLegacySA             = "FULLSEND_SA"
+	VarLegacyWIFProvider    = "FULLSEND_WIF_PROVIDER"
+	VarLegacyForge          = "FULLSEND_FORGE"
+
+	// Poll/CI runtime variables.
+	VarDispatchHMAC   = "FULLSEND_DISPATCH_HMAC"
+	VarPollJobURL     = "FULLSEND_POLL_JOB_URL"
+	VarPollMode       = "FULLSEND_POLL_MODE"
+	VarGitLabBotToken = "FULLSEND_GITLAB_BOT_TOKEN"
+)
 
 // ErrNotFound indicates a requested resource was not found on the forge.
 var ErrNotFound = errors.New("not found")
@@ -90,6 +132,54 @@ var ErrNotFork = errors.New("repository exists but is not a fork of the source")
 // IsNotFork reports whether err indicates a non-fork name collision.
 func IsNotFork(err error) bool {
 	return errors.Is(err, ErrNotFork)
+}
+
+// IsTransient reports whether err represents a transient failure that
+// may succeed on retry. It checks for:
+//   - non-fast-forward race conditions (ErrNonFastForward)
+//   - forge-specific API errors that self-report transient-ness via the
+//     transientReporter interface (e.g., HTTP 429, 500–504)
+//   - HTTP client/network timeouts
+//   - unexpected connection closures (io.EOF, io.ErrUnexpectedEOF)
+//
+// Callers can use this to decide whether retrying an operation is
+// worthwhile before falling back to a log-and-continue strategy.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsNonFastForward(err) {
+		return true
+	}
+	// Forge-specific error types (github.APIError, gitlab.APIError,
+	// jira.APIError) implement this interface to self-report whether
+	// the status code indicates a transient server-side failure.
+	type transientReporter interface {
+		IsTransient() bool
+	}
+	var te transientReporter
+	if errors.As(err, &te) {
+		return te.IsTransient()
+	}
+	// Context cancellation / deadline errors are not transient —
+	// they reflect caller intent, not a server-side failure.
+	// context.DeadlineExceeded implements Timeout() bool (returning
+	// true), so this guard must come before the Timeout() check.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	// HTTP client timeout (e.g. net/http.Client.Timeout exceeded).
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return true
+	}
+	// Unexpected connection closure — the server dropped the connection
+	// before a full response was read. Common under load or during
+	// transient GCP/GitHub infrastructure issues.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return false
 }
 
 // ErrNotSupported indicates that the forge implementation does not
@@ -200,6 +290,14 @@ type IssueComment struct {
 	Body      string
 	Author    string
 	CreatedAt string
+}
+
+// Reaction represents an emoji reaction on an issue, pull request,
+// or comment.
+type Reaction struct {
+	ID      int64
+	Content string // e.g. "+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"
+	User    string // login of the user who added the reaction
 }
 
 // PullRequestReview represents a formal review on a pull request.
@@ -550,6 +648,38 @@ type Client interface {
 	UpdateIssueComment(ctx context.Context, owner, repo string, commentID int, body string) error
 	DeleteIssueComment(ctx context.Context, owner, repo string, commentID int) error
 	MinimizeComment(ctx context.Context, nodeID, reason string) error
+
+	// AddIssueReaction adds an emoji reaction to an issue or pull request.
+	// content must be one of the values accepted by the forge: on GitHub,
+	// "+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes".
+	// It returns the reaction's ID, used to remove it later via
+	// DeleteIssueReaction. Unlike comments, reactions do not generate
+	// GitHub notifications, making them useful for low-noise status
+	// signaling. Returns forge.ErrNotSupported if the forge has no
+	// equivalent concept.
+	AddIssueReaction(ctx context.Context, owner, repo string, number int, content string) (id int64, err error)
+
+	// DeleteIssueReaction removes a previously added reaction by ID.
+	// Returns forge.ErrNotSupported if the forge has no equivalent concept.
+	DeleteIssueReaction(ctx context.Context, owner, repo string, number int, reactionID int64) error
+
+	// AddIssueCommentReaction adds an emoji reaction to a specific comment,
+	// rather than the issue/PR itself. Used when a run was triggered by a
+	// slash command, so the reaction targets the comment that invoked the
+	// agent instead of the issue/PR. See AddIssueReaction for content
+	// values. Returns forge.ErrNotSupported if the forge has no equivalent
+	// concept.
+	AddIssueCommentReaction(ctx context.Context, owner, repo string, commentID int, content string) (id int64, err error)
+
+	// DeleteIssueCommentReaction removes a previously added comment
+	// reaction by ID. Returns forge.ErrNotSupported if the forge has no
+	// equivalent concept.
+	DeleteIssueCommentReaction(ctx context.Context, owner, repo string, commentID int, reactionID int64) error
+
+	// ListIssueReactions returns the emoji reactions on an issue or
+	// pull request. Returns forge.ErrNotSupported if the forge has no
+	// equivalent concept.
+	ListIssueReactions(ctx context.Context, owner, repo string, number int) ([]Reaction, error)
 
 	// Pull request operations
 	GetPullRequestInfo(ctx context.Context, owner, repo string, number int) (*PullRequestInfo, error)

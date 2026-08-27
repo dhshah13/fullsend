@@ -50,6 +50,11 @@ jobs:
           GH_TOKEN: ""
           GITHUB_TOKEN: ""
 
+      # script-test runs the pi hook extension's node:test suite.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+
       - run: make script-test
 
       - name: Upload coverage to Codecov
@@ -138,8 +143,5 @@ jobs:
       - name: Install JS dependencies
         run: npm ci
 
-      - name: Run Vitest (admin SPA)
+      - name: Run Vitest (docs theme + site Worker)
         run: npm test
-
-      - name: Run svelte-check
-        run: npm run check

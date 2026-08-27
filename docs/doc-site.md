@@ -42,7 +42,7 @@ The `docs:dev` and `docs:build` scripts in the root `package.json` handle submod
 - **`.github/workflows/site-build.yml`** — builds the VitePress site on PRs and pushes to `main`, uploads the artifact
 - **`.github/workflows/site-deploy.yml`** — deploys the built artifact to Cloudflare Workers on `main` pushes, uploads preview versions on PRs
 
-For Cloudflare Worker setup, secrets, and troubleshooting, see [`web-admin-deployment.md`](web-admin-deployment.md).
+For Cloudflare Worker setup and troubleshooting, see [`site-deployment.md`](site-deployment.md).
 
 ## Documentation versioning (investigation)
 

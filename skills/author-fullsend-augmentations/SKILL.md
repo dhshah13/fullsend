@@ -270,7 +270,7 @@ Typical families (names and availability change — verify each run):
 When file-level overrides exist in the checkout you are reading, prefer them
 over whole-skill forks for single-file / few-file changes.
 
-**Harness `skills:` merge caveat (still verify in ADR 0045 / compose docs):**
+**Harness `skills:` merge caveat (verify in [Harness Field Reference](../../docs/contributing/harness-fields.md)):**
 `base:` composition merges skill entries with deduplication by basename —
 a child entry whose directory name matches a base skill **replaces** it
 (child wins), not loads alongside. Say that plainly when recommending a fork.
