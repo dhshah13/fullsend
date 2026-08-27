@@ -774,6 +774,48 @@ func CreateWithRetry(name string, providers []string, image, policy string, maxA
 	return fmt.Errorf("sandbox creation failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
+// terminalSandboxPhases lists sandbox phases that will never transition to
+// Ready on their own. When one is detected during polling, createOnce returns
+// immediately instead of burning the full timeout. "Error" is the phase
+// OpenShell 0.0.111+ reports once the main process exits; "Completed" is
+// reserved for the pending upstream exit-zero mapping (NVIDIA/OpenShell#2884)
+// and is inert until that lands.
+var terminalSandboxPhases = []string{"Error", "Completed"}
+
+// readySandboxPhase is the phase createOnce waits for.
+const readySandboxPhase = "Ready"
+
+// sandboxPhaseRe matches the "Phase:" field of `openshell sandbox get` output.
+// The escape sequences cover the case where OpenShell is forced to colorize
+// despite writing to a pipe; they are interleaved with the separating
+// whitespace because either the label or the value (or both) may be wrapped.
+var sandboxPhaseRe = regexp.MustCompile(`(?m)^[ \t]*(?:\x1b\[[0-9;]*m)*Phase:(?:[ \t]|\x1b\[[0-9;]*m)*([A-Za-z]+)`)
+
+// sandboxPhase extracts the reported phase from `openshell sandbox get`
+// output, or "" when no phase field is present.
+func sandboxPhase(output string) string {
+	m := sandboxPhaseRe.FindStringSubmatch(output)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// terminalSandboxPhase returns the sandbox phase when it is terminal, or ""
+// otherwise. Matching is anchored to the "Phase:" field rather than searching
+// the whole output, so an unrelated occurrence of a phase name elsewhere in
+// the get output (the sandbox name, labels, annotations, or the printed
+// policy YAML) cannot be mistaken for a terminal phase.
+func terminalSandboxPhase(output string) string {
+	phase := sandboxPhase(output)
+	for _, terminal := range terminalSandboxPhases {
+		if phase == terminal {
+			return phase
+		}
+	}
+	return ""
+}
+
 // createOnce creates a persistent OpenShell sandbox and waits for it to be
 // ready. If providers are given, they are passed as --provider flags. If image
 // is non-empty, it is passed as --from to start the sandbox from a container
@@ -798,19 +840,28 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 	for _, p := range providers {
 		args = append(args, "--provider", p)
 	}
-	// Without a command, sandbox create starts an interactive shell and
-	// blocks until it exits. Pass `true` so it returns immediately.
-	args = append(args, "--", "true")
+	// Keep a long-running process inside the sandbox so it stays alive
+	// for subsequent sandbox exec calls. Prior to OpenShell 0.0.111 the
+	// `true` command worked because an exited main process left the
+	// sandbox Ready; starting with 0.0.111 an exited process makes the
+	// sandbox terminal. --detach returns immediately while sleep infinity
+	// continues running in the background.
+	args = append(args, "--detach", "--", "sleep", "infinity")
 
 	cmd := exec.CommandContext(ctx, "openshell", args...)
 	cmd.Stdin = nil
 	out, err := cmd.CombinedOutput()
+	createOutput := strings.TrimSpace(string(out))
 
 	if err != nil {
 		check := exec.CommandContext(ctx, "openshell", "sandbox", "get", name)
 		if checkErr := check.Run(); checkErr != nil {
-			return fmt.Errorf("sandbox create failed: %s", string(out))
+			// Wrap err too: when openshell cannot execute at all the
+			// combined output is empty and it is the only diagnostic.
+			return fmt.Errorf("sandbox create failed: %w (output: %s)", err, createOutput)
 		}
+		// Sandbox exists despite the create error — continue to the
+		// polling loop, but preserve createOutput for diagnostics.
 	}
 
 	// Wait for sandbox to be fully ready (image pull can take a while).
@@ -824,8 +875,30 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 		checkErr := check.Run()
 		lastOutput = stdoutBuf.String()
 		lastStderr = stderrBuf.String()
-		if checkErr == nil && strings.Contains(lastOutput, "Ready") {
-			return nil
+		// Both checks read the anchored "Phase:" field rather than
+		// searching the whole output, which also carries the sandbox
+		// name, labels, annotations and the printed policy YAML — an
+		// unanchored search there could abort a healthy creation or
+		// report a provisioning sandbox as ready.
+		//
+		// When no phase field parses at all the output shape has
+		// changed, and anchoring alone would time out every healthy
+		// creation. Fall back to the historical substring check in that
+		// case only: it cannot reintroduce the decoy problem, because a
+		// decoy requires a phase field to be present and say otherwise.
+		if checkErr == nil {
+			switch phase := sandboxPhase(lastOutput); {
+			case phase == readySandboxPhase:
+				return nil
+			case phase == "" && strings.Contains(lastOutput, readySandboxPhase):
+				return nil
+			}
+			// Detect terminal phases and fail immediately instead of
+			// polling through the full timeout.
+			if phase := terminalSandboxPhase(lastOutput); phase != "" {
+				return fmt.Errorf("sandbox %q entered terminal phase %q (will not become Ready)\ncreate output: %s\nstdout: %s\nstderr: %s",
+					name, phase, createOutput, lastOutput, lastStderr)
+			}
 		}
 		time.Sleep(readyPoll)
 	}
@@ -836,8 +909,8 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 
 	containerLogs := collectPodmanLogs(name)
 
-	return fmt.Errorf("sandbox %q not ready after %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
-		name, timeout, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
+	return fmt.Errorf("sandbox %q not ready after %s\ncreate output: %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
+		name, timeout, createOutput, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
 }
 
 // Delete deletes a sandbox, returning any error for the caller to log.
