@@ -570,6 +570,14 @@ func TestSandboxHookConfig_SSRFEgressAllowlist(t *testing.T) {
 	assert.Equal(t, "gitlab.internal:443,other.host:8443", cfg.SSRFEgressAllowlist())
 }
 
+func TestSandboxHookConfig_ForgeEgressEntry(t *testing.T) {
+	cfg := SandboxHookConfigFromHarness(nil)
+	assert.Empty(t, cfg.ForgeEgressEntry())
+
+	cfg = cfg.WithForgeEgressEntry("gitlab.cee.redhat.com:443")
+	assert.Equal(t, "gitlab.cee.redhat.com:443", cfg.ForgeEgressEntry())
+}
+
 func countPhase(plan []HookGroup, phase HookPhase) int {
 	n := 0
 	for _, g := range plan {

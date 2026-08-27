@@ -249,19 +249,20 @@ Secrets and variables are deployed at different scopes depending on the installa
 **Target repo variables:**
 - `FULLSEND_MINT_URL`
 - `FULLSEND_GCP_REGION` (value drift is detected and repaired by convergence)
-- `FULLSEND_PER_REPO_INSTALL` — Flag indicating per-repo mode (set to "true")
 - `FULLSEND_REVIEW_CLIENT_ID` — OAuth client ID of the review agent's GitHub App (best-effort, conditional on successful lookup)
 
 #### GitLab
 
 **Target repo CI/CD variables (protected):**
 - `FULLSEND_FORGE_TOKEN` — Project access token for bot identity (stored as protected CI/CD variable)
-- `FULLSEND_FORGE` — Set to `"gitlab"`
-- `FULLSEND_PER_REPO_INSTALL` — Flag indicating per-repo mode (set to `"true"`)
 - `FULLSEND_LAST_POLL_AT_FAST` — Timestamp of last slash poll run (name predates the slash/events terminology split; used by the slash-command schedule)
 - `FULLSEND_LAST_POLL_AT_FULL` — Timestamp of last event poll run (name predates the slash/events terminology split; used by the event-discovery schedule)
 - `FULLSEND_POLL_MODE` — Pipeline schedule variable (`"slash"` or `"events"`); set automatically per schedule during install, not a project-level CI/CD variable
 - `FULLSEND_LABEL_STATE` — JSON object tracking label sync state
+- `FULLSEND_DISPATCHED_KEYS_FAST` — JSON map of recently dispatched event keys (slash-command schedule)
+- `FULLSEND_DISPATCHED_KEYS_FULL` — JSON map of recently dispatched event keys (event-discovery schedule)
+- `FULLSEND_FAILED_KEYS_FAST` — JSON map of event keys to failure counts (slash-command schedule)
+- `FULLSEND_FAILED_KEYS_FULL` — JSON map of event keys to failure counts (event-discovery schedule)
 
 **Inference variables (required when inference is configured):**
 - `FULLSEND_GCP_PROJECT_ID` — GCP project ID for inference (stored as a CI/CD secret, protected + masked)
