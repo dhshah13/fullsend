@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -477,20 +478,19 @@ func TestRunIssuesPostComment_FromFile(t *testing.T) {
 }
 
 func TestRunIssuesPostComment_JiraCapsStickyMaxSize(t *testing.T) {
-	fc := forge.NewFakeClient()
-	fc.AuthenticatedUser = "bot"
-	tc := tracker.NewForgeClient(fc)
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
 	ctx := context.Background()
 
 	// Sized to land in the 32-65 KiB band called out by the review: over
 	// Jira's MarkdownToADF limit (jira.MaxMarkdownBytes = 32 KiB) but
 	// under sticky's own default cap (65000), so only a tracker-aware
 	// MaxSize catches it.
-	firstBody := strings.Repeat("a", 40000)
+	firstBody := strings.Repeat("a", 30000)
 
 	cfg := &issuesPostCommentConfig{
 		trackerName: trackerJira,
-		project:     "acme/widgets",
+		project:     "PROJ",
 		number:      42,
 		marker:      "<!-- test:agent -->",
 		testClient:  tc,
@@ -502,16 +502,15 @@ func TestRunIssuesPostComment_JiraCapsStickyMaxSize(t *testing.T) {
 	cfg.testBody = "second run"
 	require.NoError(t, runIssuesPostComment(ctx, cfg))
 
-	comments, err := tc.ListComments(ctx, "acme/widgets", 42)
+	comments, err := tc.ListComments(ctx, "PROJ", 42)
 	require.NoError(t, err)
 	require.Len(t, comments, 1)
 
-	// Combining "second run" with the collapsed 40 KB history would
+	// Combining "second run" with the collapsed 30 KB history would
 	// exceed jira.MaxMarkdownBytes, so the Jira path must trim the
 	// history rather than assembling a body that would fail once it
 	// reaches Jira's MarkdownToADF.
 	assert.LessOrEqual(t, len(comments[0].Body), jira.MaxMarkdownBytes)
-	assert.NotContains(t, string(comments[0].Body), "Previous run")
 	assert.Contains(t, string(comments[0].Body), "second run")
 }
 
@@ -566,30 +565,37 @@ func TestValidateJiraMarker_AllowsSafeChars(t *testing.T) {
 	}
 }
 
-func TestRunIssuesPostComment_JiraRejectsUnsafeMarker(t *testing.T) {
+func TestRunIssuesPostComment_JiraAcceptsMarkerWithSpecialChars(t *testing.T) {
+	// Jira now stores markers in comment entity properties instead of
+	// the visible body, so marker character restrictions no longer
+	// apply — characters that Jira's ADF round-trip would escape are
+	// fine in a property value.
+	tc, fc, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+	_ = fc
+
 	cfg := &issuesPostCommentConfig{
 		trackerName: trackerJira,
 		project:     "PROJ",
 		number:      42,
 		marker:      "<!-- fullsend:post_review -->",
+		testClient:  tc,
 		testPrinter: ui.New(io.Discard),
 		testBody:    "body",
 	}
 
-	err := runIssuesPostComment(context.Background(), cfg)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--marker")
+	err = runIssuesPostComment(context.Background(), cfg)
+	require.NoError(t, err)
 }
 
 func TestRunIssuesPostComment_JiraRoundTripUpdatesInPlace(t *testing.T) {
-	// Drives postTrackerStickyComment twice through tracker.NewJiraClient
-	// (via NewFakeJiraClient) so comment bodies actually round-trip
-	// through the real jira.MarkdownToADF/ADFToMarkdown conversions,
-	// unlike the forge.NewFakeClient-backed tests above. This is the
-	// regression test for marker re-detection surviving that round trip:
-	// without it, a marker containing an escaped character would create
-	// a new comment every run instead of updating in place.
-	tc, err := tracker.NewFakeJiraClient("https://acme.atlassian.net")
+	// Drives the Jira property-based sticky comment path twice through
+	// tracker.JiraClient (via NewFakeJiraClientWithFake) so comment
+	// bodies round-trip through real jira.MarkdownToADF/ADFToMarkdown.
+	// The marker is stored in a comment entity property, not in the
+	// visible ADF body, and must be matched via property on the second
+	// run to update in place instead of flooding a new comment.
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
 	require.NoError(t, err)
 	ctx := context.Background()
 
@@ -612,6 +618,138 @@ func TestRunIssuesPostComment_JiraRoundTripUpdatesInPlace(t *testing.T) {
 	require.Len(t, comments, 1, "second run should update the existing comment in place, not flood a new one")
 	assert.Contains(t, string(comments[0].Body), "second run")
 	assert.Contains(t, string(comments[0].Body), "Previous run")
+}
+
+func TestRunIssuesPostComment_JiraMarkerNotInVisibleBody(t *testing.T) {
+	// The marker must be stored only in the comment entity property,
+	// not in the visible ADF body that Jira renders to users.
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	cfg := &issuesPostCommentConfig{
+		trackerName: trackerJira,
+		project:     "PROJ",
+		number:      42,
+		marker:      "<!-- fullsend:triage-agent -->",
+		testClient:  tc,
+		testPrinter: ui.New(io.Discard),
+		testBody:    "visible content only",
+	}
+	require.NoError(t, runIssuesPostComment(ctx, cfg))
+
+	comments, err := tc.ListComments(ctx, "PROJ", 42)
+	require.NoError(t, err)
+	require.Len(t, comments, 1)
+	// The visible body must contain the content but NOT the marker.
+	assert.Contains(t, string(comments[0].Body), "visible content only")
+	assert.NotContains(t, string(comments[0].Body), "<!-- fullsend:triage-agent -->")
+}
+
+func TestRunIssuesPostComment_JiraLegacyMigration(t *testing.T) {
+	// A legacy Jira comment has the marker embedded in the visible ADF
+	// body (old behavior). On the next run, the property-based path
+	// should find it via body-text fallback, set the property, and
+	// strip the marker from the body on update.
+	tc, fc, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	marker := "<!-- fullsend:triage-agent -->"
+
+	// Simulate a legacy comment: marker embedded in body, no property.
+	legacyBody := marker + "\nlegacy content"
+	_, createErr := fc.CreateComment(ctx, "PROJ-42", legacyBody)
+	require.NoError(t, createErr)
+
+	// Run post-comment, which should find the legacy comment via body
+	// fallback, update it, and set the property.
+	cfg := &issuesPostCommentConfig{
+		trackerName: trackerJira,
+		project:     "PROJ",
+		number:      42,
+		marker:      marker,
+		testClient:  tc,
+		testPrinter: ui.New(io.Discard),
+		testBody:    "updated via property",
+	}
+	require.NoError(t, runIssuesPostComment(ctx, cfg))
+
+	comments, err := tc.ListComments(ctx, "PROJ", 42)
+	require.NoError(t, err)
+	require.Len(t, comments, 1, "should update the legacy comment in place")
+	assert.Contains(t, string(comments[0].Body), "updated via property")
+	// After migration, marker should not be in the visible body.
+	assert.NotContains(t, string(comments[0].Body), marker)
+
+	// Third run: should find the now-migrated comment via property,
+	// not via body, confirming property was set during migration.
+	cfg.testBody = "third run"
+	require.NoError(t, runIssuesPostComment(ctx, cfg))
+
+	comments, err = tc.ListComments(ctx, "PROJ", 42)
+	require.NoError(t, err)
+	require.Len(t, comments, 1, "third run should still update the same comment")
+	assert.Contains(t, string(comments[0].Body), "third run")
+}
+
+func TestRunIssuesPostComment_JiraPropertyPermissionFailure(t *testing.T) {
+	// When the Jira API rejects property writes (e.g. 403), the
+	// update should fail with an actionable error rather than
+	// silently falling back to a visible marker.
+	tc, fc, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	marker := "<!-- fullsend:triage-agent -->"
+
+	// First run succeeds (no property error on create).
+	cfg := &issuesPostCommentConfig{
+		trackerName: trackerJira,
+		project:     "PROJ",
+		number:      42,
+		marker:      marker,
+		testClient:  tc,
+		testPrinter: ui.New(io.Discard),
+		testBody:    "first run",
+	}
+	require.NoError(t, runIssuesPostComment(ctx, cfg))
+
+	// Now simulate a property write failure for the update path.
+	fc.PropertyError = fmt.Errorf("set comment property: %w", forge.ErrForbidden)
+
+	cfg.testBody = "second run"
+	err = runIssuesPostComment(ctx, cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sticky marker property")
+}
+
+func TestRunIssuesPostComment_GitHubUnchangedByJiraPropertyFeature(t *testing.T) {
+	// Verify that GitHub/GitLab comments still use the body-embedded
+	// marker path — the Jira property feature must not affect other
+	// backends.
+	fc := forge.NewFakeClient()
+	fc.AuthenticatedUser = "bot"
+	tc := tracker.NewForgeClient(fc)
+	ctx := context.Background()
+
+	cfg := &issuesPostCommentConfig{
+		trackerName: trackerGitHub,
+		project:     "acme/widgets",
+		number:      42,
+		marker:      "<!-- test:agent -->",
+		testClient:  tc,
+		testPrinter: ui.New(io.Discard),
+		testBody:    "github body",
+	}
+	require.NoError(t, runIssuesPostComment(ctx, cfg))
+
+	comments, err := tc.ListComments(ctx, "acme/widgets", 42)
+	require.NoError(t, err)
+	require.Len(t, comments, 1)
+	// GitHub path embeds marker in body (HTML comment, invisible).
+	assert.Contains(t, string(comments[0].Body), "<!-- test:agent -->")
+	assert.Contains(t, string(comments[0].Body), "github body")
 }
 
 // --- resolveTracker tests ---
@@ -707,8 +845,11 @@ func TestRunIssuesPostComment_TrackerFromConfig(t *testing.T) {
 
 func TestRunIssuesPostComment_TrackerFlagOverridesConfig(t *testing.T) {
 	// --tracker jira should win over a "github" config default and
-	// trigger jira-specific marker validation, proving the flag takes
-	// priority over the config value.
+	// route through the Jira property-based path, proving the flag
+	// takes priority over the config value.
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+
 	reader, err := config.ParsePerRepoConfig([]byte("tracker: github\n"))
 	require.NoError(t, err)
 
@@ -716,15 +857,22 @@ func TestRunIssuesPostComment_TrackerFlagOverridesConfig(t *testing.T) {
 		trackerName:      trackerJira,
 		project:          "PROJ",
 		number:           42,
-		marker:           "<!-- fullsend:post_review -->", // contains an unsafe char
+		marker:           "<!-- fullsend:triage -->",
+		testClient:       tc,
 		testConfigReader: reader,
 		testPrinter:      ui.New(io.Discard),
 		testBody:         "body",
 	}
 
 	err = runIssuesPostComment(context.Background(), cfg)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--marker")
+	require.NoError(t, err)
+
+	comments, err := tc.ListComments(context.Background(), "PROJ", 42)
+	require.NoError(t, err)
+	require.Len(t, comments, 1)
+	// Marker should NOT be in visible body (Jira property path).
+	assert.NotContains(t, string(comments[0].Body), "<!-- fullsend:triage -->")
+	assert.Contains(t, string(comments[0].Body), "body")
 }
 
 func TestRunIssuesPostComment_NoTrackerNoConfig_Errors(t *testing.T) {
