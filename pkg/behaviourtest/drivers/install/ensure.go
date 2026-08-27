@@ -249,6 +249,9 @@ func (e *repoEnsurer) awaitDeletion(ctx context.Context, org, repoName, target s
 		}
 		if attempt < resetMaxAttempts {
 			e.logf("[ensure] %s still visible, attempt %d/%d — backing off %v", target, attempt, resetMaxAttempts, delay)
+			if ctx.Err() != nil {
+				return fmt.Errorf("context cancelled while waiting for %s deletion: %w", target, ctx.Err())
+			}
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("context cancelled while waiting for %s deletion: %w", target, ctx.Err())
@@ -306,6 +309,9 @@ func (e *repoEnsurer) awaitCreation(ctx context.Context, org, repoName, target s
 		}
 		if attempt < resetMaxAttempts {
 			e.logf("[ensure] %s not yet visible, attempt %d/%d — backing off %v", target, attempt, resetMaxAttempts, delay)
+			if ctx.Err() != nil {
+				return fmt.Errorf("context cancelled while waiting for %s creation: %w", target, ctx.Err())
+			}
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("context cancelled while waiting for %s creation: %w", target, ctx.Err())
@@ -340,6 +346,9 @@ func awaitWorkflowReady(ctx context.Context, client forge.Client, org, repo, wor
 		}
 
 		if attempt < settleMaxAttempts {
+			if ctx.Err() != nil {
+				return fmt.Errorf("context cancelled while waiting for %s on %s: %w", workflowFile, target, ctx.Err())
+			}
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("context cancelled while waiting for %s on %s: %w", workflowFile, target, ctx.Err())
