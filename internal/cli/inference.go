@@ -266,7 +266,7 @@ Required IAM roles on the target project:
 				return fmt.Errorf("cannot check status of reserved placeholder org %q", org)
 			}
 
-			return runInferenceStatus(cmd, org, repo, project, pool, provider, format)
+			return runInferenceStatus(cmd, org, repo, project, pool, provider, format, nil)
 		},
 	}
 
@@ -278,9 +278,12 @@ Required IAM roles on the target project:
 	return cmd
 }
 
-func runInferenceStatus(cmd *cobra.Command, org, repo, project, pool, provider, format string) error {
+func runInferenceStatus(cmd *cobra.Command, org, repo, project, pool, provider, format string, client gcf.GCFClient) error {
 	ctx := cmd.Context()
-	gcpClient := gcf.NewLiveGCFClient(project)
+	gcpClient := client
+	if gcpClient == nil {
+		gcpClient = gcf.NewLiveGCFClient(project)
+	}
 
 	poolName := pool
 	providerName := provider
