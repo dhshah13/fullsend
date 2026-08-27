@@ -37,6 +37,7 @@ var validConfigAgentName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 type AgentEntry struct {
 	Name    string `yaml:"name,omitempty"`
 	Source  string `yaml:"source,omitempty"`
+	Ref     string `yaml:"ref,omitempty"`
 	Enabled *bool  `yaml:"enabled,omitempty"`
 	Runtime string `yaml:"runtime,omitempty"`
 	Model   string `yaml:"model,omitempty"`
