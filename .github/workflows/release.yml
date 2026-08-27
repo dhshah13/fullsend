@@ -70,7 +70,7 @@ jobs:
       id-token: write
       pull-requests: write
       checks: read
-    uses: fullsend-ai/agents/.github/workflows/functional-tests.yml@b9c0745580084af09d1f1e2df8448d1d478458c6 # main (includes agents#1010 cross-repo checkout fix)
+    uses: fullsend-ai/agents/.github/workflows/functional-tests.yml@beed20e7e85f7f7cf9678a78fd1f440755560ca3 # main (includes agents#1010 cross-repo checkout fix)
     with:
       fullsend_ref: ${{ github.ref_name }}
     secrets:
