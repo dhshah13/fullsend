@@ -6036,7 +6036,9 @@ func TestRunCommand_HasEventFileFlag(t *testing.T) {
 }
 
 func TestResolveAgentSource_OverrideOnlyEntryUsesAgentsRepoFallback(t *testing.T) {
-	dir := t.TempDir()
+	// canonTempDir, not t.TempDir: the sourced-entry assertion below compares
+	// against containedLocalPath's symlink-resolved output.
+	dir := canonTempDir(t)
 	printer := ui.New(io.Discard)
 	cfg, err := config.ParsePerRepoConfig([]byte(`# fullsend per-repo configuration
 version: "1"
