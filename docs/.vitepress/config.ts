@@ -175,7 +175,10 @@ export default defineConfig({
     return pageSeoHead({ page, title, description, cleanUrls: siteConfig.cleanUrls });
   },
 
-  srcExclude: ["**/agents/icons/**", "**/testing/**"],
+  // Keep template placeholders (mirrors `isNonContent`'s `0000-*-template`
+  // rule) out of the build entirely, so they never reach the sitemap or get
+  // canonical/OG metadata and are not offered to search engines.
+  srcExclude: ["**/agents/icons/**", "**/testing/**", "**/0000-*-template.md"],
 
   ignoreDeadLinks: true,
 

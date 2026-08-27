@@ -1,6 +1,6 @@
 ---
 sidebar_position: 1
-description: Set up fullsend step by step — get inference, choose an agent runtime, and configure GitHub to start running autonomous SDLC agents on your repos.
+description: Step-by-step setup for fullsend — connect a model provider, choose where your agents run, and configure GitHub so they can work on your repositories.
 ---
 
 # Getting Started
