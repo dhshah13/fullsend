@@ -329,10 +329,30 @@ func EnsureProvider(ctx context.Context, name, providerType string, credentials,
 	}
 
 	args, extraEnv, secrets := buildProviderArgs(name, providerType, credentials, config, fromURL)
+	updateArgs := buildProviderUpdateArgs(name, credentials, config, fromURL)
+	return ensureProviderArgs(ctx, name, args, updateArgs, extraEnv, secrets)
+}
 
+// EnsureProviderLiteral creates or updates a provider whose credential
+// values were resolved in process — a token the runner exchanged or read
+// from its own environment — and must be passed to openshell verbatim.
+// Unlike EnsureProvider, values are never run through os.ExpandEnv: an
+// opaque access token may legitimately contain `$`, and expanding it would
+// mangle the credential silently (#6689). Values still travel by bare-key
+// form in the child process environment, never on the command line.
+func EnsureProviderLiteral(ctx context.Context, name, providerType string, credentials map[string]string) error {
+	args, extraEnv, secrets := buildProviderArgsLiteral(name, providerType, credentials)
+	updateArgs := buildProviderUpdateArgsLiteral(name, credentials)
+	return ensureProviderArgs(ctx, name, args, updateArgs, extraEnv, secrets)
+}
+
+// ensureProviderArgs runs the create-with-retry loop shared by
+// EnsureProvider and EnsureProviderLiteral. updateArgs is used when the
+// provider already exists.
+func ensureProviderArgs(ctx context.Context, name string, args, updateArgs, extraEnv, secrets []string) error {
 	var lastErr error
 	for attempt := range providerRetries {
-		lastErr = tryCreateProvider(ctx, name, args, extraEnv, secrets, credentials, config, fromURL)
+		lastErr = tryCreateProvider(ctx, name, args, updateArgs, extraEnv, secrets)
 		if lastErr == nil {
 			return nil
 		}
@@ -378,7 +398,7 @@ var providerModifiedConcurrentlyRe = regexp.MustCompile(`provider was modified\W
 
 // tryCreateProvider performs a single attempt to create (or update) a
 // provider via openshell. Extracted from EnsureProvider to support retry.
-func tryCreateProvider(ctx context.Context, name string, args, extraEnv, secrets []string, credentials, config map[string]string, fromURL bool) error {
+func tryCreateProvider(ctx context.Context, name string, args, updateArgs, extraEnv, secrets []string) error {
 	createCtx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(createCtx, "openshell", args...)
@@ -390,7 +410,7 @@ func tryCreateProvider(ctx context.Context, name string, args, extraEnv, secrets
 		if strings.Contains(strings.ToLower(outStr), "provider already exists") {
 			// Provider exists from a prior run — update it with current credentials.
 			// Pass original ctx (not createCtx) so updateProvider gets a fresh timeout.
-			return updateProvider(ctx, name, credentials, config, extraEnv, secrets, fromURL)
+			return updateProvider(ctx, name, updateArgs, extraEnv, secrets)
 		}
 		// Redact known credential values from error output.
 		for _, s := range secrets {
@@ -401,9 +421,10 @@ func tryCreateProvider(ctx context.Context, name string, args, extraEnv, secrets
 	return nil
 }
 
-// updateProvider runs openshell provider update for an already-existing provider.
-func updateProvider(ctx context.Context, name string, credentials, config map[string]string, extraEnv, secrets []string, fromURL bool) error {
-	args := buildProviderUpdateArgs(name, credentials, config, fromURL)
+// updateProvider runs openshell provider update for an already-existing
+// provider with pre-built args (see buildProviderUpdateArgs and
+// buildProviderUpdateArgsLiteral).
+func updateProvider(ctx context.Context, name string, args, extraEnv, secrets []string) error {
 	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "openshell", args...)
@@ -479,6 +500,58 @@ func buildProviderArgs(name, providerType string, credentials, config map[string
 	}
 
 	return args, extraEnv, secrets
+}
+
+// buildProviderArgsLiteral is buildProviderArgs for in-process credential
+// values: no os.ExpandEnv, no config, bare-key form with the value in the
+// child environment only. An empty value uses the inline KEY= form.
+func buildProviderArgsLiteral(name, providerType string, credentials map[string]string) (args, extraEnv, secrets []string) {
+	args = []string{"provider", "create",
+		"--name", name,
+		"--type", providerType,
+	}
+	credArgs, extraEnv, secrets := literalCredentialArgs(credentials)
+	return append(args, credArgs...), extraEnv, secrets
+}
+
+// buildProviderUpdateArgsLiteral is buildProviderUpdateArgs for in-process
+// credential values (no expansion).
+func buildProviderUpdateArgsLiteral(name string, credentials map[string]string) []string {
+	args := []string{"provider", "update", name}
+	credArgs, _, _ := literalCredentialArgs(credentials)
+	return append(args, credArgs...)
+}
+
+func literalCredentialArgs(credentials map[string]string) (args, extraEnv, secrets []string) {
+	for _, k := range sortedKeys(credentials) {
+		v := credentials[k]
+		if v == "" {
+			args = append(args, "--credential", k+"=")
+			continue
+		}
+		secrets = append(secrets, v)
+		extraEnv = append(extraEnv, k+"="+v)
+		args = append(args, "--credential", k)
+	}
+	return args, extraEnv, secrets
+}
+
+// SetProviderCredentialExpiry records when a provider credential stops
+// being valid (`openshell provider update --credential-expires-at`). The
+// gateway then fails placeholder resolution closed after that instant, which
+// is the backstop for a run-scoped provider whose runner died before the
+// deferred DeleteProvider ran (#6689).
+func SetProviderCredentialExpiry(ctx context.Context, name, key string, expiresAt time.Time) error {
+	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+	defer cancel()
+	args := []string{"provider", "update", name,
+		"--credential-expires-at", key + "=" + expiresAt.UTC().Format(time.RFC3339),
+	}
+	out, err := exec.CommandContext(ctx, "openshell", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("provider %q: setting credential expiry for %s failed: %w (output: %s)", name, key, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func sortedKeys(m map[string]string) []string {
@@ -923,7 +996,9 @@ func DeleteProvider(name string) error {
 	out, err := exec.CommandContext(ctx, "openshell", "provider", "delete", name).CombinedOutput()
 	if err != nil {
 		outStr := string(out)
-		// Ignore "not found" — the provider may already be gone.
+		// Defensive only: the 0.0.83 CLI reports a missing provider with
+		// "! Provider <name> not found" and exit 0, which already returns nil
+		// above. A future non-zero variant is still not a cleanup failure.
 		if strings.Contains(strings.ToLower(outStr), "not found") ||
 			strings.Contains(strings.ToLower(outStr), "does not exist") {
 			return nil

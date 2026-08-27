@@ -7,7 +7,7 @@ sandbox, the credentials, and the verdict.
 | Runtime | Use it for | Status |
 |---|---|---|
 | **[`claude`](runtimes/claude.md)** | Production agent runs (Claude Code) | Default |
-| **[`pi`](runtimes/pi.md)** | Second runtime, opt-in per org/repo — Claude, Grok, Gemini and GPT | Supported for `triage`, `prioritize`, `code`, `fix` |
+| **[`pi`](runtimes/pi.md)** | Second runtime, opt-in per repo — Claude, Grok, Gemini and GPT | Supported for `triage`, `prioritize`, `code`, `fix` |
 | `dummy` | Behaviour tests — scripted ops, no inference | Internal |
 | `opencode` | Not yet functional | Stub |
 

@@ -281,7 +281,7 @@ func TestBuildPiRunCommand_OpenAI(t *testing.T) {
 	// Config-dir guard: auth.json and models.json must not exist.
 	assert.Contains(t, cmd, "auth.json", "config-dir guard checks auth.json")
 	assert.Contains(t, cmd, "models.json", "config-dir guard checks models.json")
-	assert.Contains(t, cmd, fmt.Sprintf("exit %d", piHooksMissingExit), "config-dir guard uses the same exit code")
+	assert.Contains(t, cmd, fmt.Sprintf("exit %d", piConfigTamperedExit), "config-dir guard uses its own exit code")
 	// No Vertex hygiene or extensions.
 	assert.NotContains(t, cmd, "unset ANTHROPIC_API_KEY", "anthropic env hygiene does not fire for openai")
 	assert.NotContains(t, cmd, "unset XAI_API_KEY", "xai env hygiene does not fire for openai")
@@ -298,14 +298,44 @@ func TestBuildPiRunCommand_OpenAI(t *testing.T) {
 		assert.Contains(t, cmd, "&& unset OPENAI_BASE_URL AZURE_OPENAI_API_KEY", "unset for %s", spec)
 	}
 
-	// unset and guard must run after the agent-writable .env is sourced.
+	// The env hygiene runs after the agent-writable .env is sourced; the
+	// config-dir guard runs before it (nothing can shadow `test` yet) and
+	// again after it, behind `unset -f test`, in case .env wrote a file.
 	params.Model = "openai/gpt-5.6-luna"
 	cmd = buildPiRunCommand(params, m)
 	envIdx := strings.Index(cmd, ". '"+sandbox.SandboxWorkspace+"/.env'")
 	unsetIdx := strings.Index(cmd, "&& unset OPENAI_BASE_URL")
 	assert.Less(t, envIdx, unsetIdx, "unset after .env sourced")
-	guardIdx := strings.Index(cmd, "auth.json")
-	assert.Less(t, envIdx, guardIdx, "config-dir guard after .env sourced")
+	guard := piOpenAIConfigGuard(PiRuntime{}.ConfigDir())
+	assert.Equal(t, 2, strings.Count(cmd, guard), "guard runs twice")
+	firstGuard := strings.Index(cmd, guard)
+	secondGuard := strings.LastIndex(cmd, guard)
+	assert.Less(t, firstGuard, envIdx, "first guard before .env sourced")
+	assert.Less(t, envIdx, secondGuard, "second guard after .env sourced")
+	assert.Less(t, strings.Index(cmd, "&& unset -f test command grep"), secondGuard, "unset -f precedes the second guard")
+	assert.Greater(t, strings.Index(cmd, "&& unset -f test command grep"), envIdx, "unset -f after .env sourced")
+}
+
+// TestPiOpenAIConfigGuard_ShadowedTest proves the post-.env pass: a sourced
+// file that redefines `test` to always succeed cannot hide a planted
+// auth.json once `unset -f test` has run.
+func TestPiOpenAIConfigGuard_ShadowedTest(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"openai":{"type":"api_key","key":"sk-planted"}}`), 0o644))
+	env := filepath.Join(t.TempDir(), ".env")
+	// Every tool the guard uses, shadowed the way a hostile .env would.
+	require.NoError(t, os.WriteFile(env, []byte("test() { return 1; }\ncommand() { return 1; }\ngrep() { return 1; }\n"), 0o644))
+
+	shadowed := exec.Command("sh", "-c", ". "+shellQuote(env)+" && "+piOpenAIConfigGuard(dir)+" && echo RAN")
+	out, err := shadowed.CombinedOutput()
+	require.NoError(t, err, "without unset -f the shadowed builtins let the guard pass: %s", out)
+
+	guarded := exec.Command("sh", "-c", ". "+shellQuote(env)+" && unset -f test command grep && "+piOpenAIConfigGuard(dir)+" && echo RAN")
+	out, err = guarded.CombinedOutput()
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr, "output: %s", out)
+	assert.Equal(t, piConfigTamperedExit, exitErr.ExitCode())
+	assert.NotContains(t, string(out), "RAN")
 }
 
 func TestTranslatePiModel_OpenAI(t *testing.T) {
@@ -317,7 +347,7 @@ func TestTranslatePiModel_OpenAI(t *testing.T) {
 	assert.Equal(t, "OpenAI/gpt-5.6-luna", translatePiModel("OpenAI/gpt-5.6-luna"))
 
 	// A bare id under FULLSEND_PI_PROVIDER=openai gets the prefix.
-	t.Setenv(piProviderEnv, piOpenAIProviderName)
+	t.Setenv(piProviderEnv, piOpenAIProvider)
 	assert.Equal(t, "openai/gpt-5.6-luna", translatePiModel("gpt-5.6-luna"))
 }
 
@@ -347,10 +377,16 @@ func TestPiOpenAIConfigGuard(t *testing.T) {
 	assert.Equal(t, 0, code)
 	assert.Contains(t, out, "RAN")
 
-	// auth.json present: fails.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte("{}"), 0o644))
+	// pi writes an empty auth.json on every start: passes.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte("{}\n"), 0o644))
 	code, out = run()
-	assert.Equal(t, piHooksMissingExit, code, "auth.json present")
+	assert.Equal(t, 0, code, "pi's own empty auth.json is not tampering")
+	assert.Contains(t, out, "RAN")
+
+	// An openai entry in auth.json would supply a different key: fails.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"openai":{"type":"api_key","key":"sk-planted"}}`), 0o644))
+	code, out = run()
+	assert.Equal(t, piConfigTamperedExit, code, "auth.json with an openai entry")
 	assert.NotContains(t, out, "RAN")
 	assert.Contains(t, out, "placeholder-leak risk")
 	require.NoError(t, os.Remove(filepath.Join(dir, "auth.json")))
@@ -358,15 +394,29 @@ func TestPiOpenAIConfigGuard(t *testing.T) {
 	// models.json present: fails.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "models.json"), []byte("{}"), 0o644))
 	code, out = run()
-	assert.Equal(t, piHooksMissingExit, code, "models.json present")
+	assert.Equal(t, piConfigTamperedExit, code, "models.json present")
 	assert.NotContains(t, out, "RAN")
 	require.NoError(t, os.Remove(filepath.Join(dir, "models.json")))
 
+	// A key that unescapes to openai: fails (substring check, escape rule).
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"open\u0061i":{"type":"api_key","key":"sk-planted"}}`), 0o644))
+	code, _ = run()
+	assert.Equal(t, piConfigTamperedExit, code, "escaped openai key")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"OpenAI":{"type":"api_key","key":"sk-planted"}}`), 0o644))
+	code, _ = run()
+	assert.Equal(t, piConfigTamperedExit, code, "case-varied openai key")
+	// Another provider's key alone is not this guard's business.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"anthropic":{"type":"api_key","key":"sk-ant-x"}}`), 0o644))
+	code, out = run()
+	assert.Equal(t, 0, code, "an unrelated provider entry passes")
+	assert.Contains(t, out, "RAN")
+	require.NoError(t, os.Remove(filepath.Join(dir, "auth.json")))
+
 	// Both present: fails.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte("{}"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"openai":{}}`), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "models.json"), []byte("{}"), 0o644))
 	code, _ = run()
-	assert.Equal(t, piHooksMissingExit, code, "both present")
+	assert.Equal(t, piConfigTamperedExit, code, "both present")
 }
 
 func TestBuildPiRunCommand_DirectProviderKeepsAnthropicEnv(t *testing.T) {

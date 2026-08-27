@@ -9,13 +9,23 @@
 // The returned access token is opaque (never assume a prefix or structure),
 // short-lived (≤1 h), and scoped to api.model.request. No refresh token is
 // returned.
+//
+// Both URLs are trusted, fixed channels rather than user or remote
+// configuration — the OIDC endpoint is injected by GitHub into the job and
+// is a runner-only, deny-listed variable; the token endpoint is a first-party
+// constant — so this client is outside the SSRF-hardening scope described in
+// docs/contributing/go-code.md ("Secure HTTP clients"). It still applies the
+// baseline that section asks of every client: HTTPS only, an explicit
+// timeout, and a bounded response body.
 package openaiwif
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -32,9 +42,9 @@ const (
 	// a maintainer's live test.
 	defaultSubjectTokenType = "urn:ietf:params:oauth:token-type:jwt"
 
-	// maxResponseBytes bounds how many bytes we read from either endpoint.
-	// Both responses should be small JSON; this prevents a broken upstream
-	// from filling memory.
+	// maxResponseBytes bounds how many bytes we accept from either endpoint.
+	// Both responses are small JSON; a larger body is an error, not
+	// something to parse.
 	maxResponseBytes = 1 << 20 // 1 MiB
 
 	// httpTimeout is the per-request timeout for both the OIDC assertion
@@ -90,6 +100,15 @@ type oidcResponse struct {
 	Value string `json:"value"`
 }
 
+// exchangeRequest is the OpenAI token endpoint's JSON request shape.
+type exchangeRequest struct {
+	GrantType          string `json:"grant_type"`
+	SubjectTokenType   string `json:"subject_token_type"`
+	SubjectToken       string `json:"subject_token"`
+	IdentityProviderID string `json:"identity_provider_id"`
+	ServiceAccountID   string `json:"service_account_id"`
+}
+
 // tokenResponse is the OpenAI token endpoint's JSON shape.
 type tokenResponse struct {
 	AccessToken string `json:"access_token"`
@@ -131,6 +150,12 @@ func Exchange(ctx context.Context, cfg Config) (*Token, error) {
 	if tokenEndpoint == "" {
 		tokenEndpoint = openAITokenEndpoint
 	}
+	if err := requireSecureURL("OIDC request URL", cfg.OIDCRequestURL); err != nil {
+		return nil, fmt.Errorf("openaiwif: %w", err)
+	}
+	if err := requireSecureURL("token endpoint", tokenEndpoint); err != nil {
+		return nil, fmt.Errorf("openaiwif: %w", err)
+	}
 
 	// Step 1: fetch the GitHub OIDC assertion.
 	assertion, err := fetchAssertion(ctx, client, cfg.OIDCRequestURL, cfg.OIDCRequestToken, cfg.Audience)
@@ -146,12 +171,57 @@ func Exchange(ctx context.Context, cfg Config) (*Token, error) {
 	return tok, nil
 }
 
+// requireSecureURL rejects anything but https, except plain http to a
+// loopback address (test servers).
+func requireSecureURL(what, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parsing %s: %w", what, err)
+	}
+	switch {
+	case u.Scheme == "https":
+		return nil
+	case u.Scheme == "http" && isLoopback(u.Hostname()):
+		return nil
+	}
+	return fmt.Errorf("%s must use https (got scheme %q)", what, u.Scheme)
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// readBounded reads at most maxResponseBytes from r and errors when the
+// body is larger, so an oversized response is never parsed.
+func readBounded(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if len(body) > maxResponseBytes {
+		return nil, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
+	}
+	return body, nil
+}
+
 // fetchAssertion requests a GitHub OIDC JWT from the runner's token endpoint.
 func fetchAssertion(ctx context.Context, client *http.Client, oidcURL, oidcToken, audience string) (string, error) {
-	// The audience is appended as a query parameter; URL-encode it.
-	reqURL := oidcURL + "&audience=" + url.QueryEscape(audience)
+	// GitHub hands the runner a URL that already carries api-version; the
+	// audience is one more query parameter, added through url.Values so it
+	// is encoded correctly whether or not a query string is present.
+	u, err := url.Parse(oidcURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing OIDC request URL: %w", err)
+	}
+	q := u.Query()
+	q.Set("audience", audience)
+	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return "", fmt.Errorf("building request: %w", err)
 	}
@@ -163,13 +233,12 @@ func fetchAssertion(ctx context.Context, client *http.Client, oidcURL, oidcToken
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if err != nil {
-		return "", fmt.Errorf("reading response: %w", err)
-	}
-
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("OIDC endpoint returned %d", resp.StatusCode)
+	}
+	body, err := readBounded(resp.Body)
+	if err != nil {
+		return "", err
 	}
 
 	var oidc oidcResponse
@@ -186,19 +255,26 @@ func fetchAssertion(ctx context.Context, client *http.Client, oidcURL, oidcToken
 func exchangeToken(ctx context.Context, client *http.Client, endpoint, assertion, identityProviderID, serviceAccountID, subjectTokenType string) (*Token, error) {
 	exchangeTime := time.Now()
 
-	payload := url.Values{
-		"grant_type":           {"urn:ietf:params:oauth:grant-type:token-exchange"},
-		"subject_token_type":   {subjectTokenType},
-		"subject_token":        {assertion},
-		"identity_provider_id": {identityProviderID},
-		"service_account_id":   {serviceAccountID},
+	// OpenAI's token endpoint takes a JSON body (developers.openai.com,
+	// "Workload identity token exchange" reference), not the form encoding
+	// RFC 8693 examples use.
+	payload, err := json.Marshal(exchangeRequest{
+		GrantType:          "urn:ietf:params:oauth:grant-type:token-exchange",
+		SubjectTokenType:   subjectTokenType,
+		SubjectToken:       assertion,
+		IdentityProviderID: identityProviderID,
+		ServiceAccountID:   serviceAccountID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encoding request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(payload.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -206,13 +282,12 @@ func exchangeToken(ctx context.Context, client *http.Client, endpoint, assertion
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
-	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
-	}
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("token endpoint returned %d", resp.StatusCode)
+	}
+	body, err := readBounded(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
 	var tok tokenResponse
@@ -224,6 +299,12 @@ func exchangeToken(ctx context.Context, client *http.Client, endpoint, assertion
 	}
 	if tok.ExpiresIn <= 0 {
 		return nil, fmt.Errorf("token endpoint returned invalid expires_in: %d", tok.ExpiresIn)
+	}
+	// The value is sent as `Authorization: Bearer` by the gateway; anything
+	// else would be silently wrong, so treat the documented token_type as a
+	// checked precondition (RFC 6749 §5.1: case-insensitive).
+	if !strings.EqualFold(tok.TokenType, "Bearer") {
+		return nil, fmt.Errorf("token endpoint returned unsupported token_type %q (expected Bearer)", tok.TokenType)
 	}
 
 	return &Token{

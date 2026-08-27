@@ -1125,6 +1125,15 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// Only harness-declared and URL-resolved providers are loaded and created;
 	// directory providers not referenced by this harness are skipped entirely.
 	result.Profiles = dedupResolvedProfiles(result.Profiles)
+	// The sandbox name is generated before providers are created so a
+	// run-scoped provider can carry its suffix (#6689).
+	sandboxName := generateSandboxName(agentName)
+	if len(sandboxName) > maxSandboxNameLen {
+		return fmt.Errorf("sandbox name %q is %d characters, exceeding the OpenShell limit of %d", sandboxName, len(sandboxName), maxSandboxNameLen)
+	}
+	// runScopedProviders maps a harness provider name to the run-scoped
+	// instance created for it; sandbox creation attaches the latter.
+	runScopedProviders := map[string]string{}
 	allProviderNames := append([]string{}, h.Providers...)
 	if len(h.Providers) > 0 || len(result.Providers) > 0 || len(result.Profiles) > 0 {
 		// Enable provider-backed policy composition on the gateway.
@@ -1180,6 +1189,30 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			delete(urlProviderNames, name)
 		}
 
+		// Run-scoped providers are created synchronously, before the
+		// shared ones: their credential is resolved in process (a WIF
+		// exchange or the runner's own OPENAI_API_KEY), the instance is
+		// named after this run so concurrent runs on a shared gateway
+		// never overwrite each other's token, and it is deleted when the
+		// run ends — even under --keep-sandbox, because a live-token
+		// provider must not outlive the run (#6689).
+		created := make(map[string]struct{}, len(allDefs))
+		sharedDefs := allDefs[:0:0]
+		for _, pd := range allDefs {
+			if pd.Type != openAIProviderType {
+				sharedDefs = append(sharedDefs, pd)
+				continue
+			}
+			scopedName, scopedKeys, err := ensureOpenAIProvider(ctx, pd, sandboxName, printer)
+			if err != nil {
+				return err
+			}
+			created[pd.Name] = struct{}{}
+			runScopedProviders[pd.Name] = scopedName
+			defer cleanupRunScopedProvider(scopedName, scopedKeys, printer)
+		}
+		allDefs = sharedDefs
+
 		var (
 			mu   sync.Mutex
 			wg   sync.WaitGroup
@@ -1205,7 +1238,6 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		if err := errors.Join(errs...); err != nil {
 			return err
 		}
-		created := make(map[string]struct{}, len(allDefs))
 		for _, pd := range allDefs {
 			created[pd.Name] = struct{}{}
 		}
@@ -1215,16 +1247,12 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			}
 		}
 
-		allProviderNames = sandboxProviderNames(h.Providers, result.Providers)
+		allProviderNames = applyRunScopedProviderNames(sandboxProviderNames(h.Providers, result.Providers), runScopedProviders)
 	}
 
 	workItemID := resolveWorkItemID()
 
 	// 3. Create run directory and initialise tracer.
-	sandboxName := generateSandboxName(agentName)
-	if len(sandboxName) > maxSandboxNameLen {
-		return fmt.Errorf("sandbox name %q is %d characters, exceeding the OpenShell limit of %d", sandboxName, len(sandboxName), maxSandboxNameLen)
-	}
 	if outputBase == "" {
 		outputBase = filepath.Join(os.TempDir(), "fullsend")
 	}
@@ -2411,6 +2439,11 @@ var reservedSandboxKeys = map[string]bool{
 	"FULLSEND_TARGET_REPO_DIR": true,
 	"FULLSEND_ROLE":            true,
 	"FULLSEND_SLUG":            true,
+	// The openai provider's placeholder (#6689): the only sanctioned way for
+	// an OpenAI credential to reach the sandbox is the run-scoped OpenShell
+	// provider, so env.sandbox must not be able to export a real key over
+	// the placeholder.
+	"OPENAI_API_KEY": true,
 }
 
 func init() {

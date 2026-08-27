@@ -29,11 +29,11 @@ const (
 	// used by translatePiModel to normalize short-form xai/ specs and by
 	// buildPiRunCommand to gate extension loading and env hygiene.
 	piXaiVertexProvider = "xai-vertex"
-	// piOpenAIProviderName is the lowercase provider name used as a gate in
+	// piOpenAIProvider is the lowercase provider name used as a gate in
 	// buildPiRunCommand. Unlike Vertex providers, OpenAI models use pi's
 	// built-in openai provider, which reads OPENAI_API_KEY from the env —
 	// the run-scoped OpenShell provider injects a short-lived placeholder.
-	piOpenAIProviderName = "openai"
+	piOpenAIProvider = "openai"
 	// piProviderEnv replaces the provider prefix applied to bare model ids.
 	// The model itself is resolved once by the CLI (--model, FULLSEND_MODEL,
 	// or the FULLSEND_PI_MODEL alias on pi; #6526) and arrives in
@@ -165,6 +165,12 @@ func piThinkingFor(effort string) (string, bool) {
 // extension would give a hookless iteration that looks healthy.
 const piHooksMissingExit = 97
 
+// piConfigTamperedExit is the exit code of the config-dir integrity guard
+// for the openai provider (auth.json or models.json present). Distinct from
+// piHooksMissingExit so Run can name the actual cause instead of reporting a
+// hook-adapter problem.
+const piConfigTamperedExit = 98
+
 // buildPiRunCommand renders the in-sandbox command line. Security-relevant
 // flags: --no-approve and defaultProjectTrust "never" keep repo-owned .pi/
 // out; --no-extensions with explicit -e means only the runner-vetted
@@ -185,12 +191,23 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 		model = m.Model
 	}
 	modelSpec := translatePiModel(model)
+	// pi matches the provider prefix case-insensitively, so the gates must
+	// too or "Anthropic-Vertex/..." would run on Vertex with the unset
+	// skipped.
+	provider, _, _ := strings.Cut(modelSpec, "/")
+	vertex := strings.EqualFold(provider, piDefaultProvider)
+	xaiVertex := strings.EqualFold(provider, piXaiVertexProvider)
+	openai := strings.EqualFold(provider, piOpenAIProvider)
 
 	parts := []string{"cd " + shellQuote(params.RepoDir)}
 	if hooksEnabled {
 		// Before .env: that file is agent-writable and could otherwise
 		// shadow the guard's tools with functions or a PATH entry.
 		parts = append(parts, "&& "+piHooksGuard(hooksExt, r.piManifestPath()))
+	}
+	if openai {
+		// Same reason: check the config dir before .env can shadow `test`.
+		parts = append(parts, "&& "+piOpenAIConfigGuard(r.ConfigDir()))
 	}
 	parts = append(parts,
 		"&& . "+shellQuote(envFile),
@@ -203,13 +220,6 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 		// so mirror it and Gemini on Vertex is just a model name.
 		`&& export GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-$CLOUD_ML_REGION}"`,
 	)
-	// pi matches the provider prefix case-insensitively, so the gate must
-	// too or "Anthropic-Vertex/..." would run on Vertex with the unset
-	// skipped.
-	provider, _, _ := strings.Cut(modelSpec, "/")
-	vertex := strings.EqualFold(provider, piDefaultProvider)
-	xaiVertex := strings.EqualFold(provider, piXaiVertexProvider)
-	openai := strings.EqualFold(provider, piOpenAIProviderName)
 	if vertex {
 		// Claude-on-Vertex: the bundled Anthropic SDK would send a stray
 		// ANTHROPIC_API_KEY to Google as X-Api-Key and honour
@@ -256,13 +266,14 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 			// (provider not attached) instead of pi's generic "No API key".
 			`&& [ -n "${OPENAI_API_KEY:-}" ] || { echo 'fullsend: OPENAI_API_KEY is empty in the sandbox (openai provider not attached)' >&2; exit 1; }`,
 		)
-		// Config-dir integrity guard: models.json is the only way to change
-		// pi's openai base URL (no env override exists), and auth.json could
-		// outrank --api-key in pi's resolution order. A redirect to another
-		// allowed REST host is the placeholder-leak vector; fail closed.
-		// This guard runs for the openai provider even when hooks are
-		// disabled, because the threat is credential leak, not tool misuse.
-		parts = append(parts, "&& "+piOpenAIConfigGuard(r.ConfigDir()))
+		// Config-dir integrity guard, second pass: .env itself could have
+		// written auth.json or models.json just now. `unset -f` is a special
+		// builtin, which a sourced function cannot shadow, so it restores the
+		// real `test` before the check; the first pass (before .env) already
+		// caught anything written between iterations. This runs for the
+		// openai provider even when hooks are disabled, because the threat is
+		// credential leak, not tool misuse.
+		parts = append(parts, "&& unset -f test command grep", "&& "+piOpenAIConfigGuard(r.ConfigDir()))
 	}
 	parts = append(parts,
 		"&& pi",
@@ -333,18 +344,28 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 const piManifestEnv = "FULLSEND_PI_MANIFEST"
 
 // piOpenAIConfigGuard is the POSIX sh fragment that fails closed when the
-// pi config directory contains auth.json or models.json. models.json is the
-// only way to change pi's openai base URL (no env override exists), and a
-// redirect to another allowed REST host is the placeholder-leak vector
-// described in ADR 0025. auth.json could outrank --api-key in pi's
-// resolution order. This guard runs for the openai provider even when hooks
-// are disabled, because the threat is credential leak, not tool misuse.
+// pi config directory carries models.json, or an auth.json with an openai
+// entry. models.json is the only way to change pi's openai base URL (no
+// env override exists), and a redirect to another allowed REST host is the
+// placeholder-leak vector described in ADR 0025; an openai entry in
+// auth.json would supply a different key. pi 0.84.3 itself writes an empty
+// auth.json (`{}`) on every start (AuthStorage.ensureFileExists), so the
+// file's presence proves nothing — only its content does: an `openai` key
+// in any case, or any `\u00` JSON escape (pi never writes escaped keys; a
+// planted `"open\u0061i"` would otherwise slip a substring check). This is
+// a substring test, not a JSON parse — sh has no JSON tooling — which is
+// why the escape rule exists. Run emits the
+// guard twice: before the agent-writable .env is sourced (nothing can
+// shadow the builtins yet) and after it, behind `unset -f test command
+// grep` (a special builtin, so a function .env defined cannot stand in);
+// `command -p` uses the default PATH, so a PATH swap cannot either. It
+// applies whether or not hooks are enabled.
 func piOpenAIConfigGuard(configDir string) string {
+	auth := shellQuote(configDir + "/auth.json")
+	models := shellQuote(configDir + "/models.json")
 	return fmt.Sprintf(
-		`{ ! test -f %s && ! test -f %s || { echo 'fullsend: pi config dir contains auth.json or models.json; refusing to run openai provider (placeholder-leak risk)' >&2; exit %d; }; }`,
-		shellQuote(configDir+"/auth.json"),
-		shellQuote(configDir+"/models.json"),
-		piHooksMissingExit,
+		`{ ! test -f %s && { ! test -f %s || ! command -p grep -qiE '"openai"|\\u00' %s; } || { echo 'fullsend: pi config dir has models.json or an openai entry in auth.json; refusing to run the openai provider (placeholder-leak risk)' >&2; exit %d; }; }`,
+		models, auth, auth, piConfigTamperedExit,
 	)
 }
 
@@ -461,6 +482,9 @@ func (r PiRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printe
 	}
 	if exitCode == piHooksMissingExit && params.HooksSettingsPath != "" {
 		return exitCode, fmt.Errorf("pi hook adapter or manifest missing or modified in %s; refusing to run unhooked (was Bootstrap run, or did the agent change it?)", r.ConfigDir())
+	}
+	if exitCode == piConfigTamperedExit {
+		return exitCode, fmt.Errorf("pi config dir %s contains auth.json or models.json; refusing to run the openai provider because either can redirect or replace the runner's credential (did the agent write it between iterations?)", r.ConfigDir())
 	}
 
 	if exitCode == 0 && lastResult != nil && lastResult.IsError {

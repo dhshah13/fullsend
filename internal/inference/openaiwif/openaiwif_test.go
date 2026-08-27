@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -52,13 +51,17 @@ func TestExchange_HappyPath(t *testing.T) {
 		},
 		func(w http.ResponseWriter, r *http.Request) {
 			assert.Equal(t, http.MethodPost, r.Method)
-			assert.Equal(t, "application/x-www-form-urlencoded", r.Header.Get("Content-Type"))
-			require.NoError(t, r.ParseForm())
-			assert.Equal(t, "urn:ietf:params:oauth:grant-type:token-exchange", r.FormValue("grant_type"))
-			assert.Equal(t, defaultSubjectTokenType, r.FormValue("subject_token_type"))
-			assert.Equal(t, fakeJWT, r.FormValue("subject_token"))
-			assert.Equal(t, "idp-123", r.FormValue("identity_provider_id"))
-			assert.Equal(t, "sa-456", r.FormValue("service_account_id"))
+			assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+			var body map[string]string
+			// assert, not require: FailNow must not run on the handler goroutine.
+			if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&body)) {
+				return
+			}
+			assert.Equal(t, "urn:ietf:params:oauth:grant-type:token-exchange", body["grant_type"])
+			assert.Equal(t, defaultSubjectTokenType, body["subject_token_type"])
+			assert.Equal(t, fakeJWT, body["subject_token"])
+			assert.Equal(t, "idp-123", body["identity_provider_id"])
+			assert.Equal(t, "sa-456", body["service_account_id"])
 			json.NewEncoder(w).Encode(tokenResponse{ //nolint:errcheck
 				AccessToken: fakeAccessToken,
 				TokenType:   "bearer",
@@ -344,6 +347,38 @@ func TestExchange_MissingConfig(t *testing.T) {
 	}
 }
 
+func TestExchange_RejectsNonBearerTokenType(t *testing.T) {
+	t.Parallel()
+	for _, tokenType := range []string{"", "MAC", "DPoP"} {
+		t.Run("token_type="+tokenType, func(t *testing.T) {
+			_, _, cfg := newTestServers(t,
+				func(w http.ResponseWriter, _ *http.Request) {
+					json.NewEncoder(w).Encode(oidcResponse{Value: "jwt"}) //nolint:errcheck
+				},
+				func(w http.ResponseWriter, _ *http.Request) {
+					json.NewEncoder(w).Encode(tokenResponse{AccessToken: "tok", TokenType: tokenType, ExpiresIn: 3600}) //nolint:errcheck
+				},
+			)
+			_, err := Exchange(context.Background(), cfg)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "token_type")
+			assert.NotContains(t, err.Error(), "tok\"", "the token value is not quoted")
+		})
+	}
+	// Case-insensitive per RFC 6749 §5.1.
+	_, _, cfg := newTestServers(t,
+		func(w http.ResponseWriter, _ *http.Request) {
+			json.NewEncoder(w).Encode(oidcResponse{Value: "jwt"}) //nolint:errcheck
+		},
+		func(w http.ResponseWriter, _ *http.Request) {
+			json.NewEncoder(w).Encode(tokenResponse{AccessToken: "tok", TokenType: "BEARER", ExpiresIn: 3600}) //nolint:errcheck
+		},
+	)
+	tok, err := Exchange(context.Background(), cfg)
+	require.NoError(t, err)
+	assert.Equal(t, "tok", tok.Value)
+}
+
 func TestExchange_CustomSubjectTokenType(t *testing.T) {
 	t.Parallel()
 	const customType = "urn:ietf:params:oauth:token-type:id_token"
@@ -354,8 +389,11 @@ func TestExchange_CustomSubjectTokenType(t *testing.T) {
 			json.NewEncoder(w).Encode(oidcResponse{Value: "jwt"}) //nolint:errcheck
 		},
 		func(w http.ResponseWriter, r *http.Request) {
-			require.NoError(t, r.ParseForm())
-			receivedType = r.FormValue("subject_token_type")
+			var body map[string]string
+			if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&body)) {
+				return
+			}
+			receivedType = body["subject_token_type"]
 			json.NewEncoder(w).Encode(tokenResponse{ //nolint:errcheck
 				AccessToken: "tok",
 				TokenType:   "bearer",
@@ -394,6 +432,23 @@ func TestExchange_ErrorsNeverContainSecrets(t *testing.T) {
 	assert.NotContains(t, err.Error(), cfg.OIDCRequestToken,
 		"error must not contain the OIDC request token")
 
+	// Test 1b: the token endpoint fails but echoes a token in its error
+	// body — the body must never be quoted into the error.
+	_, _, cfg = newTestServers(t,
+		func(w http.ResponseWriter, _ *http.Request) {
+			json.NewEncoder(w).Encode(oidcResponse{Value: secretJWT}) //nolint:errcheck
+		},
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"upstream","echo":"` + secretToken + `"}`)) //nolint:errcheck
+		},
+	)
+	_, err = Exchange(context.Background(), cfg)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), secretToken,
+		"error must not quote the token endpoint's response body")
+	assert.Contains(t, err.Error(), "500", "the status code is still reported")
+
 	// Test 2: Build a URL where the audience appears in query params.
 	// Verify the error from a connection failure doesn't leak it either.
 	cfg2 := Config{
@@ -405,9 +460,33 @@ func TestExchange_ErrorsNeverContainSecrets(t *testing.T) {
 	}
 	_, err = Exchange(context.Background(), cfg2)
 	require.Error(t, err)
-	// The URL-encoded audience should not appear in the error message
-	// (it may appear as part of the URL if the HTTP client includes it;
-	// this test documents current behavior rather than enforcing it
-	// absolutely, since Go's HTTP client error messages are not controlled).
-	_ = url.QueryEscape(cfg2.Audience) // exercise the encoding path
+	assert.Contains(t, err.Error(), "assertion request failed")
+	// The audience is not a secret and Go's url.Error carries the URL, but
+	// the bearer runner token is a header and must never surface.
+	assert.NotContains(t, err.Error(), "secret-runner-token")
+}
+
+func TestExchange_RequiresHTTPS(t *testing.T) {
+	t.Parallel()
+	_, _, cfg := newTestServers(t,
+		func(w http.ResponseWriter, _ *http.Request) { json.NewEncoder(w).Encode(oidcResponse{Value: "jwt"}) }, //nolint:errcheck
+		func(w http.ResponseWriter, _ *http.Request) {
+			json.NewEncoder(w).Encode(tokenResponse{AccessToken: "tok", TokenType: "Bearer", ExpiresIn: 3600}) //nolint:errcheck
+		},
+	)
+	// httptest servers are plain http on loopback and are accepted.
+	_, err := Exchange(context.Background(), cfg)
+	require.NoError(t, err)
+
+	bad := cfg
+	bad.OIDCRequestURL = "http://oidc.example.invalid/token"
+	_, err = Exchange(context.Background(), bad)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must use https")
+
+	bad = cfg
+	bad.TokenEndpoint = "http://auth.example.invalid/oauth/token"
+	_, err = Exchange(context.Background(), bad)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "token endpoint must use https")
 }

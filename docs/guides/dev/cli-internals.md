@@ -701,6 +701,7 @@ var executableFiles = map[string]struct{}{
 | `internal/scaffold/scaffold.go` | ~146 | Embedded template system |
 | `internal/inference/inference.go` | ~26 | Provider interface |
 | `internal/inference/vertex/vertex.go` | ~80 | Agent Platform (Vertex AI) implementation |
+| `internal/inference/openaiwif/openaiwif.go` | ~250 | OpenAI Workload Identity Federation token exchange (runner-side) |
 | `internal/config/config.go` | ~264 | Org/repo config structures |
 
 ## See Also

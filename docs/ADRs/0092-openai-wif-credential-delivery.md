@@ -59,14 +59,18 @@ Runner-side exchange with a run-scoped OpenShell provider:
 2. A run-scoped provider (`openai-<suffix>`) carries the token as a
    bare-key credential, never expanded through `os.ExpandEnv` (the
    opaque token may contain `$`). The provider has
-   `--credential-expires-at` set and is deleted in deferred cleanup
-   regardless of `--keep-sandbox`.
+   `--credential-expires-at` set (the token's own expiry, or a bounded
+   lifetime for a static `OPENAI_API_KEY` from the runner environment)
+   and is deleted in deferred cleanup regardless of `--keep-sandbox`;
+   a provider whose expiry cannot be set is deleted immediately.
 3. The `fullsend-openai` OpenShell profile scopes egress to
    `POST /v1/responses` on `api.openai.com` for `**/node` binaries.
 4. The pi runtime gate passes `--api-key "$OPENAI_API_KEY"` so pi uses
-   the placeholder. A config-dir integrity guard (exit 97 on
+   the placeholder. A config-dir integrity guard (exit 98 on
    `auth.json`/`models.json`) closes the redirect vector even with
-   hooks disabled.
+   hooks disabled; it runs before the agent-writable `.env` is sourced
+   and again after it behind `unset -f test`, so a sourced shell
+   function cannot shadow the check.
 5. The token value is redacted by exact match in run output and provider
    errors; `::add-mask::` is emitted on GitHub Actions;
    `FULLSEND_OPENAI_*` are in `oidcDenyKeys`.

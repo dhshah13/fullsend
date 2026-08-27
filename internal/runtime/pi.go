@@ -55,7 +55,7 @@ const piXaiVertexExtensionPath = sandbox.SandboxPiExtensionsDir + "/xai-vertex"
 // credential placeholder through the run-scoped OpenShell provider, not
 // Vertex ADC. The model ids are two-segment ("openai/gpt-5.6-luna") and pass
 // through to pi's built-in openai provider unchanged. The provider constant
-// is piOpenAIProviderName in pi_run.go.
+// is piOpenAIProvider in pi_run.go.
 
 func (PiRuntime) Name() string { return "pi" }
 
