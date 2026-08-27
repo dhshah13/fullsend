@@ -99,7 +99,8 @@ func newAgentUpdateCmd() *cobra.Command {
 		Use:   "update <name> [sha]",
 		Short: "Update a URL agent to a new commit SHA",
 		Long: `Re-pin a URL-based agent to a new commit SHA and recompute the
-integrity hash. If no SHA is provided, the default branch HEAD is used.
+integrity hash. If no SHA is provided, the branch ref stored at adoption
+time is re-resolved; if no ref was stored, the default branch HEAD is used.
 
 Only URL agents can be updated — local path agents have nothing to pin.`,
 		Args: cobra.RangeArgs(1, 2),

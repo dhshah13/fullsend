@@ -27,6 +27,13 @@ var validConfigAgentName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 // disabling built-in scaffold agents without removing their role.
 // A suppression-only entry (Enabled=false, no Source) is valid.
 //
+// Ref records the original branch or tag ref that was resolved to a
+// commit SHA when the agent was adopted via `agent add`. When present,
+// `agent update` re-resolves against this ref instead of the repo's
+// default branch, so agents adopted from non-default branches stay on
+// their intended branch across updates. Empty for entries that predate
+// this field or were adopted with an explicit commit SHA.
+//
 // Runtime, Model and Effort tune how the agent runs (ADR 0091): they
 // override the repo-wide runtime: key and the harness model:/effort:
 // for this agent, beneath the per-run --runtime/--model/--effort flags
