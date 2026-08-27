@@ -2,6 +2,7 @@ import { defineConfig } from "vitepress";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DOCS_URL_BASE, globalSeoHead, isIndexablePage, pageSeoHead } from "./seo";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const docsDir = path.resolve(__dirname, "..");
@@ -158,7 +159,21 @@ export default defineConfig({
         href: "https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap",
       },
     ],
+    // Site-wide SEO metadata (Open Graph type/site name/image + Twitter card).
+    ...globalSeoHead,
   ],
+
+  // Emit sitemap.xml for the docs. The hostname carries the /docs/ base (and a
+  // trailing slash) because VitePress resolves base-less page paths against it.
+  sitemap: {
+    hostname: DOCS_URL_BASE,
+  },
+
+  // Per-page canonical + Open Graph tags derived from the resolved page data.
+  transformHead({ page, title, description, siteConfig }) {
+    if (!isIndexablePage(page)) return [];
+    return pageSeoHead({ page, title, description, cleanUrls: siteConfig.cleanUrls });
+  },
 
   srcExclude: ["**/agents/icons/**", "**/testing/**"],
 

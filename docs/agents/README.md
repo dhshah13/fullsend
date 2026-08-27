@@ -1,3 +1,7 @@
+---
+description: Reference for the agents fullsend ships — triage, code, review, fix, retro, and prioritize — plus how to register custom agents via config.
+---
+
 # Agents
 
 Reference documentation for the agents shipped by fullsend.

@@ -1,3 +1,7 @@
+---
+description: The components of the fullsend agent execution stack and how they fit together — the current architectural truth, kept in sync with accepted ADRs.
+---
+
 # Architecture
 
 What are the components of the agent execution stack?
