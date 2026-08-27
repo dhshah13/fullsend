@@ -412,7 +412,9 @@ When the fetch falls outside that envelope you must build a custom client. Commo
 - **Constrain redirects.** Block them (as `fetch.FetchURL` does) or cap the hop count; and if you allow any hop, re-run the checks above against each redirect target — both the scheme check and, via per-connection dialing, the internal-IP check — not just the scheme.
 
 When the set of legitimate hosts *is* known, add a domain allowlist too, even on the custom path.
-## Security: credential redaction for external content
+
+
+## Credential redaction for external content
 
 Any runner feature that processes external content — validation script
 output, CI logs, script stdout/stderr — for injection into LLM prompts,
