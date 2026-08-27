@@ -197,6 +197,22 @@ func Install(ctx context.Context, cfg InstallConfig,
 		return result, fmt.Errorf("generating scaffold files: %w", err)
 	}
 
+	// Step 4b: For GitLab, merge fullsend's include and workflow rules
+	// into the existing .gitlab-ci.yml instead of overwriting it. The
+	// static scaffold skips .gitlab-ci.yml; we generate it dynamically
+	// by reading the existing file and merging fullsend entries.
+	if cfg.Forge == ForgeGitLab {
+		mergedRoot, mergeErr := mergeGitLabRootCI(ctx, client, cfg.Owner, cfg.Repo)
+		if mergeErr != nil {
+			return result, fmt.Errorf("merging .gitlab-ci.yml: %w", mergeErr)
+		}
+		files = append(files, forge.TreeFile{
+			Path:    ".gitlab-ci.yml",
+			Content: mergedRoot,
+			Mode:    "100644",
+		})
+	}
+
 	// Step 5: Write repository variables. Variables and secrets are
 	// written before the scaffold commit so the workflow's required
 	// secrets exist by the time an event triggers a run. This

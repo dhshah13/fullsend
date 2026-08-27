@@ -1120,8 +1120,10 @@ func TestBuildScaffoldFiles_GitLab(t *testing.T) {
 	for _, f := range files {
 		paths[f.Path] = true
 	}
+	// .gitlab-ci.yml is no longer in static scaffold — the install flow
+	// merges fullsend entries into the existing file dynamically.
 	for _, expected := range []string{
-		".gitlab-ci.yml",
+		".gitlab/ci/fullsend-pipeline.yml",
 		".gitlab/ci/fullsend-agent.yml",
 		".gitlab/ci/fullsend-dispatch.yml",
 		".gitlab/ci/fullsend-poll.yml",
@@ -1130,6 +1132,10 @@ func TestBuildScaffoldFiles_GitLab(t *testing.T) {
 		if !paths[expected] {
 			t.Errorf("missing expected scaffold file %q", expected)
 		}
+	}
+	if paths[".gitlab-ci.yml"] {
+		t.Error(".gitlab-ci.yml should not be in static scaffold — " +
+			"root file is merged dynamically by Install")
 	}
 }
 
