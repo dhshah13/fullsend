@@ -84,6 +84,12 @@ func collectGitLabUpgradeTemplates(runnerTags []string, targetRef string) ([]for
 		// it contains only include directives and stages that rarely change
 		// between versions. The root .gitlab-ci.yml is user-owned and handled
 		// by the install merge path, not the upgrade path.
+		//
+		// NOTE: Because the pipeline wrapper is excluded from upgrades,
+		// structural changes to fullsend-pipeline.yml require a manual
+		// upgrade path or a one-time migration step. If the wrapper's
+		// layout changes in a future release, add it back to the upgrade
+		// template set or provide an explicit migration in the release.
 		if f.Path == ".gitlab/ci/fullsend-dispatch.yml" || f.Path == ".gitlab/ci/fullsend-pipeline.yml" {
 			continue
 		}
