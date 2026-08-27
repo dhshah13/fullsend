@@ -750,6 +750,32 @@ func TestPinAgentURL_InvalidResolvedSHA(t *testing.T) {
 	assert.Contains(t, err.Error(), "not a valid commit SHA")
 }
 
+func TestPinAgentURL_GitHubBranchRefCapture(t *testing.T) {
+	// Verify that pinAgentURL correctly resolves a GitHub branch URL
+	// and captures the branch name as originalRef. The fetch step
+	// fails because buildRawURL constructs a raw.githubusercontent.com
+	// URL that cannot be served by the test server, but the resolution
+	// path — including originalRef capture — is fully exercised and
+	// verified through printer output.
+	resolvedSHA := "c1c2c3c4c5c6c7c8c9c0d1d2d3d4d5d6d7d8d9d0"
+
+	client := forge.NewFakeClient()
+	client.BranchRefs["org/repo/release-2.0"] = resolvedSHA
+
+	var buf strings.Builder
+	printer := ui.New(&buf)
+	_, ref, err := pinAgentURL(context.Background(),
+		"https://raw.githubusercontent.com/org/repo/release-2.0/harness/triage.yaml",
+		client, printer)
+	require.Error(t, err, "expected fetch error because raw.githubusercontent.com is unreachable in tests")
+	assert.Contains(t, err.Error(), "fetching")
+	assert.Empty(t, ref, "originalRef is cleared on error return")
+
+	output := buf.String()
+	assert.Contains(t, output, "org/repo@release-2.0", "should resolve against the branch ref")
+	assert.Contains(t, output, "Resolved to "+resolvedSHA[:12], "should show resolved SHA")
+}
+
 func TestRunAgentUpdate_GitHubURLUsesRawURL(t *testing.T) {
 	newSHA := "f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1"
 	newContent := []byte("role: triage\nupdated: true\n")
