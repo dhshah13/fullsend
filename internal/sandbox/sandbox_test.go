@@ -650,10 +650,104 @@ exit 0
 	args := string(logged)
 	assert.Contains(t, args, "--detach",
 		"sandbox create must use --detach for persistent sandboxes")
-	assert.Contains(t, args, "sleep infinity",
-		"sandbox create must use 'sleep infinity' as the persistent command")
+	assert.Contains(t, strings.TrimSpace(args), "--detach -- sleep infinity",
+		"the persistent command must be the trailing argument sequence")
 	assert.NotContains(t, args, "-- true",
 		"sandbox create must not use 'true' as the command (breaks OpenShell 0.0.111+)")
+}
+
+// TestCreateOnce_ReadyFallsBackWhenPhaseFieldAbsent covers output-format
+// drift: if OpenShell stops emitting a parseable "Phase:" field, anchoring
+// alone would time out every healthy sandbox, so the historical substring
+// check still applies when no phase parses at all.
+func TestCreateOnce_ReadyFallsBackWhenPhaseFieldAbsent(t *testing.T) {
+	dir := t.TempDir()
+
+	script := `#!/bin/sh
+if [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$2" = "get" ]; then
+  echo "Sandbox:"
+  echo "  Status: Ready"
+  exit 0
+fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "", 5*time.Second)
+	assert.NoError(t, err, "a renamed phase field must not strand a Ready sandbox")
+}
+
+// TestCreateOnce_ReadyWithColorizedPhase covers the success path when the
+// phase value is ANSI-wrapped; TestTerminalSandboxPhase only tabulates the
+// failure phases.
+func TestCreateOnce_ReadyWithColorizedPhase(t *testing.T) {
+	dir := t.TempDir()
+
+	script := "#!/bin/sh\n" +
+		"if [ \"$2\" = \"create\" ]; then\n  exit 0\nfi\n" +
+		"if [ \"$2\" = \"get\" ]; then\n" +
+		"  printf '  \\033[2mPhase:\\033[0m \\033[32mReady\\033[0m\\n'\n" +
+		"  exit 0\nfi\nexit 0\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "", 5*time.Second)
+	assert.NoError(t, err, "a colorized Ready phase must be recognised")
+}
+
+// TestCreateOnce_CreateAndGetBothFail asserts the immediate-failure path
+// reports the exec error, which is the only diagnostic when openshell
+// produces no output at all.
+func TestCreateOnce_CreateAndGetBothFail(t *testing.T) {
+	dir := t.TempDir()
+
+	script := `#!/bin/sh
+exit 3
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "", 5*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sandbox create failed")
+	assert.Contains(t, err.Error(), "exit status 3",
+		"the exec error must survive when the command produces no output")
+}
+
+// TestCreateOnce_ReadyRequiresPhaseField guards the readiness check against
+// the decoy problem the terminal-phase check already handles: "Ready" in the
+// printed policy YAML must not be mistaken for a Ready sandbox.
+func TestCreateOnce_ReadyRequiresPhaseField(t *testing.T) {
+	dir := t.TempDir()
+
+	// Fake openshell: get reports Provisioning, but "Ready" appears in the
+	// policy YAML that `sandbox get` prints below the sandbox fields.
+	script := `#!/bin/sh
+if [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$2" = "get" ]; then
+  echo "Sandbox:"
+  echo "  Name: test-sandbox"
+  echo "  Phase: Provisioning"
+  echo "network:"
+  echo "  egress:"
+  echo "    allow:"
+  echo "      - host: Ready.example.com"
+  exit 0
+fi
+exit 0
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	err := createOnce("test-sandbox", nil, "", "", 2*time.Second)
+	require.Error(t, err, "a Provisioning sandbox must not be reported Ready")
+	assert.Contains(t, err.Error(), "not ready after")
 }
 
 func TestCreateOnce_TerminalPhaseFastFailure(t *testing.T) {
@@ -710,17 +804,43 @@ exit 0
 }
 
 func TestTerminalSandboxPhase(t *testing.T) {
+	// Shaped like real `openshell sandbox get` output: the phase names also
+	// appear in the sandbox name, a label, and the printed policy YAML, none
+	// of which may be mistaken for the sandbox phase.
+	decoyOutput := `Sandbox:
+
+  Id: abc123
+  Name: fullsend-Error-Completed-repro
+  Phase: Provisioning
+  Resource version: 7
+  Labels:
+    last-outcome: Completed
+  Policy source: sandbox
+  Revision: 3
+network:
+  egress:
+    allow:
+      - host: Completed.example.com
+      - host: Error.example.com
+`
+
 	tests := []struct {
 		name   string
 		output string
 		want   string
 	}{
-		{"ready is not terminal", "Phase: Ready", ""},
-		{"creating is not terminal", "Phase: Creating", ""},
-		{"error is terminal", "Phase: Error", "Error"},
-		{"dead is terminal", "Phase: Dead", "Dead"},
-		{"completed is terminal", "Phase: Completed", "Completed"},
+		{"ready is not terminal", "  Phase: Ready", ""},
+		{"provisioning is not terminal", "  Phase: Provisioning", ""},
+		{"stopping is not terminal", "  Phase: Stopping", ""},
+		{"error is terminal", "  Phase: Error", "Error"},
+		{"completed is terminal", "  Phase: Completed", "Completed"},
+		{"colorized phase label", "  \x1b[2mPhase:\x1b[0m Error", "Error"},
+		{"colorized phase value", "  Phase: \x1b[31mError\x1b[0m", "Error"},
+		{"colorized label and value", "  \x1b[1mPhase:\x1b[0m \x1b[31mError\x1b[0m", "Error"},
+		{"no space after colon", "  Phase:Error", "Error"},
 		{"empty output", "", ""},
+		{"no phase field", "Sandbox:\n  Id: abc123\n", ""},
+		{"phase names outside the phase field are ignored", decoyOutput, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
