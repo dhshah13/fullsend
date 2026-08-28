@@ -458,8 +458,10 @@ stages:
                 : > "${PRIOR_REVIEW_FILE}"
               elif [ "${BYTE_COUNT}" -gt 1 ]; then
                 CURRENT_SECTION=$(awk '/<!-- sticky:history-start -->/{exit} {print}' "${PRIOR_REVIEW_FILE}")
+                # sed -nE, not grep -oP — kept in lockstep with the GitHub
+                # scaffold's pre-fetch-prior-review.sh (see its comment for why).
                 PRIOR_REVIEW_SHA=$(printf '%s' "${CURRENT_SECTION}" \
-                  | grep -oP '(?<=\*\*Head SHA:\*\* )[0-9a-f]{7,64}' | head -1 || true)
+                  | sed -nE 's/.*\*\*Head SHA:\*\* ([0-9a-f]{7,64}).*/\1/p' | head -1)
               fi
             else
               PRIOR_REVIEW_PROVENANCE="unverifiable-wrong-user"
