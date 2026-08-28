@@ -25,11 +25,21 @@ for mdfile in "$@"; do
         [[ "$target" =~ ^https?:// || "$target" =~ ^mailto: || "$target" =~ ^# ]] && continue
         path="${target%%#*}"
         [[ -z "$path" ]] && continue
-        resolved="$(cd "$file_dir" && realpath -m "$path")"
+        # python3, not realpath -m: BSD realpath (macOS) has no -m, and a
+        # link target may not exist. os.path.realpath resolves what exists
+        # and normalizes the rest — GNU `realpath -m` semantics. python3 is
+        # always present here: pre-commit itself runs on it.
+        resolved="$(cd "$file_dir" && python3 -c \
+            'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path")"
         if [[ "$resolved" != "$REPO_ROOT/"* && "$resolved" != "$REPO_ROOT" ]]; then
             escaped_links+=("$rel_file: $target")
         fi
-    done < <(grep -oP '(?<=\])\(\K[^)]+' "$mdfile" || true)
+    # grep -oE + sed, not grep -oP: BSD grep (macOS) has no -P — it exited
+    # with "invalid option" and the `|| true` swallowed it, so the loop saw
+    # zero links and this hook passed vacuously on every macOS commit. The
+    # two-step form is the same match: a literal "](", then everything up
+    # to the next ")" or end of line, all occurrences per line.
+    done < <(grep -oE '\]\([^)]+' "$mdfile" | sed -E 's/^\]\(//' || true)
 done
 
 if [[ ${#escaped_links[@]} -eq 0 ]]; then
