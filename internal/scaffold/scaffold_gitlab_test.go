@@ -177,6 +177,9 @@ func TestGitLabDispatchContent(t *testing.T) {
 	assert.Contains(t, s, "CEL:")
 	assert.Contains(t, s, "entity.kind")
 	assert.Contains(t, s, "transition.kind")
+	// [skip ci] / [ci skip] in MR title suppresses dispatch on merged-results pipelines
+	assert.Contains(t, s, `CI_MERGE_REQUEST_TITLE =~ /\[(skip ci|ci skip)\]/i`)
+	assert.Contains(t, s, "when: never")
 	// Child pipeline includes the generic agent template
 	assert.Contains(t, s, "fullsend-agent.yml")
 	assert.NotContains(t, s, "fullsend-${STAGE}.yml")
