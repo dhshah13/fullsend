@@ -20,6 +20,14 @@ const fullsendPipelineInclude = ".gitlab/ci/fullsend-pipeline.yml"
 // fullsend-specific workflow name.
 const fullsendWorkflowNamePrefix = "fullsend "
 
+// fullsendStages are the pipeline stages that fullsend's jobs use.
+// GitLab's deep merge only applies to hash maps — stages: is a YAML
+// array and is overwritten, not merged (see gitlab-org/gitlab#29980).
+// When the root .gitlab-ci.yml already defines stages:, the included
+// file's stages are silently dropped, so these must be added directly
+// to the root file.
+var fullsendStages = []string{"dispatch", "poll", "agent"}
+
 // fullsendWorkflowRules are the workflow:rules entries that fullsend
 // requires in the root .gitlab-ci.yml. GitLab does not merge workflow:
 // definitions across includes, so these must be in the root file.
@@ -39,11 +47,17 @@ type workflowRule struct {
 // .gitlab-ci.yml. It uses yaml.v3's Node API to preserve comments and
 // formatting in the existing file.
 //
-// The merge performs two operations:
+// The merge performs up to three operations:
 //  1. Appends an include entry for .gitlab/ci/fullsend-pipeline.yml
 //     (skipped if already present)
-//  2. Merges workflow:rules entries (deduplicates by if: condition),
-//     sets auto_cancel.on_new_commit: none if not present
+//  2. Appends fullsend's stages (dispatch, poll, agent) to the
+//     existing stages: array, deduplicating if already present.
+//     Skipped when no stages: key exists.
+//  3. When a workflow: block already exists, merges workflow:rules
+//     entries (deduplicates by if: condition) and sets
+//     auto_cancel.on_new_commit: none if not present. When no
+//     workflow: block exists, it is left absent so the repo's
+//     push-triggered pipelines are not disrupted.
 //
 // When existing is nil or empty, returns a minimal .gitlab-ci.yml with
 // just the fullsend include and workflow block.
@@ -70,6 +84,7 @@ func MergeGitLabCI(existing []byte) ([]byte, error) {
 	if err := mergeInclude(root); err != nil {
 		return nil, err
 	}
+	mergeStages(root)
 	if err := mergeWorkflow(root); err != nil {
 		return nil, err
 	}
@@ -101,6 +116,7 @@ func UnmergeGitLabCI(existing []byte) ([]byte, error) {
 	}
 
 	removeInclude(root)
+	removeStages(root)
 	removeWorkflowRules(root)
 
 	// If the root mapping is empty after cleanup, the file has no
@@ -206,15 +222,46 @@ func isFullsendPipelineInclude(node *yaml.Node) bool {
 	return false
 }
 
-// mergeWorkflow ensures the workflow: block contains fullsend's rules
-// and auto_cancel settings. Creates the block if it doesn't exist.
+// mergeStages appends fullsend's stages to an existing stages: array,
+// deduplicating entries that are already present. When no stages: key
+// exists, the function is a no-op — the included pipeline file's
+// stages will be used by GitLab automatically.
+func mergeStages(root *yaml.Node) {
+	stagesVal := findMappingValue(root, "stages")
+	if stagesVal == nil || stagesVal.Kind != yaml.SequenceNode {
+		return
+	}
+
+	// Collect existing stage names for deduplication.
+	existing := make(map[string]bool)
+	for _, item := range stagesVal.Content {
+		if item.Kind == yaml.ScalarNode {
+			existing[item.Value] = true
+		}
+	}
+
+	// Append missing fullsend stages.
+	for _, stage := range fullsendStages {
+		if !existing[stage] {
+			stagesVal.Content = append(stagesVal.Content, &yaml.Node{
+				Kind:  yaml.ScalarNode,
+				Value: stage,
+				Tag:   "!!str",
+			})
+		}
+	}
+}
+
+// mergeWorkflow ensures an existing workflow: block contains fullsend's
+// rules and auto_cancel settings. When no workflow: block exists, it is
+// left absent — fullsend's jobs have their own rules: that self-filter
+// by pipeline source, and creating a workflow: block would gate all
+// pipelines to only fullsend's sources, breaking push-triggered CI.
 func mergeWorkflow(root *yaml.Node) error {
 	workflowVal := findMappingValue(root, "workflow")
 	if workflowVal == nil {
-		// Create the entire workflow: block.
-		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: "workflow", Tag: "!!str"}
-		valNode := buildWorkflowNode()
-		root.Content = append(root.Content, keyNode, valNode)
+		// No existing workflow block — leave it absent so the repo's
+		// push-triggered pipelines continue to run.
 		return nil
 	}
 
@@ -312,28 +359,6 @@ func makeRuleNode(r workflowRule) *yaml.Node {
 	}
 }
 
-// buildWorkflowNode creates a complete workflow: mapping node.
-func buildWorkflowNode() *yaml.Node {
-	rulesSeq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
-	for _, r := range fullsendWorkflowRules {
-		rulesSeq.Content = append(rulesSeq.Content, makeRuleNode(r))
-	}
-
-	return &yaml.Node{
-		Kind: yaml.MappingNode,
-		Tag:  "!!map",
-		Content: []*yaml.Node{
-			{Kind: yaml.ScalarNode, Value: "auto_cancel", Tag: "!!str"},
-			{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
-				{Kind: yaml.ScalarNode, Value: "on_new_commit", Tag: "!!str"},
-				{Kind: yaml.ScalarNode, Value: "none", Tag: "!!str"},
-			}},
-			{Kind: yaml.ScalarNode, Value: "rules", Tag: "!!str"},
-			rulesSeq,
-		},
-	}
-}
-
 // removeInclude removes the fullsend pipeline include entry from
 // the include: sequence. If the sequence becomes empty, removes the
 // include: key entirely.
@@ -359,6 +384,38 @@ func removeInclude(root *yaml.Node) {
 		}
 	} else if isFullsendPipelineInclude(includeVal) {
 		root.Content = append(root.Content[:includeIdx], root.Content[includeIdx+2:]...)
+	}
+}
+
+// removeStages removes fullsend's stages from the stages: array. If
+// the array becomes empty, removes the stages: key entirely.
+func removeStages(root *yaml.Node) {
+	stagesIdx := findMappingKeyIndex(root, "stages")
+	if stagesIdx < 0 {
+		return
+	}
+	stagesVal := root.Content[stagesIdx+1]
+	if stagesVal.Kind != yaml.SequenceNode {
+		return
+	}
+
+	fsStages := make(map[string]bool)
+	for _, stage := range fullsendStages {
+		fsStages[stage] = true
+	}
+
+	var kept []*yaml.Node
+	for _, item := range stagesVal.Content {
+		if item.Kind == yaml.ScalarNode && fsStages[item.Value] {
+			continue
+		}
+		kept = append(kept, item)
+	}
+
+	if len(kept) == 0 {
+		root.Content = append(root.Content[:stagesIdx], root.Content[stagesIdx+2:]...)
+	} else {
+		stagesVal.Content = kept
 	}
 }
 

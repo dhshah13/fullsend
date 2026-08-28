@@ -49,12 +49,16 @@ build:
 	assert.Contains(t, s, "- test")
 	assert.Contains(t, s, "make build")
 
-	// Fullsend entries added.
+	// Fullsend include added.
 	assert.Contains(t, s, "fullsend-pipeline.yml")
-	assert.Contains(t, s, "workflow:")
-	assert.Contains(t, s, "auto_cancel:")
-	assert.Contains(t, s, "on_new_commit: none")
-	assert.Contains(t, s, `$CI_PIPELINE_SOURCE == "merge_request_event"`)
+
+	// Fullsend stages appended to existing stages array.
+	assert.Contains(t, s, "- dispatch")
+	assert.Contains(t, s, "- poll")
+	assert.Contains(t, s, "- agent")
+
+	// No workflow block should be created when none existed.
+	assert.NotContains(t, s, "workflow:")
 }
 
 func TestMergeGitLabCI_ExistingWithWorkflowRules(t *testing.T) {
@@ -380,6 +384,136 @@ include:
 	assert.Contains(t, s, "fullsend-pipeline.yml")
 }
 
+func TestMergeGitLabCI_StagesAddedToExistingArray(t *testing.T) {
+	existing := []byte(`stages:
+  - build
+  - test
+`)
+	result, err := MergeGitLabCI(existing)
+	require.NoError(t, err)
+	s := string(result)
+
+	// Original stages preserved.
+	assert.Contains(t, s, "- build")
+	assert.Contains(t, s, "- test")
+
+	// Fullsend stages appended.
+	assert.Contains(t, s, "- dispatch")
+	assert.Contains(t, s, "- poll")
+	assert.Contains(t, s, "- agent")
+}
+
+func TestMergeGitLabCI_StagesDeduplicatesExisting(t *testing.T) {
+	existing := []byte(`stages:
+  - build
+  - dispatch
+  - test
+`)
+	result, err := MergeGitLabCI(existing)
+	require.NoError(t, err)
+	s := string(result)
+
+	// dispatch already present — should not be duplicated.
+	assert.Equal(t, 1, strings.Count(s, "- dispatch"), "dispatch stage should not be duplicated")
+
+	// Other fullsend stages added.
+	assert.Contains(t, s, "- poll")
+	assert.Contains(t, s, "- agent")
+}
+
+func TestMergeGitLabCI_NoWorkflowBlockCreatedWhenAbsent(t *testing.T) {
+	existing := []byte(`stages:
+  - build
+job1:
+  script: echo hi
+`)
+	result, err := MergeGitLabCI(existing)
+	require.NoError(t, err)
+	s := string(result)
+
+	// Fullsend include added.
+	assert.Contains(t, s, "fullsend-pipeline.yml")
+
+	// No workflow block should be created — fullsend's jobs
+	// self-filter via their own rules:.
+	assert.NotContains(t, s, "workflow:")
+}
+
+func TestMergeGitLabCI_NoStagesKeyLeftAlone(t *testing.T) {
+	// When no stages: key exists, fullsend's stages come from the
+	// included pipeline file and do not need to be in the root.
+	existing := []byte(`job1:
+  script: echo hi
+`)
+	result, err := MergeGitLabCI(existing)
+	require.NoError(t, err)
+	s := string(result)
+
+	// No stages: key added.
+	assert.NotContains(t, s, "stages:")
+}
+
+func TestMergeGitLabCI_StagesIdempotent(t *testing.T) {
+	existing := []byte(`stages:
+  - build
+  - dispatch
+  - poll
+  - agent
+`)
+	result, err := MergeGitLabCI(existing)
+	require.NoError(t, err)
+	s := string(result)
+
+	// All fullsend stages already present — no duplicates.
+	assert.Equal(t, 1, strings.Count(s, "- dispatch"))
+	assert.Equal(t, 1, strings.Count(s, "- poll"))
+	assert.Equal(t, 1, strings.Count(s, "- agent"))
+}
+
+func TestUnmergeGitLabCI_RemovesFullsendStages(t *testing.T) {
+	existing := []byte(`---
+include:
+  - local: '.gitlab/ci/fullsend-pipeline.yml'
+
+stages:
+  - build
+  - test
+  - dispatch
+  - poll
+  - agent
+`)
+	result, err := UnmergeGitLabCI(existing)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	s := string(result)
+
+	// Fullsend stages removed.
+	assert.NotContains(t, s, "- dispatch")
+	assert.NotContains(t, s, "- poll")
+	assert.NotContains(t, s, "- agent")
+
+	// User stages preserved.
+	assert.Contains(t, s, "- build")
+	assert.Contains(t, s, "- test")
+}
+
+func TestUnmergeGitLabCI_RemovesStagesKeyWhenEmpty(t *testing.T) {
+	existing := []byte(`---
+include:
+  - local: '.gitlab/ci/fullsend-pipeline.yml'
+
+stages:
+  - dispatch
+  - poll
+  - agent
+`)
+	result, err := UnmergeGitLabCI(existing)
+	require.NoError(t, err)
+
+	// Everything was fullsend-only, file should be nil.
+	assert.Nil(t, result, "file should be nil when only fullsend content remains")
+}
+
 func TestMergeGitLabCI_PreservesComments(t *testing.T) {
 	existing := []byte(`---
 # My project CI configuration
@@ -400,4 +534,9 @@ build:
 	// Comments should be preserved by yaml.Node API.
 	assert.Contains(t, s, "# My project CI configuration")
 	assert.Contains(t, s, "# Build job")
+
+	// Fullsend stages added to existing array.
+	assert.Contains(t, s, "- dispatch")
+	assert.Contains(t, s, "- poll")
+	assert.Contains(t, s, "- agent")
 }
