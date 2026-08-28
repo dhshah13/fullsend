@@ -22,6 +22,13 @@ endpoints:
     path: /v1/responses
     protocol: rest
     enforcement: enforce
+    # OpenShell 0.0.110+ resets any inspected request body that contains the
+    # literal placeholder prefix, whether or not a credential follows it
+    # (NVIDIA/OpenShell#2904) — an agent that has read text mentioning the
+    # prefix could not call the model. Model bodies never legitimately carry
+    # a placeholder, so let this endpoint forward bodies uninspected; the
+    # bearer header is still injected and the method/path rules still apply.
+    allow_uninspected_credentials: true
     rules:
       - allow:
           method: POST

@@ -197,10 +197,17 @@ credential. What remains:
   `request_body_credential_rewrite: true` is not an opt-out (an
   unresolvable marker still fails, `rest.rs:1698`); the only one is
   `allow_uninspected_credentials: true` on the model endpoint, which
-  forwards such a body raw (a literal placeholder — a reserved token, not
-  a secret — would then reach the model API). Not adopted by this ADR:
-  it is a fleet-profile decision (the Vertex profile has the same
-  exposure) and belongs with the upstream fix.
+  forwards such a body raw while the bearer header is still injected and
+  the method/path rules still apply (verified: a body carrying the
+  prefix, and even the real placeholder string, gets 200; `GET
+  /v1/models` stays 403). A literal placeholder — a reserved token, not
+  a secret — would then reach the model API. **Adopted** for the two
+  default model profiles fullsend ships (`profiles/fullsend-openai.yaml`
+  and `profiles/fullsend-vertex-ai.yaml`); the fleet's own agents resolve
+  their Vertex profile from fullsend-ai/agents (`harness/*.yaml` →
+  `profiles/fullsend-vertex-ai.yaml`), which needs the same flag to
+  protect fullsend's review/code agents, and the upstream fix is
+  NVIDIA/OpenShell#2904.
 - Static credentials are endpoint-bound at 0.0.115: the proxy
   substitutes a placeholder only at the host, port and path of the
   profile endpoint that issued it (`providers-v2.mdx` "Static Credential
