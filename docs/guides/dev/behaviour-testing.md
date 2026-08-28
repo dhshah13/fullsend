@@ -236,7 +236,7 @@ Concurrent callers for the same repo are serialized via `singleflight.Group` —
 Runner env (defaults shown):
 
 ```
-BEHAVIOUR_SCM=github
+BEHAVIOUR_SCM=github              # also: gitlab; future: forgejo
 BEHAVIOUR_CI=githubactions
 BEHAVIOUR_INSTALL_MODE=per-repo
 ENVIRONMENT=dev               # mint/infra target: dev (default, local and PRs) or stage (push to main)
