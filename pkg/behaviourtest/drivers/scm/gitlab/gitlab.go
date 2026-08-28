@@ -145,16 +145,13 @@ func (d *Driver) CommitFileToFork(ctx context.Context, forkOwner, forkRepo, bran
 	return d.Client.CreateOrUpdateFileOnBranch(ctx, forkOwner, forkRepo, branch, path, message, content)
 }
 
-func (d *Driver) CreateForkChangeProposal(ctx context.Context, baseOwner, baseRepo, title, body, forkOwner, forkRepo, head, base string) (*forge.ChangeProposal, error) {
-	if forkOwner == baseOwner {
-		// Same-owner fork: the REST API's "owner:branch" head format is
-		// ambiguous because the owner is the same for both repos. Use the
-		// cross-repo method which explicitly identifies the head repository.
-		return d.Client.CreateCrossRepoChangeProposal(ctx, baseOwner, baseRepo, forkOwner, forkRepo, title, body, head, base)
-	}
-	// Cross-owner fork: the standard "forkOwner:branch" format works.
-	headRef := forkOwner + ":" + head
-	return d.Client.CreateChangeProposal(ctx, baseOwner, baseRepo, title, body, headRef, base)
+func (d *Driver) CreateForkChangeProposal(ctx context.Context, _, _, title, body, forkOwner, forkRepo, head, base string) (*forge.ChangeProposal, error) {
+	// GitLab fork MRs: POST to the fork project's merge_requests endpoint
+	// with a plain branch name as source_branch. GitLab automatically
+	// targets the upstream (parent) project when the source project is a
+	// fork, so no target_project_id or "owner:branch" head format is
+	// needed.
+	return d.Client.CreateChangeProposal(ctx, forkOwner, forkRepo, title, body, head, base)
 }
 
 // ParseRepo splits "owner/repo" into owner and repo name.
