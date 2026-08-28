@@ -303,6 +303,9 @@ func TestGitLabAgentTemplateContent(t *testing.T) {
 	assert.Contains(t, s, `export GOCACHE="${RUNNER_TEMP:-/tmp}/go-cache"`)
 	// "latest" resolution via GitHub API
 	assert.Contains(t, s, "releases/latest")
+	// tar extraction uses --no-same-owner for non-root containers (#6720)
+	assert.Contains(t, s, "tar --no-same-owner")
+	assert.NotContains(t, s, "tar xzf /tmp/fullsend.tar.gz")
 }
 
 func TestGitLabAgentTemplateFixReviewBodyPreFetch(t *testing.T) {
@@ -473,6 +476,9 @@ func TestGitLabPollContent(t *testing.T) {
 	// non-root runners where /root/go is not writable (#6477).
 	assert.Contains(t, s, `export GOPATH="${RUNNER_TEMP:-/tmp}/go"`)
 	assert.Contains(t, s, `export GOCACHE="${RUNNER_TEMP:-/tmp}/go-cache"`)
+	// tar extraction uses --no-same-owner for non-root containers (#6720)
+	assert.Contains(t, s, "tar --no-same-owner")
+	assert.NotContains(t, s, "tar xzf /tmp/fullsend.tar.gz")
 }
 
 func TestGitLabRootPipelineContent(t *testing.T) {
