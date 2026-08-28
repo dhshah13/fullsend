@@ -50,8 +50,10 @@ type workflowRule struct {
 //  1. include: contains the fullsend-pipeline.yml entry
 //  2. If stages: exists, it contains dispatch, poll, agent
 //     (if no stages: key, the included pipeline provides them)
-//  3. If workflow:rules: exists, it contains fullsend's three if: conditions
-//     (if no workflow: block, fullsend's jobs self-filter)
+//  3. If workflow: exists, it must have a rules: sequence containing
+//     fullsend's three if: conditions. If workflow: exists without
+//     rules:, that is drift — MergeGitLabCI would add them.
+//     (if no workflow: block at all, fullsend's jobs self-filter)
 //
 // Used by the installer to skip unnecessary .gitlab-ci.yml writes when
 // all entries are already present, avoiding YAML formatting churn.
@@ -103,23 +105,28 @@ func HasFullsendEntries(existing []byte) bool {
 		}
 	}
 
-	// 3. If workflow:rules: exists, it must contain fullsend's if: conditions.
+	// 3. If workflow: exists, rules: must be present and contain
+	//    fullsend's if: conditions. A workflow: block without rules:
+	//    is drift — MergeGitLabCI would add them.
 	workflowVal := findMappingValue(root, "workflow")
 	if workflowVal != nil && workflowVal.Kind == yaml.MappingNode {
 		rulesVal := findMappingValue(workflowVal, "rules")
-		if rulesVal != nil && rulesVal.Kind == yaml.SequenceNode {
-			existingRules := make(map[string]bool)
-			for _, item := range rulesVal.Content {
-				if item.Kind == yaml.MappingNode {
-					if v := findMappingValue(item, "if"); v != nil {
-						existingRules[v.Value] = true
-					}
+		if rulesVal == nil || rulesVal.Kind != yaml.SequenceNode {
+			// workflow: exists but has no rules: sequence —
+			// MergeGitLabCI would add rules here.
+			return false
+		}
+		existingRules := make(map[string]bool)
+		for _, item := range rulesVal.Content {
+			if item.Kind == yaml.MappingNode {
+				if v := findMappingValue(item, "if"); v != nil {
+					existingRules[v.Value] = true
 				}
 			}
-			for _, r := range fullsendWorkflowRules {
-				if !existingRules[r.If] {
-					return false
-				}
+		}
+		for _, r := range fullsendWorkflowRules {
+			if !existingRules[r.If] {
+				return false
 			}
 		}
 	}

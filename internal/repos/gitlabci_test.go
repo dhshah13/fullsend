@@ -614,8 +614,8 @@ func TestHasFullsendEntries_InvalidYAML(t *testing.T) {
 }
 
 func TestHasFullsendEntries_WorkflowWithoutRules(t *testing.T) {
-	// workflow: exists but has no rules: key. This is not drift for
-	// the rules check — rules were never there to drift from.
+	// workflow: exists but has no rules: key — MergeGitLabCI would
+	// add rules, so this is drift.
 	yaml := `---
 include:
   - local: '.gitlab/ci/fullsend-pipeline.yml'
@@ -623,7 +623,7 @@ include:
 workflow:
   name: "my project"
 `
-	assert.True(t, HasFullsendEntries([]byte(yaml)))
+	assert.False(t, HasFullsendEntries([]byte(yaml)))
 }
 
 func TestHasFullsendEntries_PartialStagesMissing(t *testing.T) {
