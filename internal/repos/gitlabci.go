@@ -400,8 +400,8 @@ func removeStages(root *yaml.Node) {
 	}
 
 	fsStages := make(map[string]bool)
-	for _, s := range fullsendStages {
-		fsStages[s] = true
+	for _, stage := range fullsendStages {
+		fsStages[stage] = true
 	}
 
 	var kept []*yaml.Node
