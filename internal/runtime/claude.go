@@ -47,6 +47,10 @@ func (r ClaudeRuntime) Bootstrap(input BootstrapInput) error {
 		return fmt.Errorf("agent path is required")
 	}
 
+	if err := validateAgentName(input.AgentName(), agentPath); err != nil {
+		return err
+	}
+
 	sandboxName := input.SandboxName()
 	configDir := r.ConfigDir()
 
@@ -513,6 +517,41 @@ func buildPluginConfigs(plugins []string, pluginsBase, mktBase, marketplace, ver
 		result = append(result, pluginConfigEntry{path: entry.path, data: data})
 	}
 	return result, nil
+}
+
+// validateAgentName reads the agent definition at agentPath, extracts the
+// frontmatter name: field, and returns an error when it does not match
+// requestedName. Claude Code resolves --agent by the frontmatter name, not
+// the filename, so a mismatch means the runtime will silently fall back to
+// the default agent — producing an unconstrained run (#6764).
+//
+// When the definition has no frontmatter or no name: field, validation is
+// skipped: the runtime uses its own resolution chain (filename, positional
+// argument).
+func validateAgentName(requestedName, agentPath string) error {
+	if requestedName == "" {
+		return nil
+	}
+	data, err := os.ReadFile(agentPath)
+	if err != nil {
+		// Let the caller's own ReadFile produce the canonical error.
+		return nil
+	}
+	def, err := parsePiAgent(data)
+	if err != nil || def.Name == "" {
+		// Unparseable or unnamed — skip validation; the runtime will
+		// fall back to its own resolution chain.
+		return nil
+	}
+	if def.Name != requestedName {
+		return fmt.Errorf(
+			"agent name mismatch: requested %q but definition declares name: %q — "+
+				"the runtime will receive --agent %q and silently fall back to the default agent; "+
+				"update the agent name in the harness config or the definition frontmatter so they match",
+			requestedName, def.Name, requestedName,
+		)
+	}
+	return nil
 }
 
 // agentDestName returns the sandbox filename for the agent definition.
