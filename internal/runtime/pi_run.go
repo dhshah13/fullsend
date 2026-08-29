@@ -317,7 +317,7 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 		tools := m.Tools
 		if len(tools) == 0 {
 			// An agent that lists only tools pi cannot provide (or only
-			// Skill) gets no built-in tools rather than pi's defaults.
+			// Skill) gets no built-in tools rather than the defaultTools set.
 			parts = append(parts, "--no-builtin-tools")
 		} else {
 			parts = append(parts, "--tools "+shellQuote(strings.Join(tools, ",")))

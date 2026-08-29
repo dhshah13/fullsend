@@ -16,7 +16,7 @@ ghcr.io/nvidia/openshell-community/sandboxes/base  (upstream, multi-arch)
 
 | Image | Directory | Description |
 |-------|-----------|-------------|
-| `fullsend-sandbox` | [`images/sandbox/`](sandbox/) | Base sandbox with Claude Code, jq, acli, gitleaks, tirith, pre-commit, and gitlint. |
+| `fullsend-sandbox` | [`images/sandbox/`](sandbox/) | Base sandbox with Claude Code, pi, ripgrep + fd (pi grep/find backends), jq, acli, gitleaks, tirith, pre-commit, and gitlint. |
 | `fullsend-code` | [`images/code/`](code/) | Extends `fullsend-sandbox` with Go toolchain and scan-secrets wrapper. Used by the code-implementation agent. |
 
 Both images are built for **linux/amd64** and **linux/arm64**.
@@ -138,6 +138,8 @@ Every binary downloaded during the build is **version-pinned** and
 | ProtectAI DeBERTa model (runner) | `PROTECTAI_MODEL_REV` + per-file SHA256 | `sha256sum -c` |
 | libtokenizers (runner) | `TOKENIZERS_VERSION` + `TOKENIZERS_SHA256_{AMD64,ARM64}` | `sha256sum -c` |
 | Gitleaks | `GITLEAKS_VERSION` + `GITLEAKS_SHA256_{AMD64,ARM64}` | `sha256sum -c` |
+| ripgrep | `RIPGREP_VERSION` + `RIPGREP_SHA256_{AMD64,ARM64}` | `sha256sum -c` + version assertion |
+| fd | `FD_VERSION` + `FD_SHA256_{AMD64,ARM64}` | `sha256sum -c` + version assertion |
 | Tirith | `TIRITH_VERSION` + `TIRITH_SHA256_{AMD64,ARM64}` | `sha256sum -c` |
 | Go toolchain | `GO_VERSION` + `GO_SHA256_{AMD64,ARM64}` | `sha256sum -c` |
 | Claude Code | `CLAUDE_CODE_VERSION` ARG + npm version pin | npm registry integrity check |
