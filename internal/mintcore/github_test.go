@@ -296,6 +296,9 @@ func TestRolePermissions_CoderAndFixIncludePackagesRead(t *testing.T) {
 		require.NotNil(t, perms, "role %q should exist", role)
 		assert.Equal(t, "read", perms["packages"], "role %q: expected packages=read, got %q", role, perms["packages"])
 	}
+	// Assert expected permission counts to catch accidental additions/removals.
+	assert.Len(t, RolePermissionsFor("coder"), 6, "coder role should have exactly 6 permissions")
+	assert.Len(t, RolePermissionsFor("fix"), 5, "fix role should have exactly 5 permissions")
 }
 
 func TestRolePermissions_ReturnsCopy(t *testing.T) {
