@@ -818,6 +818,8 @@ func TestWorkItemKeyEnvCompatibility(t *testing.T) {
 		content := string(loadRepoFile(".github/workflows/reusable-code.yml")(t))
 		section := extractStepSection(t, content, "Run code agent")
 		assert.Contains(t, section,
+			"FULLSEND_WORK_ITEM_URL: ${{ fromJSON(inputs.event_payload).issue.html_url }}")
+		assert.Contains(t, section,
 			"FULLSEND_WORK_ITEM_KEY: ${{ fromJSON(inputs.event_payload).issue.number }}")
 		assert.Contains(t, section,
 			"ISSUE_NUMBER: ${{ fromJSON(inputs.event_payload).issue.number }}")
