@@ -122,7 +122,7 @@ func TestValidateAgentName(t *testing.T) {
 			name:          "mismatched names fail",
 			requestedName: "coder",
 			fileContent:   "---\nname: code\n---\n# Agent",
-			wantErr:       `agent name mismatch: requested "coder" but definition declares name: "code"`,
+			wantErr:       `agent name mismatch: requested "coder" but definition declares "code"`,
 		},
 		{
 			name:          "empty requested name skips validation",
