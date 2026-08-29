@@ -6041,7 +6041,7 @@ func TestRunCommand_HasEventFileFlag(t *testing.T) {
 	assert.Equal(t, "", flag.DefValue)
 }
 
-func TestExtractNormEventFromPayload_Valid(t *testing.T) {
+func TestExtractNormalizedEventFromPayload_Valid(t *testing.T) {
 	payload := []byte(`{
 		"issue": {"number": 42, "html_url": "https://example.com/issues/42"},
 		"_normalized_event": {
@@ -6053,26 +6053,26 @@ func TestExtractNormEventFromPayload_Valid(t *testing.T) {
 			"source": {"system": "jira", "raw_type": "comment"}
 		}
 	}`)
-	m := extractNormEventFromPayload(payload)
+	m := extractNormalizedEventFromPayload(payload)
 	require.NotNil(t, m)
 	src, ok := m["source"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "jira", src["system"])
 }
 
-func TestExtractNormEventFromPayload_Missing(t *testing.T) {
+func TestExtractNormalizedEventFromPayload_Missing(t *testing.T) {
 	// Legacy payload without _normalized_event should return nil.
 	payload := []byte(`{"issue": {"number": 42, "html_url": "https://example.com/issues/42"}}`)
-	assert.Nil(t, extractNormEventFromPayload(payload))
+	assert.Nil(t, extractNormalizedEventFromPayload(payload))
 }
 
-func TestExtractNormEventFromPayload_Invalid(t *testing.T) {
+func TestExtractNormalizedEventFromPayload_Invalid(t *testing.T) {
 	// Invalid _normalized_event (missing required fields) should return nil.
 	payload := []byte(`{"_normalized_event": {"repo": ""}}`)
-	assert.Nil(t, extractNormEventFromPayload(payload))
+	assert.Nil(t, extractNormalizedEventFromPayload(payload))
 }
 
-func TestExtractNormEventFromFile_Valid(t *testing.T) {
+func TestExtractNormalizedEventFromFile_Valid(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "event-payload.json")
 	require.NoError(t, os.WriteFile(path, []byte(`{
@@ -6086,15 +6086,15 @@ func TestExtractNormEventFromFile_Valid(t *testing.T) {
 			"source": {"system": "jira", "raw_type": "comment"}
 		}
 	}`), 0o644))
-	m := extractNormEventFromFile(path)
+	m := extractNormalizedEventFromFile(path)
 	require.NotNil(t, m)
 	src, ok := m["source"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, "jira", src["system"])
 }
 
-func TestExtractNormEventFromFile_NoFile(t *testing.T) {
-	assert.Nil(t, extractNormEventFromFile("/nonexistent/path"))
+func TestExtractNormalizedEventFromFile_NoFile(t *testing.T) {
+	assert.Nil(t, extractNormalizedEventFromFile("/nonexistent/path"))
 }
 
 func TestExtractNormalizedEventFromDispatch_DispatchFile(t *testing.T) {

@@ -4384,7 +4384,7 @@ func prHeadSHAFromEventPath(path string) string {
 // back to the empty-map behavior documented in ResolveOverlays).
 func extractNormalizedEventFromDispatch(fullsendDir string) map[string]any {
 	// Try 1: on-disk dispatch event-payload.json (per-org path).
-	if m := extractNormEventFromFile(filepath.Join(fullsendDir, "dispatch", "event-payload.json")); m != nil {
+	if m := extractNormalizedEventFromFile(filepath.Join(fullsendDir, "dispatch", "event-payload.json")); m != nil {
 		return m
 	}
 	// Try 2: GITHUB_EVENT_PATH → inputs.event_payload (per-repo path).
@@ -4404,21 +4404,21 @@ func extractNormalizedEventFromDispatch(fullsendDir string) map[string]any {
 	if err := json.Unmarshal(data, &wrapper); err != nil || wrapper.Inputs.EventPayload == "" {
 		return nil
 	}
-	return extractNormEventFromPayload([]byte(wrapper.Inputs.EventPayload))
+	return extractNormalizedEventFromPayload([]byte(wrapper.Inputs.EventPayload))
 }
 
-// extractNormEventFromFile reads a JSON file and extracts _normalized_event.
-func extractNormEventFromFile(path string) map[string]any {
+// extractNormalizedEventFromFile reads a JSON file and extracts _normalized_event.
+func extractNormalizedEventFromFile(path string) map[string]any {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
-	return extractNormEventFromPayload(data)
+	return extractNormalizedEventFromPayload(data)
 }
 
-// extractNormEventFromPayload extracts and validates the _normalized_event
+// extractNormalizedEventFromPayload extracts and validates the _normalized_event
 // field from a legacy event-payload JSON blob.
-func extractNormEventFromPayload(payload []byte) map[string]any {
+func extractNormalizedEventFromPayload(payload []byte) map[string]any {
 	var raw map[string]any
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return nil
