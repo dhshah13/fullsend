@@ -12,7 +12,8 @@
 // GitLab.
 //
 // This package only defines the interface and thin adapters over
-// forge.Client (see ForgeClient). Nothing calls tracker.Client yet.
+// forge.Client (see ForgeClient). Consumers include statuscomment
+// (run-status notifications) and reconcilestatus (orphan cleanup).
 package tracker
 
 import (

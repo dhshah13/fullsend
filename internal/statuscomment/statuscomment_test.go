@@ -747,6 +747,11 @@ func TestReconcileOrphaned_EnabledMode_SynthesizesOnFailureWithNoMarker(t *testi
 	tc := tracker.NewForgeClient(fc)
 	setNow(t, time.Date(2026, 6, 3, 14, 0, 0, 0, time.UTC))
 
+	// A status comment should always exist for a run that reached the harness
+	// under the default mode — its absence alongside a failed job means the
+	// process crashed before it could post anything at all (e.g. during
+	// environment validation), leaving maintainers unable to tell "no review
+	// was triggered" from "review was attempted and failed silently." See #3635.
 	err := ReconcileOrphaned(context.Background(), tc, "org/repo", 7, "run-99", "https://ci/run/99", "abc1234def", ReasonTerminated, "", "failure", false, "Review")
 	require.NoError(t, err)
 
@@ -809,6 +814,11 @@ func TestReconcileOrphaned_OnFailure_SynthesizesWhenSkippedEvenIfJobSucceeded(t 
 
 	comments := fc.IssueComments["org/repo/7"]
 	require.Len(t, comments, 1, "should synthesize an interrupted comment despite jobStatus==success")
+	// The label is deliberately outcome-neutral: "no completion comment" is
+	// true whether the notifier failed to set up (never attempted a post)
+	// or its own skip-reason comment post failed — ReconcileOrphaned can't
+	// tell those apart, so it shouldn't assert a specific cause. See the
+	// review discussion on PR #5736.
 	assert.Contains(t, comments[0].Body, "⏭️ Skipped (no completion comment)")
 	assert.NotContains(t, comments[0].Body, "comment failed to post")
 	assert.NotContains(t, comments[0].Body, "❌ Terminated")
@@ -1521,6 +1531,8 @@ func TestSanitizeDetail_Truncates(t *testing.T) {
 	assert.Equal(t, strings.Repeat("x", maxDetailLen)+"…", got)
 }
 
+// A reason is script-controlled text, so it must not be able to forge the
+// marker comments ReconcileOrphaned depends on, nor escape the status line.
 func TestPostCompletionWithDetail_DetailCannotForgeMarkers(t *testing.T) {
 	fc := forge.NewFakeClient()
 	cfg := config.StatusNotificationConfig{
@@ -1540,6 +1552,10 @@ func TestPostCompletionWithDetail_DetailCannotForgeMarkers(t *testing.T) {
 	assert.Contains(t, body, "⏭️ Skipped (evil &lt;!-- fullsend:agent-status:999 -->)")
 }
 
+// Verify that buildStartBody, buildCompletionBody, and
+// buildInterruptedBody use \n\n (paragraph break) between the status
+// line and the metadata line. A bare \n renders as inline whitespace
+// on GitLab (strict CommonMark), collapsing the two lines into one.
 func TestParagraphBreak_BetweenStatusAndMetadata(t *testing.T) {
 	t.Run("start body", func(t *testing.T) {
 		fc := forge.NewFakeClient()
@@ -1827,6 +1843,9 @@ func TestPostStart_ReactionErrorIsNonFatal(t *testing.T) {
 	require.NoError(t, err, "a failed reaction should not fail the run")
 }
 
+// A comment API failure should leave the start reaction in place rather
+// than swapping it to reflect a completion that was never successfully
+// recorded — otherwise the reaction and comment tell contradictory stories.
 func TestPostCompletion_ReactionNotSwappedWhenCommentFails(t *testing.T) {
 	fc := forge.NewFakeClient()
 	cfg := config.StatusNotificationConfig{
