@@ -141,6 +141,154 @@ func TestCreateForkChangeProposal_Error(t *testing.T) {
 	}
 }
 
+func TestEnsureRepoPublic_AlreadyPublic(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.Repos = []forge.Repository{
+		{Name: "repo", FullName: "org/repo", Private: false},
+	}
+	d := New(fc)
+
+	err := d.EnsureRepoPublic(context.Background(), "org", "repo")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEnsureRepoPublic_MakesPublic(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.Repos = []forge.Repository{
+		{Name: "repo", FullName: "org/repo", Private: true},
+	}
+	d := New(fc)
+
+	err := d.EnsureRepoPublic(context.Background(), "org", "repo")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// After UpdateRepoVisibility + re-check, repo should be public.
+	repo, _ := fc.GetRepo(context.Background(), "org", "repo")
+	if repo.Private {
+		t.Error("repo should be public after EnsureRepoPublic")
+	}
+}
+
+func TestEnsureRepoPublic_GetRepoError(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.Errors["GetRepo"] = errors.New("api error")
+	d := New(fc)
+
+	err := d.EnsureRepoPublic(context.Background(), "org", "repo")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestEnsureRepoPublic_UpdateVisibilityError(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.Repos = []forge.Repository{
+		{Name: "repo", FullName: "org/repo", Private: true},
+	}
+	fc.Errors["UpdateRepoVisibility"] = errors.New("org policy prevents public repos")
+	d := New(fc)
+
+	err := d.EnsureRepoPublic(context.Background(), "org", "repo")
+	if err == nil {
+		t.Fatal("expected error when visibility update fails")
+	}
+}
+
+func TestEnsureRepoPublic_ReVerifyError(t *testing.T) {
+	// UpdateRepoVisibility succeeds, but the re-verification GetRepo fails.
+	fc := forge.NewFakeClient()
+	fc.Repos = []forge.Repository{
+		{Name: "repo", FullName: "org/repo", Private: true},
+	}
+	d := &Driver{Client: &reVerifyFailClient{FakeClient: fc}}
+
+	err := d.EnsureRepoPublic(context.Background(), "org", "repo")
+	if err == nil {
+		t.Fatal("expected error when re-verification GetRepo fails")
+	}
+}
+
+// reVerifyFailClient wraps FakeClient. UpdateRepoVisibility succeeds
+// but the second GetRepo call returns an error.
+type reVerifyFailClient struct {
+	*forge.FakeClient
+	getRepoCount int
+}
+
+func (c *reVerifyFailClient) GetRepo(ctx context.Context, owner, repo string) (*forge.Repository, error) {
+	c.getRepoCount++
+	if c.getRepoCount >= 2 {
+		return nil, errors.New("re-verify API error")
+	}
+	return c.FakeClient.GetRepo(ctx, owner, repo)
+}
+
+func TestEnsureRepoPublic_StillPrivateAfterUpdate(t *testing.T) {
+	// Simulate a repo that stays private even after UpdateRepoVisibility
+	// (e.g., org policy override).
+	fc := forge.NewFakeClient()
+	fc.Repos = []forge.Repository{
+		{Name: "repo", FullName: "org/repo", Private: true},
+	}
+	d := &Driver{Client: &stillPrivateClient{FakeClient: fc}}
+
+	err := d.EnsureRepoPublic(context.Background(), "org", "repo")
+	if err == nil {
+		t.Fatal("expected error when repo remains private after update")
+	}
+}
+
+// stillPrivateClient wraps FakeClient but makes UpdateRepoVisibility
+// a no-op so the repo stays private after the call.
+type stillPrivateClient struct {
+	*forge.FakeClient
+}
+
+func (c *stillPrivateClient) UpdateRepoVisibility(_ context.Context, _, _ string, _ bool) error {
+	// Intentionally don't change repo visibility to simulate org policy.
+	return nil
+}
+
+func TestSubmitPullRequestReview(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.PullRequestHeadSHA = "abc123"
+	d := New(fc)
+
+	err := d.SubmitPullRequestReview(context.Background(), "owner", "repo", 1, "APPROVE")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fc.CreatedReviews) != 1 {
+		t.Fatalf("expected 1 review, got %d", len(fc.CreatedReviews))
+	}
+}
+
+func TestSubmitPullRequestReview_GetSHAError(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.Errors["GetPullRequestHeadSHA"] = errors.New("sha lookup failed")
+	d := New(fc)
+
+	err := d.SubmitPullRequestReview(context.Background(), "owner", "repo", 1, "APPROVE")
+	if err == nil {
+		t.Fatal("expected error when GetPullRequestHeadSHA fails")
+	}
+}
+
+func TestSubmitPullRequestReview_CreateReviewError(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.PullRequestHeadSHA = "abc123"
+	fc.Errors["CreatePullRequestReview"] = errors.New("review failed")
+	d := New(fc)
+
+	err := d.SubmitPullRequestReview(context.Background(), "owner", "repo", 1, "APPROVE")
+	if err == nil {
+		t.Fatal("expected error when CreatePullRequestReview fails")
+	}
+}
+
 func TestParseRepo_Success(t *testing.T) {
 	owner, repo, err := ParseRepo("acme/widget")
 	if err != nil {
