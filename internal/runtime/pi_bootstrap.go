@@ -95,13 +95,8 @@ func (r PiRuntime) Bootstrap(input BootstrapInput) error {
 	// Fail fast when the harness-configured agent name does not match the
 	// definition's frontmatter name: — the runtime would silently fall back
 	// to the default agent, producing an unconstrained run (#6764).
-	if reqName := input.AgentName(); reqName != "" && def.Name != "" && reqName != def.Name {
-		return fmt.Errorf(
-			"agent name mismatch: requested %q but definition declares name: %q — "+
-				"the runtime will receive --agent %q and silently fall back to the default agent; "+
-				"update the agent name in the harness config or the definition frontmatter so they match",
-			reqName, def.Name, reqName,
-		)
+	if err := checkAgentName(input.AgentName(), def.Name); err != nil {
+		return err
 	}
 	agentName := input.AgentName()
 	if agentName == "" {

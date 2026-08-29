@@ -519,6 +519,24 @@ func buildPluginConfigs(plugins []string, pluginsBase, mktBase, marketplace, ver
 	return result, nil
 }
 
+// checkAgentName returns an error when requestedName and definitionName are
+// both non-empty and do not match. Both ClaudeRuntime and PiRuntime call
+// this shared helper so the mismatch message is defined in one place.
+func checkAgentName(requestedName, definitionName string) error {
+	if requestedName == "" || definitionName == "" {
+		return nil
+	}
+	if definitionName != requestedName {
+		return fmt.Errorf(
+			"agent name mismatch: requested %q but definition declares name: %q — "+
+				"the runtime will receive --agent %q and silently fall back to the default agent; "+
+				"update the agent name in the harness config or the definition frontmatter so they match",
+			requestedName, definitionName, requestedName,
+		)
+	}
+	return nil
+}
+
 // validateAgentName reads the agent definition at agentPath, extracts the
 // frontmatter name: field, and returns an error when it does not match
 // requestedName. Claude Code resolves --agent by the frontmatter name, not
@@ -538,20 +556,12 @@ func validateAgentName(requestedName, agentPath string) error {
 		return nil
 	}
 	def, err := parsePiAgent(data)
-	if err != nil || def.Name == "" {
-		// Unparseable or unnamed — skip validation; the runtime will
-		// fall back to its own resolution chain.
+	if err != nil {
+		// Unparseable — skip validation; the runtime will fall back to
+		// its own resolution chain.
 		return nil
 	}
-	if def.Name != requestedName {
-		return fmt.Errorf(
-			"agent name mismatch: requested %q but definition declares name: %q — "+
-				"the runtime will receive --agent %q and silently fall back to the default agent; "+
-				"update the agent name in the harness config or the definition frontmatter so they match",
-			requestedName, def.Name, requestedName,
-		)
-	}
-	return nil
+	return checkAgentName(requestedName, def.Name)
 }
 
 // agentDestName returns the sandbox filename for the agent definition.
