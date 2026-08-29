@@ -5,10 +5,10 @@ Complete reference for all fields available in a fullsend harness YAML file. For
 ```yaml
 # ── Required ──────────────────────────────────────────────────
 agent: agents/my-agent.md           # Path to agent definition
-role: my-agent                      # Role name (lowercase letter first, then a-z, 0-9, _, -; no double hyphens)
+role: triage                        # A role the mint serves (built-in on the hosted mint); not the agent's name. Format: lowercase letter first, then a-z, 0-9, _, -; no double hyphens
 
 # ── Identity & metadata ──────────────────────────────────────
-slug: my-org-my-role                # GitHub App identity (convention: <org>-<role>)
+slug: my-org-my-role                # install-time App discovery (convention: <org>-<role>); not read by the mint
 description: One-line summary       # Human-readable description
 doc: docs/agents/my-agent.md        # Source-repo-only; not resolved at runtime
 trigger: "event.entity.kind == 'work_item'"  # Optional CEL expression over NormalizedEvent (see CEL Triggers Reference)
@@ -126,9 +126,9 @@ security:
 
 Most fields are self-explanatory from the inline comments above. This section expands on fields where additional context helps.
 
-**`role`** — The agent's identity within fullsend. Dispatch uses the role to match config-registered agents to built-in defaults (same-name config agents take precedence). The role also determines which GitHub App credentials the mint service issues.
+**`role`** — The agent's identity within fullsend. Dispatch uses the role to match config-registered agents to built-in defaults (same-name config agents take precedence). The role also determines which GitHub App credentials **and permissions** the mint service issues. It must be a role the mint serves: on the hosted mint that is the fixed built-in set (`triage`, `coder`, `review`, `retro`, `prioritize`, `fullsend`); custom roles require your own mint. An unserved role returns `403`. See [Custom Agent Identity](../guides/user/custom-agent-identity.md).
 
-**`slug`** — Maps to a GitHub App installation. The `<org>-<role>` convention keeps slugs unique when multiple orgs share a mint. For custom GitHub App identity, see [Custom Agent Identity](../guides/user/custom-agent-identity.md).
+**`slug`** — Install-time hint used by `fullsend github setup` to find or name the GitHub App. The `<org>-<role>` convention keeps slugs unique when multiple orgs share a mint. The **mint does not read `slug`** when issuing a token — identity and permissions come from `role`, so changing `slug` alone changes neither. For a custom GitHub App identity, see [Custom Agent Identity](../guides/user/custom-agent-identity.md).
 
 **`doc`** — Path to a human-readable document describing the agent's purpose and design. Resolved in the source repo only; the runtime ignores it. Useful for documentation indexes and discoverability.
 

@@ -135,7 +135,7 @@ model: opus
 effort: high                        # optional: low, medium, high, xhigh, max (claude runtime only)
 image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
 policy: policies/my-agent.yaml
-role: my-agent
+role: triage                        # a role the mint serves — not the agent's name (see Custom Agent Identity)
 
 providers:
   - vertex-ai          # Required: model access (Anthropic API + GCP)

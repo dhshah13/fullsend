@@ -86,8 +86,8 @@ image: ghcr.io/fullsend-ai/fullsend-sandbox:latest  # Pin to a digest before CI 
 policy: policies/base.yaml
 providers:
   - vertex-ai
-role: my-agent
-slug: my-org-my-agent               # GitHub App identity; convention: <org>-<role> (see Custom agent identity)
+role: triage                        # a role your mint SERVES — not the agent's name (see note below)
+slug: my-org-my-agent               # install-time App discovery only; the mint never reads it
 trigger: |
   event.entity.kind == "work_item"
     && event.transition.kind == "label_changed"
@@ -95,6 +95,16 @@ trigger: |
     && event.transition.label.action == "added"
 timeout_minutes: 15
 ```
+
+> **`role` is not the agent's name.** The agent's name is `name:` in its `.md`;
+> `role:` selects which GitHub App and permissions the mint issues. On the
+> default (hosted) mint, `role:` must be one of the built-in roles it serves —
+> `triage`, `coder`, `review`, `retro`, `prioritize`, `fullsend`. Pick the one
+> whose permissions fit what your agent does (a code-writing agent uses
+> `role: coder`). A made-up role like `role: my-agent` returns `403` from the
+> mint. To use a *new* role or your *own* identity, you need your own mint —
+> see [Custom Agent Identity](custom-agent-identity.md).
+
 
 **`providers/vertex-ai.yaml`** — provider definition (declares a provider by name and type):
 ```yaml
@@ -348,6 +358,7 @@ allowed_remote_resources:
 |---------|-----|
 | Agent crashes at 0s | Sandbox can't reach Vertex AI — verify that `providers/vertex-ai.yaml` is listed in your harness `providers:` and that `ANTHROPIC_VERTEX_PROJECT_ID`/`CLOUD_ML_REGION` are set (in your `--env-file` for local runs, or in the workflow `env` block for CI) |
 | "role field is required" | Add `role:` to harness |
+| `403` / "role not allowed" from the mint | Your `role:` is not one the mint serves. On the hosted mint use a built-in role (`triage`, `coder`, `review`, `retro`, `prioritize`, `fullsend`); for a custom role, point `FULLSEND_MINT_URL` at your own mint — see [Custom Agent Identity](custom-agent-identity.md) |
 | Agent can't find input files | Pre-script output paths must match `host_files` entries |
 | Provider blocks requests | Check that the required provider profile is listed in `providers:` and exists in the `providers/` directory |
 | Schema validation fails | Compare the sandbox output (`$FULLSEND_OUTPUT_DIR/<result>.json`) against the schema referenced in `validation_loop` / `FULLSEND_OUTPUT_SCHEMA`; re-run with `--keep-sandbox` to inspect |
