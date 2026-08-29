@@ -237,7 +237,7 @@ Runner env (defaults shown):
 
 ```
 BEHAVIOUR_SCM=github              # also: gitlab; future: forgejo
-BEHAVIOUR_CI=githubactions
+BEHAVIOUR_CI=githubactions        # also: gitlabci; future: tekton
 BEHAVIOUR_INSTALL_MODE=per-repo
 ENVIRONMENT=dev               # mint/infra target: dev (default, local and PRs) or stage (push to main)
 E2E_GCP_PROJECT_ID=...        # inference project; install runs inference provision per pool repo
