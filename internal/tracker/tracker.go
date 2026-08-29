@@ -84,4 +84,25 @@ type Client interface {
 	// UpdateComment updates the body of commentID on the issue (project, number).
 	// number is included because Jira requires the issue key to update a comment.
 	UpdateComment(ctx context.Context, project string, number int, commentID string, body Body) error
+	// DeleteComment removes the comment identified by commentID from the issue.
+	// number is included because Jira requires the issue key to delete a comment.
+	DeleteComment(ctx context.Context, project string, number int, commentID string) error
+}
+
+// Reactor is an optional capability for adding and removing emoji
+// reactions on issues and comments. Not all trackers support reactions
+// (e.g. Jira has no emoji-reaction model), so consumers should
+// type-assert their tracker.Client to Reactor before calling reaction
+// methods. Forge-backed tracker clients implement Reactor; Jira clients
+// do not.
+type Reactor interface {
+	// AddIssueReaction adds an emoji reaction to an issue or pull request.
+	// content is the reaction type (e.g. "eyes", "+1", "confused").
+	AddIssueReaction(ctx context.Context, project string, number int, content string) (id int64, err error)
+	// DeleteIssueReaction removes a previously added issue reaction by ID.
+	DeleteIssueReaction(ctx context.Context, project string, number int, reactionID int64) error
+	// AddCommentReaction adds an emoji reaction to a specific comment.
+	AddCommentReaction(ctx context.Context, project string, number int, commentID string, content string) (id int64, err error)
+	// DeleteCommentReaction removes a previously added comment reaction by ID.
+	DeleteCommentReaction(ctx context.Context, project string, number int, commentID string, reactionID int64) error
 }

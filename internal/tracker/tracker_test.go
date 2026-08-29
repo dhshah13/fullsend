@@ -219,6 +219,10 @@ func (staticClient) CreateComment(_ context.Context, _ string, _ int, _ Body) (*
 func (staticClient) UpdateComment(_ context.Context, _ string, _ int, _ string, _ Body) error {
 	return nil
 }
+func (staticClient) DeleteComment(_ context.Context, _ string, _ int, _ string) error {
+	return nil
+}
 
 var _ Client = staticClient{}
 var _ Client = (*ForgeClient)(nil)
+var _ Reactor = (*ForgeClient)(nil)

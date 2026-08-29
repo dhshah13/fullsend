@@ -52,6 +52,7 @@ type jiraClient interface {
 	CreateCommentWithProperties(ctx context.Context, issueIDOrKey, body string, properties []jira.CommentProperty) (*jira.Comment, error)
 	UpdateComment(ctx context.Context, issueIDOrKey, commentID, body string) error
 	SetCommentProperty(ctx context.Context, issueIDOrKey, commentID, propertyKey string, value any) error
+	DeleteComment(ctx context.Context, issueIDOrKey, commentID string) error
 }
 
 var _ jiraClient = (*jira.LiveClient)(nil)
@@ -228,6 +229,12 @@ func (c *JiraClient) MigrateAndUpdateComment(ctx context.Context, project string
 func (c *JiraClient) UpdateComment(ctx context.Context, project string, number int, commentID string, body Body) error {
 	key := issueKey(project, number)
 	return wrapNotFound(c.jira.UpdateComment(ctx, key, commentID, string(body)))
+}
+
+// DeleteComment implements Client.
+func (c *JiraClient) DeleteComment(ctx context.Context, project string, number int, commentID string) error {
+	key := issueKey(project, number)
+	return wrapNotFound(c.jira.DeleteComment(ctx, key, commentID))
 }
 
 // fromJiraComment converts a jira.Comment to a tracker.Comment. HTMLURL is

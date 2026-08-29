@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,7 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/security"
 	"github.com/fullsend-ai/fullsend/internal/statuscomment"
 	"github.com/fullsend-ai/fullsend/internal/telemetry"
+	"github.com/fullsend-ai/fullsend/internal/tracker"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -4442,16 +4444,17 @@ func setupStatusNotifierGitHub(notifyCfg config.StatusNotificationConfig, owner,
 		runID = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 
-	n := statuscomment.New(nil, notifyCfg, owner, repo, sOpts.statusNum, sOpts.runURL, sha, runID)
+	project := owner + "/" + repo
+	n := statuscomment.New(nil, notifyCfg, project, sOpts.statusNum, sOpts.runURL, sha, runID)
 	n.SetWarnFunc(func(format string, args ...any) {
 		printer.StepWarn(fmt.Sprintf(format, args...))
 	})
 	if sOpts.statusComment != 0 {
-		n.SetTriggerCommentID(sOpts.statusComment)
+		n.SetTriggerCommentID(strconv.Itoa(sOpts.statusComment))
 	}
 
 	canonRole := resolveRole(role)
-	n.SetClientFactory(func(ctx context.Context) (forge.Client, error) {
+	n.SetClientFactory(func(ctx context.Context) (tracker.Client, error) {
 		result, err := statusMintToken(ctx, mintclient.MintRequest{
 			MintURL: mintURL,
 			Role:    canonRole,
@@ -4466,7 +4469,7 @@ func setupStatusNotifierGitHub(notifyCfg config.StatusNotificationConfig, owner,
 		if os.Getenv("GITHUB_ACTIONS") == "true" {
 			fmt.Fprintf(os.Stderr, "::add-mask::%s\n", result.Token)
 		}
-		return gh.New(result.Token), nil
+		return tracker.NewForgeClient(gh.New(result.Token)), nil
 	})
 
 	return n, nil
@@ -4496,7 +4499,8 @@ func setupStatusNotifierGitLab(notifyCfg config.StatusNotificationConfig, owner,
 		runID = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 
-	n := statuscomment.New(client, notifyCfg, owner, repo, sOpts.statusNum, sOpts.runURL, sha, runID)
+	project := owner + "/" + repo
+	n := statuscomment.New(tracker.NewForgeClient(client), notifyCfg, project, sOpts.statusNum, sOpts.runURL, sha, runID)
 	n.SetWarnFunc(func(format string, args ...any) {
 		printer.StepWarn(fmt.Sprintf(format, args...))
 	})

@@ -15,6 +15,7 @@ import (
 	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
 	"github.com/fullsend-ai/fullsend/internal/mintclient"
 	"github.com/fullsend-ai/fullsend/internal/statuscomment"
+	"github.com/fullsend-ai/fullsend/internal/tracker"
 )
 
 // gitlabNoteServer returns an httptest.Server that handles GitLab note API calls
@@ -322,6 +323,7 @@ func stubReconcileVars(t *testing.T, onReconcile func(completionMode, jobStatus 
 	t.Helper()
 	origMint := reconcileMintToken
 	origForge := reconcileNewForgeClient
+	origTracker := reconcileNewTrackerClient
 	origReconcile := reconcileOrphaned
 
 	reconcileMintToken = func(_ context.Context, _ mintclient.MintRequest) (*mintclient.MintResult, error) {
@@ -335,13 +337,17 @@ func stubReconcileVars(t *testing.T, onReconcile func(completionMode, jobStatus 
 		t.Cleanup(srv.Close)
 		return gh.New(token).WithBaseURL(srv.URL)
 	}
-	reconcileOrphaned = func(_ context.Context, _ forge.Client, _, _ string, _ int, _, _, _ string, _ statuscomment.TerminationReason, completionMode, jobStatus string, wasSkipped bool, agentDescription string) error {
+	reconcileNewTrackerClient = func(fc forge.Client) tracker.Client {
+		return tracker.NewForgeClient(fc)
+	}
+	reconcileOrphaned = func(_ context.Context, _ tracker.Client, _ string, _ int, _, _, _ string, _ statuscomment.TerminationReason, completionMode, jobStatus string, wasSkipped bool, agentDescription string) error {
 		onReconcile(completionMode, jobStatus, wasSkipped, agentDescription)
 		return nil
 	}
 	t.Cleanup(func() {
 		reconcileMintToken = origMint
 		reconcileNewForgeClient = origForge
+		reconcileNewTrackerClient = origTracker
 		reconcileOrphaned = origReconcile
 	})
 }

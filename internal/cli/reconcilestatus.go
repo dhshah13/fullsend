@@ -13,6 +13,7 @@ import (
 	gl "github.com/fullsend-ai/fullsend/internal/forge/gitlab"
 	"github.com/fullsend-ai/fullsend/internal/mintclient"
 	"github.com/fullsend-ai/fullsend/internal/statuscomment"
+	"github.com/fullsend-ai/fullsend/internal/tracker"
 )
 
 var reconcileMintToken = mintclient.MintToken
@@ -20,6 +21,12 @@ var reconcileNewForgeClient = func(token string) forge.Client {
 	return gh.New(token)
 }
 var reconcileOrphaned = statuscomment.ReconcileOrphaned
+
+// reconcileNewTrackerClient wraps a forge.Client in a tracker.ForgeClient
+// for use by ReconcileOrphaned.
+var reconcileNewTrackerClient = func(fc forge.Client) tracker.Client {
+	return tracker.NewForgeClient(fc)
+}
 
 func newReconcileStatusCmd() *cobra.Command {
 	var (
@@ -65,20 +72,22 @@ finalized, this is a no-op.`,
 				return err
 			}
 
-			var client forge.Client
+			var forgeClient forge.Client
 			if forgePlatform == "gitlab" {
 				var gitlabErr error
-				client, gitlabErr = newGitLabClientFromEnv("status reconciliation")
+				forgeClient, gitlabErr = newGitLabClientFromEnv("status reconciliation")
 				if gitlabErr != nil {
 					return gitlabErr
 				}
 			} else {
 				var githubErr error
-				client, githubErr = reconcileGitHubClient(cmd, mintURL, role, repoName)
+				forgeClient, githubErr = reconcileGitHubClient(cmd, mintURL, role, repoName)
 				if githubErr != nil {
 					return githubErr
 				}
 			}
+
+			tc := reconcileNewTrackerClient(forgeClient)
 
 			var termReason statuscomment.TerminationReason
 			switch reason {
@@ -110,7 +119,8 @@ finalized, this is a no-op.`,
 
 			agentDescription := titleCase(strings.ReplaceAll(role, "-", " "))
 
-			return reconcileOrphaned(cmd.Context(), client, owner, repoName, number, runID, runURL, sha, termReason, completionMode, jobStatus, wasSkipped, agentDescription)
+			project := owner + "/" + repoName
+			return reconcileOrphaned(cmd.Context(), tc, project, number, runID, runURL, sha, termReason, completionMode, jobStatus, wasSkipped, agentDescription)
 		},
 	}
 
