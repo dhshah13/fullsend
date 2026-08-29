@@ -6186,3 +6186,98 @@ agents:
 	assert.Equal(t, filepath.Join(dir, "harness", "lint.yaml"), path)
 	assert.Nil(t, deps)
 }
+
+// The token upload must wait for a between-iteration sweep in progress: the
+// in-sandbox tar truncates .gcp-oidc-token on open, so a kill mid-write
+// would leave an empty token until the next 4-minute tick. The iteration
+// loop side has no seam short of running the whole command, so it is
+// covered by the lock's documented contract rather than a test.
+func TestRefreshOIDCToken_WaitsForSandboxQuiesce(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"value":"fresh-oidc-token-content"}`)
+	}))
+	defer srv.Close()
+	stubOpenshell(t, "exit 0")
+
+	sandboxQuiesceMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- refreshOIDCToken(context.Background(), "sb", srv.URL, "bearer test-auth")
+	}()
+	select {
+	case err := <-done:
+		sandboxQuiesceMu.Unlock()
+		t.Fatalf("upload ran while the sweep held the lock (err=%v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	sandboxQuiesceMu.Unlock()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("upload did not proceed once the lock was released")
+	}
+}
+
+// The lock must be released even when the critical section panics: the run's
+// deferred oidcWg/refreshWg waits would otherwise block on a refresher that
+// can never acquire it, hanging the process instead of surfacing the panic.
+func TestWithSandboxQuiesce_ReleasesTheLockOnPanic(t *testing.T) {
+	assert.Panics(t, func() {
+		_ = withSandboxQuiesce(nil, func() error { panic("boom") })
+	})
+	require.True(t, sandboxQuiesceMu.TryLock(), "the quiesce lock is still held after a panic")
+	sandboxQuiesceMu.Unlock()
+}
+
+// A sweep waiting on a credential refresher must say so: nothing else prints
+// between iterations, so an unreported wait looks like a stalled run.
+func TestWithSandboxQuiesce_ReportsALongWait(t *testing.T) {
+	original := sandboxQuiesceWarnAfter
+	sandboxQuiesceWarnAfter = 50 * time.Millisecond
+	t.Cleanup(func() { sandboxQuiesceWarnAfter = original })
+
+	waited := make(chan time.Duration, 4)
+	ran := make(chan struct{})
+	done := make(chan error, 1)
+
+	sandboxQuiesceMu.Lock()
+	go func() {
+		done <- withSandboxQuiesce(
+			func(d time.Duration) { waited <- d },
+			func() error { close(ran); return nil },
+		)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		sandboxQuiesceMu.Unlock()
+		t.Fatal("no report while the lock was held")
+	}
+	select {
+	case <-ran:
+		sandboxQuiesceMu.Unlock()
+		t.Fatal("the critical section ran while the lock was held")
+	default:
+	}
+
+	sandboxQuiesceMu.Unlock()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the critical section did not run once the lock was released")
+	}
+	<-ran
+	assert.Empty(t, waited, "the wait is reported once, not once per poll")
+}
+
+// The common case says nothing: a refresher waiting on a sweep is routine,
+// and every refresher passes a nil notify.
+func TestWithSandboxQuiesce_UncontendedRunsWithoutReporting(t *testing.T) {
+	notified := 0
+	require.NoError(t, withSandboxQuiesce(func(time.Duration) { notified++ }, func() error { return nil }))
+	assert.Equal(t, 0, notified)
+	require.True(t, sandboxQuiesceMu.TryLock(), "the quiesce lock is still held after the call returned")
+	sandboxQuiesceMu.Unlock()
+}

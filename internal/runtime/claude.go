@@ -178,7 +178,11 @@ func (ClaudeRuntime) Run(ctx context.Context, params RunParams, printer *ui.Prin
 	return exitCode, nil
 }
 
+// ClearIterationArtifacts terminates processes the previous iteration left
+// running (see killStrayProcesses), then removes its outputs and transcripts
+// so artifacts are per-iteration.
 func (r ClaudeRuntime) ClearIterationArtifacts(sandboxName string) error {
+	clearStrayProcesses(sandbox.Exec, sandboxName, os.Stderr)
 	clearCmd := fmt.Sprintf("rm -rf %s/output/* %s/*.jsonl", r.WorkspaceDir(), r.ConfigDir())
 	_, _, _, err := sandbox.Exec(sandboxName, clearCmd, 10*time.Second)
 	return err

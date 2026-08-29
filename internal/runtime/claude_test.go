@@ -597,6 +597,44 @@ func TestClaudeRuntime_ClearIterationArtifacts_OpenshellNotInPath(t *testing.T) 
 	assert.Error(t, err)
 }
 
+// ClearIterationArtifacts sweeps stray processes left by the previous
+// iteration before removing its files (see killStrayProcesses).
+func TestClaudeRuntime_ClearIterationArtifacts_SweepsStraysBeforeFiles(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	fakeOpenshellBootstrap(t, logPath, filepath.Join(t.TempDir(), "unused"))
+
+	require.NoError(t, ClaudeRuntime{}.ClearIterationArtifacts("test-sandbox"))
+
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	log := string(logBytes)
+	sweep := strings.Index(log, "ps -o pid= -o ppid=")
+	rm := strings.Index(log, "rm -rf /sandbox/workspace/output/*")
+	require.NotEqual(t, -1, sweep, "expected the stray-process sweep to run")
+	require.NotEqual(t, -1, rm, "expected the file cleanup to run")
+	assert.Less(t, sweep, rm, "sweep must precede the file cleanup")
+}
+
+// A sweep that fails (exit 124 is the only exec failure sandbox.Exec
+// reports) is warning-only: the rm -rf still runs and the result is nil.
+func TestClaudeRuntime_ClearIterationArtifacts_SweepFailureIsNotAnError(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	binDir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> '" + logPath + "'\n" +
+		"for last; do :; done\n" +
+		"case \"$last\" in *\"stray processes killed\"*) echo boom >&2; exit 124 ;; esac\n" +
+		"exit 0\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	require.NoError(t, ClaudeRuntime{}.ClearIterationArtifacts("test-sandbox"))
+
+	log, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(log), "rm -rf /sandbox/workspace/output/*", "file cleanup still runs after a failed sweep")
+}
+
 func TestClaudeRuntime_ExtractTranscripts_OpenshellNotInPath(t *testing.T) {
 	t.Setenv("PATH", "")
 

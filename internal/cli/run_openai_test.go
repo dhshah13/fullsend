@@ -1137,3 +1137,40 @@ func TestResolveOpenAICredential_ConfigFallback(t *testing.T) {
 		assert.Contains(t, err.Error(), "inference.openai in config.yaml")
 	})
 }
+
+// The re-seed's sandbox execs must wait for a between-iteration sweep in
+// progress (sandboxQuiesceMu): none reaches the fake openshell while the
+// lock is held, and the seed lands once it is released.
+func TestReseedOpenAIAuth_WaitsForSandboxQuiesce(t *testing.T) {
+	binDir := t.TempDir()
+	log := filepath.Join(binDir, "log")
+	script := "#!/bin/sh\ncase \"$*\" in *'printf %s'*) echo polled >> " + shellQuoteForTest(log) + "; printf '" + ph("v222_OPENAI_API_KEY") + "'; exit 0 ;; *auth.json*) echo seeded >> " + shellQuoteForTest(log) + "; exit 0 ;; esac; exit 1\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	h := openAIProviderHandle{sandbox: "fs-x", authSeed: `printf '{"openai":...}' > /sandbox/pi-config/auth.json`}
+
+	sandboxQuiesceMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := reseedOpenAIAuth(context.Background(), h, ph("v111_OPENAI_API_KEY"), ui.New(io.Discard))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		sandboxQuiesceMu.Unlock()
+		t.Fatalf("re-seed ran while the sweep held the lock (err=%v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	_, statErr := os.Stat(log)
+	assert.True(t, os.IsNotExist(statErr), "no exec reached the sandbox while the sweep held the lock")
+	sandboxQuiesceMu.Unlock()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("re-seed did not proceed once the lock was released")
+	}
+	data, err := os.ReadFile(log)
+	require.NoError(t, err)
+	assert.Equal(t, "polled\nseeded\n", string(data))
+}

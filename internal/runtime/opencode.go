@@ -44,6 +44,11 @@ func (OpenCodeRuntime) Run(_ context.Context, _ RunParams, _ *ui.Printer, _ time
 	return -1, fmt.Errorf("opencode runtime is not yet implemented")
 }
 
+// ClearIterationArtifacts is a no-op while Run is a stub: nothing has run in
+// the sandbox, so there is nothing to clear. When Run is implemented this
+// must sweep stray sandbox processes (clearStrayProcesses, see
+// killStrayProcesses) before removing the iteration's files, like the other
+// runtimes — the Runtime interface documents that as part of the contract.
 func (OpenCodeRuntime) ClearIterationArtifacts(_ string) error { return nil }
 
 // TranscriptHandler stub methods — return not-implemented errors for extract

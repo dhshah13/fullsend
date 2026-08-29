@@ -121,7 +121,7 @@ Harness `security.fail_mode` controls whether critical findings **block** the ru
 
 | Interface | Responsibility |
 |-----------|----------------|
-| `runtime.Runtime` | Name, config dir, env exports, bootstrap, run loop, per-iteration artifact cleanup |
+| `runtime.Runtime` | Name, config dir, env exports, bootstrap, run loop, per-iteration cleanup — `ClearIterationArtifacts` sweeps stray sandbox-user processes first, then deletes the iteration's files; a failed sweep is a warning, never an iteration failure |
 | `runtime.BootstrapInput` | Portable agent name/path, skill dirs, and plugin dirs to upload |
 | `runtime.SandboxHooksBootstrap` | Optional `BootstrapInput` extension — runtime-neutral sandbox tool hook config (`security.SandboxHookConfig`); every runtime should honour it |
 | `runtime.TranscriptHandler` | Extract transcripts/debug logs; parse errors for CI annotations |

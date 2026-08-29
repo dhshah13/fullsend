@@ -942,6 +942,14 @@ func effectiveReadyTimeout(override time.Duration) time.Duration {
 	return t
 }
 
+// KeepAliveCommand is the sandbox's canonical main process, started by
+// createOnce so the sandbox stays Ready between `sandbox exec` calls
+// (OpenShell 0.0.111+ makes a sandbox terminal once its main process
+// exits). It runs as the sandbox user, so anything that sweeps the sandbox
+// user's processes (runtime.killStrayProcesses) must spare exactly this
+// argv — keep the two in sync through this constant.
+const KeepAliveCommand = "sleep infinity"
+
 // Create creates a persistent OpenShell sandbox and waits for it to be ready.
 // It retries up to DefaultMaxCreateAttempts times with exponential backoff,
 // deleting the failed sandbox between attempts.
@@ -1057,9 +1065,10 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 	// for subsequent sandbox exec calls. Prior to OpenShell 0.0.111 the
 	// `true` command worked because an exited main process left the
 	// sandbox Ready; starting with 0.0.111 an exited process makes the
-	// sandbox terminal. --detach returns immediately while sleep infinity
-	// continues running in the background.
-	args = append(args, "--detach", "--", "sleep", "infinity")
+	// sandbox terminal. --detach returns immediately while the keep-alive
+	// command continues running in the background.
+	args = append(args, "--detach", "--")
+	args = append(args, strings.Fields(KeepAliveCommand)...)
 
 	cmd := exec.CommandContext(ctx, "openshell", args...)
 	cmd.Stdin = nil
