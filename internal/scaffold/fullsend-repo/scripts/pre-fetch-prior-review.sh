@@ -12,13 +12,16 @@ set -euo pipefail
 
 PRIOR_FILE=${GITHUB_WORKSPACE:-/tmp}/prior-review.txt
 REVIEW_BOT="${ORG_NAME}-review[bot]"
+SHARED_REVIEW_BOT="fullsend-ai-review[bot]"
 PROVENANCE="none"
 
-# Fetch full comment object (not just body) for provenance validation
+# Fetch full comment object (not just body) for provenance validation.
+# Match either the org-specific bot or the shared vendor App identity
+# (see ADR 0029/0059/0068 and #5550).
 COMMENT_JSON=$(gh api "repos/${SOURCE_REPO}/issues/${PR_NUM}/comments" \
   --paginate --jq '.[]' \
-  | jq --arg bot "${REVIEW_BOT}" -s \
-    '[.[] | select(.user.login == $bot
+  | jq --arg bot "${REVIEW_BOT}" --arg shared_bot "${SHARED_REVIEW_BOT}" -s \
+    '[.[] | select((.user.login == $bot or .user.login == $shared_bot)
       and (.body | contains("<!-- fullsend:review-agent -->")))] | last // empty' \
   2>/dev/null || echo "")
 

@@ -282,6 +282,8 @@ Each agent role has its own identity, permissions, and purpose:
 - Secret name: `fullsend-{role}-app-pem`
 
 > **Note:** The "fix" role reuses the "coder" app and PEM — no separate GitHub App or secret is created for it.
+>
+> **Note:** The default deployment uses a shared vendor App (`fullsend-ai-review[bot]`). Code that gates on a review bot's identity must match both the org-specific and shared vendor forms — see [Bot Identities](../../contributing/bot-identities.md) for details.
 
 > **Note:** Mint-only dogfood roles such as `scribe` can be registered with
 > `fullsend mint add-role` (and used via remote harness registration) but are

@@ -226,7 +226,8 @@ jobs:
             pull_request_review)
               if [[ "${EVENT_ACTION}" == "submitted" && "${REVIEW_STATE}" == "changes_requested" ]]; then
                 REVIEW_BOT="${ORG_NAME}-review[bot]"
-                if [[ "${REVIEW_USER_LOGIN}" == "${REVIEW_BOT}" ]]; then
+                SHARED_REVIEW_BOT="fullsend-ai-review[bot]"
+                if [[ "${REVIEW_USER_LOGIN}" == "${REVIEW_BOT}" || "${REVIEW_USER_LOGIN}" == "${SHARED_REVIEW_BOT}" ]]; then
                   # Block fork PRs — fail closed if we cannot determine.
                   # Human PRs need fullsend-fix + write+ author (not triage-only).
                   if [[ -n "${PR_HEAD_REPO}" && -n "${PR_BASE_REPO}" ]]; then

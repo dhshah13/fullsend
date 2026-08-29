@@ -111,7 +111,7 @@ like production dispatch: first whitespace token of the first comment line.
 | `close_or_plan` | Has sub-issues and all are closed → close the parent, or plan further work / open new sub-issues | Decision |
 | `trigger_code` | Stale `ready-to-code` / `/fs-code` / stuck Code start → `/fs-code` | Yes |
 | `trigger_review` | Stale review launch/start, or newer commits since last Review → `/fs-review` | Yes |
-| `trigger_fix` | Unresolved threads all from the review bot and launch/start is stale (or ready to run) → `/fs-fix` | Yes |
+| `trigger_fix` | Unresolved threads all from a review bot and launch/start is stale (or ready to run) → `/fs-fix` | Yes |
 | `needs_info_self` | `needs-info` and you're the author → provide info | Decision |
 | `needs_review_decision` | Manual-review labels, human unresolved threads, failed CI (`FAILURE`/`ERROR`), or `mergeStateStatus=BLOCKED` under `ready-for-merge` | Decision |
 | `ready_to_merge` | `ready-for-merge` **and** `mergeStateStatus` is `CLEAN`/`UNSTABLE`, no unresolved threads, checks settled, review not still required, not yet enqueued | Decision (never auto-merged) |
