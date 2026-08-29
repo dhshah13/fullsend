@@ -16,6 +16,7 @@ v1 reference implementations:
 - `pkg/behaviourtest/drivers/scm/github/`
 - `pkg/behaviourtest/drivers/scm/gitlab/`
 - `pkg/behaviourtest/drivers/ci/githubactions/`
+- `pkg/behaviourtest/drivers/ci/gitlabci/`
 - `pkg/behaviourtest/drivers/install/repopool_cfmint_previews.go` (RepoPoolCFMintPreviews)
 - `pkg/behaviourtest/drivers/install/repopool_external_mint.go` (RepoPoolExternalMint)
 
@@ -25,7 +26,7 @@ Set when starting the suite (not in feature files):
 
 ```
 BEHAVIOUR_SCM=github              # also: gitlab; future: forgejo
-BEHAVIOUR_CI=githubactions        # future: tekton, gitlabci
+BEHAVIOUR_CI=githubactions        # also: gitlabci; future: tekton
 BEHAVIOUR_INSTALL_MODE=per-repo   # v1 default and only supported value
 ENVIRONMENT=dev                   # mint/infra target: dev (default) or stage
 ```
@@ -75,5 +76,6 @@ Prefer unit tests with `httptest` for REST helpers. Optional smoke scenarios aga
 ## Future backends checklist
 
 - [x] GitLab SCM driver (implemented; `@skip:gitlab` tag removal pending)
-- [ ] Tekton or GitLab CI driver
+- [x] GitLab CI driver (implemented; suite wiring currently uses a GitHub-backed `forge.Client` — not yet live-testable against real GitLab backends)
+- [ ] Tekton CI driver
 - [ ] Non-GitHub install backends
