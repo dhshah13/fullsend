@@ -113,7 +113,7 @@ Then the harness "fix" workflow fails reporting "Refusing to push"
 Pick a stable fragment of the failure-comment contract (the category
 label headline or a fixed detail phrase). No shipped scenario uses this
 step yet — the fix stage's only dispatch route is a `changes_requested`
-review from the org review bot, which the suite cannot produce — but the
+review from a review bot, which the suite cannot produce — but the
 step is unit-tested and ready for a suite-reachable fail-closed path.
 
 ### Compatibility tags
