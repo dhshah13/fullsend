@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -433,15 +434,53 @@ func TestRunImportVariables_RequiresOwnerSlashRepo(t *testing.T) {
 	assert.Contains(t, err.Error(), "owner/repo")
 }
 
-func TestRunImportVariables_CallsGH(t *testing.T) {
-	// Replace ghRunner with a stub.
-	var calls [][]string
-	origGH := ghRunner
-	ghRunner = func(_ context.Context, args ...string) (string, error) {
-		calls = append(calls, args)
-		return "", nil
+// fakeVariableSetter records repository-variable writes and can fail on
+// a chosen call, so the partial-write path is exercised.
+type fakeVariableSetter struct {
+	calls    [][4]string
+	failOn   int
+	failWith error
+}
+
+func (f *fakeVariableSetter) CreateOrUpdateRepoVariable(_ context.Context, owner, repo, name, value string) error {
+	f.calls = append(f.calls, [4]string{owner, repo, name, value})
+	if f.failWith != nil && len(f.calls) == f.failOn {
+		return f.failWith
 	}
-	defer func() { ghRunner = origGH }()
+	return nil
+}
+
+func stubVariableSetter(t *testing.T, f *fakeVariableSetter) {
+	t.Helper()
+	orig := newRepoVariableSetter
+	newRepoVariableSetter = func() (repoVariableSetter, error) { return f, nil }
+	t.Cleanup(func() { newRepoVariableSetter = orig })
+}
+
+func TestRunImportVariables_UsesTheForgeClient(t *testing.T) {
+	// Repository variables are a forge operation: they go through
+	// forge.Client, never the gh CLI (docs/contributing/forge-abstraction.md).
+	f := &fakeVariableSetter{}
+	stubVariableSetter(t, f)
+
+	ids := config.OpenAIWIFConfig{
+		Audience:           "fullsend://acme",
+		IdentityProviderID: "idp_123",
+		ServiceAccountID:   "sa_456",
+	}
+	var buf bytes.Buffer
+	printer := newTestPrinter(&buf)
+
+	require.NoError(t, runImportVariables(context.Background(), printer, ids, "acme/widget"))
+	require.Len(t, f.calls, 3)
+	assert.Equal(t, [4]string{"acme", "widget", openAIAudienceEnv, "fullsend://acme"}, f.calls[0])
+	assert.Equal(t, [4]string{"acme", "widget", openAIIdentityProviderIDEnv, "idp_123"}, f.calls[1])
+	assert.Equal(t, [4]string{"acme", "widget", openAIServiceAccountIDEnv, "sa_456"}, f.calls[2])
+}
+
+func TestRunImportVariables_PartialWriteIsReported(t *testing.T) {
+	f := &fakeVariableSetter{failOn: 2, failWith: fmt.Errorf("403 forbidden")}
+	stubVariableSetter(t, f)
 
 	ids := config.OpenAIWIFConfig{
 		Audience:           "fullsend://acme",
@@ -452,12 +491,12 @@ func TestRunImportVariables_CallsGH(t *testing.T) {
 	printer := newTestPrinter(&buf)
 
 	err := runImportVariables(context.Background(), printer, ids, "acme/widget")
-	require.NoError(t, err)
-
-	require.Len(t, calls, 3)
-	assert.Equal(t, []string{"variable", "set", "FULLSEND_OPENAI_AUDIENCE", "--repo", "acme/widget", "--body", "fullsend://acme"}, calls[0])
-	assert.Equal(t, []string{"variable", "set", "FULLSEND_OPENAI_IDENTITY_PROVIDER_ID", "--repo", "acme/widget", "--body", "idp_123"}, calls[1])
-	assert.Equal(t, []string{"variable", "set", "FULLSEND_OPENAI_SERVICE_ACCOUNT_ID", "--repo", "acme/widget", "--body", "sa_456"}, calls[2])
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), openAIIdentityProviderIDEnv)
+	assert.Contains(t, buf.String(), "partial trio",
+		"the operator must be told the repository is now in a state a run refuses")
+	assert.Contains(t, buf.String(), openAIAudienceEnv, "and which variable did land")
+	assert.Len(t, f.calls, 2, "the third write is not attempted after a failure")
 }
 
 // --- status command tests ---
@@ -601,7 +640,10 @@ func TestRunInferenceOpenAIStatus_NoConfig(t *testing.T) {
 	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget",
 		"--fullsend-dir", fullsendDir})
 	err := cmd.Execute()
-	require.NoError(t, err)
+	// An unconfigured repository is a failure, like the GCP status
+	// command's unhealthy mapping — it has to be able to gate a check.
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no OpenAI WIF identifiers configured")
 	assert.Contains(t, buf.String(), "No OpenAI WIF identifiers configured")
 }
 
@@ -631,7 +673,8 @@ func TestRunInferenceOpenAIStatus_PartialConfig(t *testing.T) {
 	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget",
 		"--fullsend-dir", fullsendDir})
 	err := cmd.Execute()
-	require.NoError(t, err)
+	require.Error(t, err, "a partial trio is a state the run path refuses")
+	assert.Contains(t, err.Error(), "partially configured")
 	assert.Contains(t, buf.String(), "Partial trio")
 }
 
@@ -795,7 +838,11 @@ func TestInferenceOpenAIStatusCmd_DoesNotRequireGitHubToken(t *testing.T) {
 	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget",
 		"--fullsend-dir", filepath.Join(dir, ".fullsend")})
 	err := cmd.Execute()
-	require.NoError(t, err) // should not fail with "no GitHub token found"
+	// It reports an unconfigured repository, but never a missing GitHub
+	// token: status needs no forge credentials.
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no OpenAI WIF identifiers configured")
+	assert.NotContains(t, err.Error(), "token")
 }
 
 // --- request JSON round-trip test (golden) ---
@@ -1254,4 +1301,67 @@ func TestParseRepoList_DedupesCaseInsensitively(t *testing.T) {
 
 	// The same rule keeps the mixed-owner guard honest.
 	assert.Equal(t, []string{"acme"}, repoOwners([]string{"acme/widget", "Acme/gadget"}))
+}
+
+func TestImport_AudienceFromProviderBlockWhenReplyLeavesItDefault(t *testing.T) {
+	// An administrator who reuses an existing provider is told to put its
+	// audience in the provider block; import must honour that rather than
+	// recording the audience we proposed.
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc.Reply.IdentityProviderID = "idp_live"
+	doc.Reply.Audience = ""
+	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_live"
+	doc.Provider.Audience = "corp-existing-audience"
+
+	b, err := json.MarshalIndent(doc, "", "  ")
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "reply.json")
+	require.NoError(t, os.WriteFile(path, b, 0o644))
+
+	ids, err := resolveImportIDs([]string{path}, "", "", "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "corp-existing-audience", ids.Audience)
+}
+
+func TestRunInferenceOpenAIStatus_PartialTrioExitsNonZero(t *testing.T) {
+	// The GCP status command fails on an unhealthy mapping; this one must
+	// too, or a broken enrolment cannot gate anything.
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"), []byte(`inference:
+  openai:
+    audience: fullsend://acme
+`), 0o644))
+
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+	t.Setenv("GITHUB_REPOSITORY", "")
+
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget", "--fullsend-dir", fullsendDir})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "partially configured")
+}
+
+func TestServiceAccountFor_SeveralNamedRepositoriesAlwaysNeedASelector(t *testing.T) {
+	reply := openAIReplyDoc{ServiceAccountIDs: map[string]string{
+		"acme/widget": "sa_widget",
+		"acme/gadget": "", // not filled in yet
+	}}
+	_, err := reply.serviceAccountFor("")
+	require.Error(t, err, "picking the only filled entry would misattribute once the other is filled")
+	assert.Contains(t, err.Error(), "--repo")
+
+	sa, err := reply.serviceAccountFor("acme/widget")
+	require.NoError(t, err)
+	assert.Equal(t, "sa_widget", sa)
 }

@@ -115,14 +115,14 @@ fullsend inference openai request <owner/repo>[,<owner/repo>…] \
 |------|---------|-------------|
 | `--audience` | `fullsend://<owner>` | OpenAI Workload Identity audience |
 | `--project` | *(empty)* | OpenAI project name or ID for the service accounts |
-| `--service-account` | `fullsend-<repo>-ci` | Existing service account ID to map (default: ask for one to be created per repository) |
+| `--service-account` | *(none)* | Map this existing service account instead of asking for `fullsend-<repo>-ci` to be created in the mapping |
 | `--ref` | `refs/heads/main` | The `ref` assertion: the branch fullsend's agent workflows run from. Assertions are exact, so a repository whose default branch is not `main` needs this or every exchange fails |
 | `--format` | `json` | Output format: `json` (versioned schema) or `md` (copy-paste ticket) |
 | `--out` | *(stdout)* | Write output to a file |
 
 ### `inference openai import`
 
-Takes the administrator's reply and writes `inference.openai` into `.fullsend/config.yaml` through the same setters as `fullsend github setup --openai-*`. All three identifiers must be present — a partial trio is refused, and the config is validated before it is written.
+Takes the administrator's reply and writes `inference.openai` into `.fullsend/config.yaml` through the same setters as `fullsend github setup --openai-*`. All three identifiers must be present — a partial trio is refused, and the config is validated before it is written. The write is local: commit `.fullsend/config.yaml` afterwards, since fullsend reads the base branch for pull-request events.
 
 The reply file may be either the bare reply object or the whole document `request --format json` produced with its `reply` section filled in — an administrator can edit and return the same file. When it names service accounts for several repositories, pass `--repo <owner/repo>` to choose one, or `--service-account-id` to give the value outright.
 

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
+	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
 	"github.com/fullsend-ai/fullsend/internal/inference/openaiwif"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
@@ -126,8 +126,8 @@ Every value in the document is computed from the repository names.
 Nothing is sent anywhere; the command needs no credentials.
 
 Output formats:
-  --format json   A stable, versioned JSON schema suitable for a
-                  future API submission.
+  --format json   A versioned interchange schema, so a document written
+                  by one release is readable by the next.
   --format md     A copy-paste ticket/email matching the guide's
                   route-B template.`,
 		Args: cobra.ExactArgs(1),
@@ -139,6 +139,11 @@ Output formats:
 			if len(repos) == 0 {
 				return fmt.Errorf("at least one owner/repo is required")
 			}
+
+			audience = strings.TrimSpace(audience)
+			project = strings.TrimSpace(project)
+			serviceAccount = strings.TrimSpace(serviceAccount)
+			ref = strings.TrimSpace(ref)
 
 			// The default audience is derived from the owner, so every
 			// repository in one request must share it — otherwise the
@@ -370,6 +375,13 @@ type openAIReplyDoc struct {
 	ServiceAccountID   string            `json:"service_account_id,omitempty"`
 	ServiceAccountIDs  map[string]string `json:"service_account_ids,omitempty"`
 
+	// Provider carries the audience when an administrator reusing an
+	// existing provider edited it there — which is what the generated
+	// document and the guide tell them to do.
+	Provider *struct {
+		Audience string `json:"audience"`
+	} `json:"provider,omitempty"`
+
 	// Reply carries the same fields when the file is a full request
 	// document; its values win, since that is the section the
 	// administrator was asked to fill in.
@@ -385,6 +397,12 @@ func (d openAIReplyDoc) resolved() openAIReplyDoc {
 	out.Reply = nil
 	if out.Audience == "" {
 		out.Audience = d.Audience
+	}
+	// reply.audience wins, then the provider block: an administrator who
+	// reused a provider updates one of the two, and the mapping was
+	// written against whichever they set.
+	if out.Audience == "" && d.Provider != nil {
+		out.Audience = d.Provider.Audience
 	}
 	if out.IdentityProviderID == "" {
 		out.IdentityProviderID = d.IdentityProviderID
@@ -426,13 +444,21 @@ func (d openAIReplyDoc) serviceAccountFor(repo string) (string, error) {
 			return "", fmt.Errorf("the reply has no service account for %s (it names %s)", repo, strings.Join(keys, ", "))
 		}
 	}
-	switch len(filled) {
-	case 0:
-		return "", nil
-	case 1:
-		for _, v := range filled {
-			return v, nil
+	// One filled entry among several named repositories is still
+	// ambiguous: the others are filled in later, and a silent pick would
+	// then attribute the wrong account.
+	if len(d.ServiceAccountIDs) <= 1 {
+		switch len(filled) {
+		case 0:
+			return "", nil
+		case 1:
+			for _, v := range filled {
+				return v, nil
+			}
 		}
+	}
+	if len(filled) == 0 {
+		return "", nil
 	}
 	keys := make([]string, 0, len(filled))
 	for k := range filled {
@@ -492,7 +518,7 @@ token with variable-write permissions and --repo).`,
 	cmd.Flags().StringVar(&flagServiceAccountID, "service-account-id", "", "OpenAI service account ID")
 	cmd.Flags().StringVar(&fullsendDir, "fullsend-dir", ".fullsend", "path to the .fullsend configuration directory")
 	cmd.Flags().BoolVar(&variables, "variables", false, "set FULLSEND_OPENAI_* repository variables instead of writing config.yaml (requires --repo)")
-	cmd.Flags().StringVar(&repo, "repo", "", "target repository (owner/repo) for --variables")
+	cmd.Flags().StringVar(&repo, "repo", "", "target repository (owner/repo) for --variables, and the repository to select from a reply naming several")
 
 	return cmd
 }
@@ -585,6 +611,7 @@ func runImportConfig(printer *ui.Printer, ids config.OpenAIWIFConfig, fullsendDi
 	}
 
 	printer.StepDone("Wrote inference.openai to " + configPath)
+	printer.StepInfo("This is a local write: commit " + configPath + " so CI runs see it (fullsend reads the base branch for pull-request events)")
 	printer.KeyValue("audience", ids.Audience)
 	printer.KeyValue("identity_provider_id", ids.IdentityProviderID)
 	printer.KeyValue("service_account_id", ids.ServiceAccountID)
@@ -592,12 +619,22 @@ func runImportConfig(printer *ui.Printer, ids config.OpenAIWIFConfig, fullsendDi
 	return nil
 }
 
-// ghRunner runs a gh CLI command and returns its combined output. Tests
-// can replace this variable with a stub.
-var ghRunner = func(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "gh", args...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+// repoVariableSetter is the forge operation `import --variables` needs.
+// Setting a repository variable is a forge operation, so it goes through
+// forge.Client like every other one (docs/contributing/forge-abstraction.md
+// prohibits shelling out to the gh CLI outside internal/forge/github).
+type repoVariableSetter interface {
+	CreateOrUpdateRepoVariable(ctx context.Context, owner, repo, name, value string) error
+}
+
+// newRepoVariableSetter builds the client from the usual token
+// resolution; tests replace it.
+var newRepoVariableSetter = func() (repoVariableSetter, error) {
+	token, err := resolveToken()
+	if err != nil {
+		return nil, err
+	}
+	return gh.New(token), nil
 }
 
 func runImportVariables(ctx context.Context, printer *ui.Printer, ids config.OpenAIWIFConfig, repo string) error {
@@ -618,6 +655,11 @@ func runImportVariables(ctx context.Context, printer *ui.Printer, ids config.Ope
 		return fmt.Errorf("invalid repo name %q", repoName)
 	}
 
+	client, err := newRepoVariableSetter()
+	if err != nil {
+		return err
+	}
+
 	type varEntry struct {
 		name  string
 		value string
@@ -633,15 +675,13 @@ func runImportVariables(ctx context.Context, printer *ui.Printer, ids config.Ope
 	// what was written so the operator can re-run or clear it.
 	var written []string
 	for _, v := range vars {
-		ghArgs := []string{"variable", "set", v.name, "--repo", repo, "--body", v.value}
 		printer.StepStart(fmt.Sprintf("Setting %s on %s", v.name, repo))
-		out, err := ghRunner(ctx, ghArgs...)
-		if err != nil {
+		if err := client.CreateOrUpdateRepoVariable(ctx, owner, repoName, v.name, v.value); err != nil {
 			printer.StepFail(fmt.Sprintf("Failed to set %s", v.name))
 			if len(written) > 0 {
 				printer.StepWarn(fmt.Sprintf("%s already set on %s: the repository now holds a partial trio, which a run refuses — re-run the same command to finish, or remove them", strings.Join(written, ", "), repo))
 			}
-			return fmt.Errorf("setting variable %s on %s: %w\n%s", v.name, repo, err, out)
+			return fmt.Errorf("setting variable %s on %s: %w", v.name, repo, err)
 		}
 		written = append(written, v.name)
 		printer.StepDone(fmt.Sprintf("Set %s on %s", v.name, repo))
@@ -739,7 +779,9 @@ func resolveOpenAIStatusSources(fullsendDir string) (openAIStatusSource, error) 
 	}
 	perRepo, ok := writer.(config.PerRepoConfigReader)
 	if !ok {
-		return s, nil
+		// Same condition import refuses by name, rather than a generic
+		// "nothing configured" (org mode is deprecated, ADR 0044).
+		return s, fmt.Errorf("%s contains an org-mode config; OpenAI WIF enrolment is per-repo", fullsendDir)
 	}
 	cfgIDs := perRepo.ConfigInferenceOpenAI().Trimmed()
 	s.Source = "config.yaml"
@@ -781,7 +823,7 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 		}
 		printer.StepFail("No OpenAI WIF identifiers configured")
 		printer.StepInfo("Run 'fullsend inference openai import' or 'fullsend github setup --openai-*' to configure")
-		return nil
+		return fmt.Errorf("no OpenAI WIF identifiers configured for %s", repo)
 	}
 
 	if missing := ids.Missing(); len(missing) > 0 {
@@ -790,7 +832,7 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 			printer.StepInfo("A run takes the three identifiers from one source: with any FULLSEND_OPENAI_* variable set, all three must come from variables — the config.yaml block is not consulted")
 		}
 		printer.StepInfo("All three identifiers must be set for the exchange to work")
-		return nil
+		return fmt.Errorf("OpenAI WIF is partially configured in %s: missing %s", sources.Source, strings.Join(missing, ", "))
 	}
 
 	printer.StepDone("All three identifiers are set")

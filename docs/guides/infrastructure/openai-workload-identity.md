@@ -222,7 +222,9 @@ The reply gives you the three identifiers from [What you end up with](#what-you-
 Record them with
 [`fullsend inference openai import`](../../cli/inference.md#inference-openai-import) — it takes the
 filled-in reply JSON (`fullsend inference openai import reply.json`) or the three values as flags,
-and writes them the same way [step 4](#4-tell-fullsend-the-three-identifiers) does.
+and writes the same `inference.openai` block [step 4](#4-tell-fullsend-the-three-identifiers)
+describes. Unlike `fullsend github setup`, which opens a pull request, `import` only writes the file
+on your machine: commit it, or a CI run will not see the identifiers.
 
 To check the enrolment before a real agent run, `fullsend inference openai status <owner>/<repo>`
 prints the resolved identifiers and where they came from; inside a GitHub Actions job with

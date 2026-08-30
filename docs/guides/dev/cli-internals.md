@@ -696,7 +696,7 @@ var executableFiles = map[string]struct{}{
 | `internal/cli/admin.go` | ~2415 | Install/uninstall/analyze/enable/disable |
 | `internal/cli/mint.go` | ~1022 | Mint deploy/enroll/unenroll/status |
 | `internal/cli/inference.go` | ~408 | Inference WIF provision/status (GCP) |
-| `internal/cli/inference_openai.go` | ~760 | OpenAI WIF enrolment: request document, reply import, status/exchange |
+| `internal/cli/inference_openai.go` | ~900 | OpenAI WIF enrolment: request document, reply import, status/exchange |
 | `internal/cli/github.go` | ~966 | GitHub setup/set/status/uninstall/sync-scaffold/enroll/unenroll |
 | `internal/cli/issues.go` | ~430 | Issue read/write commands (`fullsend issues get`, `post-comment`) |
 | `internal/cli/tracker_client.go` | ~122 | Tracker client factory (GitHub/GitLab/Jira) |
