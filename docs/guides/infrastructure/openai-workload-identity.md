@@ -7,7 +7,7 @@ fullsend renews it for as long as the run lasts, and the agent sandbox never see
 ever holds a placeholder that the OpenShell gateway swaps for the real token on the way out.
 
 Setting it up is one visit to the OpenAI console — yours, or your IT administrator's — and one
-`fullsend github setup` run per repository. No key is created, downloaded or rotated.
+command per repository. No key is created, downloaded or rotated.
 
 > **GitHub Actions only.** The exchange needs the job's OIDC endpoint. For GitLab CI and for runs
 > on your own machine, use an API key in the runner environment — see [Run it locally](#run-it-locally).
@@ -30,7 +30,9 @@ feature (one that includes fullsend PR #6695; check the release notes).
 ## Which route are you on?
 
 Workload Identity Providers and their service-account mappings are an **organization-level**
-security setting in OpenAI (Organization Settings → Security). Who can edit them decides your route:
+security setting in OpenAI (Organization Settings → Security). Who can edit them decides your route —
+open that page to find out: if you can see **Workload Identity Provider** and add one, you are on
+route A; if the page or the setting is not there, you are on route B and someone else owns it.
 
 - **Route A — you can manage providers in your OpenAI organization.** Being an owner of a project
   is not enough; you need the organization-level permission. You create (or reuse) the provider and

@@ -2,16 +2,19 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
+	"github.com/fullsend-ai/fullsend/internal/inference/openaiwif"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
@@ -251,7 +254,7 @@ func TestInferenceOpenAIImportCmd_Flags(t *testing.T) {
 }
 
 func TestResolveImportIDs_FromFlags(t *testing.T) {
-	ids, err := resolveImportIDs(nil, "aud", "idp", "sa")
+	ids, err := resolveImportIDs(nil, "aud", "idp", "sa", "")
 	require.NoError(t, err)
 	assert.Equal(t, config.OpenAIWIFConfig{
 		Audience:           "aud",
@@ -272,7 +275,7 @@ func TestResolveImportIDs_FromFile(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(replyPath, data, 0o644))
 
-	ids, err := resolveImportIDs([]string{replyPath}, "", "", "")
+	ids, err := resolveImportIDs([]string{replyPath}, "", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "fullsend://acme", ids.Audience)
 	assert.Equal(t, "idp_123", ids.IdentityProviderID)
@@ -291,7 +294,7 @@ func TestResolveImportIDs_FromFileWithSingleServiceAccountIDs(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(replyPath, data, 0o644))
 
-	ids, err := resolveImportIDs([]string{replyPath}, "", "", "")
+	ids, err := resolveImportIDs([]string{replyPath}, "", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "sa_widget", ids.ServiceAccountID)
 }
@@ -308,7 +311,7 @@ func TestResolveImportIDs_FlagsOverrideFile(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(replyPath, data, 0o644))
 
-	ids, err := resolveImportIDs([]string{replyPath}, "from-flag", "", "")
+	ids, err := resolveImportIDs([]string{replyPath}, "from-flag", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "from-flag", ids.Audience)
 	assert.Equal(t, "idp-file", ids.IdentityProviderID)
@@ -411,7 +414,7 @@ func TestRunImportVariables_RequiresRepo(t *testing.T) {
 	var buf bytes.Buffer
 	printer := newTestPrinter(&buf)
 
-	err := runImportVariables(printer, ids, "")
+	err := runImportVariables(context.Background(), printer, ids, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--repo is required")
 }
@@ -425,7 +428,7 @@ func TestRunImportVariables_RequiresOwnerSlashRepo(t *testing.T) {
 	var buf bytes.Buffer
 	printer := newTestPrinter(&buf)
 
-	err := runImportVariables(printer, ids, "acme")
+	err := runImportVariables(context.Background(), printer, ids, "acme")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "owner/repo")
 }
@@ -434,7 +437,7 @@ func TestRunImportVariables_CallsGH(t *testing.T) {
 	// Replace ghRunner with a stub.
 	var calls [][]string
 	origGH := ghRunner
-	ghRunner = func(args ...string) (string, error) {
+	ghRunner = func(_ context.Context, args ...string) (string, error) {
 		calls = append(calls, args)
 		return "", nil
 	}
@@ -448,7 +451,7 @@ func TestRunImportVariables_CallsGH(t *testing.T) {
 	var buf bytes.Buffer
 	printer := newTestPrinter(&buf)
 
-	err := runImportVariables(printer, ids, "acme/widget")
+	err := runImportVariables(context.Background(), printer, ids, "acme/widget")
 	require.NoError(t, err)
 
 	require.Len(t, calls, 3)
@@ -495,7 +498,8 @@ func TestResolveOpenAIStatusSources_FromConfig(t *testing.T) {
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
 
-	s := resolveOpenAIStatusSources(fullsendDir)
+	s, err := resolveOpenAIStatusSources(fullsendDir)
+	require.NoError(t, err)
 	assert.Equal(t, "fullsend://acme", s.Audience)
 	assert.Equal(t, "config.yaml", s.AudienceSource)
 	assert.Equal(t, "idp_cfg", s.IdentityProviderID)
@@ -504,7 +508,12 @@ func TestResolveOpenAIStatusSources_FromConfig(t *testing.T) {
 	assert.Equal(t, "config.yaml", s.SASource)
 }
 
-func TestResolveOpenAIStatusSources_EnvOverridesConfig(t *testing.T) {
+func TestResolveOpenAIStatusSources_VariablesWinAsASet(t *testing.T) {
+	// The run path (resolveOpenAICredential) treats the FULLSEND_OPENAI_*
+	// variables as one source: any of them set means all three come from
+	// variables, and the committed block is not consulted. status must
+	// report the same thing, or it would call a trio healthy that a run
+	// refuses.
 	dir := t.TempDir()
 	fullsendDir := filepath.Join(dir, ".fullsend")
 	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
@@ -523,11 +532,35 @@ func TestResolveOpenAIStatusSources_EnvOverridesConfig(t *testing.T) {
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
 
-	s := resolveOpenAIStatusSources(fullsendDir)
+	s, err := resolveOpenAIStatusSources(fullsendDir)
+	require.NoError(t, err)
+	assert.Equal(t, "variables", s.Source)
 	assert.Equal(t, "from-env", s.Audience)
 	assert.Contains(t, s.AudienceSource, "variable")
-	assert.Equal(t, "idp_cfg", s.IdentityProviderID)
-	assert.Equal(t, "config.yaml", s.IDPSource)
+	assert.Empty(t, s.IdentityProviderID, "config.yaml is not consulted once a variable is set")
+	assert.Empty(t, s.ServiceAccountID, "config.yaml is not consulted once a variable is set")
+
+	ids := config.OpenAIWIFConfig{
+		Audience:           s.Audience,
+		IdentityProviderID: s.IdentityProviderID,
+		ServiceAccountID:   s.ServiceAccountID,
+	}
+	assert.Equal(t, []string{"identity_provider_id", "service_account_id"}, ids.Missing(),
+		"the same partial trio a run would refuse")
+}
+
+func TestResolveOpenAIStatusSources_MalformedConfigIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"),
+		[]byte("inference: [this is not a mapping\n"), 0o644))
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+
+	_, err := resolveOpenAIStatusSources(fullsendDir)
+	require.Error(t, err, "a broken config must not read as 'not configured yet'")
 }
 
 func TestResolveOpenAIStatusSources_NoConfig(t *testing.T) {
@@ -538,7 +571,8 @@ func TestResolveOpenAIStatusSources_NoConfig(t *testing.T) {
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
 
-	s := resolveOpenAIStatusSources(fullsendDir)
+	s, err := resolveOpenAIStatusSources(fullsendDir)
+	require.NoError(t, err)
 	assert.Empty(t, s.Audience)
 	assert.Empty(t, s.IdentityProviderID)
 	assert.Empty(t, s.ServiceAccountID)
@@ -553,6 +587,8 @@ func TestRunInferenceOpenAIStatus_NoConfig(t *testing.T) {
 	t.Setenv(openAIServiceAccountIDEnv, "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+	// CI itself sets this; the command must behave the same either way.
+	t.Setenv("GITHUB_REPOSITORY", "")
 
 	var buf bytes.Buffer
 	cmd := newRootCmd()
@@ -630,13 +666,13 @@ func TestRunInferenceOpenAIStatus_FullConfigNoActions(t *testing.T) {
 // --- buildRequestDoc tests ---
 
 func TestBuildRequestDoc_DefaultAudience(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "", "")
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "", "", openAIDefaultRef)
 	assert.Equal(t, "fullsend://acme", doc.Provider.Audience)
 	assert.Equal(t, "fullsend://acme", doc.Reply.Audience)
 }
 
 func TestBuildRequestDoc_CorrectAssertions(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "")
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
 
 	require.Len(t, doc.Mappings, 2)
 
@@ -651,13 +687,13 @@ func TestBuildRequestDoc_CorrectAssertions(t *testing.T) {
 }
 
 func TestBuildRequestDoc_ServiceAccountIDPerRepo(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "aud", "", "")
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "aud", "", "", openAIDefaultRef)
 	assert.Equal(t, "fullsend-widget-ci", doc.Mappings[0].Target.ServiceAccount)
 	assert.Equal(t, "fullsend-gadget-ci", doc.Mappings[1].Target.ServiceAccount)
 }
 
 func TestBuildRequestDoc_SharedServiceAccount(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "aud", "", "shared-sa")
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "aud", "", "shared-sa", openAIDefaultRef)
 	assert.Equal(t, "shared-sa", doc.Mappings[0].Target.ServiceAccount)
 	assert.Equal(t, "shared-sa", doc.Mappings[1].Target.ServiceAccount)
 }
@@ -665,7 +701,7 @@ func TestBuildRequestDoc_SharedServiceAccount(t *testing.T) {
 // --- renderRequestMarkdown tests ---
 
 func TestRenderRequestMarkdown_ContainsExpectedSections(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "", "")
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "", "", openAIDefaultRef)
 	md, err := renderRequestMarkdown(doc)
 	require.NoError(t, err)
 
@@ -762,6 +798,7 @@ func TestBuildRequestDoc_JSONRoundTrip(t *testing.T) {
 		"fullsend://acme",
 		"openai-proj-001",
 		"",
+		openAIDefaultRef,
 	)
 
 	b, err := json.MarshalIndent(doc, "", "  ")
@@ -856,4 +893,214 @@ func TestInferenceOpenAIRequestCmd_MarkdownMultiRepo(t *testing.T) {
 	assert.Contains(t, output, "fullsend-gadget-ci")
 	assert.True(t, strings.Contains(output, "Service account ID for acme/widget"))
 	assert.True(t, strings.Contains(output, "Service account ID for acme/gadget"))
+}
+
+// --- round trip: the document we generate is the document an admin returns ---
+
+func TestImport_AcceptsTheFilledInRequestDocument(t *testing.T) {
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	// What an administrator does: fill in the reply section of the file
+	// `request --format json` produced, and send the same file back.
+	doc.Reply.IdentityProviderID = "idp_live"
+	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_live"
+
+	b, err := json.MarshalIndent(doc, "", "  ")
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "reply.json")
+	require.NoError(t, os.WriteFile(path, b, 0o644))
+
+	ids, err := resolveImportIDs([]string{path}, "", "", "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "fullsend://acme", ids.Audience)
+	assert.Equal(t, "idp_live", ids.IdentityProviderID)
+	assert.Equal(t, "sa_live", ids.ServiceAccountID)
+	require.NoError(t, validateImportIDs(ids))
+}
+
+func TestImport_MultiRepoReplyNeedsASelector(t *testing.T) {
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc.Reply.IdentityProviderID = "idp_live"
+	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_widget"
+	doc.Reply.ServiceAccountIDs["acme/gadget"] = "sa_gadget"
+	b, err := json.MarshalIndent(doc, "", "  ")
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "reply.json")
+	require.NoError(t, os.WriteFile(path, b, 0o644))
+
+	_, err = resolveImportIDs([]string{path}, "", "", "", "")
+	require.Error(t, err, "two service accounts and nothing to choose with")
+	assert.Contains(t, err.Error(), "--repo")
+	assert.Contains(t, err.Error(), "acme/gadget")
+
+	ids, err := resolveImportIDs([]string{path}, "", "", "", "acme/gadget")
+	require.NoError(t, err)
+	assert.Equal(t, "sa_gadget", ids.ServiceAccountID, "--repo selects that repository's account")
+
+	_, err = resolveImportIDs([]string{path}, "", "", "", "acme/absent")
+	require.Error(t, err, "a repository the reply does not name")
+	assert.Contains(t, err.Error(), "no service account for acme/absent")
+}
+
+// --- request generation guards ---
+
+func TestRequest_MixedOwnersNeedAnExplicitAudience(t *testing.T) {
+	cmd := newRootCmd()
+	var out strings.Builder
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"inference", "openai", "request", "acme/widget,other/gadget", "--project", "p"})
+	err := cmd.Execute()
+	require.Error(t, err, "the default audience is derived from the owner, so two owners are ambiguous")
+	assert.Contains(t, err.Error(), "--audience")
+
+	cmd = newRootCmd()
+	out.Reset()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"inference", "openai", "request", "acme/widget,other/gadget", "--project", "p", "--audience", "shared-aud", "--format", "json"})
+	require.NoError(t, cmd.Execute(), "explicit audience covers both owners")
+	assert.Contains(t, out.String(), "shared-aud")
+}
+
+func TestRequest_RefIsOverridable(t *testing.T) {
+	doc := buildRequestDoc([]string{"acme/widget"}, "aud", "", "", "refs/heads/trunk")
+	require.Len(t, doc.Mappings, 1)
+	assert.Equal(t, "refs/heads/trunk", doc.Mappings[0].Assertions.Ref,
+		"a repository whose default branch is not main needs its own ref")
+
+	assert.Equal(t, openAIDefaultRef, buildRequestDoc([]string{"acme/widget"}, "aud", "", "", "").Mappings[0].Assertions.Ref)
+}
+
+func TestParseRepoList_Dedupes(t *testing.T) {
+	repos, err := parseRepoList("acme/widget, acme/widget ,acme/gadget")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"acme/widget", "acme/gadget"}, repos)
+}
+
+func TestRequestMarkdown_ExistingServiceAccountIsNotCreated(t *testing.T) {
+	md, err := renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "sa_existing", openAIDefaultRef))
+	require.NoError(t, err)
+	assert.Contains(t, md, "sa_existing (existing — map it, do not create a new one)")
+	assert.NotContains(t, md, "sa_existing (create inline")
+
+	md, err = renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", openAIDefaultRef))
+	require.NoError(t, err)
+	assert.Contains(t, md, "create inline in the mapping")
+}
+
+func TestRequestMarkdown_StatesTheAssertionRules(t *testing.T) {
+	md, err := renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", openAIDefaultRef))
+	require.NoError(t, err)
+	for _, want := range []string{
+		"no wildcards",
+		"`repository_owner`",
+		"`workflow_ref`",
+		"`sub`",
+		"Do **not** create an API key",
+		"`api.model.request` only",
+		"`refs/heads/main`",
+	} {
+		assert.Contains(t, md, want, "the generated request must carry the rule: %s", want)
+	}
+}
+
+func TestRunInferenceOpenAIStatus_RefusesToTestAnotherRepository(t *testing.T) {
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"), []byte(`inference:
+  openai:
+    audience: fullsend://acme
+    identity_provider_id: idp_123
+    service_account_id: sa_456
+`), 0o644))
+
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+	// A job that does have an OIDC endpoint, but belongs to another repo.
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-token")
+	t.Setenv("GITHUB_REPOSITORY", "acme/other")
+
+	exchanged := false
+	stubOpenAIExchange(t, func(context.Context, openaiwif.Config) (*openaiwif.Token, error) {
+		exchanged = true
+		return &openaiwif.Token{Value: "tok-abcdef123456", ExpiresAt: time.Now().Add(time.Hour), Scope: "api.model.request"}, nil
+	})
+
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget", "--fullsend-dir", fullsendDir})
+	require.NoError(t, cmd.Execute())
+
+	assert.False(t, exchanged, "this job's token proves nothing about acme/widget")
+	assert.Contains(t, buf.String(), "cannot test acme/widget")
+}
+
+func TestRunInferenceOpenAIStatus_ExchangesForItsOwnRepository(t *testing.T) {
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"), []byte(`inference:
+  openai:
+    audience: fullsend://acme
+    identity_provider_id: idp_123
+    service_account_id: sa_456
+`), 0o644))
+
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-token")
+	t.Setenv("GITHUB_REPOSITORY", "acme/widget")
+
+	stubOpenAIExchange(t, func(context.Context, openaiwif.Config) (*openaiwif.Token, error) {
+		return &openaiwif.Token{Value: "tok-secret-value-abcdef", ExpiresAt: time.Now().Add(30 * time.Minute), Scope: "api.model.request"}, nil
+	})
+
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget", "--fullsend-dir", fullsendDir})
+	require.NoError(t, cmd.Execute())
+
+	out := buf.String()
+	assert.Contains(t, out, "Exchange succeeded for acme/widget")
+	assert.Contains(t, out, "api.model.request")
+	assert.NotContains(t, out, "tok-secret-value-abcdef", "the token is never printed")
+}
+
+func TestRunInferenceOpenAIStatus_OverBroadScopeFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"), []byte(`inference:
+  openai:
+    audience: fullsend://acme
+    identity_provider_id: idp_123
+    service_account_id: sa_456
+`), 0o644))
+
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-token")
+	t.Setenv("GITHUB_REPOSITORY", "acme/widget")
+
+	stubOpenAIExchange(t, func(context.Context, openaiwif.Config) (*openaiwif.Token, error) {
+		return &openaiwif.Token{Value: "tok-abcdef123456", ExpiresAt: time.Now().Add(time.Hour), Scope: "api.model.request api.admin"}, nil
+	})
+
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget", "--fullsend-dir", fullsendDir})
+	err := cmd.Execute()
+	require.Error(t, err, "a run refuses a broader token, so status must not call it healthy")
+	assert.Contains(t, err.Error(), "refused")
 }

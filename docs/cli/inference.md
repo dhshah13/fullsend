@@ -4,7 +4,7 @@ sidebar_label: fullsend inference
 
 # fullsend inference
 
-Manage GCP Workload Identity Federation (WIF) infrastructure for Agent Platform access. These commands create, inspect, and remove the WIF pool, OIDC provider, and IAM bindings that allow GitHub Actions workflows to authenticate with GCP.
+Manage the inference credentials agent runs use. `provision`, `deprovision` and `status` create, inspect, and remove the GCP Workload Identity Federation (WIF) pool, OIDC provider, and IAM bindings that let GitHub Actions workflows authenticate with GCP for Agent Platform (Vertex) access. [`openai`](#inference-openai) enrols repositories with OpenAI WIF for GPT models on the pi runtime.
 
 ## Commands
 
@@ -85,7 +85,9 @@ Read-only — makes no changes.
 
 ## `inference openai`
 
-Commands for enrolling repositories with OpenAI Workload Identity Federation. These commands do not call the OpenAI API — they produce documents and update local configuration.
+Commands for enrolling repositories with OpenAI Workload Identity Federation (see the [operator guide](../guides/infrastructure/openai-workload-identity.md)). They need neither GCP access nor an OpenAI key.
+
+`request` and `import` never reach the network: they produce a document and update local configuration. `status` reads configuration too, and — only when run inside a GitHub Actions job with `id-token: write` — performs one token exchange with OpenAI to prove the mapping accepts that repository, reporting the granted scope and expiry without ever printing the token.
 
 ### `inference openai request`
 

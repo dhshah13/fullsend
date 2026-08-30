@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -32,7 +34,10 @@ const (
 	// openAIDefaultPermission is the only permission an agent run needs.
 	openAIDefaultPermission = "api.model.request"
 
-	// openAIDefaultRef is the ref assertion for the mapping.
+	// openAIDefaultRef is the ref assertion for the mapping: fullsend
+	// installs its agent workflows on the default branch and dispatches
+	// them there. A repository whose default branch is not main needs
+	// --ref, or every exchange fails on an assertion that cannot match.
 	openAIDefaultRef = "refs/heads/main"
 )
 
@@ -66,9 +71,13 @@ type openAIRequestAssertions struct {
 }
 
 type openAIRequestTarget struct {
-	Project        string   `json:"project"`
-	ServiceAccount string   `json:"service_account"`
-	Permissions    []string `json:"permissions"`
+	Project        string `json:"project"`
+	ServiceAccount string `json:"service_account"`
+	// CreateInline is false when the caller named an existing service
+	// account with --service-account, so the document does not tell the
+	// administrator to create one.
+	CreateInline bool     `json:"create_inline"`
+	Permissions  []string `json:"permissions"`
 }
 
 type openAIRequestReply struct {
@@ -99,6 +108,7 @@ func newInferenceOpenAIRequestCmd() *cobra.Command {
 	var audience string
 	var project string
 	var serviceAccount string
+	var ref string
 	var format string
 	var outFile string
 
@@ -126,13 +136,19 @@ Output formats:
 				return fmt.Errorf("at least one owner/repo is required")
 			}
 
-			// Derive owner from first repo for default audience.
-			owner := strings.SplitN(repos[0], "/", 2)[0]
+			// The default audience is derived from the owner, so every
+			// repository in one request must share it — otherwise the
+			// second owner's mapping would silently carry the first
+			// owner's audience.
 			if audience == "" {
-				audience = defaultOpenAIAudiencePrefix + owner
+				owners := repoOwners(repos)
+				if len(owners) > 1 {
+					return fmt.Errorf("repositories span more than one owner (%s): pass --audience with the provider's audience, since the default is derived from the owner", strings.Join(owners, ", "))
+				}
+				audience = defaultOpenAIAudiencePrefix + owners[0]
 			}
 
-			doc := buildRequestDoc(repos, audience, project, serviceAccount)
+			doc := buildRequestDoc(repos, audience, project, serviceAccount, ref)
 
 			var output string
 			switch format {
@@ -168,6 +184,7 @@ Output formats:
 	cmd.Flags().StringVar(&audience, "audience", "", "OpenAI Workload Identity audience (default: fullsend://<owner>)")
 	cmd.Flags().StringVar(&project, "project", "", "OpenAI project name or ID for the service accounts")
 	cmd.Flags().StringVar(&serviceAccount, "service-account", "", "existing service account ID to map (default: create fullsend-<repo>-ci per repo)")
+	cmd.Flags().StringVar(&ref, "ref", openAIDefaultRef, "ref assertion for the mappings (the branch fullsend's agent workflows run from)")
 	cmd.Flags().StringVar(&format, "format", "json", "output format: json, md")
 	cmd.Flags().StringVar(&outFile, "out", "", "write output to a file instead of stdout")
 
@@ -193,7 +210,32 @@ func parseRepoList(arg string) ([]string, error) {
 		}
 		repos = append(repos, p)
 	}
-	return repos, nil
+	// A duplicate would render as two identical mappings in the request.
+	seen := make(map[string]bool, len(repos))
+	deduped := repos[:0]
+	for _, r := range repos {
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		deduped = append(deduped, r)
+	}
+	return deduped, nil
+}
+
+// repoOwners returns the distinct owners of a repository list, in order.
+func repoOwners(repos []string) []string {
+	var owners []string
+	seen := make(map[string]bool, len(repos))
+	for _, r := range repos {
+		owner := strings.SplitN(r, "/", 2)[0]
+		if seen[owner] {
+			continue
+		}
+		seen[owner] = true
+		owners = append(owners, owner)
+	}
+	return owners
 }
 
 // defaultServiceAccountID derives the default service account name for
@@ -204,7 +246,10 @@ func defaultServiceAccountID(repo string) string {
 	return "fullsend-" + repoName + "-ci"
 }
 
-func buildRequestDoc(repos []string, audience, project, serviceAccount string) openAIRequestDoc {
+func buildRequestDoc(repos []string, audience, project, serviceAccount, ref string) openAIRequestDoc {
+	if strings.TrimSpace(ref) == "" {
+		ref = openAIDefaultRef
+	}
 	doc := openAIRequestDoc{
 		Version: openAIRequestSchemaVersion,
 		Provider: openAIRequestProvider{
@@ -221,7 +266,8 @@ func buildRequestDoc(repos []string, audience, project, serviceAccount string) o
 
 	for _, repo := range repos {
 		sa := serviceAccount
-		if sa == "" {
+		createInline := serviceAccount == ""
+		if createInline {
 			sa = defaultServiceAccountID(repo)
 		}
 
@@ -231,11 +277,12 @@ func buildRequestDoc(repos []string, audience, project, serviceAccount string) o
 				Iss:        githubOIDCIssuer,
 				Aud:        audience,
 				Repository: repo,
-				Ref:        openAIDefaultRef,
+				Ref:        ref,
 			},
 			Target: openAIRequestTarget{
 				Project:        project,
 				ServiceAccount: sa,
+				CreateInline:   createInline,
 				Permissions:    []string{openAIDefaultPermission},
 			},
 		}
@@ -263,8 +310,9 @@ keep its audience and report it back (see Reply below).
 ## Service account mappings
 
 One mapping per repository. Every assertion must be exact — no wildcards,
-no ` + "`" + `repository_owner` + "`" + `, no ` + "`" + `workflow_ref` + "`" + ` (fullsend starts agent runs
-from seven workflow files). Do **not** create an API key for the service account.
+no ` + "`" + `repository_owner` + "`" + `, no ` + "`" + `workflow_ref` + "`" + ` and no ` + "`" + `sub` + "`" + ` (fullsend starts agent
+runs from several workflow files in the repository, so any single value would
+exclude the others). Do **not** create an API key for the service account.
 {{ range .Mappings }}
 ### {{ .Repository }}
 
@@ -272,8 +320,8 @@ from seven workflow files). Do **not** create an API key for the service account
 |---|---|
 | Claim assertions | ` + "`" + `iss` + "`" + ` = ` + "`" + `{{ .Assertions.Iss }}` + "`" + ` · ` + "`" + `aud` + "`" + ` = ` + "`" + `{{ .Assertions.Aud }}` + "`" + ` · ` + "`" + `repository` + "`" + ` = ` + "`" + `{{ .Assertions.Repository }}` + "`" + ` · ` + "`" + `ref` + "`" + ` = ` + "`" + `{{ .Assertions.Ref }}` + "`" + ` |
 | Project | {{ if .Target.Project }}` + "`" + `{{ .Target.Project }}` + "`" + `{{ else }}*(specify the project name or ID)*{{ end }} |
-| Service account | {{ .Target.ServiceAccount }} (create inline in the mapping) |
-| Permissions | ` + "`" + `{{ index .Target.Permissions 0 }}` + "`" + ` only |
+| Service account | {{ .Target.ServiceAccount }}{{ if .Target.CreateInline }} (create inline in the mapping){{ else }} (existing — map it, do not create a new one){{ end }} |
+| Permissions | {{ range $i, $p := .Target.Permissions }}{{ if $i }}, {{ end }}` + "`" + `{{ $p }}` + "`" + `{{ end }} only |
 {{ end }}
 ## Reply
 
@@ -299,14 +347,86 @@ func renderRequestMarkdown(doc openAIRequestDoc) (string, error) {
 
 // --- import command ---
 
-// openAIReplyDoc is the JSON shape accepted by the import command. It
-// mirrors the request schema's reply section so an admin who fills the
-// JSON in can be imported directly.
+// openAIReplyDoc is the JSON shape accepted by the import command. Two
+// documents are accepted, because both reach an administrator: the reply
+// section on its own, and the whole request document from
+// `inference openai request --format json` with its "reply" object filled
+// in — which is what an administrator who edits the file we sent them
+// hands back.
 type openAIReplyDoc struct {
 	IdentityProviderID string            `json:"identity_provider_id"`
 	Audience           string            `json:"audience"`
 	ServiceAccountID   string            `json:"service_account_id,omitempty"`
 	ServiceAccountIDs  map[string]string `json:"service_account_ids,omitempty"`
+
+	// Reply carries the same fields when the file is a full request
+	// document; its values win, since that is the section the
+	// administrator was asked to fill in.
+	Reply *openAIReplyDoc `json:"reply,omitempty"`
+}
+
+// resolved folds a full request document into the reply shape.
+func (d openAIReplyDoc) resolved() openAIReplyDoc {
+	if d.Reply == nil {
+		return d
+	}
+	out := *d.Reply
+	out.Reply = nil
+	if out.Audience == "" {
+		out.Audience = d.Audience
+	}
+	if out.IdentityProviderID == "" {
+		out.IdentityProviderID = d.IdentityProviderID
+	}
+	if out.ServiceAccountID == "" {
+		out.ServiceAccountID = d.ServiceAccountID
+	}
+	if len(out.ServiceAccountIDs) == 0 {
+		out.ServiceAccountIDs = d.ServiceAccountIDs
+	}
+	return out
+}
+
+// serviceAccountFor picks the service account for repo out of a reply.
+// A reply for several repositories needs a selector, and says so rather
+// than silently importing none.
+func (d openAIReplyDoc) serviceAccountFor(repo string) (string, error) {
+	if d.ServiceAccountID != "" {
+		return d.ServiceAccountID, nil
+	}
+	filled := make(map[string]string, len(d.ServiceAccountIDs))
+	for k, v := range d.ServiceAccountIDs {
+		if strings.TrimSpace(v) != "" {
+			filled[k] = v
+		}
+	}
+	if repo != "" {
+		if v, ok := filled[repo]; ok {
+			return v, nil
+		}
+		if len(filled) > 0 {
+			keys := make([]string, 0, len(filled))
+			for k := range filled {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			return "", fmt.Errorf("the reply has no service account for %s (it names %s)", repo, strings.Join(keys, ", "))
+		}
+	}
+	switch len(filled) {
+	case 0:
+		return "", nil
+	case 1:
+		for _, v := range filled {
+			return v, nil
+		}
+	}
+	keys := make([]string, 0, len(filled))
+	for k := range filled {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return "", fmt.Errorf("the reply names %d service accounts (%s): pass --repo <owner/repo> to choose one, or --service-account-id", len(filled), strings.Join(keys, ", "))
 }
 
 func newInferenceOpenAIImportCmd() *cobra.Command {
@@ -337,7 +457,7 @@ token with variable-write permissions and --repo).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			printer := ui.New(cmd.OutOrStdout())
 
-			ids, err := resolveImportIDs(args, flagAudience, flagIdentityProviderID, flagServiceAccountID)
+			ids, err := resolveImportIDs(args, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo)
 			if err != nil {
 				return err
 			}
@@ -347,7 +467,7 @@ token with variable-write permissions and --repo).`,
 			}
 
 			if variables {
-				return runImportVariables(printer, ids, repo)
+				return runImportVariables(cmd.Context(), printer, ids, repo)
 			}
 
 			return runImportConfig(printer, ids, fullsendDir)
@@ -366,7 +486,7 @@ token with variable-write permissions and --repo).`,
 
 // resolveImportIDs takes the command arguments and flags and returns the
 // OpenAI WIF config. Flags take precedence over the JSON file.
-func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagServiceAccountID string) (config.OpenAIWIFConfig, error) {
+func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo string) (config.OpenAIWIFConfig, error) {
 	var ids config.OpenAIWIFConfig
 
 	// Load from JSON file if provided.
@@ -375,21 +495,18 @@ func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagS
 		if err != nil {
 			return ids, fmt.Errorf("reading reply file: %w", err)
 		}
-		var reply openAIReplyDoc
-		if err := json.Unmarshal(data, &reply); err != nil {
+		var doc openAIReplyDoc
+		if err := json.Unmarshal(data, &doc); err != nil {
 			return ids, fmt.Errorf("parsing reply JSON: %w", err)
 		}
+		reply := doc.resolved()
 		ids.Audience = reply.Audience
 		ids.IdentityProviderID = reply.IdentityProviderID
-		// Single service_account_id takes precedence; for multi-repo
-		// replies the caller must use --service-account-id to select.
-		if reply.ServiceAccountID != "" {
-			ids.ServiceAccountID = reply.ServiceAccountID
-		} else if len(reply.ServiceAccountIDs) == 1 {
-			for _, v := range reply.ServiceAccountIDs {
-				ids.ServiceAccountID = v
-			}
+		sa, err := reply.serviceAccountFor(repo)
+		if err != nil {
+			return ids, err
 		}
+		ids.ServiceAccountID = sa
 	}
 
 	// Flags override file values.
@@ -430,6 +547,12 @@ func runImportConfig(printer *ui.Printer, ids config.OpenAIWIFConfig, fullsendDi
 
 	perRepo.SetInferenceOpenAI(ids)
 
+	// Fail closed the way `fullsend github setup` does, rather than
+	// writing a config the next run would reject.
+	if err := perRepo.Validate(); err != nil {
+		return fmt.Errorf("invalid config after import: %w", err)
+	}
+
 	data, err := perRepo.Marshal()
 	if err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
@@ -453,13 +576,13 @@ func runImportConfig(printer *ui.Printer, ids config.OpenAIWIFConfig, fullsendDi
 
 // ghRunner runs a gh CLI command and returns its combined output. Tests
 // can replace this variable with a stub.
-var ghRunner = func(args ...string) (string, error) {
-	cmd := exec.Command("gh", args...)
+var ghRunner = func(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
-func runImportVariables(printer *ui.Printer, ids config.OpenAIWIFConfig, repo string) error {
+func runImportVariables(ctx context.Context, printer *ui.Printer, ids config.OpenAIWIFConfig, repo string) error {
 	if repo == "" {
 		return fmt.Errorf("--repo is required when using --variables")
 	}
@@ -487,14 +610,22 @@ func runImportVariables(printer *ui.Printer, ids config.OpenAIWIFConfig, repo st
 		{openAIServiceAccountIDEnv, ids.ServiceAccountID},
 	}
 
+	// The three are written one at a time, so a failure halfway leaves a
+	// partial trio on the repository — which a run refuses. Say exactly
+	// what was written so the operator can re-run or clear it.
+	var written []string
 	for _, v := range vars {
 		ghArgs := []string{"variable", "set", v.name, "--repo", repo, "--body", v.value}
 		printer.StepStart(fmt.Sprintf("Setting %s on %s", v.name, repo))
-		out, err := ghRunner(ghArgs...)
+		out, err := ghRunner(ctx, ghArgs...)
 		if err != nil {
 			printer.StepFail(fmt.Sprintf("Failed to set %s", v.name))
+			if len(written) > 0 {
+				printer.StepWarn(fmt.Sprintf("%s already set on %s: the repository now holds a partial trio, which a run refuses — re-run the same command to finish, or remove them", strings.Join(written, ", "), repo))
+			}
 			return fmt.Errorf("setting variable %s on %s: %w\n%s", v.name, repo, err, out)
 		}
+		written = append(written, v.name)
 		printer.StepDone(fmt.Sprintf("Set %s on %s", v.name, repo))
 	}
 
@@ -539,6 +670,9 @@ at the config checks.`,
 
 // openAIStatusSource describes where an identifier was resolved from.
 type openAIStatusSource struct {
+	// Source names where the trio came from as a whole ("variables" or
+	// "config.yaml"), mirroring the run path's all-or-nothing rule.
+	Source             string
 	Audience           string
 	AudienceSource     string
 	IdentityProviderID string
@@ -547,49 +681,44 @@ type openAIStatusSource struct {
 	SASource           string
 }
 
-func resolveOpenAIStatusSources(fullsendDir string) openAIStatusSource {
+// resolveOpenAIStatusSources resolves the identifiers exactly as
+// resolveOpenAICredential does for a real run: the FULLSEND_OPENAI_*
+// variables win as a set — if any one of them is set, that is the source,
+// and a gap in it is a gap — and the committed inference.openai block is
+// used only when none of them is set. Reporting a mixed trio here would
+// tell the operator a run will work when the run would refuse it.
+func resolveOpenAIStatusSources(fullsendDir string) (openAIStatusSource, error) {
 	var s openAIStatusSource
 
-	// Check environment variables first (they take precedence).
 	envAud := strings.TrimSpace(os.Getenv(openAIAudienceEnv))
 	envIDP := strings.TrimSpace(os.Getenv(openAIIdentityProviderIDEnv))
 	envSA := strings.TrimSpace(os.Getenv(openAIServiceAccountIDEnv))
 
-	// Load config as fallback.
-	var cfgIDs config.OpenAIWIFConfig
+	if envAud != "" || envIDP != "" || envSA != "" {
+		s.Source = "variables"
+		s.Audience, s.AudienceSource = envAud, "variable "+openAIAudienceEnv
+		s.IdentityProviderID, s.IDPSource = envIDP, "variable "+openAIIdentityProviderIDEnv
+		s.ServiceAccountID, s.SASource = envSA, "variable "+openAIServiceAccountIDEnv
+		return s, nil
+	}
+
 	writer, err := config.LoadConfigWriter(fullsendDir, config.LoadOpts{MissingOK: true})
-	if err == nil {
-		if perRepo, ok := writer.(config.PerRepoConfigReader); ok {
-			cfgIDs = perRepo.ConfigInferenceOpenAI().Trimmed()
-		}
+	if err != nil {
+		// A malformed or unreadable config must not read as "nothing
+		// configured yet" — that is the one state an operator would
+		// misdiagnose.
+		return s, fmt.Errorf("loading config from %s: %w", fullsendDir, err)
 	}
-
-	// Resolve each field: env var wins, then config.
-	if envAud != "" {
-		s.Audience = envAud
-		s.AudienceSource = "variable " + openAIAudienceEnv
-	} else if cfgIDs.Audience != "" {
-		s.Audience = cfgIDs.Audience
-		s.AudienceSource = "config.yaml"
+	perRepo, ok := writer.(config.PerRepoConfigReader)
+	if !ok {
+		return s, nil
 	}
-
-	if envIDP != "" {
-		s.IdentityProviderID = envIDP
-		s.IDPSource = "variable " + openAIIdentityProviderIDEnv
-	} else if cfgIDs.IdentityProviderID != "" {
-		s.IdentityProviderID = cfgIDs.IdentityProviderID
-		s.IDPSource = "config.yaml"
-	}
-
-	if envSA != "" {
-		s.ServiceAccountID = envSA
-		s.SASource = "variable " + openAIServiceAccountIDEnv
-	} else if cfgIDs.ServiceAccountID != "" {
-		s.ServiceAccountID = cfgIDs.ServiceAccountID
-		s.SASource = "config.yaml"
-	}
-
-	return s
+	cfgIDs := perRepo.ConfigInferenceOpenAI().Trimmed()
+	s.Source = "config.yaml"
+	s.Audience, s.AudienceSource = cfgIDs.Audience, "config.yaml"
+	s.IdentityProviderID, s.IDPSource = cfgIDs.IdentityProviderID, "config.yaml"
+	s.ServiceAccountID, s.SASource = cfgIDs.ServiceAccountID, "config.yaml"
+	return s, nil
 }
 
 func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, fullsendDir string) error {
@@ -598,7 +727,11 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 	printer.Header("OpenAI WIF Status: " + repo)
 	printer.Blank()
 
-	sources := resolveOpenAIStatusSources(fullsendDir)
+	sources, err := resolveOpenAIStatusSources(fullsendDir)
+	if err != nil {
+		printer.StepFail("Could not read the configuration")
+		return err
+	}
 
 	// Print resolved identifiers.
 	printOpenAIStatusField(printer, "audience", sources.Audience, sources.AudienceSource)
@@ -620,7 +753,10 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 	}
 
 	if missing := ids.Missing(); len(missing) > 0 {
-		printer.StepWarn(fmt.Sprintf("Partial trio: missing %s", strings.Join(missing, ", ")))
+		printer.StepWarn(fmt.Sprintf("Partial trio in %s: missing %s", sources.Source, strings.Join(missing, ", ")))
+		if sources.Source == "variables" {
+			printer.StepInfo("A run takes the three identifiers from one source: with any FULLSEND_OPENAI_* variable set, all three must come from variables — the config.yaml block is not consulted")
+		}
 		printer.StepInfo("All three identifiers must be set for the exchange to work")
 		return nil
 	}
@@ -635,6 +771,16 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 	if oidcURL == "" || oidcToken == "" {
 		printer.StepInfo("Not inside a GitHub Actions job with id-token: write")
 		printer.StepInfo("The exchange can only be tested from a GitHub Actions workflow")
+		return nil
+	}
+
+	// Only now does the repository argument matter: an exchange proves
+	// the identity of the job it runs in, so checking another
+	// repository's name here would report a mapping as healthy on the
+	// strength of this repository's token.
+	if current := strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY")); current != "" && !strings.EqualFold(current, repo) {
+		printer.StepWarn(fmt.Sprintf("This job runs in %s, so it cannot test %s: an exchange here would prove %s's mapping only", current, repo, current))
+		printer.StepInfo("Run the command from a job in " + repo + " to test its mapping")
 		return nil
 	}
 
@@ -654,7 +800,7 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 		return fmt.Errorf("OpenAI WIF exchange: %w", err)
 	}
 
-	printer.StepDone("Exchange succeeded")
+	printer.StepDone("Exchange succeeded for " + repo)
 	printer.Blank()
 
 	scope := tok.Scope
@@ -664,9 +810,14 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 	printer.KeyValue("scope", scope)
 	printer.KeyValue("expires_in", time.Until(tok.ExpiresAt).Round(time.Second).String())
 
-	if warning, err := checkOpenAIScope(tok.Scope); err != nil {
-		printer.StepWarn(err.Error())
-	} else if warning != "" {
+	// A token broader than model access is refused by `fullsend run`, so
+	// it must not read as a healthy status here either.
+	warning, scopeErr := checkOpenAIScope(tok.Scope)
+	if scopeErr != nil {
+		printer.StepFail("The mapping grants more than model access")
+		return fmt.Errorf("OpenAI WIF token refused: %w", scopeErr)
+	}
+	if warning != "" {
 		printer.StepWarn(warning)
 	}
 
