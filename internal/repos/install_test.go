@@ -633,6 +633,10 @@ func TestCheckInstallComponents_GitLab_FullyInstalled(t *testing.T) {
 	fc.Secrets["acme/api/"+forge.SecretGCPProjectID] = true
 	fc.Secrets["acme/api/"+forge.SecretGCPWIFProvider] = true
 	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
+	fc.PipelineSchedules["acme/api"] = []forge.PipelineSchedule{
+		{ID: 1, Description: "fullsend slash poll", Active: true},
+		{ID: 2, Description: "fullsend event poll", Active: true},
+	}
 
 	installed, err := checkInstallComponents(context.Background(), fc, "acme", "api", ForgeGitLab, GitLabForgeConfig(), nil)
 	if err != nil {

@@ -171,6 +171,34 @@ func ProbeComponents(ctx context.Context, client forge.Client, owner, repo, forg
 		}
 	}
 
+	// Pipeline schedules (GitLab only — GitHub uses webhook dispatch).
+	if forgeName == ForgeGitLab {
+		schedules, schedErr := client.ListPipelineSchedules(ctx, owner, repo)
+		if schedErr != nil {
+			return nil, fmt.Errorf("checking pipeline schedules: %w", schedErr)
+		}
+		hasSlashPoll := false
+		hasEventPoll := false
+		for _, s := range schedules {
+			if s.Description == "fullsend slash poll" {
+				hasSlashPoll = true
+			}
+			if s.Description == "fullsend event poll" {
+				hasEventPoll = true
+			}
+		}
+		results = append(results, ComponentStatus{
+			Name:    "schedule:slash-poll",
+			Present: hasSlashPoll,
+			Match:   hasSlashPoll,
+		})
+		results = append(results, ComponentStatus{
+			Name:    "schedule:event-poll",
+			Present: hasEventPoll,
+			Match:   hasEventPoll,
+		})
+	}
+
 	// Required secrets (existence check only — values cannot be read back).
 	for _, secretName := range requiredSecretsForForge(forgeName) {
 		exists, err := client.RepoSecretExists(ctx, owner, repo, secretName)
