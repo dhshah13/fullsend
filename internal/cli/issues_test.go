@@ -703,6 +703,69 @@ func TestRunIssuesPostComment_JiraPropertyPermissionFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "sticky marker property")
 }
 
+func TestPostJiraStickyComment_DryRun_Create(t *testing.T) {
+	// Dry-run create should not create a comment.
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+	printer := ui.New(io.Discard)
+	cfg := sticky.Config{Marker: "<!-- test -->", DryRun: true}
+
+	url, err := postJiraStickyComment(context.Background(), tc, "PROJ", 42, "hello", cfg, printer)
+	require.NoError(t, err)
+	assert.Empty(t, url)
+
+	// No comment should be created.
+	comments, err := tc.ListComments(context.Background(), "PROJ", 42)
+	require.NoError(t, err)
+	assert.Empty(t, comments)
+}
+
+func TestPostJiraStickyComment_DryRun_Update(t *testing.T) {
+	// Dry-run update should not modify the existing comment.
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+	printer := ui.New(io.Discard)
+	cfg := sticky.Config{Marker: "<!-- test -->"}
+	ctx := context.Background()
+
+	// Create the initial comment (not dry run).
+	_, err = postJiraStickyComment(ctx, tc, "PROJ", 42, "first", cfg, printer)
+	require.NoError(t, err)
+
+	// Dry run update should not modify the comment.
+	cfg.DryRun = true
+	url, err := postJiraStickyComment(ctx, tc, "PROJ", 42, "second", cfg, printer)
+	require.NoError(t, err)
+	assert.Empty(t, url)
+
+	comments, err := tc.ListComments(ctx, "PROJ", 42)
+	require.NoError(t, err)
+	require.Len(t, comments, 1)
+	assert.NotContains(t, string(comments[0].Body), "second")
+}
+
+func TestPostJiraStickyComment_EmptyBody(t *testing.T) {
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+	printer := ui.New(io.Discard)
+	cfg := sticky.Config{Marker: "<!-- test -->"}
+
+	_, err = postJiraStickyComment(context.Background(), tc, "PROJ", 42, "   ", cfg, printer)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "comment body is empty")
+}
+
+func TestPostJiraStickyComment_EmptyMarker(t *testing.T) {
+	tc, _, err := tracker.NewFakeJiraClientWithFake("https://acme.atlassian.net")
+	require.NoError(t, err)
+	printer := ui.New(io.Discard)
+	cfg := sticky.Config{Marker: "  "}
+
+	_, err = postJiraStickyComment(context.Background(), tc, "PROJ", 42, "body", cfg, printer)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "marker is empty")
+}
+
 func TestRunIssuesPostComment_GitHubUnchangedByJiraPropertyFeature(t *testing.T) {
 	// Verify that GitHub/GitLab comments still use the body-embedded
 	// marker path — the Jira property feature must not affect other

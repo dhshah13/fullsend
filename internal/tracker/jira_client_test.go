@@ -385,4 +385,52 @@ func TestJiraClient_MigrateAndUpdateComment(t *testing.T) {
 	}
 }
 
+func TestJiraClient_MigrateAndUpdateComment_SetPropertyError(t *testing.T) {
+	fc := &FakeJiraClient{}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+	ctx := context.Background()
+	marker := "<!-- fullsend:triage-agent -->"
+
+	// Create a comment to update.
+	_, err := fc.CreateComment(ctx, "PROJ-42", "content")
+	if err != nil {
+		t.Fatalf("CreateComment: %v", err)
+	}
+
+	// Simulate a property write failure.
+	fc.PropertyError = errors.New("403 forbidden")
+
+	err = c.MigrateAndUpdateComment(ctx, "PROJ", 42, "1", "updated", marker)
+	if err == nil {
+		t.Fatal("expected error from MigrateAndUpdateComment when SetCommentProperty fails")
+	}
+	if !errors.Is(err, fc.PropertyError) {
+		t.Errorf("error should wrap PropertyError, got: %v", err)
+	}
+}
+
+func TestJiraClient_MigrateAndUpdateComment_UpdateCommentError(t *testing.T) {
+	fc := &FakeJiraClient{}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+	ctx := context.Background()
+	marker := "<!-- fullsend:triage-agent -->"
+
+	// Create a comment to update.
+	_, err := fc.CreateComment(ctx, "PROJ-42", "content")
+	if err != nil {
+		t.Fatalf("CreateComment: %v", err)
+	}
+
+	// Simulate an update failure (property write succeeds, body update fails).
+	fc.UpdateError = forge.ErrNotFound
+
+	err = c.MigrateAndUpdateComment(ctx, "PROJ", 42, "1", "updated", marker)
+	if err == nil {
+		t.Fatal("expected error from MigrateAndUpdateComment when UpdateComment fails")
+	}
+	if !errors.Is(err, forge.ErrNotFound) {
+		t.Errorf("error should wrap forge.ErrNotFound, got: %v", err)
+	}
+}
+
 var _ Client = (*JiraClient)(nil)

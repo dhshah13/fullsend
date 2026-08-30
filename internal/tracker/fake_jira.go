@@ -35,6 +35,10 @@ type FakeJiraClient struct {
 	// PropertyError, when non-nil, is returned by SetCommentProperty
 	// to simulate permission failures.
 	PropertyError error
+
+	// UpdateError, when non-nil, is returned by UpdateComment to
+	// simulate update failures.
+	UpdateError error
 }
 
 func (f *FakeJiraClient) GetIssue(_ context.Context, issueIDOrKey string) (*jira.Issue, error) {
@@ -104,6 +108,9 @@ func (f *FakeJiraClient) CreateCommentWithProperties(_ context.Context, issueIDO
 }
 
 func (f *FakeJiraClient) UpdateComment(_ context.Context, issueIDOrKey, commentID, body string) error {
+	if f.UpdateError != nil {
+		return f.UpdateError
+	}
 	f.UpdatedIssueKey = issueIDOrKey
 	f.UpdatedCommentID = commentID
 	f.UpdatedBody = body
