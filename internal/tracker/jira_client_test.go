@@ -240,6 +240,51 @@ func TestJiraClient_UpdateComment(t *testing.T) {
 	}
 }
 
+func TestJiraClient_DeleteComment(t *testing.T) {
+	fc := &FakeJiraClient{}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+	ctx := context.Background()
+
+	// Create a comment first so we have something to delete.
+	_, err := c.CreateComment(ctx, "PROJ", 42, "to be deleted")
+	if err != nil {
+		t.Fatalf("CreateComment returned error: %v", err)
+	}
+
+	comments, err := c.ListComments(ctx, "PROJ", 42)
+	if err != nil {
+		t.Fatalf("ListComments returned error: %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 comment before delete, got %d", len(comments))
+	}
+
+	if err := c.DeleteComment(ctx, "PROJ", 42, comments[0].ID); err != nil {
+		t.Fatalf("DeleteComment returned error: %v", err)
+	}
+
+	comments, err = c.ListComments(ctx, "PROJ", 42)
+	if err != nil {
+		t.Fatalf("ListComments returned error: %v", err)
+	}
+	if len(comments) != 0 {
+		t.Errorf("expected 0 comments after delete, got %d", len(comments))
+	}
+}
+
+func TestJiraClient_DeleteComment_NotFound(t *testing.T) {
+	fc := &FakeJiraClient{}
+	c := newTestJiraClient(t, fc, "https://acme.atlassian.net")
+
+	err := c.DeleteComment(context.Background(), "PROJ", 42, "nonexistent")
+	if err == nil {
+		t.Fatal("DeleteComment on nonexistent comment: got nil error, want error")
+	}
+	if !IsNotFound(err) {
+		t.Errorf("DeleteComment error does not satisfy tracker.IsNotFound: %v", err)
+	}
+}
+
 func TestJiraClient_NotFoundWrapping(t *testing.T) {
 	// JiraClient must wrap forge.ErrNotFound into tracker.ErrNotFound so
 	// callers using tracker.IsNotFound get the expected result. Verify
@@ -430,6 +475,25 @@ func TestJiraClient_MigrateAndUpdateComment_UpdateCommentError(t *testing.T) {
 	}
 	if !errors.Is(err, forge.ErrNotFound) {
 		t.Errorf("error should wrap forge.ErrNotFound, got: %v", err)
+	}
+}
+
+func TestNewFakeJiraClient(t *testing.T) {
+	c, err := NewFakeJiraClient("https://acme.atlassian.net")
+	if err != nil {
+		t.Fatalf("NewFakeJiraClient returned error: %v", err)
+	}
+
+	ctx := context.Background()
+	created, err := c.CreateComment(ctx, "PROJ", 42, "test comment")
+	if err != nil {
+		t.Fatalf("CreateComment returned error: %v", err)
+	}
+	if created.ID == "" {
+		t.Error("CreateComment returned empty ID")
+	}
+	if created.Body != "test comment" {
+		t.Errorf("CreateComment body = %q, want %q", created.Body, "test comment")
 	}
 }
 
