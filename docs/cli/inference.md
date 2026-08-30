@@ -13,6 +13,9 @@ Manage GCP Workload Identity Federation (WIF) infrastructure for Agent Platform 
 | `fullsend inference provision <org\|owner/repo>` | Create WIF pool/provider and grant Agent Platform access |
 | `fullsend inference deprovision <org\|owner/repo>` | Remove org or repo from WIF |
 | `fullsend inference status <org\|owner/repo>` | Check WIF health and print config values |
+| `fullsend inference openai request <owner/repo>[,…]` | Generate WIF provider/mapping request for OpenAI admin |
+| `fullsend inference openai import [reply.json]` | Import OpenAI WIF identifiers into config |
+| `fullsend inference openai status <owner/repo>` | Check OpenAI WIF configuration and exchange status |
 
 ## `inference provision`
 
@@ -80,8 +83,78 @@ fullsend inference status <org|owner/repo> \
 
 Read-only — makes no changes.
 
+## `inference openai`
+
+Commands for enrolling repositories with OpenAI Workload Identity Federation. These commands do not call the OpenAI API — they produce documents and update local configuration.
+
+### `inference openai request`
+
+Generates the request document an administrator needs to enable OpenAI WIF for one or more repositories. Every value is computed from the repository names. Nothing is sent anywhere; the command needs no credentials.
+
+```bash
+fullsend inference openai request <owner/repo>[,<owner/repo>…] \
+  [--audience "<audience>"] \
+  [--project "<openai-project>"] \
+  [--service-account "<existing-sa-id>"] \
+  [--format json|md] \
+  [--out <file>]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--audience` | `fullsend://<owner>` | OpenAI Workload Identity audience |
+| `--project` | *(empty)* | OpenAI project name or ID for the service accounts |
+| `--service-account` | `fullsend-<repo>-ci` | Existing service account ID (default: one per repo) |
+| `--format` | `json` | Output format: `json` (versioned schema) or `md` (copy-paste ticket) |
+| `--out` | *(stdout)* | Write output to a file |
+
+### `inference openai import`
+
+Takes the administrator's reply and writes `inference.openai` into `.fullsend/config.yaml` through the same setters as `fullsend github setup --openai-*`. All three identifiers must be present — a partial trio is refused.
+
+```bash
+# From a reply JSON file:
+fullsend inference openai import reply.json
+
+# From flags:
+fullsend inference openai import \
+  --audience "fullsend://<owner>" \
+  --identity-provider-id "<idp-id>" \
+  --service-account-id "<sa-id>"
+
+# Set repository variables instead of config.yaml:
+fullsend inference openai import \
+  --variables --repo <owner/repo> \
+  --audience "fullsend://<owner>" \
+  --identity-provider-id "<idp-id>" \
+  --service-account-id "<sa-id>"
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--audience` | | OpenAI Workload Identity audience |
+| `--identity-provider-id` | | OpenAI identity provider ID |
+| `--service-account-id` | | OpenAI service account ID |
+| `--fullsend-dir` | `.fullsend` | Path to the .fullsend configuration directory |
+| `--variables` | `false` | Set `FULLSEND_OPENAI_*` repository variables instead of config.yaml |
+| `--repo` | | Target repository (`owner/repo`) for `--variables` |
+
+### `inference openai status`
+
+Prints the resolved OpenAI WIF identifiers and their source (config layer or environment variables), and flags a partial trio. When run inside a GitHub Actions job with `id-token: write`, performs one exchange and reports the returned scope and expiry without ever printing the token.
+
+```bash
+fullsend inference openai status <owner/repo> \
+  [--fullsend-dir ".fullsend"]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fullsend-dir` | `.fullsend` | Path to the .fullsend configuration directory |
+
 ## See also
 
 - [Getting inference for fullsend](../guides/getting-started/getting-inference.md) — getting started guide
+- [OpenAI Workload Identity](../guides/infrastructure/openai-workload-identity.md) — end-to-end OpenAI WIF setup guide
 - [Advanced setup](../guides/infrastructure/advanced-setup.md) — non-standard installation paths and WIF configuration
 - [CLI internals](../guides/dev/cli-internals.md) — command tree and implementation details

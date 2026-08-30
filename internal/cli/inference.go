@@ -29,6 +29,7 @@ to the GitHub admin who runs 'fullsend github setup'.`,
 	cmd.AddCommand(newInferenceProvisionCmd())
 	cmd.AddCommand(newInferenceStatusCmd())
 	cmd.AddCommand(newInferenceDeprovisionCmd())
+	cmd.AddCommand(newInferenceOpenAICmd())
 	return cmd
 }
 

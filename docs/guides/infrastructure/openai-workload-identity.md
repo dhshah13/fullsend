@@ -86,6 +86,12 @@ you are done.
 
 ## 3. Map the repository to a service account (once per repository)
 
+> **Shortcut:** `fullsend inference openai request <owner/repo>` generates the
+> complete request document (JSON or Markdown) with every value computed from the
+> repository name — use it to produce the ticket for your administrator instead of
+> filling in the tables below by hand. See
+> [`fullsend inference openai`](../../cli/inference.md#inference-openai) for details.
+
 Open the provider you created and add a **service account mapping**:
 
 | Field | Enter |
@@ -125,6 +131,11 @@ org-wide installation mode the runs happen in the organization's central `.fulls
 so assert that repository instead.
 
 ## 4. Tell fullsend the three identifiers
+
+> **Shortcut:** `fullsend inference openai import` writes the three identifiers
+> into `.fullsend/config.yaml` (or sets repository variables with `--variables`).
+> It accepts a JSON reply file or CLI flags. See
+> [`fullsend inference openai import`](../../cli/inference.md#inference-openai-import).
 
 Re-run the setup command you enrolled the repository with, adding the three values:
 
