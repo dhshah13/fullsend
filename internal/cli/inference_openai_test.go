@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -255,7 +256,7 @@ func TestInferenceOpenAIImportCmd_Flags(t *testing.T) {
 }
 
 func TestResolveImportIDs_FromFlags(t *testing.T) {
-	ids, err := resolveImportIDs(nil, "aud", "idp", "sa", "")
+	ids, err := resolveImportIDs(ui.New(io.Discard), nil, "aud", "idp", "sa", "")
 	require.NoError(t, err)
 	assert.Equal(t, config.OpenAIWIFConfig{
 		Audience:           "aud",
@@ -276,7 +277,7 @@ func TestResolveImportIDs_FromFile(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(replyPath, data, 0o644))
 
-	ids, err := resolveImportIDs([]string{replyPath}, "", "", "", "")
+	ids, err := resolveImportIDs(ui.New(io.Discard), []string{replyPath}, "", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "fullsend://acme", ids.Audience)
 	assert.Equal(t, "idp_123", ids.IdentityProviderID)
@@ -295,7 +296,7 @@ func TestResolveImportIDs_FromFileWithSingleServiceAccountIDs(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(replyPath, data, 0o644))
 
-	ids, err := resolveImportIDs([]string{replyPath}, "", "", "", "")
+	ids, err := resolveImportIDs(ui.New(io.Discard), []string{replyPath}, "", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "sa_widget", ids.ServiceAccountID)
 }
@@ -312,7 +313,7 @@ func TestResolveImportIDs_FlagsOverrideFile(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(replyPath, data, 0o644))
 
-	ids, err := resolveImportIDs([]string{replyPath}, "from-flag", "", "", "")
+	ids, err := resolveImportIDs(ui.New(io.Discard), []string{replyPath}, "from-flag", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "from-flag", ids.Audience)
 	assert.Equal(t, "idp-file", ids.IdentityProviderID)
@@ -964,7 +965,7 @@ func TestImport_AcceptsTheFilledInRequestDocument(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reply.json")
 	require.NoError(t, os.WriteFile(path, b, 0o644))
 
-	ids, err := resolveImportIDs([]string{path}, "", "", "", "")
+	ids, err := resolveImportIDs(ui.New(io.Discard), []string{path}, "", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "fullsend://acme", ids.Audience)
 	assert.Equal(t, "idp_live", ids.IdentityProviderID)
@@ -982,16 +983,16 @@ func TestImport_MultiRepoReplyNeedsASelector(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reply.json")
 	require.NoError(t, os.WriteFile(path, b, 0o644))
 
-	_, err = resolveImportIDs([]string{path}, "", "", "", "")
+	_, err = resolveImportIDs(ui.New(io.Discard), []string{path}, "", "", "", "")
 	require.Error(t, err, "two service accounts and nothing to choose with")
 	assert.Contains(t, err.Error(), "--repo")
 	assert.Contains(t, err.Error(), "acme/gadget")
 
-	ids, err := resolveImportIDs([]string{path}, "", "", "", "acme/gadget")
+	ids, err := resolveImportIDs(ui.New(io.Discard), []string{path}, "", "", "", "acme/gadget")
 	require.NoError(t, err)
 	assert.Equal(t, "sa_gadget", ids.ServiceAccountID, "--repo selects that repository's account")
 
-	_, err = resolveImportIDs([]string{path}, "", "", "", "acme/absent")
+	_, err = resolveImportIDs(ui.New(io.Discard), []string{path}, "", "", "", "acme/absent")
 	require.Error(t, err, "a repository the reply does not name")
 	assert.Contains(t, err.Error(), "no service account for acme/absent")
 }
@@ -1285,7 +1286,7 @@ func TestImport_ServiceAccountFlagResolvesAnAmbiguousReply(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reply.json")
 	require.NoError(t, os.WriteFile(path, b, 0o644))
 
-	ids, err := resolveImportIDs([]string{path}, "", "", "sa_chosen", "")
+	ids, err := resolveImportIDs(ui.New(io.Discard), []string{path}, "", "", "sa_chosen", "")
 	require.NoError(t, err, "--service-account-id is the answer to the ambiguity, not a value applied after failing on it")
 	assert.Equal(t, "sa_chosen", ids.ServiceAccountID)
 }
@@ -1300,7 +1301,7 @@ func TestImport_RepoSelectionIsCaseInsensitive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reply.json")
 	require.NoError(t, os.WriteFile(path, b, 0o644))
 
-	ids, err := resolveImportIDs([]string{path}, "", "", "", "Acme/Widget")
+	ids, err := resolveImportIDs(ui.New(io.Discard), []string{path}, "", "", "", "Acme/Widget")
 	require.NoError(t, err, "GitHub matches owner/repo case-insensitively")
 	assert.Equal(t, "sa_widget", ids.ServiceAccountID)
 }
@@ -1329,7 +1330,7 @@ func TestImport_AudienceFromProviderBlockWhenReplyLeavesItDefault(t *testing.T) 
 	path := filepath.Join(t.TempDir(), "reply.json")
 	require.NoError(t, os.WriteFile(path, b, 0o644))
 
-	ids, err := resolveImportIDs([]string{path}, "", "", "", "")
+	ids, err := resolveImportIDs(ui.New(io.Discard), []string{path}, "", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "corp-existing-audience", ids.Audience)
 }
@@ -1486,15 +1487,19 @@ func TestImport_RefusesADocumentThatDisagreesAboutTheAudience(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reply.json")
 	require.NoError(t, os.WriteFile(path, b, 0o644))
 
-	_, err = resolveImportIDs([]string{path}, "", "", "", "")
+	_, err = resolveImportIDs(ui.New(io.Discard), []string{path}, "", "", "", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "corp-existing-audience")
 	assert.Contains(t, err.Error(), "fullsend://acme")
 
-	// --audience is the documented way out of the ambiguity.
-	ids, err := resolveImportIDs([]string{path}, "corp-existing-audience", "", "", "")
+	// --audience is the documented way out of the ambiguity — and the
+	// operator still hears that the file contradicts itself, since only
+	// they know which value the mapping was written against.
+	var out bytes.Buffer
+	ids, err := resolveImportIDs(ui.New(&out), []string{path}, "corp-existing-audience", "", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, "corp-existing-audience", ids.Audience)
+	assert.Contains(t, out.String(), "disagrees with itself about the audience")
 }
 
 func TestRequestMarkdown_ReplyListsEachRepositoryOnce(t *testing.T) {

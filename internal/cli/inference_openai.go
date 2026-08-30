@@ -593,7 +593,7 @@ token with variable-write permissions and --repo).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			printer := ui.New(cmd.OutOrStdout())
 
-			ids, err := resolveImportIDs(args, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo)
+			ids, err := resolveImportIDs(printer, args, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo)
 			if err != nil {
 				return err
 			}
@@ -622,7 +622,7 @@ token with variable-write permissions and --repo).`,
 
 // resolveImportIDs takes the command arguments and flags and returns the
 // OpenAI WIF config. Flags take precedence over the JSON file.
-func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo string) (config.OpenAIWIFConfig, error) {
+func resolveImportIDs(printer *ui.Printer, args []string, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo string) (config.OpenAIWIFConfig, error) {
 	var ids config.OpenAIWIFConfig
 
 	// Load from JSON file if provided.
@@ -639,8 +639,16 @@ func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagS
 		// whose provider block and reply disagree, so the conflict is
 		// only fatal when the operator has not already answered it.
 		reply, err := doc.resolved()
-		if err != nil && flagAudience == "" {
-			return ids, err
+		if err != nil {
+			if flagAudience == "" {
+				return ids, err
+			}
+			// --audience answers the ambiguity, but the operator should
+			// still hear that the file contradicts itself: the mapping
+			// was written against one of the two values, and only they
+			// know which.
+			printer.StepWarn(err.Error())
+			printer.StepInfo("Using --audience " + flagAudience + "; make sure it is the audience the mapping asserts")
 		}
 		ids.Audience = reply.Audience
 		ids.IdentityProviderID = reply.IdentityProviderID
