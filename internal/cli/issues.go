@@ -194,7 +194,7 @@ func newIssuesPostCommentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "post-comment",
 		Short: "Post or update a sticky comment on an issue",
-		Long: `Posts a comment with a hidden HTML marker on an issue. On first
+		Long: `Posts a comment with a sticky marker on an issue. On first
 run, creates a new comment. On re-runs, finds the existing comment
 by its marker and edits in-place, collapsing old content into
 <details> blocks. This prevents comment flooding on re-runs.
@@ -229,7 +229,7 @@ The --result flag accepts a file path or "-" for stdin.`,
 	cmd.Flags().StringVar(&cfg.trackerName, "tracker", "", "tracker backend: github, gitlab, or jira (required unless a default is set via config)")
 	cmd.Flags().StringVar(&cfg.project, "project", "", "project identifier: owner/repo (GitHub/GitLab) or project key (Jira) (required)")
 	cmd.Flags().IntVar(&cfg.number, "number", 0, "issue number (required)")
-	cmd.Flags().StringVar(&cfg.marker, "marker", "", "hidden HTML marker to identify this agent's comments (required)")
+	cmd.Flags().StringVar(&cfg.marker, "marker", "", "sticky marker to identify this agent's comments (required)")
 	cmd.Flags().StringVar(&cfg.result, "result", "-", "path to comment body file, or '-' for stdin")
 	cmd.Flags().StringVar(&cfg.token, "token", "", "API token (default: env var per tracker)")
 	cmd.Flags().StringVar(&cfg.jiraURL, "jira-url", "", "Jira instance URL (default: $JIRA_BASE_URL)")
@@ -344,7 +344,7 @@ func postJiraStickyComment(ctx context.Context, jc *tracker.JiraClient, project 
 		// markers and the property-based path where oldBody has no
 		// marker). The new body is passed without the marker prefix
 		// because the marker lives in a property, not the visible body.
-		oldBody := string(jira.ADFToMarkdown(existing.Body))
+		oldBody := jira.ADFToMarkdown(existing.Body)
 		newBody := sticky.BuildUpdatedBody(oldBody, body, cfg)
 
 		if cfg.DryRun {

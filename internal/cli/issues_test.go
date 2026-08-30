@@ -482,11 +482,13 @@ func TestRunIssuesPostComment_JiraCapsStickyMaxSize(t *testing.T) {
 	require.NoError(t, err)
 	ctx := context.Background()
 
-	// Sized to land in the 32-65 KiB band called out by the review: over
-	// Jira's MarkdownToADF limit (jira.MaxMarkdownBytes = 32 KiB) but
-	// under sticky's own default cap (65000), so only a tracker-aware
-	// MaxSize catches it.
-	firstBody := strings.Repeat("a", 30000)
+	// Under jira.MaxMarkdownBytes individually (so MarkdownToADF accepts
+	// it on the first run), but large enough that the second-run body —
+	// "second run" plus a <details> wrapper around this history — exceeds
+	// jira.MaxMarkdownBytes, forcing the Jira-aware MaxSize cap to trim
+	// the history rather than assembling a body that would fail once it
+	// reaches Jira's MarkdownToADF.
+	firstBody := strings.Repeat("a", 32700)
 
 	cfg := &issuesPostCommentConfig{
 		trackerName: trackerJira,
@@ -506,10 +508,10 @@ func TestRunIssuesPostComment_JiraCapsStickyMaxSize(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, comments, 1)
 
-	// Combining "second run" with the collapsed 30 KB history would
-	// exceed jira.MaxMarkdownBytes, so the Jira path must trim the
-	// history rather than assembling a body that would fail once it
-	// reaches Jira's MarkdownToADF.
+	// The collapsed ~32 KB history plus "second run" and its <details>
+	// wrapper exceeds jira.MaxMarkdownBytes, so the Jira path must
+	// trim the history rather than assembling a body that would fail
+	// once it reaches Jira's MarkdownToADF.
 	assert.LessOrEqual(t, len(comments[0].Body), jira.MaxMarkdownBytes)
 	assert.Contains(t, string(comments[0].Body), "second run")
 }
