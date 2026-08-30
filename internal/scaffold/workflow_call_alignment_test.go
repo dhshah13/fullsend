@@ -841,6 +841,9 @@ func TestWorkItemKeyEnvCompatibility(t *testing.T) {
 			`._normalized_event.entity.key // .issue.number // .pull_request.number // empty`)
 		assert.Contains(t, exportSection,
 			`if ._normalized_event.source.system == "jira" then empty`)
+		assert.Contains(t, exportSection, `echo "work_item_key<<${DELIM}"`)
+		assert.Contains(t, exportSection, `printf '%s' "${WORK_ITEM_KEY}"`)
+		assert.NotContains(t, exportSection, `echo "work_item_key=${WORK_ITEM_KEY}"`)
 
 		runSection := extractStepSection(t, content, "Run harness agent")
 		assert.Contains(t, runSection,

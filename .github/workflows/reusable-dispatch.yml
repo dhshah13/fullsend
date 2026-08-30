@@ -1767,7 +1767,10 @@ jobs:
             printf '%s' "${URL}"
             echo
             echo "${DELIM}"
-            echo "work_item_key=${WORK_ITEM_KEY}"
+            echo "work_item_key<<${DELIM}"
+            printf '%s' "${WORK_ITEM_KEY}"
+            echo
+            echo "${DELIM}"
             echo "issue_number=${ISSUE_NUMBER}"
           } >> "${GITHUB_OUTPUT}"
 
