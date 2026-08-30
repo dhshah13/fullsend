@@ -352,13 +352,13 @@ regenerates this document with it.
 
 ## Service account mappings
 
-One mapping per repository. Assertions are exact scalar values, AND-ed
-within a mapping and OR-ed across mappings. One trailing wildcard with a
-non-empty prefix is permitted per assertion value (e.g.
-` + "`" + `refs/pull/*` + "`" + `). Do not assert ` + "`" + `repository_owner` + "`" + `, ` + "`" + `workflow_ref` + "`" + ` or
-` + "`" + `sub` + "`" + ` (fullsend starts agent runs from several workflow files in the
-repository, so any single value would exclude the others). Do **not**
-create an API key for the service account.
+One mapping per repository. Assertions are exact scalar values, AND-ed within a
+mapping and OR-ed across mappings; one trailing wildcard with a non-empty prefix
+is permitted per value (e.g. ` + "`" + `refs/pull/*` + "`" + `). Do not assert
+` + "`" + `repository_owner` + "`" + `, ` + "`" + `workflow_ref` + "`" + ` or ` + "`" + `sub` + "`" + `: a fullsend installation starts agent
+runs from more than one workflow file, so any single value would exclude the
+others.
+Do **not** create an API key for the service account.
 {{ range .Mappings }}
 ### {{ .Repository }}{{ if .Assertions.Ref }} (ref: ` + "`" + `{{ .Assertions.Ref }}` + "`" + `){{ end }}
 
