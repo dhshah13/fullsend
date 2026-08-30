@@ -1470,3 +1470,110 @@ func TestGolden_ExplicitRef_MultiRepo(t *testing.T) {
 	// Reply still has one entry per repo, not per mapping.
 	assert.Len(t, doc.Reply.ServiceAccountIDs, 2)
 }
+
+func TestImport_RefusesADocumentThatDisagreesAboutTheAudience(t *testing.T) {
+	// The generated document pre-fills reply.audience, so an administrator
+	// who reuses a provider and edits only the provider block leaves the two
+	// disagreeing. Recording either one silently configures an audience no
+	// mapping asserts, and every exchange then fails far from the cause.
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "proj-1", "", "")
+	doc.Reply.IdentityProviderID = "idp_live"
+	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_live"
+	doc.Provider.Audience = "corp-existing-audience"
+
+	b, err := json.MarshalIndent(doc, "", "  ")
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "reply.json")
+	require.NoError(t, os.WriteFile(path, b, 0o644))
+
+	_, err = resolveImportIDs([]string{path}, "", "", "", "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "corp-existing-audience")
+	assert.Contains(t, err.Error(), "fullsend://acme")
+
+	// --audience is the documented way out of the ambiguity.
+	ids, err := resolveImportIDs([]string{path}, "corp-existing-audience", "", "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "corp-existing-audience", ids.Audience)
+}
+
+func TestRequestMarkdown_ReplyListsEachRepositoryOnce(t *testing.T) {
+	// --ref emits two mappings per repository; the reply table asks for one
+	// service account per repository, not one per mapping.
+	md, err := renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", "refs/heads/main"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(md, "Service account ID for acme/widget"),
+		"one reply row per repository, however many mappings it takes")
+}
+
+func TestBuildRequestDoc_ExplicitPullRefEmitsOneMapping(t *testing.T) {
+	// --ref refs/pull/* asks for the mapping the companion already provides.
+	doc := buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", openAIPullRefPattern)
+	require.Len(t, doc.Mappings, 1)
+	assert.Equal(t, openAIPullRefPattern, doc.Mappings[0].Assertions.Ref)
+}
+
+func TestRequestCmd_RejectsARefThatIsNotARef(t *testing.T) {
+	cmd := newInferenceOpenAIRequestCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"acme/widget", "--audience", "aud", "--ref", "main"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refs/heads/main")
+}
+
+func TestRequestCmd_WarnsWhenMappingsExceedTheProviderLimit(t *testing.T) {
+	repos := make([]string, 0, 26)
+	for i := 0; i < 26; i++ {
+		repos = append(repos, fmt.Sprintf("acme/widget-%d", i))
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := newInferenceOpenAIRequestCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{strings.Join(repos, ","), "--audience", "aud", "--ref", "refs/heads/main"})
+	require.NoError(t, cmd.Execute())
+	assert.Contains(t, stderr.String(), "exceeds OpenAI's limit of 50")
+	assert.Contains(t, stderr.String(), "--ref emits two mappings")
+
+	// 25 repositories with --ref is exactly the cap, so it must not warn.
+	var quietOut, quietErr bytes.Buffer
+	quiet := newInferenceOpenAIRequestCmd()
+	quiet.SetOut(&quietOut)
+	quiet.SetErr(&quietErr)
+	quiet.SetArgs([]string{strings.Join(repos[:25], ","), "--audience", "aud", "--ref", "refs/heads/main"})
+	require.NoError(t, quiet.Execute())
+	assert.NotContains(t, quietErr.String(), "exceeds OpenAI's limit")
+}
+
+func TestOpenAIEnrolment_RefusesOrgModeConfig(t *testing.T) {
+	// Org install mode is deprecated (ADR 0044): both entry points must say
+	// so by name rather than reporting "nothing configured".
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"), []byte(`version: 1
+org: acme
+repos:
+  acme/widget:
+    enabled: true
+`), 0o644))
+
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
+
+	_, err := resolveOpenAIStatusSources(fullsendDir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "org-mode config")
+
+	err = runImportConfig(ui.New(&bytes.Buffer{}), config.OpenAIWIFConfig{
+		Audience:           "aud",
+		IdentityProviderID: "idp",
+		ServiceAccountID:   "sa",
+	}, fullsendDir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "org-mode config")
+}

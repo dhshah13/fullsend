@@ -42,6 +42,10 @@ const (
 	// mappings. OpenAI allows one trailing wildcard with a non-empty
 	// prefix.
 	openAIPullRefPattern = "refs/pull/*"
+
+	// openAIMaxMappingsPerProvider is OpenAI's documented ceiling on
+	// service-account mappings per identity provider.
+	openAIMaxMappingsPerProvider = 50
 )
 
 // --- request command ---
@@ -99,8 +103,8 @@ import the reply into fullsend configuration, and check the
 exchange status.
 
 'request' and 'import' produce a document and update local
-configuration. 'import --variables' calls the GitHub API through gh to
-set repository variables, and 'status' performs one OpenAI token
+configuration. 'import --variables' calls the GitHub API through the
+forge client to set repository variables, and 'status' performs one OpenAI token
 exchange when it runs inside a GitHub Actions job with id-token: write.
 No OpenAI API key is used or created by any of them.`,
 	}
@@ -147,6 +151,14 @@ Output formats:
 			serviceAccount = strings.TrimSpace(serviceAccount)
 			ref = strings.TrimSpace(ref)
 
+			// The assertion is compared literally against the OIDC ref
+			// claim, which always starts with refs/. A value that does
+			// not is a mapping no run can ever match, and the failure
+			// would only surface as a 4xx at exchange time.
+			if ref != "" && !strings.HasPrefix(ref, "refs/") {
+				return fmt.Errorf("--ref must be a full git ref such as refs/heads/main (got %q)", ref)
+			}
+
 			// The default audience is derived from the owner, so every
 			// repository in one request must share it — otherwise the
 			// second owner's mapping would silently carry the first
@@ -160,6 +172,17 @@ Output formats:
 			}
 
 			doc := buildRequestDoc(repos, audience, project, serviceAccount, ref)
+
+			// OpenAI caps a provider at 50 mappings and --ref emits two
+			// per repository, so a large enrolment can produce a
+			// document the administrator cannot install as written.
+			if len(doc.Mappings) > openAIMaxMappingsPerProvider {
+				printer := ui.New(cmd.ErrOrStderr())
+				printer.StepWarn(fmt.Sprintf(
+					"%d mappings for %d repositories exceeds OpenAI's limit of %d per provider%s — split the enrolment across providers, or ask for a second provider",
+					len(doc.Mappings), len(repos), openAIMaxMappingsPerProvider,
+					map[bool]string{true: " (--ref emits two mappings per repository)", false: ""}[ref != ""]))
+			}
 
 			var output string
 			switch format {
@@ -263,6 +286,10 @@ func defaultServiceAccountID(repo string) string {
 
 func buildRequestDoc(repos []string, audience, project, serviceAccount, ref string) openAIRequestDoc {
 	ref = strings.TrimSpace(ref)
+	// An explicit --ref refs/pull/* asks for the mapping the companion
+	// already provides; emitting both spends two of the fifty mapping
+	// slots on one identical assertion.
+	companion := ref != "" && ref != openAIPullRefPattern
 	doc := openAIRequestDoc{
 		Version: openAIRequestSchemaVersion,
 		Provider: openAIRequestProvider{
@@ -312,7 +339,7 @@ func buildRequestDoc(repos []string, audience, project, serviceAccount, ref stri
 		}
 		doc.Mappings = append(doc.Mappings, mapping)
 
-		if ref != "" {
+		if companion {
 			// Companion mapping for PR-review-triggered runs.
 			pullMapping := openAIRequestMapping{
 				Repository: repo,
@@ -377,7 +404,7 @@ Please provide the following identifiers so we can configure the repository:
 |---|---|
 | Identity provider ID | *(from the provider you created or reused)* |
 | Provider's audience | ` + "`" + `{{ .Reply.Audience }}` + "`" + ` *(confirm or update if different)* |
-{{ range .Mappings }}| Service account ID for {{ .Repository }} | *(from the mapping above)* |
+{{ range $repo, $_ := .Reply.ServiceAccountIDs }}| Service account ID for {{ $repo }} | *(from the mapping above)* |
 {{ end }}
 These identifiers are not secrets — they grant nothing on their own.
 The mapping only trusts a GitHub OIDC token whose claims match.
@@ -419,20 +446,37 @@ type openAIReplyDoc struct {
 }
 
 // resolved folds a full request document into the reply shape.
-func (d openAIReplyDoc) resolved() openAIReplyDoc {
+//
+// The audience appears twice in a generated document — in the provider
+// block and pre-filled in the reply — and the mapping was written
+// against exactly one of them. An administrator reusing an existing
+// provider edits whichever they read first, so a document where the two
+// disagree is ambiguous rather than merely redundant: picking either
+// silently configures the repository with an audience no mapping
+// asserts, and every exchange then fails with a 4xx far from its cause.
+func (d openAIReplyDoc) resolved() (openAIReplyDoc, error) {
+	providerAudience := ""
+	if d.Provider != nil {
+		providerAudience = strings.TrimSpace(d.Provider.Audience)
+	}
+
 	if d.Reply == nil {
-		return d
+		if d.Audience == "" {
+			d.Audience = providerAudience
+		} else if err := checkAudienceAgreement(d.Audience, providerAudience); err != nil {
+			return d, err
+		}
+		return d, nil
 	}
 	out := *d.Reply
 	out.Reply = nil
 	if out.Audience == "" {
 		out.Audience = d.Audience
 	}
-	// reply.audience wins, then the provider block: an administrator who
-	// reused a provider updates one of the two, and the mapping was
-	// written against whichever they set.
-	if out.Audience == "" && d.Provider != nil {
-		out.Audience = d.Provider.Audience
+	if out.Audience == "" {
+		out.Audience = providerAudience
+	} else if err := checkAudienceAgreement(out.Audience, providerAudience); err != nil {
+		return out, err
 	}
 	if out.IdentityProviderID == "" {
 		out.IdentityProviderID = d.IdentityProviderID
@@ -443,7 +487,19 @@ func (d openAIReplyDoc) resolved() openAIReplyDoc {
 	if len(out.ServiceAccountIDs) == 0 {
 		out.ServiceAccountIDs = d.ServiceAccountIDs
 	}
-	return out
+	return out, nil
+}
+
+// checkAudienceAgreement refuses a document whose provider block and
+// reply disagree about the audience.
+func checkAudienceAgreement(replyAudience, providerAudience string) error {
+	if providerAudience == "" || strings.TrimSpace(replyAudience) == providerAudience {
+		return nil
+	}
+	return fmt.Errorf(
+		"the document disagrees with itself about the audience: provider.audience is %q but reply.audience is %q — "+
+			"set both to the audience the mapping actually asserts, or pass --audience to override the file",
+		providerAudience, replyAudience)
 }
 
 // serviceAccountFor picks the service account for repo out of a reply.
@@ -568,7 +624,13 @@ func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagS
 		if err := json.Unmarshal(data, &doc); err != nil {
 			return ids, fmt.Errorf("parsing reply JSON: %w", err)
 		}
-		reply := doc.resolved()
+		// An explicit --audience is the documented way past a document
+		// whose provider block and reply disagree, so the conflict is
+		// only fatal when the operator has not already answered it.
+		reply, err := doc.resolved()
+		if err != nil && flagAudience == "" {
+			return ids, err
+		}
 		ids.Audience = reply.Audience
 		ids.IdentityProviderID = reply.IdentityProviderID
 		// An explicit --service-account-id is the answer to the very

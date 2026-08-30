@@ -157,10 +157,13 @@ path's `attribute.repository` scoping: `issues`, `issue_comment`, and `pull_requ
 carry the default branch ref, while `pull_request_review` events carry `refs/pull/<N>/merge`. A
 repository-only mapping covers all of them.
 
-Anyone who can merge to the default branch can add a workflow with `permissions: id-token: write`
-that obtains a model token: the mapping's blast radius is "write access to this repository", and
-the service account's spend limit is what bounds it. That is the trade for not asserting
-`workflow_ref`, which cannot cover fullsend's several agent workflow files with one value.
+Anyone with write access can obtain a model token: pushing a branch with a workflow that has
+`permissions: id-token: write` is enough, since a same-repository `pull_request` run executes the
+workflow from that branch — no merge to the default branch required. The mapping's blast radius is
+"write access to this repository", and the service account's spend limit is what bounds it. That is
+the trade for not asserting `workflow_ref`, which cannot cover fullsend's agent workflow files with
+one value. fullsend's own dispatch authorization governs which agent runs *fullsend* starts; it does
+not stand between such a workflow and OpenAI's token endpoint.
 
 GitHub mints the token for the repository the job runs in, so the agent jobs fullsend starts for
 pull requests from forks are covered too (they run in your repository, not the fork). Fork handling
