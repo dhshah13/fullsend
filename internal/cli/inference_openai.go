@@ -364,6 +364,12 @@ func buildRequestDoc(repos []string, audience, project, serviceAccount, ref stri
 }
 
 // requestMarkdownTmpl matches the guide's route-B template structure.
+//
+// The reply table ranges over Reply.ServiceAccountIDs rather than over
+// Mappings: --ref emits two mappings per repository, and the
+// administrator fills in one service account per repository, not one
+// per mapping. Row order stays stable because text/template visits map
+// keys in sorted order, unlike a bare range over a map in Go.
 var requestMarkdownTmpl = template.Must(template.New("request").Parse(`# OpenAI Workload Identity Federation Request
 
 ## Provider (reuse or create)
@@ -382,13 +388,15 @@ regenerates this document with it.
 
 ## Service account mappings
 
-One mapping per repository. Assertions are exact scalar values, AND-ed within a
-mapping and OR-ed across mappings; one trailing wildcard with a non-empty prefix
-is permitted per value (e.g. ` + "`" + `refs/pull/*` + "`" + `). Do not assert
-` + "`" + `repository_owner` + "`" + `, ` + "`" + `workflow_ref` + "`" + ` or ` + "`" + `sub` + "`" + `: a fullsend installation starts agent
-runs from more than one workflow file, so any single value would exclude the
-others.
-Do **not** create an API key for the service account.
+One mapping per repository, with these rules:
+
+- Assertions are exact scalar values, AND-ed within a mapping and OR-ed across
+  mappings; one trailing wildcard with a non-empty prefix is permitted per value
+  (e.g. ` + "`" + `refs/pull/*` + "`" + `).
+- Do not assert ` + "`" + `repository_owner` + "`" + `, ` + "`" + `workflow_ref` + "`" + ` or ` + "`" + `sub` + "`" + `: a fullsend
+  installation starts agent runs from more than one workflow file, so any single
+  value would exclude the others.
+- Do **not** create an API key for the service account.
 {{ range .Mappings }}
 ### {{ .Repository }}{{ if .Assertions.Ref }} (ref: ` + "`" + `{{ .Assertions.Ref }}` + "`" + `){{ end }}
 
