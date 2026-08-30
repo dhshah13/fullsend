@@ -147,11 +147,19 @@ Two things not to do:
 - **Do not assert `repository_owner`, a prefix or any pattern instead of `repository`** — see the
   per-repository rule above.
 
-**Which runs this mapping trusts.** `ref` = `refs/heads/main` covers every fullsend agent workflow
-as installed on `main`, and GitHub mints the token for the repository the job runs in — so the
-agent jobs fullsend starts for pull requests from forks are covered too (they run in your
-repository, not the fork). What keeps an untrusted actor from starting such a run is fullsend's own
-dispatch authorization (only events from people with write access trigger agents), not the mapping.
+**Which runs this mapping trusts.** Be precise about this, because it is the boundary you are
+setting: the mapping trusts **any job in that repository, at that ref, that can request an OIDC
+token** — not one named workflow. `ref` = `refs/heads/main` covers every fullsend agent workflow as
+installed on `main`, and it equally covers any other workflow on `main` with
+`permissions: id-token: write`. Anyone who can merge to `main` can therefore add a workflow that
+obtains a model token: the mapping's blast radius is "write access to this repository", and the
+service account's spend limit is what bounds it. That is the trade for not asserting `workflow_ref`,
+which cannot cover fullsend's several agent workflow files with one value.
+
+GitHub mints the token for the repository the job runs in, so the agent jobs fullsend starts for
+pull requests from forks are covered too (they run in your repository, not the fork). What keeps an
+untrusted *contributor* from starting such a run is fullsend's own dispatch authorization (only
+events from people with write access trigger agents), not the mapping.
 If you want the mapping itself to exclude some triggers, add a claim the untrusted runs cannot
 carry — for example a GitHub `environment` that the agent jobs reference and that protects itself
 with required reviewers — and assert `environment == "<name>"` here. A `workflow_dispatch` of a
@@ -261,9 +269,12 @@ and the provider ID are typically the same for every repository and only the ser
 nothing. OpenAI issues a token only to a caller presenting a GitHub OIDC token whose claims match
 a mapping, and only your repository's `main` workflow can obtain one. fullsend reads
 `.fullsend/config.yaml` from the base branch for pull-request events, so a pull request cannot
-change them for the run that reviews it. The worst thing someone with write access could do is
-point the block at their own OpenAI organization — and pay for your runs. fullsend prints the three
-values in the run log so you can always see which mapping a run used.
+change them for the run that reviews it. Someone with write access could point the block at their
+own OpenAI organization — and pay for their own runs — but note that write access already carries
+the greater power described under [A3](#a3-map-the-repository-to-a-service-account-route-a): a
+workflow they merge to `main` can obtain a model token from your mapping. Guard write access and the
+project's spend limit accordingly. fullsend prints the three values in the run log so you can always
+see which mapping a run used.
 
 If you would rather keep them out of the repository, set them as **repository variables** instead
 (Settings → Secrets and variables → Actions → Variables): `FULLSEND_OPENAI_AUDIENCE`,

@@ -497,6 +497,7 @@ func TestResolveOpenAIStatusSources_FromConfig(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 
 	s, err := resolveOpenAIStatusSources(fullsendDir)
 	require.NoError(t, err)
@@ -531,6 +532,7 @@ func TestResolveOpenAIStatusSources_VariablesWinAsASet(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "from-env")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 
 	s, err := resolveOpenAIStatusSources(fullsendDir)
 	require.NoError(t, err)
@@ -558,6 +560,7 @@ func TestResolveOpenAIStatusSources_MalformedConfigIsAnError(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 
 	_, err := resolveOpenAIStatusSources(fullsendDir)
 	require.Error(t, err, "a broken config must not read as 'not configured yet'")
@@ -570,6 +573,7 @@ func TestResolveOpenAIStatusSources_NoConfig(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 
 	s, err := resolveOpenAIStatusSources(fullsendDir)
 	require.NoError(t, err)
@@ -585,6 +589,7 @@ func TestRunInferenceOpenAIStatus_NoConfig(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 	// CI itself sets this; the command must behave the same either way.
@@ -616,6 +621,7 @@ func TestRunInferenceOpenAIStatus_PartialConfig(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 
@@ -647,6 +653,7 @@ func TestRunInferenceOpenAIStatus_FullConfigNoActions(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 
@@ -779,6 +786,7 @@ func TestInferenceOpenAIStatusCmd_DoesNotRequireGitHubToken(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 
@@ -1018,6 +1026,7 @@ func TestRunInferenceOpenAIStatus_RefusesToTestAnotherRepository(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 	// A job that does have an OIDC endpoint, but belongs to another repo.
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-token")
@@ -1053,6 +1062,7 @@ func TestRunInferenceOpenAIStatus_ExchangesForItsOwnRepository(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-token")
 	t.Setenv("GITHUB_REPOSITORY", "acme/widget")
@@ -1087,6 +1097,7 @@ func TestRunInferenceOpenAIStatus_OverBroadScopeFailsClosed(t *testing.T) {
 	t.Setenv(openAIAudienceEnv, "")
 	t.Setenv(openAIIdentityProviderIDEnv, "")
 	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-token")
 	t.Setenv("GITHUB_REPOSITORY", "acme/widget")
@@ -1103,4 +1114,144 @@ func TestRunInferenceOpenAIStatus_OverBroadScopeFailsClosed(t *testing.T) {
 	err := cmd.Execute()
 	require.Error(t, err, "a run refuses a broader token, so status must not call it healthy")
 	assert.Contains(t, err.Error(), "refused")
+}
+
+func TestRunInferenceOpenAIStatus_OverBroadScopeNeverPrintsSuccess(t *testing.T) {
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"), []byte(`inference:
+  openai:
+    audience: fullsend://acme
+    identity_provider_id: idp_123
+    service_account_id: sa_456
+`), 0o644))
+
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-token")
+	t.Setenv("GITHUB_REPOSITORY", "acme/widget")
+
+	stubOpenAIExchange(t, func(context.Context, openaiwif.Config) (*openaiwif.Token, error) {
+		return &openaiwif.Token{Value: "tok-abcdef123456", ExpiresAt: time.Now().Add(time.Hour), Scope: "api.model.request api.admin"}, nil
+	})
+
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget", "--fullsend-dir", fullsendDir})
+	require.Error(t, cmd.Execute())
+	assert.NotContains(t, buf.String(), "Exchange succeeded",
+		"a token the run path refuses must never be announced as a success")
+}
+
+func TestRunInferenceOpenAIStatus_UnknownJobRepositoryFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"), []byte(`inference:
+  openai:
+    audience: fullsend://acme
+    identity_provider_id: idp_123
+    service_account_id: sa_456
+`), 0o644))
+
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-token")
+	t.Setenv("GITHUB_REPOSITORY", "")
+
+	exchanged := false
+	stubOpenAIExchange(t, func(context.Context, openaiwif.Config) (*openaiwif.Token, error) {
+		exchanged = true
+		return &openaiwif.Token{Value: "tok-abcdef123456", ExpiresAt: time.Now().Add(time.Hour), Scope: "api.model.request"}, nil
+	})
+
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "status", "acme/widget", "--fullsend-dir", fullsendDir})
+	require.NoError(t, cmd.Execute())
+	assert.False(t, exchanged, "with no job repository there is nothing to attribute the exchange to")
+	assert.Contains(t, buf.String(), "GITHUB_REPOSITORY is not set")
+}
+
+func TestResolveOpenAIStatusSources_StaticKeyWinsOffActions(t *testing.T) {
+	// resolveOpenAICredential ignores the committed block when there is
+	// no OIDC endpoint and OPENAI_API_KEY is set; status must say the
+	// same, or it would describe a run that cannot happen.
+	dir := t.TempDir()
+	fullsendDir := filepath.Join(dir, ".fullsend")
+	require.NoError(t, os.MkdirAll(fullsendDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(fullsendDir, "config.yaml"), []byte(`inference:
+  openai:
+    audience: fullsend://acme
+    identity_provider_id: idp_123
+    service_account_id: sa_456
+`), 0o644))
+
+	t.Setenv(openAIAudienceEnv, "")
+	t.Setenv(openAIIdentityProviderIDEnv, "")
+	t.Setenv(openAIServiceAccountIDEnv, "")
+	t.Setenv(openAIStaticKeyEnv, "")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+	t.Setenv(openAIStaticKeyEnv, "sk-local-developer-key")
+
+	s, err := resolveOpenAIStatusSources(fullsendDir)
+	require.NoError(t, err)
+	assert.Equal(t, "static key", s.Source)
+	assert.Empty(t, s.Audience, "the committed block is not what a run here would use")
+
+	// With an OIDC endpoint the block applies again, as it does for a run.
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://oidc.example/token")
+	s, err = resolveOpenAIStatusSources(fullsendDir)
+	require.NoError(t, err)
+	assert.Equal(t, "config.yaml", s.Source)
+	assert.Equal(t, "fullsend://acme", s.Audience)
+}
+
+func TestImport_ServiceAccountFlagResolvesAnAmbiguousReply(t *testing.T) {
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc.Reply.IdentityProviderID = "idp_live"
+	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_widget"
+	doc.Reply.ServiceAccountIDs["acme/gadget"] = "sa_gadget"
+	b, err := json.MarshalIndent(doc, "", "  ")
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "reply.json")
+	require.NoError(t, os.WriteFile(path, b, 0o644))
+
+	ids, err := resolveImportIDs([]string{path}, "", "", "sa_chosen", "")
+	require.NoError(t, err, "--service-account-id is the answer to the ambiguity, not a value applied after failing on it")
+	assert.Equal(t, "sa_chosen", ids.ServiceAccountID)
+}
+
+func TestImport_RepoSelectionIsCaseInsensitive(t *testing.T) {
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc.Reply.IdentityProviderID = "idp_live"
+	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_widget"
+	doc.Reply.ServiceAccountIDs["acme/gadget"] = "sa_gadget"
+	b, err := json.MarshalIndent(doc, "", "  ")
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "reply.json")
+	require.NoError(t, os.WriteFile(path, b, 0o644))
+
+	ids, err := resolveImportIDs([]string{path}, "", "", "", "Acme/Widget")
+	require.NoError(t, err, "GitHub matches owner/repo case-insensitively")
+	assert.Equal(t, "sa_widget", ids.ServiceAccountID)
+}
+
+func TestParseRepoList_DedupesCaseInsensitively(t *testing.T) {
+	repos, err := parseRepoList("acme/widget,Acme/Widget,acme/gadget")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"acme/widget", "acme/gadget"}, repos)
+
+	// The same rule keeps the mixed-owner guard honest.
+	assert.Equal(t, []string{"acme"}, repoOwners([]string{"acme/widget", "Acme/gadget"}))
 }

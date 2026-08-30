@@ -87,7 +87,15 @@ Read-only — makes no changes.
 
 Commands for enrolling repositories with OpenAI Workload Identity Federation (see the [operator guide](../guides/infrastructure/openai-workload-identity.md)). They need neither GCP access nor an OpenAI key.
 
-`request` and `import` never reach the network: they produce a document and update local configuration. `status` reads configuration too, and — only when run inside a GitHub Actions job with `id-token: write` — performs one token exchange with OpenAI to prove the mapping accepts that repository, reporting the granted scope and expiry without ever printing the token.
+What reaches the network, and what does not:
+
+| Command | Network |
+|---|---|
+| `request` | None. The document is computed from the repository names. |
+| `import` | None, unless `--variables` is passed: that calls the GitHub API through `gh` to set the three repository variables. |
+| `status` | Reads configuration only, except inside a GitHub Actions job with `id-token: write`, where it performs one token exchange with OpenAI to prove the mapping accepts *that* job's repository — reporting the granted scope and expiry, never the token. |
+
+No OpenAI API key is used or created by any of them.
 
 ### `inference openai request`
 
@@ -98,6 +106,7 @@ fullsend inference openai request <owner/repo>[,<owner/repo>…] \
   [--audience "<audience>"] \
   [--project "<openai-project>"] \
   [--service-account "<existing-sa-id>"] \
+  [--ref "refs/heads/<branch>"] \
   [--format json|md] \
   [--out <file>]
 ```
@@ -106,13 +115,16 @@ fullsend inference openai request <owner/repo>[,<owner/repo>…] \
 |------|---------|-------------|
 | `--audience` | `fullsend://<owner>` | OpenAI Workload Identity audience |
 | `--project` | *(empty)* | OpenAI project name or ID for the service accounts |
-| `--service-account` | `fullsend-<repo>-ci` | Existing service account ID (default: one per repo) |
+| `--service-account` | `fullsend-<repo>-ci` | Existing service account ID to map (default: ask for one to be created per repository) |
+| `--ref` | `refs/heads/main` | The `ref` assertion: the branch fullsend's agent workflows run from. Assertions are exact, so a repository whose default branch is not `main` needs this or every exchange fails |
 | `--format` | `json` | Output format: `json` (versioned schema) or `md` (copy-paste ticket) |
 | `--out` | *(stdout)* | Write output to a file |
 
 ### `inference openai import`
 
-Takes the administrator's reply and writes `inference.openai` into `.fullsend/config.yaml` through the same setters as `fullsend github setup --openai-*`. All three identifiers must be present — a partial trio is refused.
+Takes the administrator's reply and writes `inference.openai` into `.fullsend/config.yaml` through the same setters as `fullsend github setup --openai-*`. All three identifiers must be present — a partial trio is refused, and the config is validated before it is written.
+
+The reply file may be either the bare reply object or the whole document `request --format json` produced with its `reply` section filled in — an administrator can edit and return the same file. When it names service accounts for several repositories, pass `--repo <owner/repo>` to choose one, or `--service-account-id` to give the value outright.
 
 ```bash
 # From a reply JSON file:
@@ -139,7 +151,7 @@ fullsend inference openai import \
 | `--service-account-id` | | OpenAI service account ID |
 | `--fullsend-dir` | `.fullsend` | Path to the .fullsend configuration directory |
 | `--variables` | `false` | Set `FULLSEND_OPENAI_*` repository variables instead of config.yaml |
-| `--repo` | | Target repository (`owner/repo`) for `--variables` |
+| `--repo` | | Two roles: the target repository for `--variables`, and the repository to select from a reply that names several (`service_account_ids`). Matched case-insensitively |
 
 ### `inference openai status`
 

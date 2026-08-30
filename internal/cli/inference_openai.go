@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	// openAIRequestSchemaVersion is the versioned schema for the request
-	// JSON, so a future `fullsend inference openai apply request.json`
-	// can submit it unchanged.
+	// openAIRequestSchemaVersion versions this interchange format so a
+	// document written by one release is readable by the next. OpenAI has
+	// no API for providers or mappings today, so it is deliberately not a
+	// claim about any future submission contract.
 	openAIRequestSchemaVersion = "1"
 
 	// defaultOpenAIAudiencePrefix is the default audience convention.
@@ -95,8 +96,11 @@ Federation. Generate a request document for your administrator,
 import the reply into fullsend configuration, and check the
 exchange status.
 
-These commands do not call the OpenAI API. They produce documents
-and update local configuration.`,
+'request' and 'import' produce a document and update local
+configuration. 'import --variables' calls the GitHub API through gh to
+set repository variables, and 'status' performs one OpenAI token
+exchange when it runs inside a GitHub Actions job with id-token: write.
+No OpenAI API key is used or created by any of them.`,
 	}
 	cmd.AddCommand(newInferenceOpenAIRequestCmd())
 	cmd.AddCommand(newInferenceOpenAIImportCmd())
@@ -211,13 +215,16 @@ func parseRepoList(arg string) ([]string, error) {
 		repos = append(repos, p)
 	}
 	// A duplicate would render as two identical mappings in the request.
+	// GitHub compares owner/repo case-insensitively, so Acme/Widget and
+	// acme/widget are the same repository; the first spelling is kept.
 	seen := make(map[string]bool, len(repos))
 	deduped := repos[:0]
 	for _, r := range repos {
-		if seen[r] {
+		key := strings.ToLower(r)
+		if seen[key] {
 			continue
 		}
-		seen[r] = true
+		seen[key] = true
 		deduped = append(deduped, r)
 	}
 	return deduped, nil
@@ -229,10 +236,11 @@ func repoOwners(repos []string) []string {
 	seen := make(map[string]bool, len(repos))
 	for _, r := range repos {
 		owner := strings.SplitN(r, "/", 2)[0]
-		if seen[owner] {
+		key := strings.ToLower(owner)
+		if seen[key] {
 			continue
 		}
-		seen[owner] = true
+		seen[key] = true
 		owners = append(owners, owner)
 	}
 	return owners
@@ -305,7 +313,10 @@ var requestMarkdownTmpl = template.Must(template.New("request").Parse(`# OpenAI 
 | Use uploaded JWKS for token verification | **Off** |
 
 If the organization already has a provider with a different audience,
-keep its audience and report it back (see Reply below).
+use that audience — in the mapping assertions below as well as in the
+Reply, since the two must match — and report it back. Re-running
+` + "`" + `fullsend inference openai request --audience "<the provider's audience>"` + "`" + `
+regenerates this document with it.
 
 ## Service account mappings
 
@@ -401,8 +412,10 @@ func (d openAIReplyDoc) serviceAccountFor(repo string) (string, error) {
 		}
 	}
 	if repo != "" {
-		if v, ok := filled[repo]; ok {
-			return v, nil
+		for k, v := range filled {
+			if strings.EqualFold(k, repo) {
+				return v, nil
+			}
 		}
 		if len(filled) > 0 {
 			keys := make([]string, 0, len(filled))
@@ -502,11 +515,16 @@ func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagS
 		reply := doc.resolved()
 		ids.Audience = reply.Audience
 		ids.IdentityProviderID = reply.IdentityProviderID
-		sa, err := reply.serviceAccountFor(repo)
-		if err != nil {
-			return ids, err
+		// An explicit --service-account-id is the answer to the very
+		// ambiguity serviceAccountFor reports, so it is applied first
+		// rather than after an error the operator was told to fix that way.
+		if flagServiceAccountID == "" {
+			sa, err := reply.serviceAccountFor(repo)
+			if err != nil {
+				return ids, err
+			}
+			ids.ServiceAccountID = sa
 		}
-		ids.ServiceAccountID = sa
 	}
 
 	// Flags override file values.
@@ -702,6 +720,16 @@ func resolveOpenAIStatusSources(fullsendDir string) (openAIStatusSource, error) 
 		return s, nil
 	}
 
+	// The run path ignores the committed block where an exchange is
+	// impossible and a static key is present — a developer's
+	// OPENAI_API_KEY is not overridden by the repository's CI
+	// configuration (run_openai.go, configApplies). Reporting the block
+	// as the source there would describe a run that will not happen.
+	if os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL") == "" && strings.TrimSpace(os.Getenv(openAIStaticKeyEnv)) != "" {
+		s.Source = "static key"
+		return s, nil
+	}
+
 	writer, err := config.LoadConfigWriter(fullsendDir, config.LoadOpts{MissingOK: true})
 	if err != nil {
 		// A malformed or unreadable config must not read as "nothing
@@ -747,6 +775,10 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 	}
 
 	if ids.IsZero() {
+		if sources.Source == "static key" {
+			printer.StepInfo(openAIStaticKeyEnv + " is set and this is not a GitHub Actions job, so a run here would use that key and ignore inference.openai — the same rule fullsend run applies")
+			return nil
+		}
 		printer.StepFail("No OpenAI WIF identifiers configured")
 		printer.StepInfo("Run 'fullsend inference openai import' or 'fullsend github setup --openai-*' to configure")
 		return nil
@@ -775,10 +807,17 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 	}
 
 	// Only now does the repository argument matter: an exchange proves
-	// the identity of the job it runs in, so checking another
-	// repository's name here would report a mapping as healthy on the
-	// strength of this repository's token.
-	if current := strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY")); current != "" && !strings.EqualFold(current, repo) {
+	// the identity of the job it runs in, so exchanging for another
+	// repository's name would report a mapping as healthy on the strength
+	// of this repository's token. An unknown job repository is refused
+	// too — without it there is nothing to attribute the result to.
+	current := strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))
+	switch {
+	case current == "":
+		printer.StepWarn("GITHUB_REPOSITORY is not set, so the exchange could not be attributed to " + repo)
+		printer.StepInfo("Run the command from a GitHub Actions job in " + repo)
+		return nil
+	case !strings.EqualFold(current, repo):
 		printer.StepWarn(fmt.Sprintf("This job runs in %s, so it cannot test %s: an exchange here would prove %s's mapping only", current, repo, current))
 		printer.StepInfo("Run the command from a job in " + repo + " to test its mapping")
 		return nil
@@ -800,6 +839,14 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 		return fmt.Errorf("OpenAI WIF exchange: %w", err)
 	}
 
+	// A token broader than model access is refused by `fullsend run`, so
+	// nothing may be reported as succeeded until the scope has passed.
+	warning, scopeErr := checkOpenAIScope(tok.Scope)
+	if scopeErr != nil {
+		printer.StepFail("Exchange refused: the mapping grants more than model access")
+		return fmt.Errorf("OpenAI WIF token refused: %w", scopeErr)
+	}
+
 	printer.StepDone("Exchange succeeded for " + repo)
 	printer.Blank()
 
@@ -810,13 +857,6 @@ func runInferenceOpenAIStatus(cmd *cobra.Command, printer *ui.Printer, repo, ful
 	printer.KeyValue("scope", scope)
 	printer.KeyValue("expires_in", time.Until(tok.ExpiresAt).Round(time.Second).String())
 
-	// A token broader than model access is refused by `fullsend run`, so
-	// it must not read as a healthy status here either.
-	warning, scopeErr := checkOpenAIScope(tok.Scope)
-	if scopeErr != nil {
-		printer.StepFail("The mapping grants more than model access")
-		return fmt.Errorf("OpenAI WIF token refused: %w", scopeErr)
-	}
 	if warning != "" {
 		printer.StepWarn(warning)
 	}
