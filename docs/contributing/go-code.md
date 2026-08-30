@@ -312,7 +312,7 @@ See [`forge.IsTransient`](../../internal/forge/forge.go) for the canonical examp
 ### Template map iteration
 
 Go's `text/template` `range` action visits map keys of basic types (string,
-int, float) in **sorted order** — unlike bare `range` over a map in Go code.
+int, uint, float) in **sorted order** — unlike bare `range` over a map in Go code.
 Do **not** flag `{{ range $k, $v := .SomeMap }}` in templates as
 non-deterministic when the key type is a basic type. See
 [text/template documentation](https://pkg.go.dev/text/template) (search
@@ -320,7 +320,7 @@ non-deterministic when the key type is a basic type. See
 
 **When reviewing PRs:** Do not flag `range` over a basic-type-keyed map
 inside a `text/template` as non-deterministic output. The `text/template`
-package guarantees sorted iteration for string, int, and float keys. This
+package guarantees sorted iteration for string, int, uint, and float keys. This
 is a well-documented exception to Go's general rule that map iteration
 order is unspecified.
 
