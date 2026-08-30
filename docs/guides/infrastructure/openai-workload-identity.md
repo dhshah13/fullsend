@@ -52,9 +52,10 @@ Either way, steps 4 and onwards are the same, and
 into the console; route B: the ticket to send), and `import` records the identifiers you end up with.
 
 > **The rule that holds in both routes: trust is per repository.** A mapping asserts
-> `repository == <your-github-org>/<repo>` (and `ref == refs/heads/main`) for each company-owned
-> repository you enrol — one mapping per repository (a mapping has no list form: its assertions are
-> exact values, all of which must match). Never a pattern over the organization
+> `repository == <your-github-org>/<repo>` for each company-owned repository you enrol — one
+> mapping per repository (a mapping has no list form: its assertions are exact scalar values, all of
+> which must match within a mapping, OR-ed across mappings). One trailing wildcard with a non-empty
+> prefix is permitted per assertion value (e.g. `refs/pull/*`). Never a pattern over the organization
 > (`repository_owner`, a name prefix, a derived attribute): a GitHub organization often contains
 > repositories the company does not own, and a pattern would let every one of them obtain your
 > token. Adding a repository later means adding its assertion; that is the gate, by design.
@@ -102,11 +103,13 @@ You will see something like:
 }
 ```
 
-For the real agent runs, `repository` and `ref` are the same as above; `workflow_ref` names whichever
-of the fullsend workflows installed in your repository started the run (`code.yml`, `triage.yml`,
-`review.yml`, `fix.yml`, `prioritize.yml`, `retro.yml` or `dispatch.yml` under `.github/workflows/`),
-and `job_workflow_ref` the pinned fullsend reusable workflow it calls — which is why a mapping asserts
-`repository` and `ref`, not `workflow_ref`. Delete the check workflow when you are done.
+For the real agent runs, `repository` is the same as above; `ref` depends on the triggering event
+(`refs/heads/main` for `issues` and `issue_comment`; `refs/pull/<N>/merge` for `pull_request_review`;
+the dispatched ref for `workflow_dispatch`). `workflow_ref` names whichever fullsend workflow started
+the run — a per-repo installation deploys `.github/workflows/fullsend.yaml` plus a thin `prioritize`
+caller, which invoke the vendored reusable dispatcher via `workflow_call` — and `job_workflow_ref` the
+pinned reusable workflow it calls. A mapping asserts `repository`, not `workflow_ref`, because the
+workflows vary. Delete the check workflow when you are done.
 
 ## A2. Add or reuse the identity provider (route A)
 
@@ -132,7 +135,7 @@ Open the provider and add a **service account mapping**:
 
 | Field | Enter |
 |---|---|
-| Claim assertions | `iss` = `https://token.actions.githubusercontent.com` · `aud` = the provider's audience · `repository` = `<your-github-org>/<repo>` · `ref` = `refs/heads/main` |
+| Claim assertions | `iss` = `https://token.actions.githubusercontent.com` · `aud` = the provider's audience · `repository` = `<your-github-org>/<repo>` |
 | Project | the project the runs should be billed to |
 | Service account | create a new one, for example `fullsend-<repo>-ci` |
 | Permissions | `api.model.request` (fullsend also accepts `api.model.read`; anything broader is refused at run time) |
@@ -148,22 +151,35 @@ Two things not to do:
   per-repository rule above.
 
 **Which runs this mapping trusts.** Be precise about this, because it is the boundary you are
-setting: the mapping trusts **any job in that repository, at that ref, that can request an OIDC
-token** — not one named workflow. `ref` = `refs/heads/main` covers every fullsend agent workflow as
-installed on `main`, and it equally covers any other workflow on `main` with
-`permissions: id-token: write`. Anyone who can merge to `main` can therefore add a workflow that
-obtains a model token: the mapping's blast radius is "write access to this repository", and the
-service account's spend limit is what bounds it. That is the trade for not asserting `workflow_ref`,
-which cannot cover fullsend's several agent workflow files with one value.
+setting: the mapping trusts **any job in that repository that can request an OIDC token** — not one
+named workflow, and not one ref. The default mapping has no `ref` assertion, matching the Vertex
+path's `attribute.repository` scoping: `issues`, `issue_comment`, and `pull_request_target` events
+carry the default branch ref, while `pull_request_review` events carry `refs/pull/<N>/merge`. A
+repository-only mapping covers all of them.
+
+Anyone who can merge to the default branch can add a workflow with `permissions: id-token: write`
+that obtains a model token: the mapping's blast radius is "write access to this repository", and
+the service account's spend limit is what bounds it. That is the trade for not asserting
+`workflow_ref`, which cannot cover fullsend's several agent workflow files with one value.
 
 GitHub mints the token for the repository the job runs in, so the agent jobs fullsend starts for
-pull requests from forks are covered too (they run in your repository, not the fork). What keeps an
-untrusted *contributor* from starting such a run is fullsend's own dispatch authorization (only
-events from people with write access trigger agents), not the mapping.
+pull requests from forks are covered too (they run in your repository, not the fork). Fork handling
+differs per stage: the review→fix path rejects cross-repo PRs, while other stages have their own
+authorization gates. What keeps an untrusted *contributor* from starting such a run is fullsend's
+own dispatch authorization (only events from people with write access trigger agents), not the
+mapping.
+
+**Tightening with `--ref`.** If you want the mapping to restrict which refs can exchange, pass
+`--ref refs/heads/main` to `fullsend inference openai request`. This emits **two mappings** per
+repository: one asserting `ref` = `refs/heads/main` and one asserting `ref` = `refs/pull/*` (OpenAI
+allows one trailing wildcard with a non-empty prefix), so both default-branch and
+PR-review-triggered runs work. The cost is two mappings per repository instead of one, halving the
+50-mapping-per-provider budget to 25 repositories. Teams that want branch-level narrowing choose
+that deliberately.
+
 If you want the mapping itself to exclude some triggers, add a claim the untrusted runs cannot
 carry — for example a GitHub `environment` that the agent jobs reference and that protects itself
-with required reviewers — and assert `environment == "<name>"` here. A `workflow_dispatch` of a
-fullsend workflow on a feature branch will not match `refs/heads/main`; that is expected.
+with required reviewers — and assert `environment == "<name>"` here.
 
 ## B2. Send the request (route B)
 
@@ -191,7 +207,6 @@ Please add a service-account mapping on the organization's GitHub Actions identi
   iss        = https://token.actions.githubusercontent.com
   aud        = <the provider's audience>
   repository = <org>/<repo>
-  ref        = refs/heads/main
 
 Target project: <project name / id>  (the project these runs are billed to)
 Service account: create a new one named fullsend-<repo>-ci in that project
@@ -199,11 +214,12 @@ Service account: create a new one named fullsend-<repo>-ci in that project
 Permissions on the mapping: api.model.request only — nothing broader, and please do not
 create an API key for the service account; the mapping is the credential.
 
-Please do not add a workflow_ref or sub assertion: these runs start from seven different
+Please do not add a workflow_ref or sub assertion: these runs start from several
 workflow files in the repository, so a single value would exclude the others.
 
-One mapping per repository, please (a mapping matches exact values only) — not a wildcard
-or a pattern over the organization, since not every repository in it is ours.
+One mapping per repository, please (assertions within a mapping are AND-ed exact values;
+one trailing wildcard with a non-empty prefix is permitted per value) — not a pattern over
+the organization, since not every repository in it is ours.
 
 Please send back: the identity provider ID, the provider's audience string, and the
 service account ID.
@@ -269,7 +285,7 @@ and the provider ID are typically the same for every repository and only the ser
 
 **Is it safe to commit these?** Yes. They are identifiers, not secrets: on their own they grant
 nothing. OpenAI issues a token only to a caller presenting a GitHub OIDC token whose claims match
-a mapping, and only your repository's `main` workflow can obtain one. fullsend reads
+a mapping, and only a workflow in the repository with `id-token: write` can obtain one. fullsend reads
 `.fullsend/config.yaml` from the base branch for pull-request events, so a pull request cannot
 change them for the run that reviews it. Someone with write access could point the block at their
 own OpenAI organization — and pay for their own runs — but note that write access already carries
@@ -377,6 +393,7 @@ agent starts and names the rule.
 | `OpenAI WIF is partially configured: missing …` / `inference.openai in config.yaml is partially configured` | One value is empty in the place you chose (variables, or `config.yaml`). Fill it in — fullsend will not silently fall back to an API key, and it does not mix the two sources. |
 | `… the job has no GitHub OIDC endpoint` | This is not a GitHub Actions job, or `permissions: id-token: write` is missing from the workflow. On GitLab CI or locally, use an API key. |
 | `OpenAI WIF exchange failed: … token endpoint returned 4xx` | The mapping does not match this run. Check the audience first (one character off is enough), then compare the claims from step 1 with the mapping's assertions (route B: with the administrator). Works in one repository but not another → that repository has no mapping yet. |
+| Exchange fails with 4xx on a PR-review-triggered run | The mapping has a `ref` assertion (e.g. `refs/heads/main`) but `pull_request_review` events carry `refs/pull/<N>/merge`. Either remove the `ref` assertion (the default since this release) or add a second mapping asserting `ref` = `refs/pull/*` — regenerate with `fullsend inference openai request --ref refs/heads/main` to get both. |
 | Exchange succeeded, the model call was refused | The mapping's permissions do not cover the call, or the project cannot use that model. The `scope` in the exchange response shows what was granted. |
 | `OpenAI WIF token refused: the service-account mapping grants …` | The mapping grants more than model access. Narrow its permissions to `api.model.request` (route A: edit the mapping in A3; route B: ask your administrator); fullsend will not run an agent with a broader token. |
 | `the service-account mapping does not narrow permissions` (warning) | The mapping has no permission restriction, so the token holds whatever the service account holds. Add `api.model.request` on the mapping. |

@@ -94,7 +94,7 @@ func TestInferenceOpenAIRequestCmd_JSONSingleRepo(t *testing.T) {
 	assert.Equal(t, githubOIDCIssuer, m.Assertions.Iss)
 	assert.Equal(t, "fullsend://acme", m.Assertions.Aud)
 	assert.Equal(t, "acme/widget", m.Assertions.Repository)
-	assert.Equal(t, "refs/heads/main", m.Assertions.Ref)
+	assert.Empty(t, m.Assertions.Ref, "default: no ref assertion")
 	assert.Equal(t, "fullsend-widget-ci", m.Target.ServiceAccount)
 	assert.Equal(t, []string{"api.model.request"}, m.Target.Permissions)
 	assert.Empty(t, m.Target.Project) // no --project flag
@@ -716,13 +716,13 @@ func TestRunInferenceOpenAIStatus_FullConfigNoActions(t *testing.T) {
 // --- buildRequestDoc tests ---
 
 func TestBuildRequestDoc_DefaultAudience(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "", "", "")
 	assert.Equal(t, "fullsend://acme", doc.Provider.Audience)
 	assert.Equal(t, "fullsend://acme", doc.Reply.Audience)
 }
 
 func TestBuildRequestDoc_CorrectAssertions(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", "")
 
 	require.Len(t, doc.Mappings, 2)
 
@@ -730,20 +730,20 @@ func TestBuildRequestDoc_CorrectAssertions(t *testing.T) {
 		assert.Equal(t, githubOIDCIssuer, m.Assertions.Iss)
 		assert.Equal(t, "fullsend://acme", m.Assertions.Aud)
 		assert.Equal(t, m.Repository, m.Assertions.Repository)
-		assert.Equal(t, "refs/heads/main", m.Assertions.Ref)
+		assert.Empty(t, m.Assertions.Ref, "default: no ref assertion")
 		assert.Equal(t, "proj-1", m.Target.Project)
 		assert.Equal(t, []string{"api.model.request"}, m.Target.Permissions)
 	}
 }
 
 func TestBuildRequestDoc_ServiceAccountIDPerRepo(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "aud", "", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "aud", "", "", "")
 	assert.Equal(t, "fullsend-widget-ci", doc.Mappings[0].Target.ServiceAccount)
 	assert.Equal(t, "fullsend-gadget-ci", doc.Mappings[1].Target.ServiceAccount)
 }
 
 func TestBuildRequestDoc_SharedServiceAccount(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "aud", "", "shared-sa", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "aud", "", "shared-sa", "")
 	assert.Equal(t, "shared-sa", doc.Mappings[0].Target.ServiceAccount)
 	assert.Equal(t, "shared-sa", doc.Mappings[1].Target.ServiceAccount)
 }
@@ -751,7 +751,7 @@ func TestBuildRequestDoc_SharedServiceAccount(t *testing.T) {
 // --- renderRequestMarkdown tests ---
 
 func TestRenderRequestMarkdown_ContainsExpectedSections(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "", "", "")
 	md, err := renderRequestMarkdown(doc)
 	require.NoError(t, err)
 
@@ -853,7 +853,7 @@ func TestBuildRequestDoc_JSONRoundTrip(t *testing.T) {
 		"fullsend://acme",
 		"openai-proj-001",
 		"",
-		openAIDefaultRef,
+		"",
 	)
 
 	b, err := json.MarshalIndent(doc, "", "  ")
@@ -953,7 +953,7 @@ func TestInferenceOpenAIRequestCmd_MarkdownMultiRepo(t *testing.T) {
 // --- round trip: the document we generate is the document an admin returns ---
 
 func TestImport_AcceptsTheFilledInRequestDocument(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "proj-1", "", "")
 	// What an administrator does: fill in the reply section of the file
 	// `request --format json` produced, and send the same file back.
 	doc.Reply.IdentityProviderID = "idp_live"
@@ -973,7 +973,7 @@ func TestImport_AcceptsTheFilledInRequestDocument(t *testing.T) {
 }
 
 func TestImport_MultiRepoReplyNeedsASelector(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", "")
 	doc.Reply.IdentityProviderID = "idp_live"
 	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_widget"
 	doc.Reply.ServiceAccountIDs["acme/gadget"] = "sa_gadget"
@@ -1019,11 +1019,15 @@ func TestRequest_MixedOwnersNeedAnExplicitAudience(t *testing.T) {
 
 func TestRequest_RefIsOverridable(t *testing.T) {
 	doc := buildRequestDoc([]string{"acme/widget"}, "aud", "", "", "refs/heads/trunk")
-	require.Len(t, doc.Mappings, 1)
+	require.Len(t, doc.Mappings, 2, "explicit --ref emits two mappings: one for the ref, one for refs/pull/*")
 	assert.Equal(t, "refs/heads/trunk", doc.Mappings[0].Assertions.Ref,
 		"a repository whose default branch is not main needs its own ref")
+	assert.Equal(t, openAIPullRefPattern, doc.Mappings[1].Assertions.Ref,
+		"companion mapping for PR-review-triggered runs")
 
-	assert.Equal(t, openAIDefaultRef, buildRequestDoc([]string{"acme/widget"}, "aud", "", "", "").Mappings[0].Assertions.Ref)
+	defaultDoc := buildRequestDoc([]string{"acme/widget"}, "aud", "", "", "")
+	require.Len(t, defaultDoc.Mappings, 1, "default: one mapping with no ref assertion")
+	assert.Empty(t, defaultDoc.Mappings[0].Assertions.Ref, "default: no ref assertion")
 }
 
 func TestParseRepoList_Dedupes(t *testing.T) {
@@ -1033,30 +1037,37 @@ func TestParseRepoList_Dedupes(t *testing.T) {
 }
 
 func TestRequestMarkdown_ExistingServiceAccountIsNotCreated(t *testing.T) {
-	md, err := renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "sa_existing", openAIDefaultRef))
+	md, err := renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "sa_existing", ""))
 	require.NoError(t, err)
 	assert.Contains(t, md, "sa_existing (existing — map it, do not create a new one)")
 	assert.NotContains(t, md, "sa_existing (create inline")
 
-	md, err = renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", openAIDefaultRef))
+	md, err = renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", ""))
 	require.NoError(t, err)
 	assert.Contains(t, md, "create inline in the mapping")
 }
 
 func TestRequestMarkdown_StatesTheAssertionRules(t *testing.T) {
-	md, err := renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", openAIDefaultRef))
+	md, err := renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", ""))
 	require.NoError(t, err)
 	for _, want := range []string{
-		"no wildcards",
 		"`repository_owner`",
 		"`workflow_ref`",
 		"`sub`",
 		"Do **not** create an API key",
 		"`api.model.request` only",
-		"`refs/heads/main`",
 	} {
 		assert.Contains(t, md, want, "the generated request must carry the rule: %s", want)
 	}
+	// Default: no ref assertion in the output.
+	assert.NotContains(t, md, "`ref`", "default output omits ref assertion")
+}
+
+func TestRequestMarkdown_WithRefShowsRefAssertions(t *testing.T) {
+	md, err := renderRequestMarkdown(buildRequestDoc([]string{"acme/widget"}, "aud", "p", "", "refs/heads/main"))
+	require.NoError(t, err)
+	assert.Contains(t, md, "`ref` = `refs/heads/main`", "first mapping has explicit ref")
+	assert.Contains(t, md, "`ref` = `refs/pull/*`", "companion mapping for PR-triggered runs")
 }
 
 func TestRunInferenceOpenAIStatus_RefusesToTestAnotherRepository(t *testing.T) {
@@ -1265,7 +1276,7 @@ func TestResolveOpenAIStatusSources_StaticKeyWinsOffActions(t *testing.T) {
 }
 
 func TestImport_ServiceAccountFlagResolvesAnAmbiguousReply(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", "")
 	doc.Reply.IdentityProviderID = "idp_live"
 	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_widget"
 	doc.Reply.ServiceAccountIDs["acme/gadget"] = "sa_gadget"
@@ -1280,7 +1291,7 @@ func TestImport_ServiceAccountFlagResolvesAnAmbiguousReply(t *testing.T) {
 }
 
 func TestImport_RepoSelectionIsCaseInsensitive(t *testing.T) {
-	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget", "acme/gadget"}, "fullsend://acme", "proj-1", "", "")
 	doc.Reply.IdentityProviderID = "idp_live"
 	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_widget"
 	doc.Reply.ServiceAccountIDs["acme/gadget"] = "sa_gadget"
@@ -1307,7 +1318,7 @@ func TestImport_AudienceFromProviderBlockWhenReplyLeavesItDefault(t *testing.T) 
 	// An administrator who reuses an existing provider is told to put its
 	// audience in the provider block; import must honour that rather than
 	// recording the audience we proposed.
-	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "proj-1", "", openAIDefaultRef)
+	doc := buildRequestDoc([]string{"acme/widget"}, "fullsend://acme", "proj-1", "", "")
 	doc.Reply.IdentityProviderID = "idp_live"
 	doc.Reply.Audience = ""
 	doc.Reply.ServiceAccountIDs["acme/widget"] = "sa_live"
@@ -1364,4 +1375,98 @@ func TestServiceAccountFor_SeveralNamedRepositoriesAlwaysNeedASelector(t *testin
 	sa, err := reply.serviceAccountFor("acme/widget")
 	require.NoError(t, err)
 	assert.Equal(t, "sa_widget", sa)
+}
+
+// --- golden tests: default (no --ref) and explicit --ref shapes ---
+
+func TestGolden_DefaultNoRef_SingleMapping(t *testing.T) {
+	// Golden test 1 — default (no --ref): single mapping with
+	// assertions {iss, aud, repository} and no ref field.
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "request", "acme/widget",
+		"--format", "json"})
+	require.NoError(t, cmd.Execute())
+
+	var doc openAIRequestDoc
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &doc))
+
+	require.Len(t, doc.Mappings, 1, "default: one mapping per repository")
+	m := doc.Mappings[0]
+	assert.Equal(t, githubOIDCIssuer, m.Assertions.Iss)
+	assert.Equal(t, "fullsend://acme", m.Assertions.Aud)
+	assert.Equal(t, "acme/widget", m.Assertions.Repository)
+	assert.Empty(t, m.Assertions.Ref, "default: no ref assertion")
+
+	// Verify ref is omitted from JSON output (omitempty).
+	assert.NotContains(t, buf.String(), `"ref"`,
+		"the ref field must not appear in JSON output when not set")
+}
+
+func TestGolden_ExplicitRef_TwoMappings(t *testing.T) {
+	// Golden test 2 — explicit --ref: two mappings per repository.
+	//   [0] assertions {iss, aud, repository, ref: refs/heads/main}
+	//   [1] assertions {iss, aud, repository, ref: refs/pull/*}
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "request", "acme/widget",
+		"--ref", "refs/heads/main",
+		"--format", "json"})
+	require.NoError(t, cmd.Execute())
+
+	var doc openAIRequestDoc
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &doc))
+
+	require.Len(t, doc.Mappings, 2, "explicit --ref: two mappings per repository")
+
+	// First mapping: exact ref assertion.
+	m0 := doc.Mappings[0]
+	assert.Equal(t, githubOIDCIssuer, m0.Assertions.Iss)
+	assert.Equal(t, "fullsend://acme", m0.Assertions.Aud)
+	assert.Equal(t, "acme/widget", m0.Assertions.Repository)
+	assert.Equal(t, "refs/heads/main", m0.Assertions.Ref)
+
+	// Second mapping: companion for PR-review-triggered runs.
+	m1 := doc.Mappings[1]
+	assert.Equal(t, githubOIDCIssuer, m1.Assertions.Iss)
+	assert.Equal(t, "fullsend://acme", m1.Assertions.Aud)
+	assert.Equal(t, "acme/widget", m1.Assertions.Repository)
+	assert.Equal(t, "refs/pull/*", m1.Assertions.Ref)
+
+	// Both share the same target.
+	assert.Equal(t, m0.Target, m1.Target)
+}
+
+func TestGolden_ExplicitRef_MultiRepo(t *testing.T) {
+	// With --ref and two repos, expect 4 mappings (2 per repo).
+	var buf bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"inference", "openai", "request",
+		"acme/widget,acme/gadget",
+		"--ref", "refs/heads/main",
+		"--format", "json"})
+	require.NoError(t, cmd.Execute())
+
+	var doc openAIRequestDoc
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &doc))
+
+	require.Len(t, doc.Mappings, 4, "two repos × two ref patterns")
+
+	// widget mappings.
+	assert.Equal(t, "acme/widget", doc.Mappings[0].Repository)
+	assert.Equal(t, "refs/heads/main", doc.Mappings[0].Assertions.Ref)
+	assert.Equal(t, "acme/widget", doc.Mappings[1].Repository)
+	assert.Equal(t, "refs/pull/*", doc.Mappings[1].Assertions.Ref)
+
+	// gadget mappings.
+	assert.Equal(t, "acme/gadget", doc.Mappings[2].Repository)
+	assert.Equal(t, "refs/heads/main", doc.Mappings[2].Assertions.Ref)
+	assert.Equal(t, "acme/gadget", doc.Mappings[3].Repository)
+	assert.Equal(t, "refs/pull/*", doc.Mappings[3].Assertions.Ref)
+
+	// Reply still has one entry per repo, not per mapping.
+	assert.Len(t, doc.Reply.ServiceAccountIDs, 2)
 }

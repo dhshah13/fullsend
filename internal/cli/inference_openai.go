@@ -35,11 +35,13 @@ const (
 	// openAIDefaultPermission is the only permission an agent run needs.
 	openAIDefaultPermission = "api.model.request"
 
-	// openAIDefaultRef is the ref assertion for the mapping: fullsend
-	// installs its agent workflows on the default branch and dispatches
-	// them there. A repository whose default branch is not main needs
-	// --ref, or every exchange fails on an assertion that cannot match.
-	openAIDefaultRef = "refs/heads/main"
+	// openAIPullRefPattern is the ref assertion added as a companion
+	// mapping when --ref is passed explicitly: PR-review-triggered agent
+	// runs carry refs/pull/<N>/merge, and OpenAI mapping assertions are
+	// AND-ed exact values, so covering both ref families requires two
+	// mappings. OpenAI allows one trailing wildcard with a non-empty
+	// prefix.
+	openAIPullRefPattern = "refs/pull/*"
 )
 
 // --- request command ---
@@ -68,7 +70,7 @@ type openAIRequestAssertions struct {
 	Iss        string `json:"iss"`
 	Aud        string `json:"aud"`
 	Repository string `json:"repository"`
-	Ref        string `json:"ref"`
+	Ref        string `json:"ref,omitempty"`
 }
 
 type openAIRequestTarget struct {
@@ -193,7 +195,7 @@ Output formats:
 	cmd.Flags().StringVar(&audience, "audience", "", "OpenAI Workload Identity audience (default: fullsend://<owner>)")
 	cmd.Flags().StringVar(&project, "project", "", "OpenAI project name or ID for the service accounts")
 	cmd.Flags().StringVar(&serviceAccount, "service-account", "", "existing service account ID to map (default: create fullsend-<repo>-ci per repo)")
-	cmd.Flags().StringVar(&ref, "ref", openAIDefaultRef, "ref assertion for the mappings (the branch fullsend's agent workflows run from)")
+	cmd.Flags().StringVar(&ref, "ref", "", "optional ref assertion: when set, emits two mappings per repository (one for the given ref and one for refs/pull/*) so both branch and PR-review-triggered runs work")
 	cmd.Flags().StringVar(&format, "format", "json", "output format: json, md")
 	cmd.Flags().StringVar(&outFile, "out", "", "write output to a file instead of stdout")
 
@@ -260,9 +262,7 @@ func defaultServiceAccountID(repo string) string {
 }
 
 func buildRequestDoc(repos []string, audience, project, serviceAccount, ref string) openAIRequestDoc {
-	if strings.TrimSpace(ref) == "" {
-		ref = openAIDefaultRef
-	}
+	ref = strings.TrimSpace(ref)
 	doc := openAIRequestDoc{
 		Version: openAIRequestSchemaVersion,
 		Provider: openAIRequestProvider{
@@ -284,22 +284,49 @@ func buildRequestDoc(repos []string, audience, project, serviceAccount, ref stri
 			sa = defaultServiceAccountID(repo)
 		}
 
+		target := openAIRequestTarget{
+			Project:        project,
+			ServiceAccount: sa,
+			CreateInline:   createInline,
+			Permissions:    []string{openAIDefaultPermission},
+		}
+
+		// Default: assert iss, aud, repository only — no ref. This
+		// matches the Vertex path's attribute.repository scoping and
+		// covers all event types (issues, PR review, workflow_dispatch).
+		//
+		// When --ref is passed, emit two mappings per repository:
+		// one for the explicit ref (e.g. refs/heads/main) and one for
+		// refs/pull/* so PR-review-triggered runs work too. OpenAI
+		// allows one trailing wildcard with a non-empty prefix, and
+		// mapping assertions are OR-ed across mappings.
 		mapping := openAIRequestMapping{
 			Repository: repo,
 			Assertions: openAIRequestAssertions{
 				Iss:        githubOIDCIssuer,
 				Aud:        audience,
 				Repository: repo,
-				Ref:        ref,
+				Ref:        ref, // empty when --ref is not passed → omitted from JSON
 			},
-			Target: openAIRequestTarget{
-				Project:        project,
-				ServiceAccount: sa,
-				CreateInline:   createInline,
-				Permissions:    []string{openAIDefaultPermission},
-			},
+			Target: target,
 		}
 		doc.Mappings = append(doc.Mappings, mapping)
+
+		if ref != "" {
+			// Companion mapping for PR-review-triggered runs.
+			pullMapping := openAIRequestMapping{
+				Repository: repo,
+				Assertions: openAIRequestAssertions{
+					Iss:        githubOIDCIssuer,
+					Aud:        audience,
+					Repository: repo,
+					Ref:        openAIPullRefPattern,
+				},
+				Target: target,
+			}
+			doc.Mappings = append(doc.Mappings, pullMapping)
+		}
+
 		doc.Reply.ServiceAccountIDs[repo] = ""
 	}
 
@@ -325,16 +352,19 @@ regenerates this document with it.
 
 ## Service account mappings
 
-One mapping per repository. Every assertion must be exact — no wildcards,
-no ` + "`" + `repository_owner` + "`" + `, no ` + "`" + `workflow_ref` + "`" + ` and no ` + "`" + `sub` + "`" + ` (fullsend starts agent
-runs from several workflow files in the repository, so any single value would
-exclude the others). Do **not** create an API key for the service account.
+One mapping per repository. Assertions are exact scalar values, AND-ed
+within a mapping and OR-ed across mappings. One trailing wildcard with a
+non-empty prefix is permitted per assertion value (e.g.
+` + "`" + `refs/pull/*` + "`" + `). Do not assert ` + "`" + `repository_owner` + "`" + `, ` + "`" + `workflow_ref` + "`" + ` or
+` + "`" + `sub` + "`" + ` (fullsend starts agent runs from several workflow files in the
+repository, so any single value would exclude the others). Do **not**
+create an API key for the service account.
 {{ range .Mappings }}
-### {{ .Repository }}
+### {{ .Repository }}{{ if .Assertions.Ref }} (ref: ` + "`" + `{{ .Assertions.Ref }}` + "`" + `){{ end }}
 
 | Field | Value |
 |---|---|
-| Claim assertions | ` + "`" + `iss` + "`" + ` = ` + "`" + `{{ .Assertions.Iss }}` + "`" + ` · ` + "`" + `aud` + "`" + ` = ` + "`" + `{{ .Assertions.Aud }}` + "`" + ` · ` + "`" + `repository` + "`" + ` = ` + "`" + `{{ .Assertions.Repository }}` + "`" + ` · ` + "`" + `ref` + "`" + ` = ` + "`" + `{{ .Assertions.Ref }}` + "`" + ` |
+| Claim assertions | ` + "`" + `iss` + "`" + ` = ` + "`" + `{{ .Assertions.Iss }}` + "`" + ` · ` + "`" + `aud` + "`" + ` = ` + "`" + `{{ .Assertions.Aud }}` + "`" + ` · ` + "`" + `repository` + "`" + ` = ` + "`" + `{{ .Assertions.Repository }}` + "`" + `{{ if .Assertions.Ref }} · ` + "`" + `ref` + "`" + ` = ` + "`" + `{{ .Assertions.Ref }}` + "`" + `{{ end }} |
 | Project | {{ if .Target.Project }}` + "`" + `{{ .Target.Project }}` + "`" + `{{ else }}*(specify the project name or ID)*{{ end }} |
 | Service account | {{ .Target.ServiceAccount }}{{ if .Target.CreateInline }} (create inline in the mapping){{ else }} (existing — map it, do not create a new one){{ end }} |
 | Permissions | {{ range $i, $p := .Target.Permissions }}{{ if $i }}, {{ end }}` + "`" + `{{ $p }}` + "`" + `{{ end }} only |
