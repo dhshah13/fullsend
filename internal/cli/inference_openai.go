@@ -35,11 +35,17 @@ const (
 	// openAIDefaultPermission is the only permission an agent run needs.
 	openAIDefaultPermission = "api.model.request"
 
-	// openAIDefaultRef is the ref assertion for the mapping: fullsend
-	// installs its agent workflows on the default branch and dispatches
-	// them there. A repository whose default branch is not main needs
-	// --ref, or every exchange fails on an assertion that cannot match.
-	openAIDefaultRef = "refs/heads/main"
+	// openAIPullRefPattern is the ref assertion added as a companion
+	// mapping when --ref is passed explicitly: PR-review-triggered agent
+	// runs carry refs/pull/<N>/merge, and OpenAI mapping assertions are
+	// AND-ed exact values, so covering both ref families requires two
+	// mappings. OpenAI allows one trailing wildcard with a non-empty
+	// prefix.
+	openAIPullRefPattern = "refs/pull/*"
+
+	// openAIMaxMappingsPerProvider is OpenAI's documented ceiling on
+	// service-account mappings per identity provider.
+	openAIMaxMappingsPerProvider = 50
 )
 
 // --- request command ---
@@ -68,7 +74,7 @@ type openAIRequestAssertions struct {
 	Iss        string `json:"iss"`
 	Aud        string `json:"aud"`
 	Repository string `json:"repository"`
-	Ref        string `json:"ref"`
+	Ref        string `json:"ref,omitempty"`
 }
 
 type openAIRequestTarget struct {
@@ -97,8 +103,8 @@ import the reply into fullsend configuration, and check the
 exchange status.
 
 'request' and 'import' produce a document and update local
-configuration. 'import --variables' calls the GitHub API through gh to
-set repository variables, and 'status' performs one OpenAI token
+configuration. 'import --variables' calls the GitHub API through the
+forge client to set repository variables, and 'status' performs one OpenAI token
 exchange when it runs inside a GitHub Actions job with id-token: write.
 No OpenAI API key is used or created by any of them.`,
 	}
@@ -145,6 +151,14 @@ Output formats:
 			serviceAccount = strings.TrimSpace(serviceAccount)
 			ref = strings.TrimSpace(ref)
 
+			// The assertion is compared literally against the OIDC ref
+			// claim, which always starts with refs/. A value that does
+			// not is a mapping no run can ever match, and the failure
+			// would only surface as a 4xx at exchange time.
+			if ref != "" && !strings.HasPrefix(ref, "refs/") {
+				return fmt.Errorf("--ref must be a full git ref such as refs/heads/main (got %q)", ref)
+			}
+
 			// The default audience is derived from the owner, so every
 			// repository in one request must share it — otherwise the
 			// second owner's mapping would silently carry the first
@@ -158,6 +172,20 @@ Output formats:
 			}
 
 			doc := buildRequestDoc(repos, audience, project, serviceAccount, ref)
+
+			// OpenAI caps a provider at 50 mappings and --ref emits two
+			// per repository, so a large enrolment can produce a
+			// document the administrator cannot install as written.
+			if len(doc.Mappings) > openAIMaxMappingsPerProvider {
+				because := ""
+				if ref != "" {
+					because = " (--ref emits two mappings per repository)"
+				}
+				printer := ui.New(cmd.ErrOrStderr())
+				printer.StepWarn(fmt.Sprintf(
+					"%d mappings for %d repositories exceeds OpenAI's limit of %d per provider%s — split the enrolment across providers, or ask for a second provider",
+					len(doc.Mappings), len(repos), openAIMaxMappingsPerProvider, because))
+			}
 
 			var output string
 			switch format {
@@ -193,7 +221,7 @@ Output formats:
 	cmd.Flags().StringVar(&audience, "audience", "", "OpenAI Workload Identity audience (default: fullsend://<owner>)")
 	cmd.Flags().StringVar(&project, "project", "", "OpenAI project name or ID for the service accounts")
 	cmd.Flags().StringVar(&serviceAccount, "service-account", "", "existing service account ID to map (default: create fullsend-<repo>-ci per repo)")
-	cmd.Flags().StringVar(&ref, "ref", openAIDefaultRef, "ref assertion for the mappings (the branch fullsend's agent workflows run from)")
+	cmd.Flags().StringVar(&ref, "ref", "", "optional ref assertion: when set, emits two mappings per repository (one for the given ref and one for refs/pull/*) so both branch and PR-review-triggered runs work")
 	cmd.Flags().StringVar(&format, "format", "json", "output format: json, md")
 	cmd.Flags().StringVar(&outFile, "out", "", "write output to a file instead of stdout")
 
@@ -260,9 +288,11 @@ func defaultServiceAccountID(repo string) string {
 }
 
 func buildRequestDoc(repos []string, audience, project, serviceAccount, ref string) openAIRequestDoc {
-	if strings.TrimSpace(ref) == "" {
-		ref = openAIDefaultRef
-	}
+	ref = strings.TrimSpace(ref)
+	// An explicit --ref refs/pull/* asks for the mapping the companion
+	// already provides; emitting both spends two of the fifty mapping
+	// slots on one identical assertion.
+	companion := ref != "" && ref != openAIPullRefPattern
 	doc := openAIRequestDoc{
 		Version: openAIRequestSchemaVersion,
 		Provider: openAIRequestProvider{
@@ -284,22 +314,49 @@ func buildRequestDoc(repos []string, audience, project, serviceAccount, ref stri
 			sa = defaultServiceAccountID(repo)
 		}
 
+		target := openAIRequestTarget{
+			Project:        project,
+			ServiceAccount: sa,
+			CreateInline:   createInline,
+			Permissions:    []string{openAIDefaultPermission},
+		}
+
+		// Default: assert iss, aud, repository only — no ref. This
+		// matches the Vertex path's attribute.repository scoping and
+		// covers all event types (issues, PR review, workflow_dispatch).
+		//
+		// When --ref is passed, emit two mappings per repository:
+		// one for the explicit ref (e.g. refs/heads/main) and one for
+		// refs/pull/* so PR-review-triggered runs work too. OpenAI
+		// allows one trailing wildcard with a non-empty prefix, and
+		// mapping assertions are OR-ed across mappings.
 		mapping := openAIRequestMapping{
 			Repository: repo,
 			Assertions: openAIRequestAssertions{
 				Iss:        githubOIDCIssuer,
 				Aud:        audience,
 				Repository: repo,
-				Ref:        ref,
+				Ref:        ref, // empty when --ref is not passed → omitted from JSON
 			},
-			Target: openAIRequestTarget{
-				Project:        project,
-				ServiceAccount: sa,
-				CreateInline:   createInline,
-				Permissions:    []string{openAIDefaultPermission},
-			},
+			Target: target,
 		}
 		doc.Mappings = append(doc.Mappings, mapping)
+
+		if companion {
+			// Companion mapping for PR-review-triggered runs.
+			pullMapping := openAIRequestMapping{
+				Repository: repo,
+				Assertions: openAIRequestAssertions{
+					Iss:        githubOIDCIssuer,
+					Aud:        audience,
+					Repository: repo,
+					Ref:        openAIPullRefPattern,
+				},
+				Target: target,
+			}
+			doc.Mappings = append(doc.Mappings, pullMapping)
+		}
+
 		doc.Reply.ServiceAccountIDs[repo] = ""
 	}
 
@@ -307,6 +364,12 @@ func buildRequestDoc(repos []string, audience, project, serviceAccount, ref stri
 }
 
 // requestMarkdownTmpl matches the guide's route-B template structure.
+//
+// The reply table ranges over Reply.ServiceAccountIDs rather than over
+// Mappings: --ref emits two mappings per repository, and the
+// administrator fills in one service account per repository, not one
+// per mapping. Row order stays stable because text/template visits map
+// keys in sorted order, unlike a bare range over a map in Go.
 var requestMarkdownTmpl = template.Must(template.New("request").Parse(`# OpenAI Workload Identity Federation Request
 
 ## Provider (reuse or create)
@@ -325,16 +388,21 @@ regenerates this document with it.
 
 ## Service account mappings
 
-One mapping per repository. Every assertion must be exact — no wildcards,
-no ` + "`" + `repository_owner` + "`" + `, no ` + "`" + `workflow_ref` + "`" + ` and no ` + "`" + `sub` + "`" + ` (fullsend starts agent
-runs from several workflow files in the repository, so any single value would
-exclude the others). Do **not** create an API key for the service account.
+One mapping per repository, with these rules:
+
+- Assertions are exact scalar values, AND-ed within a mapping and OR-ed across
+  mappings; one trailing wildcard with a non-empty prefix is permitted per value
+  (e.g. ` + "`" + `refs/pull/*` + "`" + `).
+- Do not assert ` + "`" + `repository_owner` + "`" + `, ` + "`" + `workflow_ref` + "`" + ` or ` + "`" + `sub` + "`" + `: a fullsend
+  installation starts agent runs from more than one workflow file, so any single
+  value would exclude the others.
+- Do **not** create an API key for the service account.
 {{ range .Mappings }}
-### {{ .Repository }}
+### {{ .Repository }}{{ if .Assertions.Ref }} (ref: ` + "`" + `{{ .Assertions.Ref }}` + "`" + `){{ end }}
 
 | Field | Value |
 |---|---|
-| Claim assertions | ` + "`" + `iss` + "`" + ` = ` + "`" + `{{ .Assertions.Iss }}` + "`" + ` · ` + "`" + `aud` + "`" + ` = ` + "`" + `{{ .Assertions.Aud }}` + "`" + ` · ` + "`" + `repository` + "`" + ` = ` + "`" + `{{ .Assertions.Repository }}` + "`" + ` · ` + "`" + `ref` + "`" + ` = ` + "`" + `{{ .Assertions.Ref }}` + "`" + ` |
+| Claim assertions | ` + "`" + `iss` + "`" + ` = ` + "`" + `{{ .Assertions.Iss }}` + "`" + ` · ` + "`" + `aud` + "`" + ` = ` + "`" + `{{ .Assertions.Aud }}` + "`" + ` · ` + "`" + `repository` + "`" + ` = ` + "`" + `{{ .Assertions.Repository }}` + "`" + `{{ if .Assertions.Ref }} · ` + "`" + `ref` + "`" + ` = ` + "`" + `{{ .Assertions.Ref }}` + "`" + `{{ end }} |
 | Project | {{ if .Target.Project }}` + "`" + `{{ .Target.Project }}` + "`" + `{{ else }}*(specify the project name or ID)*{{ end }} |
 | Service account | {{ .Target.ServiceAccount }}{{ if .Target.CreateInline }} (create inline in the mapping){{ else }} (existing — map it, do not create a new one){{ end }} |
 | Permissions | {{ range $i, $p := .Target.Permissions }}{{ if $i }}, {{ end }}` + "`" + `{{ $p }}` + "`" + `{{ end }} only |
@@ -347,7 +415,7 @@ Please provide the following identifiers so we can configure the repository:
 |---|---|
 | Identity provider ID | *(from the provider you created or reused)* |
 | Provider's audience | ` + "`" + `{{ .Reply.Audience }}` + "`" + ` *(confirm or update if different)* |
-{{ range .Mappings }}| Service account ID for {{ .Repository }} | *(from the mapping above)* |
+{{ range $repo, $_ := .Reply.ServiceAccountIDs }}| Service account ID for {{ $repo }} | *(from the mapping above)* |
 {{ end }}
 These identifiers are not secrets — they grant nothing on their own.
 The mapping only trusts a GitHub OIDC token whose claims match.
@@ -389,20 +457,37 @@ type openAIReplyDoc struct {
 }
 
 // resolved folds a full request document into the reply shape.
-func (d openAIReplyDoc) resolved() openAIReplyDoc {
+//
+// The audience appears twice in a generated document — in the provider
+// block and pre-filled in the reply — and the mapping was written
+// against exactly one of them. An administrator reusing an existing
+// provider edits whichever they read first, so a document where the two
+// disagree is ambiguous rather than merely redundant: picking either
+// silently configures the repository with an audience no mapping
+// asserts, and every exchange then fails with a 4xx far from its cause.
+func (d openAIReplyDoc) resolved() (openAIReplyDoc, error) {
+	providerAudience := ""
+	if d.Provider != nil {
+		providerAudience = strings.TrimSpace(d.Provider.Audience)
+	}
+
 	if d.Reply == nil {
-		return d
+		if d.Audience == "" {
+			d.Audience = providerAudience
+		} else if err := checkAudienceAgreement(d.Audience, providerAudience); err != nil {
+			return d, err
+		}
+		return d, nil
 	}
 	out := *d.Reply
 	out.Reply = nil
 	if out.Audience == "" {
 		out.Audience = d.Audience
 	}
-	// reply.audience wins, then the provider block: an administrator who
-	// reused a provider updates one of the two, and the mapping was
-	// written against whichever they set.
-	if out.Audience == "" && d.Provider != nil {
-		out.Audience = d.Provider.Audience
+	if out.Audience == "" {
+		out.Audience = providerAudience
+	} else if err := checkAudienceAgreement(out.Audience, providerAudience); err != nil {
+		return out, err
 	}
 	if out.IdentityProviderID == "" {
 		out.IdentityProviderID = d.IdentityProviderID
@@ -413,7 +498,19 @@ func (d openAIReplyDoc) resolved() openAIReplyDoc {
 	if len(out.ServiceAccountIDs) == 0 {
 		out.ServiceAccountIDs = d.ServiceAccountIDs
 	}
-	return out
+	return out, nil
+}
+
+// checkAudienceAgreement refuses a document whose provider block and
+// reply disagree about the audience.
+func checkAudienceAgreement(replyAudience, providerAudience string) error {
+	if providerAudience == "" || strings.TrimSpace(replyAudience) == providerAudience {
+		return nil
+	}
+	return fmt.Errorf(
+		"the document disagrees with itself about the audience: provider.audience is %q but reply.audience is %q — "+
+			"set both to the audience the mapping actually asserts, or pass --audience to override the file",
+		providerAudience, replyAudience)
 }
 
 // serviceAccountFor picks the service account for repo out of a reply.
@@ -496,7 +593,7 @@ token with variable-write permissions and --repo).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			printer := ui.New(cmd.OutOrStdout())
 
-			ids, err := resolveImportIDs(args, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo)
+			ids, err := resolveImportIDs(printer, args, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo)
 			if err != nil {
 				return err
 			}
@@ -525,7 +622,7 @@ token with variable-write permissions and --repo).`,
 
 // resolveImportIDs takes the command arguments and flags and returns the
 // OpenAI WIF config. Flags take precedence over the JSON file.
-func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo string) (config.OpenAIWIFConfig, error) {
+func resolveImportIDs(printer *ui.Printer, args []string, flagAudience, flagIdentityProviderID, flagServiceAccountID, repo string) (config.OpenAIWIFConfig, error) {
 	var ids config.OpenAIWIFConfig
 
 	// Load from JSON file if provided.
@@ -538,7 +635,21 @@ func resolveImportIDs(args []string, flagAudience, flagIdentityProviderID, flagS
 		if err := json.Unmarshal(data, &doc); err != nil {
 			return ids, fmt.Errorf("parsing reply JSON: %w", err)
 		}
-		reply := doc.resolved()
+		// An explicit --audience is the documented way past a document
+		// whose provider block and reply disagree, so the conflict is
+		// only fatal when the operator has not already answered it.
+		reply, err := doc.resolved()
+		if err != nil {
+			if flagAudience == "" {
+				return ids, err
+			}
+			// --audience answers the ambiguity, but the operator should
+			// still hear that the file contradicts itself: the mapping
+			// was written against one of the two values, and only they
+			// know which.
+			printer.StepWarn(err.Error())
+			printer.StepInfo("Using --audience " + flagAudience + "; make sure it is the audience the mapping asserts")
+		}
 		ids.Audience = reply.Audience
 		ids.IdentityProviderID = reply.IdentityProviderID
 		// An explicit --service-account-id is the answer to the very

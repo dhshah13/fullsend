@@ -36,7 +36,7 @@ fullsend
 │       │   ├── --audience <string>          #   Provider audience (default: fullsend://<owner>)
 │       │   ├── --project <name|id>          #   OpenAI project to bill the runs to
 │       │   ├── --service-account <id>       #   Map an existing service account
-│       │   ├── --ref <ref>                  #   Ref assertion (default: refs/heads/main)
+│       │   ├── --ref <ref>                  #   Tighten to a ref: emits this ref + refs/pull/*
 │       │   ├── --format <json|md>           #   Document format
 │       │   └── --out <file>                 #   Write to a file instead of stdout
 │       ├── import   [reply.json]            # Record the admin's reply in config.yaml

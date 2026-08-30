@@ -92,7 +92,7 @@ What reaches the network, and what does not:
 | Command | Network |
 |---|---|
 | `request` | None. The document is computed from the repository names. |
-| `import` | None, unless `--variables` is passed: that calls the GitHub API through `gh` to set the three repository variables. |
+| `import` | None, unless `--variables` is passed: that calls the GitHub API through the forge client to set the three repository variables. |
 | `status` | Reads configuration only, except inside a GitHub Actions job with `id-token: write`, where it performs one token exchange with OpenAI to prove the mapping accepts *that* job's repository — reporting the granted scope and expiry, never the token. |
 
 No OpenAI API key is used or created by any of them.
@@ -116,7 +116,7 @@ fullsend inference openai request <owner/repo>[,<owner/repo>…] \
 | `--audience` | `fullsend://<owner>` | OpenAI Workload Identity audience |
 | `--project` | *(empty)* | OpenAI project name or ID for the service accounts |
 | `--service-account` | *(none)* | Map this existing service account instead of asking for `fullsend-<repo>-ci` to be created in the mapping |
-| `--ref` | `refs/heads/main` | The `ref` assertion: the branch fullsend's agent workflows run from. Assertions are exact, so a repository whose default branch is not `main` needs this or every exchange fails |
+| `--ref` | *(none)* | Optional tightening. Must be a full ref (`refs/…`). When set, emits **two mappings** per repository — one asserting the given ref (e.g. `refs/heads/main`) and one asserting `refs/pull/*` — so both branch and PR-review-triggered runs work. Without `--ref`, mappings assert `iss`, `aud`, and `repository` only (no ref), matching the Vertex path's repository-scoped trust. The two-mapping cost halves the 50-mapping-per-provider budget to 25 repositories |
 | `--format` | `json` | Output format: `json` (versioned schema) or `md` (copy-paste ticket) |
 | `--out` | *(stdout)* | Write output to a file |
 
