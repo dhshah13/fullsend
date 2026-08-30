@@ -177,11 +177,14 @@ Output formats:
 			// per repository, so a large enrolment can produce a
 			// document the administrator cannot install as written.
 			if len(doc.Mappings) > openAIMaxMappingsPerProvider {
+				because := ""
+				if ref != "" {
+					because = " (--ref emits two mappings per repository)"
+				}
 				printer := ui.New(cmd.ErrOrStderr())
 				printer.StepWarn(fmt.Sprintf(
 					"%d mappings for %d repositories exceeds OpenAI's limit of %d per provider%s — split the enrolment across providers, or ask for a second provider",
-					len(doc.Mappings), len(repos), openAIMaxMappingsPerProvider,
-					map[bool]string{true: " (--ref emits two mappings per repository)", false: ""}[ref != ""]))
+					len(doc.Mappings), len(repos), openAIMaxMappingsPerProvider, because))
 			}
 
 			var output string
