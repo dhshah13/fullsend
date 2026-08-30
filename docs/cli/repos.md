@@ -77,7 +77,7 @@ fullsend repos migrate <org> --project <gcp-project>
 
 ## `repos install`
 
-Converge repos to the desired state defined in a manifest. This is the primary command for managing per-repo installations — it handles adding repos to the manifest, provisioning new repos, repairing component drift (workflow, thin callers, variables, secrets), repairing scaffold content drift, and upgrading scaffold refs.
+Converge repos to the desired state defined in a manifest. This is the primary command for managing per-repo installations — it handles adding repos to the manifest, provisioning new repos, repairing component drift (workflow, thin callers, variables, secrets, pipeline schedules), repairing scaffold content drift, and upgrading scaffold refs.
 
 When the manifest file does not exist and positional repo arguments are
 provided, `repos install` bootstraps a new manifest (`version: 1`),
@@ -88,7 +88,7 @@ required in this case. This enables a greenfield setup without running
 Runs in two phases:
 
 1. **Manifest add** — repos specified as positional arguments that are not already in the manifest are added (`--forge` is required when the target platform cannot be inferred). Per-repo overrides (`--inference-region`, `--fullsend-ref`, `--mint-url`, `--allowed-remote-resources`, `--runtime`) are written to the manifest entry.
-2. **Converge** — all manifest repos are converged through a unified probe → diff → apply pipeline. Repos with no components are freshly installed (scaffold files, variables, secrets). Repos with existing components are checked for drift (workflow, thin callers, variables, secrets — repaired automatically), scaffold content drift (repaired automatically), and scaffold ref drift (upgraded automatically).
+2. **Converge** — all manifest repos are converged through a unified probe → diff → apply pipeline. Repos with no components are freshly installed (scaffold files, variables, secrets). Repos with existing components are checked for drift (workflow, thin callers, variables, secrets, pipeline schedules — repaired automatically), scaffold content drift (repaired automatically), and scaffold ref drift (upgraded automatically).
 
 ```bash
 fullsend repos install -f repos.yaml

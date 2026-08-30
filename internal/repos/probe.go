@@ -177,26 +177,20 @@ func ProbeComponents(ctx context.Context, client forge.Client, owner, repo, forg
 		if schedErr != nil {
 			return nil, fmt.Errorf("checking pipeline schedules: %w", schedErr)
 		}
-		hasSlashPoll := false
-		hasEventPoll := false
-		for _, s := range schedules {
-			if s.Description == "fullsend slash poll" {
-				hasSlashPoll = true
+		for _, spec := range PipelineScheduleSpecs {
+			found := false
+			for _, s := range schedules {
+				if s.Description == spec.Description {
+					found = true
+					break
+				}
 			}
-			if s.Description == "fullsend event poll" {
-				hasEventPoll = true
-			}
+			results = append(results, ComponentStatus{
+				Name:    spec.ComponentName,
+				Present: found,
+				Match:   found,
+			})
 		}
-		results = append(results, ComponentStatus{
-			Name:    "schedule:slash-poll",
-			Present: hasSlashPoll,
-			Match:   hasSlashPoll,
-		})
-		results = append(results, ComponentStatus{
-			Name:    "schedule:event-poll",
-			Present: hasEventPoll,
-			Match:   hasEventPoll,
-		})
 	}
 
 	// Required secrets (existence check only — values cannot be read back).

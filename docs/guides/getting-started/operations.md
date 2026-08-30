@@ -57,7 +57,7 @@ For manifest-managed installations (including GitLab repos), use `repos install`
 fullsend repos install -f repos.yaml
 ```
 
-This is idempotent — it provisions new repos, repairs missing or drifted components (workflow, thin callers, variables, secrets), repairs scaffold content drift, and upgrades workflow refs. Variables with manifest-specified values (e.g. mint URL, GCP region, review app client ID) are checked for value drift; secrets and runtime-mutated variables are checked for presence only.
+This is idempotent — it provisions new repos, repairs missing or drifted components (workflow, thin callers, variables, secrets, pipeline schedules), repairs scaffold content drift, and upgrades workflow refs. Variables with manifest-specified values (e.g. mint URL, GCP region, review app client ID) are checked for value drift; secrets and runtime-mutated variables are checked for presence only.
 
 ## Uninstalling
 
@@ -111,7 +111,7 @@ For organizations that separate GCP and GitHub responsibilities across teams, fu
 | GCP Admin (Mint) | `fullsend mint status` | Inspect mint state and PEM health |
 
 | Fleet Admin | `fullsend repos migrate <org> --project <gcp-project>` | Migrate an org from per-org to per-repo install, generating a `repos.yaml` manifest |
-| Platform Admin | `fullsend repos install [repos...]` | Converge repos to desired state: provision new, repair component drift (workflow, thin callers, variables, secrets), repair scaffold content drift, upgrade refs |
+| Platform Admin | `fullsend repos install [repos...]` | Converge repos to desired state: provision new, repair component drift (workflow, thin callers, variables, secrets, pipeline schedules), repair scaffold content drift, upgrade refs |
 | Platform Admin | `fullsend repos uninstall <repos...>` | Tear down fullsend from repos and remove from manifest |
 | Fleet Admin | `fullsend repos status` | Compare manifest against actual per-repo state: detect missing or drifted components, ref drift, and scaffold content drift |
 | Fleet Admin | `fullsend repos set-default <key> <value>` | Set or remove a platform-level default in the manifest |

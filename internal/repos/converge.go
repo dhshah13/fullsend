@@ -537,13 +537,13 @@ func convergeRepo(ctx context.Context,
 		wifProvider, cfg, progress)
 	cr.Actions = append(cr.Actions, secretActions...)
 
-	// 2b-ii: Converge pipeline schedules (GitLab only).
+	// 2c: Converge pipeline schedules (GitLab only).
 	if resolved.Forge == ForgeGitLab {
 		schedActions := convergeSchedules(ctx, resolved, d.components, cfg.DryRun, progress)
 		cr.Actions = append(cr.Actions, schedActions...)
 	}
 
-	// Bail out before scaffold commit if variable or secret writes failed.
+	// Bail out before scaffold commit if variable, secret, or schedule writes failed.
 	var earlyErrors []string
 	for _, a := range cr.Actions {
 		if a.Action == "error" {
@@ -555,7 +555,7 @@ func convergeRepo(ctx context.Context,
 		return cr
 	}
 
-	// 2c: Collect all scaffold file changes (ref upgrade + missing
+	// 2d: Collect all scaffold file changes (ref upgrade + missing
 	// components + content drift) and commit as a single atomic
 	// operation.
 	var allScaffoldFiles []forge.TreeFile
@@ -609,7 +609,7 @@ func convergeRepo(ctx context.Context,
 		}
 	}
 
-	// 2c-ii: Content drift — detect scaffold files that exist but
+	// 2d-ii: Content drift — detect scaffold files that exist but
 	// whose content differs from the current template (e.g., template
 	// structure changed between releases while the ref stayed the
 	// same). This is the gap that caused #6576: converge only checked
@@ -637,7 +637,7 @@ func convergeRepo(ctx context.Context,
 	}
 	allScaffoldFiles = append(allScaffoldFiles, contentDriftFiles...)
 
-	// 2d: Commit all scaffold file changes in one atomic commit.
+	// 2e: Commit all scaffold file changes in one atomic commit.
 	// Variable/secret writes above are not rolled back on commit failure;
 	// the next Converge run self-heals (writes become no-ops, commit retries).
 	if len(allScaffoldFiles) > 0 && !cfg.DryRun {
@@ -835,6 +835,104 @@ func convergeSecrets(ctx context.Context,
 			Detail:    fmt.Sprintf("set %s", secretName),
 		})
 		progress(repoFullName, "sync", fmt.Sprintf("Set secret %s", secretName))
+	}
+
+	return actions
+}
+
+// convergeSchedules checks for missing pipeline schedules on GitLab
+// repos and creates them. This repairs the gap where a partial install
+// committed scaffold and variables but failed before schedule creation.
+func convergeSchedules(ctx context.Context,
+	resolved ResolvedConfig,
+	components []ComponentStatus,
+	dryRun bool,
+	progress ProgressFunc) []ComponentAction {
+
+	var actions []ComponentAction
+
+	var missingSchedules []string
+	for _, c := range components {
+		if !strings.HasPrefix(c.Name, "schedule:") {
+			continue
+		}
+		if c.Match {
+			actions = append(actions, ComponentAction{
+				Component: c.Name,
+				Action:    "none",
+				Detail:    fmt.Sprintf("%s exists", DriftFieldName(c.Name)),
+			})
+			continue
+		}
+		missingSchedules = append(missingSchedules, c.Name)
+	}
+
+	if len(missingSchedules) == 0 {
+		return actions
+	}
+
+	owner, repo := resolved.Owner, resolved.Repo
+	client := resolved.ForgeConfig.Client
+	repoFullName := owner + "/" + repo
+
+	if dryRun {
+		for _, name := range missingSchedules {
+			actions = append(actions, ComponentAction{
+				Component: name,
+				Action:    "add",
+				Detail:    fmt.Sprintf("would add %s", DriftFieldName(name)),
+			})
+		}
+		progress(repoFullName, "dry-run",
+			fmt.Sprintf("Would create %d pipeline schedule(s)", len(missingSchedules)))
+		return actions
+	}
+
+	// Need the default branch for the schedule ref.
+	repoInfo, err := client.GetRepo(ctx, owner, repo)
+	if err != nil {
+		for _, name := range missingSchedules {
+			actions = append(actions, ComponentAction{
+				Component: name,
+				Action:    "error",
+				Detail:    fmt.Sprintf("failed to get repo info for schedule creation: %v", err),
+			})
+		}
+		return actions
+	}
+	defaultBranch := repoInfo.DefaultBranch
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+
+	for _, name := range missingSchedules {
+		spec := scheduleSpecByComponent(name)
+		if spec == nil {
+			actions = append(actions, ComponentAction{
+				Component: name,
+				Action:    "error",
+				Detail:    fmt.Sprintf("unrecognized schedule component %s", DriftFieldName(name)),
+			})
+			continue
+		}
+
+		_, createErr := client.CreatePipelineSchedule(
+			ctx, owner, repo, defaultBranch, spec.Description, spec.Cron, spec.Variables)
+		if createErr != nil {
+			actions = append(actions, ComponentAction{
+				Component: name,
+				Action:    "error",
+				Detail:    fmt.Sprintf("failed to create %s: %v", DriftFieldName(name), createErr),
+			})
+			continue
+		}
+		actions = append(actions, ComponentAction{
+			Component: name,
+			Action:    "add",
+			Detail:    fmt.Sprintf("created %s", DriftFieldName(name)),
+		})
+		progress(repoFullName, "sync",
+			fmt.Sprintf("Created pipeline schedule %s", DriftFieldName(name)))
 	}
 
 	return actions
@@ -1452,109 +1550,6 @@ func resolveTargetRef(ctx context.Context, fullsendRef, upstreamRef, upstreamTag
 		}
 	}
 	return resolvedRef{ref: ref, tag: tag, manifestRef: manifestRef}
-}
-
-// convergeSchedules checks for missing pipeline schedules on GitLab
-// repos and creates them. This repairs the gap where a partial install
-// committed scaffold and variables but failed before schedule creation.
-func convergeSchedules(ctx context.Context,
-	resolved ResolvedConfig,
-	components []ComponentStatus,
-	dryRun bool,
-	progress ProgressFunc) []ComponentAction {
-
-	var actions []ComponentAction
-
-	var missingSchedules []string
-	for _, c := range components {
-		if !strings.HasPrefix(c.Name, "schedule:") {
-			continue
-		}
-		if c.Match {
-			actions = append(actions, ComponentAction{
-				Component: c.Name,
-				Action:    "none",
-				Detail:    fmt.Sprintf("%s exists", DriftFieldName(c.Name)),
-			})
-			continue
-		}
-		missingSchedules = append(missingSchedules, c.Name)
-	}
-
-	if len(missingSchedules) == 0 {
-		return actions
-	}
-
-	owner, repo := resolved.Owner, resolved.Repo
-	client := resolved.ForgeConfig.Client
-	repoFullName := owner + "/" + repo
-
-	if dryRun {
-		for _, name := range missingSchedules {
-			actions = append(actions, ComponentAction{
-				Component: name,
-				Action:    "add",
-				Detail:    fmt.Sprintf("would add %s", DriftFieldName(name)),
-			})
-		}
-		progress(repoFullName, "dry-run",
-			fmt.Sprintf("Would create %d pipeline schedule(s)", len(missingSchedules)))
-		return actions
-	}
-
-	// Need the default branch for the schedule ref.
-	repoInfo, err := client.GetRepo(ctx, owner, repo)
-	if err != nil {
-		for _, name := range missingSchedules {
-			actions = append(actions, ComponentAction{
-				Component: name,
-				Action:    "error",
-				Detail:    fmt.Sprintf("failed to get repo info for schedule creation: %v", err),
-			})
-		}
-		return actions
-	}
-	defaultBranch := repoInfo.DefaultBranch
-	if defaultBranch == "" {
-		defaultBranch = "main"
-	}
-
-	for _, name := range missingSchedules {
-		var desc, cron string
-		var vars map[string]string
-		switch name {
-		case "schedule:slash-poll":
-			desc = "fullsend slash poll"
-			cron = "*/5 * * * *"
-			vars = map[string]string{forge.VarPollMode: "slash"}
-		case "schedule:event-poll":
-			desc = "fullsend event poll"
-			cron = "2,17,32,47 * * * *"
-			vars = map[string]string{forge.VarPollMode: "events"}
-		default:
-			continue
-		}
-
-		_, createErr := client.CreatePipelineSchedule(
-			ctx, owner, repo, defaultBranch, desc, cron, vars)
-		if createErr != nil {
-			actions = append(actions, ComponentAction{
-				Component: name,
-				Action:    "error",
-				Detail:    fmt.Sprintf("failed to create %s: %v", DriftFieldName(name), createErr),
-			})
-			continue
-		}
-		actions = append(actions, ComponentAction{
-			Component: name,
-			Action:    "add",
-			Detail:    fmt.Sprintf("created %s", DriftFieldName(name)),
-		})
-		progress(repoFullName, "sync",
-			fmt.Sprintf("Created pipeline schedule %s", DriftFieldName(name)))
-	}
-
-	return actions
 }
 
 // defaultRoles returns the provided roles or falls back to the
