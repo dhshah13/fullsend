@@ -105,61 +105,47 @@ func TestAgentDestName(t *testing.T) {
 	}
 }
 
-func TestValidateAgentName(t *testing.T) {
+func TestValidateAgentNameMatch(t *testing.T) {
 	tests := []struct {
-		name          string
-		requestedName string
-		fileContent   string
-		wantErr       string // empty means no error expected
+		name           string
+		requestedName  string
+		definitionName string
+		wantErr        string // empty means no error expected
 	}{
 		{
-			name:          "matching names pass",
-			requestedName: "code",
-			fileContent:   "---\nname: code\n---\n# Agent",
-			wantErr:       "",
+			name:           "matching names pass",
+			requestedName:  "code",
+			definitionName: "code",
+			wantErr:        "",
 		},
 		{
-			name:          "mismatched names fail",
-			requestedName: "coder",
-			fileContent:   "---\nname: code\n---\n# Agent",
-			wantErr:       `agent name mismatch: requested "coder" but definition declares "code"`,
+			name:           "mismatched names fail",
+			requestedName:  "coder",
+			definitionName: "code",
+			wantErr:        `agent name mismatch: requested "coder" but definition declares "code"`,
 		},
 		{
-			name:          "empty requested name skips validation",
-			requestedName: "",
-			fileContent:   "---\nname: code\n---\n# Agent",
-			wantErr:       "",
+			name:           "empty requested name skips validation",
+			requestedName:  "",
+			definitionName: "code",
+			wantErr:        "",
 		},
 		{
-			name:          "no frontmatter skips validation",
-			requestedName: "coder",
-			fileContent:   "# Agent without frontmatter",
-			wantErr:       "",
+			name:           "empty definition name skips validation",
+			requestedName:  "coder",
+			definitionName: "",
+			wantErr:        "",
 		},
 		{
-			name:          "empty frontmatter name skips validation",
-			requestedName: "coder",
-			fileContent:   "---\ndescription: some agent\n---\n# Agent",
-			wantErr:       "",
-		},
-		{
-			name:          "nonexistent file skips validation",
-			requestedName: "coder",
-			fileContent:   "", // will use a path that doesn't exist
-			wantErr:       "",
+			name:           "both empty skips validation",
+			requestedName:  "",
+			definitionName: "",
+			wantErr:        "",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var agentPath string
-			if tc.fileContent != "" {
-				f := filepath.Join(t.TempDir(), "agent.md")
-				require.NoError(t, os.WriteFile(f, []byte(tc.fileContent), 0o644))
-				agentPath = f
-			} else {
-				agentPath = filepath.Join(t.TempDir(), "nonexistent.md")
-			}
-			err := validateAgentName(tc.requestedName, agentPath)
+			err := validateAgentNameMatch(tc.requestedName, tc.definitionName)
 			if tc.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
