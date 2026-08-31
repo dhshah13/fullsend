@@ -302,7 +302,8 @@ registration setting.
 |------|-------------|
 | fullsend | `actions:write`, `actions_variables:read`, `administration:write`, `checks:read`, `contents:write`, `issues:read`, `members:read`, `organization_projects:read`, `pull_requests:write`, `workflows:write` |
 | triage | `contents:read`, `issues:write` |
-| coder | `checks:read`, `contents:write`, `issues:write`, `pull_requests:write` |
+| coder | `checks:read`, `contents:write`, `issues:write`, `packages:read`, `pull_requests:write` |
+| fix | Same as `coder`; the fix role reuses the coder app and PEM. |
 | review | `checks:read`, `contents:read`, `issues:write`, `pull_requests:write` |
 | retro | `actions:read`, `contents:read`, `issues:write`, `pull_requests:write` |
 | prioritize | `contents:read`, `issues:write`, `organization_projects:write` |

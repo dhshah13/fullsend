@@ -95,15 +95,37 @@ To change permissions for the `code` or `fix` agent, update the `coder` role.
 The mint enforces minimum permission sets per role. Tokens cannot exceed these scopes.
 Custom roles can be registered via the standalone mint's `CUSTOM_ROLE_PERMISSIONS` env var — see the [standalone mint guide](standalone-mint.md#custom-role-permissions) for details.
 
-| Role | contents | pull_requests | issues | actions | checks | workflows | actions_variables | organization_projects | metadata |
-|------|----------|---------------|--------|---------|--------|-----------|-------------------|-----------------------|----------|
-| **fullsend** | write | write | — | write | — | write | read | — | read |
-| **triage** | read | — | write | — | — | — | — | — | read |
-| **scribe** | read | — | write | — | — | — | — | — | read |
-| **coder** | write | write | write | — | read | — | — | — | read |
-| **review** | read | write | write | — | read | — | — | — | read |
-| **retro** | read | write | write | read | — | — | — | — | read |
-| **prioritize** | read | — | write | — | — | — | — | write | read |
+| Role | contents | packages | pull_requests | issues | actions | checks | workflows | actions_variables | organization_projects | metadata |
+|------|----------|----------|---------------|--------|---------|--------|-----------|-------------------|-----------------------|----------|
+| **fullsend** | write | — | write | — | write | — | write | read | — | read |
+| **triage** | read | — | — | write | — | — | — | — | — | read |
+| **scribe** | read | — | — | write | — | — | — | — | — | read |
+| **coder** | write | read | write | write | — | read | — | — | — | read |
+| **fix** | write | read | write | write | — | — | — | — | — | read |
+| **review** | read | — | write | write | — | read | — | — | — | read |
+| **retro** | read | — | write | write | read | — | — | — | — | read |
+| **prioritize** | read | — | — | write | — | — | — | — | write | read |
+| **e2e** | write | — | write | write | write | — | write | write | — | read |
+
+The **e2e** role also grants: `administration` (write), `members` (write), `secrets` (write), `organization_actions_variables` (write), `organization_administration` (write). These permissions are omitted from the table above because no other role uses them.
+
+### Roll Out a Role Permission Change
+
+Changing the mint's role map does not update existing GitHub App installations.
+Complete the GitHub permission rollout before deploying mint code that requests
+the new permission:
+
+1. Add the permission on the GitHub App's **Permissions & events** page:
+   `https://github.com/settings/apps/<app-slug>/permissions`.
+2. Ask an administrator for each installation owner to approve the requested
+   permission at `https://github.com/settings/installations/<installation-id>`.
+3. Run fullsend's setup or convergence check and confirm that it no longer
+   reports either permission-update URL.
+4. Deploy the mint change that requests the permission.
+
+Until both GitHub-side steps are complete, an installation retains its old
+permissions. Treat the permission check's App-owner and installation-owner URLs
+as blocking rollout work, not informational warnings.
 
 ### Mint Security Controls
 
