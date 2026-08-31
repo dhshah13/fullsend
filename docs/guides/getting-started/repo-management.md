@@ -226,7 +226,7 @@ fullsend repos install -f repos.yaml --dry-run
 ```
 
 The convergence phase checks all components (workflow, thin callers,
-variables, secrets), scaffold content drift, and scaffold workflow refs
+variables, secrets, pipeline schedules), scaffold content drift, and scaffold workflow refs
 against the manifest. Missing or drifted components are repaired
 automatically; ref updates are committed as PRs (or direct pushes with
 `--direct`).
