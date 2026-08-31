@@ -717,8 +717,12 @@ func copyPermissionsWithout(perms map[string]string, omit string) map[string]str
 
 func truncateForLog(s string, max int) string {
 	s = strings.TrimSpace(s)
-	if max <= 0 || len(s) <= max {
+	if max <= 0 {
 		return s
 	}
-	return s[:max] + "…"
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "…"
 }

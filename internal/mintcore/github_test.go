@@ -459,6 +459,9 @@ func TestTruncateForLog(t *testing.T) {
 	assert.Equal(t, "short", truncateForLog("short", 10))
 	assert.Equal(t, "hello…", truncateForLog("hello world", 5))
 	assert.Equal(t, "unchanged", truncateForLog("unchanged", 0))
+	// Rune-aware: a multi-byte character must not be split.
+	assert.Equal(t, "héllo…", truncateForLog("héllo world", 5))
+	assert.Equal(t, "日本語…", truncateForLog("日本語テスト", 3))
 }
 
 func TestRolePermissions_AllRolesPresent(t *testing.T) {

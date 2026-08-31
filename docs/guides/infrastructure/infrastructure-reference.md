@@ -77,15 +77,15 @@ The mint exchanges GitHub OIDC tokens for scoped GitHub App installation tokens.
 
 ### Agent → Mint Role Mapping
 
-Each dispatch stage mints a token for a specific **mint role**. The `code` and `fix` agents both use the **coder** role (same GitHub App, same PEM, same permissions). All other built-in agents use the role matching their name. `scribe` is a mint role without a built-in dispatch stage.
+Each dispatch stage mints a token for a specific **mint role**. The `code` and `fix` agents share the same GitHub App and PEM (the **coder** App), but `fix` has its own mint role with a narrower permission set (no `checks:read`). All other built-in agents use the role matching their name. `scribe` is a mint role without a built-in dispatch stage.
 
-To change permissions for the `code` or `fix` agent, update the `coder` role.
+To change App-level permissions for the `code` or `fix` agent, update the coder App registration. To change token-level permissions, update the corresponding role (`coder` or `fix`) in `canonicalRolePermissions`.
 
 | Agent | Mint Role |
 |-------|-----------|
 | triage | triage |
 | code | coder |
-| fix | coder |
+| fix | fix |
 | review | review |
 | retro | retro |
 | prioritize | prioritize |
