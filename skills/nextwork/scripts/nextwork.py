@@ -780,7 +780,10 @@ def classify_issue(
                 status="needs_info_self",
                 reason="Needs-info; you are the author",
                 eliminated=False,
-                suggested_actions=["Provide the requested information or edit the issue body"],
+                suggested_actions=[
+                    "Provide the requested information or edit the issue body,"
+                    " then use /fs-triage to re-trigger triage"
+                ],
             )
         return Classification(
             status="waiting_info_other",

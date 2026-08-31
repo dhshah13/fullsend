@@ -139,7 +139,7 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_USER_TYPE: ${{ github.event.comment.user.type }}
           COMMENT_USER_LOGIN: ${{ github.event.comment.user.login }}
-          COMMENT_AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
+
           ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           ISSUE_IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
@@ -192,10 +192,6 @@ jobs:
           # Event-actor auth; $1=user, optional $2 = write|triage (default write).
           is_event_actor_authorized() {
             has_repo_permission "${1:-}" "${2:-write}"
-          }
-
-          is_issue_author() {
-            [[ "${COMMENT_USER_LOGIN}" == "${ISSUE_USER_LOGIN}" ]]
           }
 
           has_label() {
@@ -261,17 +257,8 @@ jobs:
                   fi
                   ;;
                 *)
-                  # Intentionally weaker gate: allows external reporters to
-                  # re-trigger triage by providing clarification on needs-info
-                  # issues. Full write-permission check is not required here.
-                  if has_label "needs-info" && ! has_label "feature"; then
-                    if [[ "${COMMENT_USER_TYPE}" != "Bot" ]]; then
-                      if [[ "${COMMENT_AUTHOR_ASSOC}" != "NONE" ]] || is_issue_author; then
-                        STAGE="triage"
-                      fi
-                    fi
-                  fi
                   ;;
+
               esac
               ;;
 

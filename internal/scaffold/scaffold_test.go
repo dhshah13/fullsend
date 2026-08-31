@@ -458,8 +458,7 @@ func TestDispatchWorkflowContent(t *testing.T) {
 	assert.Contains(t, s, "pull_request_target")
 	assert.Contains(t, s, "pull_request_review")
 	assert.Contains(t, s, "changes_requested")
-	assert.Contains(t, s, "needs-info")
-	assert.Contains(t, s, `! has_label "feature"`)
+	assert.NotContains(t, s, "needs-info")
 	assert.Contains(t, s, "opened|synchronize|ready_for_review")
 	// /code must only run on issues, not PRs
 	assert.Contains(t, s, "ISSUE_HAS_PR")
@@ -473,9 +472,8 @@ func TestDispatchWorkflowContent(t *testing.T) {
 	assert.Contains(t, s, `is_authorized triage`)
 	assert.Regexp(t, `is_authorized; then\s*\n\s+STAGE="code"`, s)
 	assert.Regexp(t, `is_authorized; then\s*\n\s+STAGE="fix"`, s)
-	assert.Contains(t, s, `COMMENT_AUTHOR_ASSOC`)
-	// Auto-triage requires assoc != NONE or issue author
-	assert.Contains(t, s, "is_issue_author")
+	assert.NotContains(t, s, `COMMENT_AUTHOR_ASSOC`)
+	assert.NotContains(t, s, "is_issue_author")
 	// Bot filtering
 	assert.Contains(t, s, `COMMENT_USER_TYPE`)
 	assert.Contains(t, s, `!= "Bot"`)
