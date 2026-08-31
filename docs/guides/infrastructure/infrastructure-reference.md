@@ -109,23 +109,42 @@ Custom roles can be registered via the standalone mint's `CUSTOM_ROLE_PERMISSION
 
 The **e2e** role also grants: `administration` (write), `members` (write), `secrets` (write), `organization_actions_variables` (write), `organization_administration` (write). These permissions are omitted from the table above because no other role uses them.
 
-### Roll Out a Role Permission Change
+### Roll Out `packages:read` (coder / fix)
 
 Changing the mint's role map does not update existing GitHub App installations.
-Complete the GitHub permission rollout before deploying mint code that requests
-the new permission:
+GitHub rejects the entire installation-token request (`422`) when mint asks for a
+permission the installation has not approved yet — there is no partial downscope.
 
-1. Add the permission on the GitHub App's **Permissions & events** page:
-   `https://github.com/settings/apps/<app-slug>/permissions`.
-2. Ask an administrator for each installation owner to approve the requested
-   permission at `https://github.com/settings/installations/<installation-id>`.
-3. Run fullsend's setup or convergence check and confirm that it no longer
-   reports either permission-update URL.
-4. Deploy the mint change that requests the permission.
+For shared hosted Apps (for example `fullsend-ai-coder`), the App owner adds the
+permission once on the App registration; each installing org's owners must then
+[Accept the update](https://docs.github.com/en/apps/using-github-apps/approving-updated-permissions-for-a-github-app).
+New installations of an already-updated App receive the new permission at install
+time. Self-managed App owners update their own App registration, then Accept on
+their installation.
 
-Until both GitHub-side steps are complete, an installation retains its old
-permissions. Treat the permission check's App-owner and installation-owner URLs
-as blocking rollout work, not informational warnings.
+Recommended operator order for adding **`packages:read`** to `coder` / `fix`
+(today the mint only omits this permission on `422` fallback — other permission
+additions do not get the same retry):
+
+1. Add **Packages: Read-only** on the GitHub App's **Permissions & events** page
+   (hosted: `https://github.com/organizations/fullsend-ai/settings/apps/<app-slug>/permissions`).
+   Optionally include a short note to users explaining why.
+2. Deploy mint code that requests `packages:read` **and** falls back on the
+   permissions-not-granted `422` by retrying once without `packages` (with a log
+   pointing admins at
+   `https://github.com/settings/installations/<installation-id>` on github.com).
+   Lagging installations keep authenticating; they simply lack packages access
+   until they Accept.
+3. Tell installation owners to Accept the pending permission update (GitHub also
+   emails org owners). Mint fallback logs include `org=` and `installation_id=`
+   when packages was omitted — use those to find lagging installs.
+4. Once fallbacks stop, the packages retry path can be removed in a follow-up if
+   desired.
+
+Do **not** block mint deploy on every installation reporting `packages:read` —
+inactive or unreachable installs would stall the platform. Treat setup /
+convergence permission-check URLs as outreach signals during rollout, not as a
+hard deploy gate.
 
 ### Mint Security Controls
 

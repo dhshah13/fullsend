@@ -505,7 +505,7 @@ func (h *Handler) mintToken(ctx context.Context, org, role string, repos []strin
 		}
 	}
 
-	token, expiresAt, granted, err := CreateInstallationToken(ctx, h.githubBaseURL, jwt, installationID, role, repos)
+	token, expiresAt, granted, err := CreateInstallationToken(ctx, h.githubBaseURL, jwt, installationID, org, role, repos)
 	if err != nil {
 		return "", "", nil, &mintError{status: http.StatusBadGateway, msg: err.Error()}
 	}

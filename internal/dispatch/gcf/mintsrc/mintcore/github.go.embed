@@ -19,6 +19,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -569,13 +570,84 @@ func ReadForeignAllowlistFromRepo(ctx context.Context, githubBaseURL, jwt string
 	return ParseForeignAllowlist(value), nil
 }
 
+// packagesPermissionKey is the GitHub App permission that may lag installation
+// approval during a packages:read rollout. When mint requests it before the
+// installation has accepted the App update, GitHub returns 422 for the entire
+// token request (no partial downscope).
+const packagesPermissionKey = "packages"
+
+// installationPermissionsNotGranted reports whether a GitHub 422 body indicates
+// the installation lacks a requested App permission (Ralph-verified message).
+func installationPermissionsNotGranted(body string) bool {
+	return strings.Contains(strings.ToLower(body), "permissions requested are not granted to this installation")
+}
+
+// isPublicGitHubAPI reports whether githubBaseURL refers to github.com's API
+// (or the empty default). Used only to choose Accept-URL wording.
+func isPublicGitHubAPI(githubBaseURL string) bool {
+	u := strings.TrimSpace(githubBaseURL)
+	if u == "" {
+		return true
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "api.github.com" || host == "github.com"
+}
+
+func installationAcceptHint(githubBaseURL string, installationID int64) string {
+	if isPublicGitHubAPI(githubBaseURL) {
+		return fmt.Sprintf("an installation admin should Accept the pending App permission update at https://github.com/settings/installations/%d", installationID)
+	}
+	return fmt.Sprintf("an installation admin should Accept the pending App permission update for installation_id=%d on this GitHub host", installationID)
+}
+
 // CreateInstallationToken exchanges a JWT for an installation access token,
 // scoped to the given repos and role-specific permissions.
-func CreateInstallationToken(ctx context.Context, githubBaseURL, jwt string, installationID int64, role string, repos []string) (string, string, *GrantedScope, error) {
+//
+// If the role map includes packages and GitHub returns 422 because that
+// permission is not granted on the installation, it retries once without
+// packages so lagging installations keep authenticating during App-permission
+// rollouts. org is used only for fallback logging.
+func CreateInstallationToken(ctx context.Context, githubBaseURL, jwt string, installationID int64, org, role string, repos []string) (string, string, *GrantedScope, error) {
 	perms := RolePermissionsFor(role)
 	if perms == nil {
 		return "", "", nil, fmt.Errorf("no permissions defined for role %q", role)
 	}
+
+	token, expiresAt, granted, status, body, err := postInstallationAccessToken(ctx, githubBaseURL, jwt, installationID, perms, repos)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if status == http.StatusCreated {
+		return token, expiresAt, granted, nil
+	}
+
+	packagesLevel := perms[packagesPermissionKey]
+	if status == http.StatusUnprocessableEntity && packagesLevel != "" && installationPermissionsNotGranted(body) {
+		fallback := copyPermissionsWithout(perms, packagesPermissionKey)
+		log.Printf("installation token 422 for org=%q installation_id=%d role=%q; packages=%s not granted on this installation — retrying without packages; %s (response: %s)",
+			org, installationID, role, packagesLevel, installationAcceptHint(githubBaseURL, installationID), truncateForLog(body, 256))
+
+		token, expiresAt, granted, status, body, err = postInstallationAccessToken(ctx, githubBaseURL, jwt, installationID, fallback, repos)
+		if err != nil {
+			return "", "", nil, err
+		}
+		if status == http.StatusCreated {
+			return token, expiresAt, granted, nil
+		}
+		return "", "", nil, fmt.Errorf("creating installation token returned status %d after packages fallback: %s", status, truncateForLog(body, 256))
+	}
+
+	return "", "", nil, fmt.Errorf("creating installation token returned status %d: %s", status, truncateForLog(body, 256))
+}
+
+// postInstallationAccessToken POSTs /app/installations/{id}/access_tokens and
+// returns the parsed success payload or the raw status/body for the caller to
+// decide on fallback. Network and marshal errors are returned via err.
+func postInstallationAccessToken(ctx context.Context, githubBaseURL, jwt string, installationID int64, perms map[string]string, repos []string) (token, expiresAt string, granted *GrantedScope, status int, body string, err error) {
 	tokenReqBody := map[string]interface{}{
 		"permissions": perms,
 	}
@@ -585,13 +657,13 @@ func CreateInstallationToken(ctx context.Context, githubBaseURL, jwt string, ins
 
 	tokenReqBytes, err := json.Marshal(tokenReqBody)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("marshaling token request: %w", err)
+		return "", "", nil, 0, "", fmt.Errorf("marshaling token request: %w", err)
 	}
 
 	reqURL := fmt.Sprintf("%s/app/installations/%d/access_tokens", githubBaseURL, installationID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(tokenReqBytes))
 	if err != nil {
-		return "", "", nil, fmt.Errorf("creating token request: %w", err)
+		return "", "", nil, 0, "", fmt.Errorf("creating token request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -600,31 +672,53 @@ func CreateInstallationToken(ctx context.Context, githubBaseURL, jwt string, ins
 
 	resp, err := mintHTTP(req)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("creating installation token: %w", err)
+		return "", "", nil, 0, "", fmt.Errorf("creating installation token: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return "", "", nil, fmt.Errorf("creating installation token returned status %d", resp.StatusCode)
+		// Cap error bodies only — success payloads can include full repository
+		// objects and must not be truncated before JSON decode.
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if readErr != nil {
+			return "", "", nil, resp.StatusCode, "", fmt.Errorf("reading installation token response: %w", readErr)
+		}
+		return "", "", nil, resp.StatusCode, string(raw), nil
 	}
 
 	var tokenResp installationTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return "", "", nil, fmt.Errorf("decoding token response: %w", err)
+		return "", "", nil, resp.StatusCode, "", fmt.Errorf("decoding token response: %w", err)
 	}
-
 	if tokenResp.Token == "" {
-		return "", "", nil, fmt.Errorf("empty installation token returned")
+		return "", "", nil, resp.StatusCode, "", fmt.Errorf("empty installation token returned")
 	}
 
-	granted := &GrantedScope{
+	granted = &GrantedScope{
 		Permissions:   tokenResp.Permissions,
 		RepoSelection: tokenResp.RepositorySelection,
 	}
 	for _, r := range tokenResp.Repositories {
 		granted.Repos = append(granted.Repos, r.FullName)
 	}
+	return tokenResp.Token, tokenResp.ExpiresAt, granted, resp.StatusCode, "", nil
+}
 
-	return tokenResp.Token, tokenResp.ExpiresAt, granted, nil
+func copyPermissionsWithout(perms map[string]string, omit string) map[string]string {
+	out := make(map[string]string, len(perms))
+	for k, v := range perms {
+		if k == omit {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func truncateForLog(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }

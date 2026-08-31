@@ -7,6 +7,9 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -177,7 +180,7 @@ func TestCreateInstallationToken_Unscoped(t *testing.T) {
 	}))
 	defer mockGH.Close()
 
-	token, expiresAt, granted, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "coder", nil)
+	token, expiresAt, granted, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "test-org", "coder", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "ghs_test_token", token)
 	assert.Equal(t, "2099-01-01T00:00:00Z", expiresAt)
@@ -218,16 +221,244 @@ func TestCreateInstallationToken(t *testing.T) {
 	}))
 	defer mockGH.Close()
 
-	token, expiresAt, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "coder", []string{"my-repo"})
+	token, expiresAt, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "test-org", "coder", []string{"my-repo"})
 	require.NoError(t, err)
 	assert.Equal(t, "ghs_test_token", token)
 	assert.Equal(t, "2099-01-01T00:00:00Z", expiresAt)
 }
 
 func TestCreateInstallationToken_UnknownRole(t *testing.T) {
-	_, _, _, err := CreateInstallationToken(t.Context(), "http://unused", "fake-jwt", 42, "nonexistent", []string{"repo"})
+	_, _, _, err := CreateInstallationToken(t.Context(), "http://unused", "fake-jwt", 42, "test-org", "nonexistent", []string{"repo"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no permissions defined")
+}
+
+func TestCreateInstallationToken_Packages422FallsBackWithoutPackages(t *testing.T) {
+	var calls int
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body map[string]interface{}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		perms := body["permissions"].(map[string]interface{})
+
+		switch calls {
+		case 1:
+			assert.Equal(t, "read", perms["packages"])
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"message":"The permissions requested are not granted to this installation."}`))
+		case 2:
+			_, hasPackages := perms["packages"]
+			assert.False(t, hasPackages, "retry must omit packages")
+			assert.Equal(t, "write", perms["contents"])
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_fallback_token",
+				ExpiresAt: "2099-01-01T00:00:00Z",
+				Permissions: map[string]string{
+					"contents": "write",
+					"metadata": "read",
+				},
+			})
+		default:
+			t.Fatalf("unexpected call %d", calls)
+		}
+	}))
+	defer mockGH.Close()
+
+	token, expiresAt, granted, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "coder", []string{"repo"})
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls)
+	assert.Equal(t, "ghs_fallback_token", token)
+	assert.Equal(t, "2099-01-01T00:00:00Z", expiresAt)
+	require.NotNil(t, granted)
+	assert.Equal(t, "write", granted.Permissions["contents"])
+	assert.Empty(t, granted.Permissions["packages"])
+}
+
+func TestCreateInstallationToken_Packages422RetryStillFails(t *testing.T) {
+	var calls int
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body map[string]interface{}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		perms := body["permissions"].(map[string]interface{})
+		if calls == 2 {
+			_, hasPackages := perms["packages"]
+			assert.False(t, hasPackages, "retry must omit packages")
+		}
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"The permissions requested are not granted to this installation."}`))
+	}))
+	defer mockGH.Close()
+
+	_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "fix", nil)
+	require.Error(t, err)
+	assert.Equal(t, 2, calls, "should retry once without packages")
+	assert.Contains(t, err.Error(), "after packages fallback")
+	assert.Contains(t, err.Error(), "422")
+}
+
+func TestCreateInstallationToken_422UnrelatedBodyDoesNotFallback(t *testing.T) {
+	var calls int
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Validation Failed","errors":[{"resource":"Installation","code":"invalid"}]}`))
+	}))
+	defer mockGH.Close()
+
+	_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "coder", nil)
+	require.Error(t, err)
+	assert.Equal(t, 1, calls, "unrelated 422 must not trigger packages fallback")
+	assert.Contains(t, err.Error(), "status 422")
+	assert.NotContains(t, err.Error(), "packages fallback")
+}
+
+func TestCreateInstallationToken_Non422DoesNotFallback(t *testing.T) {
+	var calls int
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"Forbidden"}`))
+	}))
+	defer mockGH.Close()
+
+	_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "coder", nil)
+	require.Error(t, err)
+	assert.Equal(t, 1, calls, "non-422 must not trigger packages fallback")
+	assert.Contains(t, err.Error(), "status 403")
+	assert.NotContains(t, err.Error(), "packages fallback")
+}
+
+func TestInstallationPermissionsNotGranted(t *testing.T) {
+	assert.True(t, installationPermissionsNotGranted(`{"message":"The permissions requested are not granted to this installation."}`))
+	assert.False(t, installationPermissionsNotGranted(`{"message":"Validation Failed"}`))
+}
+
+func TestInstallationAcceptHint(t *testing.T) {
+	assert.True(t, isPublicGitHubAPI(""))
+	assert.True(t, isPublicGitHubAPI("https://api.github.com"))
+	assert.True(t, isPublicGitHubAPI("https://api.github.com/"))
+	assert.False(t, isPublicGitHubAPI("https://github.example.com/api/v3"))
+	assert.False(t, isPublicGitHubAPI("https://evil.example/?x=api.github.com"))
+	assert.Contains(t, installationAcceptHint("https://api.github.com", 42), "https://github.com/settings/installations/42")
+	assert.NotContains(t, installationAcceptHint("https://github.example.com/api/v3", 42), "https://github.com/")
+	assert.Contains(t, installationAcceptHint("https://github.example.com/api/v3", 42), "installation_id=42")
+}
+
+func TestCreateInstallationToken_LargeSuccessBody(t *testing.T) {
+	// Success responses must not be capped at 4KiB — repo objects in the token
+	// payload can exceed that. Build a body larger than the error-body limit.
+	repos := make([]installationTokenRepository, 0, 200)
+	for i := 0; i < 200; i++ {
+		repos = append(repos, installationTokenRepository{FullName: fmt.Sprintf("org/very-long-repository-name-%03d-xxxxxxxxxxxxxxxx", i)})
+	}
+	payload, err := json.Marshal(installationTokenResponse{
+		Token:        "ghs_large",
+		ExpiresAt:    "2099-01-01T00:00:00Z",
+		Repositories: repos,
+		Permissions:  map[string]string{"contents": "write"},
+	})
+	require.NoError(t, err)
+	require.Greater(t, len(payload), 4096)
+
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(payload)
+	}))
+	defer mockGH.Close()
+
+	token, _, granted, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "test-org", "coder", []string{"repo"})
+	require.NoError(t, err)
+	assert.Equal(t, "ghs_large", token)
+	require.NotNil(t, granted)
+	assert.Len(t, granted.Repos, 200)
+}
+
+func TestCreateInstallationToken_422WithoutPackagesDoesNotRetry(t *testing.T) {
+	var calls int
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"The permissions requested are not granted to this installation."}`))
+	}))
+	defer mockGH.Close()
+
+	// triage has no packages:read — a 422 must not retry/omit packages.
+	_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "triage", nil)
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+	assert.Contains(t, err.Error(), "status 422")
+	assert.NotContains(t, err.Error(), "packages fallback")
+}
+
+func TestCreateInstallationToken_Packages422RetryHTTPError(t *testing.T) {
+	var calls int
+	SetMintHTTPForTest(t, func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{
+				StatusCode: http.StatusUnprocessableEntity,
+				Body:       io.NopCloser(strings.NewReader(`{"message":"The permissions requested are not granted to this installation."}`)),
+				Header:     make(http.Header),
+			}, nil
+		}
+		return nil, errors.New("retry boom")
+	})
+
+	_, _, _, err := CreateInstallationToken(t.Context(), "http://example.invalid", "fake-jwt", 99, "test-org", "coder", nil)
+	require.Error(t, err)
+	assert.Equal(t, 2, calls)
+	assert.Contains(t, err.Error(), "retry boom")
+}
+
+func TestCreateInstallationToken_EmptyToken(t *testing.T) {
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(installationTokenResponse{
+			Token:     "",
+			ExpiresAt: "2099-01-01T00:00:00Z",
+		})
+	}))
+	defer mockGH.Close()
+
+	_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "test-org", "coder", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty installation token")
+}
+
+func TestCreateInstallationToken_InvalidJSON(t *testing.T) {
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{not-json`))
+	}))
+	defer mockGH.Close()
+
+	_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "test-org", "coder", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decoding token response")
+}
+
+func TestCreateInstallationToken_HTTPError(t *testing.T) {
+	SetMintHTTPForTest(t, func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("boom")
+	})
+	_, _, _, err := CreateInstallationToken(t.Context(), "http://example.invalid", "fake-jwt", 42, "test-org", "coder", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating installation token")
+}
+
+func TestCopyPermissionsWithout(t *testing.T) {
+	in := map[string]string{"contents": "write", "packages": "read", "metadata": "read"}
+	out := copyPermissionsWithout(in, "packages")
+	assert.Equal(t, map[string]string{"contents": "write", "metadata": "read"}, out)
+	assert.Equal(t, "read", in["packages"], "input map must not be mutated")
+}
+
+func TestTruncateForLog(t *testing.T) {
+	assert.Equal(t, "short", truncateForLog("short", 10))
+	assert.Equal(t, "hello…", truncateForLog("hello world", 5))
+	assert.Equal(t, "unchanged", truncateForLog("unchanged", 0))
 }
 
 func TestRolePermissions_AllRolesPresent(t *testing.T) {
@@ -441,7 +672,7 @@ func TestCreateInstallationToken_CustomRole(t *testing.T) {
 	}))
 	defer mockGH.Close()
 
-	token, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "scanner", []string{"my-repo"})
+	token, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 42, "test-org", "scanner", []string{"my-repo"})
 	require.NoError(t, err)
 	assert.Equal(t, "ghs_custom_token", token)
 }
@@ -732,7 +963,7 @@ func TestGitHubRequests_IncludeUserAgent(t *testing.T) {
 		}))
 		defer mockGH.Close()
 
-		_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "jwt", 1, "coder", nil)
+		_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "jwt", 1, "test-org", "coder", nil)
 		require.NoError(t, err)
 	})
 }
