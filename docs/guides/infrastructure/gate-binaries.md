@@ -33,13 +33,13 @@ An agent (or malicious code in a dependency it installs) can:
 2. Set `LD_PRELOAD` to point to it
 3. Override functions in the gate binary's validation logic
 
-The dynamic linker processes `LD_PRELOAD` before the binary's own code runs, so injected code executes with the binary's identity. OpenShell's binary identity check (`/proc/pid/exe`) still sees the legitimate gate binary, meaning the proxy allows the connection — but the binary's validation logic has been bypassed.
+The dynamic linker processes `LD_PRELOAD` before the binary's own code runs, so injected code executes with the binary's identity. OpenShell's L7 process-tree tracking walks `/proc/pid/` ancestry to verify that the connecting process descends from an allowed binary — it still sees the legitimate gate binary in the process tree, meaning the proxy allows the connection — but the binary's validation logic has been bypassed.
 
 **Static linking eliminates this threat.** The dynamic linker does not process `LD_PRELOAD` for statically linked executables. There is no dynamic symbol resolution to intercept.
 
 ### Whole-binary replacement
 
-A gate binary placed on a writable path (e.g., `/sandbox/workspace/gate-query`) can be overwritten by the agent. The agent can compile a replacement binary and write it to the same path. Since OpenShell's binary identity check resolves `/proc/pid/exe` to the path — not a content hash — the proxy still allows the connection. The replacement binary bypasses all validation logic.
+A gate binary placed on a writable path (e.g., `/sandbox/workspace/gate-query`) can be overwritten by the agent. The agent can compile a replacement binary and write it to the same path. OpenShell's L7 process-tree tracking walks `/proc/pid/` ancestry to verify the connecting process descends from an allowed binary — since the replacement binary lives at the same path, it still satisfies the ancestry check. The replacement binary bypasses all validation logic.
 
 This is a simpler attack than `LD_PRELOAD` injection and applies regardless of static linking.
 
@@ -116,6 +116,14 @@ func main() {
 	query := strings.Join(os.Args[1:], " ")
 	upper := strings.ToUpper(query)
 
+	// Reject multi-statement queries (semicolons). psql's -c flag
+	// executes semicolon-separated statements, so "SELECT 1; DROP TABLE
+	// orders" would bypass the SELECT-only check below.
+	if strings.Contains(query, ";") {
+		fmt.Fprintf(os.Stderr, "gate-query: rejected — multi-statement queries are not allowed\n")
+		os.Exit(1)
+	}
+
 	// Reject non-SELECT statements.
 	trimmed := strings.TrimSpace(upper)
 	if !strings.HasPrefix(trimmed, "SELECT") {
@@ -179,7 +187,7 @@ If the query is rejected, the binary prints the reason to stderr and exits non-z
 gate-query: rejected — query must include a LIMIT clause
 ```
 
-> **Production note:** The string-matching validation above is intentionally simple for illustration. A production gate binary should use a SQL parser (e.g., `github.com/pingcap/tidb/parser` or `github.com/kyleconroy/sqlc`) to reliably detect table references, column selections, JOINs on non-indexed columns, and ORDER BY clauses targeting unindexed columns.
+> **Production note:** The string-matching validation above is intentionally simple for illustration. It blocks obvious cases — including multi-statement injection via semicolons — but cannot catch all bypass vectors (e.g., `COPY`, CTEs, or subqueries that reference forbidden tables indirectly). A production gate binary should use a SQL parser (e.g., `github.com/pingcap/tidb/parser` or `github.com/kyleconroy/sqlc`) to reliably detect table references, column selections, JOINs on non-indexed columns, and ORDER BY clauses targeting unindexed columns.
 
 ## Configuring the sandbox policy
 
@@ -245,7 +253,7 @@ This places it on a Landlock-protected read-only path that the agent cannot over
 
 2. **Binary path must be read-only.** The `binaries` path in the profile must point to a Landlock-protected location (e.g., `/usr/local/bin/`). Do not deliver gate binaries via `host_files` to the writable workspace — an agent can overwrite the binary and bypass validation. See [Whole-binary replacement](#whole-binary-replacement).
 
-3. **Binary path must be exact.** The `binaries` glob patterns in the profile are matched against the full path as resolved via `/proc/pid/exe`. Use the absolute path where the binary is installed in the container image.
+3. **Binary path must be exact.** The `binaries` glob patterns in the profile are matched against the binary path via process-tree ancestry tracking. Use the absolute path where the binary is installed in the container image.
 
 ### Credential collision limitation
 
@@ -264,11 +272,11 @@ Understanding the enforcement boundary is critical for correct policy design:
 |-------|-------------|--------------------------|----------|
 | Endpoint allowlist | OpenShell L7 proxy | No — kernel-backed | Which hosts and ports are reachable |
 | Method/path rules | OpenShell L7 proxy | No — kernel-backed | `GET /api/v3/repos/*` only |
-| Binary identity | OpenShell proxy (`/proc/pid/exe`) | No — kernel-backed | Only `gate-query` can reach `staging-db.internal:5432` |
+| Binary identity | OpenShell proxy (process-tree ancestry) | No — kernel-backed | Only `gate-query` and its child processes can reach `staging-db.internal:5432` |
 | Binary integrity | Landlock read-only path | No — kernel-backed | Agent cannot overwrite `/usr/local/bin/gate-query` |
 | Application logic | Gate binary code | Only if dynamically linked (`LD_PRELOAD`) | Query validation, table filtering, PII column blocking |
 
-The first four rows are proxy- or kernel-enforced and hold regardless of what runs inside the sandbox. The fifth row — the gate binary's own validation logic — is the binary's responsibility. Static linking protects it from `LD_PRELOAD` injection, making the application logic tamper-resistant.
+The first four rows are proxy- or kernel-enforced and hold regardless of what runs inside the sandbox. Binary identity uses process-tree ancestry — OpenShell walks `/proc/pid/` ancestry to verify that the connecting process (e.g., `psql` spawned by the gate binary) descends from an allowed binary. This is why child processes spawned by the gate binary inherit network access. The fifth row — the gate binary's own validation logic — is the binary's responsibility. Static linking protects it from `LD_PRELOAD` injection, making the application logic tamper-resistant.
 
 ## Checklist
 
