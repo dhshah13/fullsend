@@ -146,11 +146,11 @@ var stickyHistorySentinelPattern = regexp.MustCompile(`(?m)^\s*<!--\s*sticky:his
 // not a <details> opener — in which case adfBlockContent processes c
 // normally through convertBlockNode.
 func tryDetailsExpand(c ast.Node, source []byte, depth int) (map[string]any, ast.Node) {
-	html, ok := c.(*ast.HTMLBlock)
+	htmlBlock, ok := c.(*ast.HTMLBlock)
 	if !ok {
 		return nil, nil
 	}
-	raw := string(html.Lines().Value(source))
+	raw := string(htmlBlock.Lines().Value(source))
 	if !isDetailsOpen(raw) {
 		return nil, nil
 	}
@@ -256,13 +256,17 @@ func isStickyHistorySentinel(raw string) bool {
 }
 
 // extractSummary extracts the text content of the first <summary> tag in
-// raw, or "" if none is present.
+// raw, or "" if none is present. HTML entities are decoded so the title
+// stored in the ADF expand node is plain text; the read-side
+// (adfMarkdownBlock's expand case) re-encodes with html.EscapeString,
+// keeping the round-trip correct without double-encoding pre-existing
+// entities like "&amp;" → "&amp;amp;".
 func extractSummary(raw string) string {
 	match := summaryTagPattern.FindStringSubmatch(raw)
 	if match == nil {
 		return ""
 	}
-	return strings.TrimSpace(match[1])
+	return html.UnescapeString(strings.TrimSpace(match[1]))
 }
 
 // detailsInnerBody extracts the body content from a self-contained

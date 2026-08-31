@@ -2047,6 +2047,78 @@ func TestMarkdownToADF_NestedDetailsLimitation(t *testing.T) {
 	}
 }
 
+func TestMarkdownToADF_DetailsExpandRoundTrips(t *testing.T) {
+	// Verify that <details> → expand → <details> round-trips stably.
+	src := "<details><summary>Prior run</summary>\n- item one\n- item two\n</details>"
+	doc := mustADF(t, src)
+
+	// Should be an expand node, not fallback text.
+	content := asSlice(t, doc["content"])
+	if len(content) != 1 {
+		t.Fatalf("doc content len = %d, want 1 (expand)", len(content))
+	}
+	expand := asMap(t, content[0])
+	if expand["type"] != "expand" {
+		t.Fatalf("block type = %v, want %q", expand["type"], "expand")
+	}
+
+	// Render back to Markdown.
+	md := ADFToMarkdown(doc)
+
+	// Re-parse: should produce the same ADF structure.
+	doc2 := mustADF(t, md)
+	content2 := asSlice(t, doc2["content"])
+	if len(content2) != 1 {
+		t.Fatalf("round-trip doc content len = %d, want 1", len(content2))
+	}
+	expand2 := asMap(t, content2[0])
+	if expand2["type"] != "expand" {
+		t.Fatalf("round-trip block type = %v, want %q", expand2["type"], "expand")
+	}
+
+	// Render again: should be identical to the first render.
+	md2 := ADFToMarkdown(doc2)
+	if md != md2 {
+		t.Errorf("round-trip is not stable:\n  first:  %q\n  second: %q", md, md2)
+	}
+}
+
+func TestMarkdownToADF_DetailsSummaryWithHTMLEntities(t *testing.T) {
+	// A summary containing pre-existing HTML entities (e.g. &amp;)
+	// must not be double-encoded on the round-trip. extractSummary
+	// decodes entities so the ADF title is plain text, and
+	// adfMarkdownBlock re-encodes with html.EscapeString.
+	doc := mustADF(t, "<details><summary>A &amp; B</summary>\nbody\n</details>")
+
+	content := asSlice(t, doc["content"])
+	if len(content) != 1 {
+		t.Fatalf("doc content len = %d, want 1 (expand)", len(content))
+	}
+	expand := asMap(t, content[0])
+	if expand["type"] != "expand" {
+		t.Fatalf("block type = %v, want %q", expand["type"], "expand")
+	}
+	attrs := asMap(t, expand["attrs"])
+	if attrs["title"] != "A & B" {
+		t.Errorf("expand attrs.title = %v, want %q (decoded)", attrs["title"], "A & B")
+	}
+
+	// Round-trip: the rendered Markdown should re-encode the & as &amp;.
+	md := ADFToMarkdown(doc)
+	want := "<details><summary>A &amp; B</summary>\nbody\n</details>"
+	if md != want {
+		t.Errorf("ADFToMarkdown = %q, want %q", md, want)
+	}
+
+	// Re-parse should produce the same decoded title.
+	doc2 := mustADF(t, md)
+	expand2 := asMap(t, asSlice(t, doc2["content"])[0])
+	attrs2 := asMap(t, expand2["attrs"])
+	if attrs2["title"] != "A & B" {
+		t.Errorf("round-trip attrs.title = %v, want %q", attrs2["title"], "A & B")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ADFToMarkdown — expand → <details>
 // ---------------------------------------------------------------------------
@@ -2112,41 +2184,5 @@ func TestADFToMarkdown_ExpandNodeWithoutTitle(t *testing.T) {
 	want := "<details>\ncontent\n</details>"
 	if got != want {
 		t.Errorf("ADFToMarkdown(expand without title) = %q, want %q", got, want)
-	}
-}
-
-func TestMarkdownToADF_DetailsExpandRoundTrips(t *testing.T) {
-	// Verify that <details> → expand → <details> round-trips stably.
-	src := "<details><summary>Prior run</summary>\n- item one\n- item two\n</details>"
-	doc := mustADF(t, src)
-
-	// Should be an expand node, not fallback text.
-	content := asSlice(t, doc["content"])
-	if len(content) != 1 {
-		t.Fatalf("doc content len = %d, want 1 (expand)", len(content))
-	}
-	expand := asMap(t, content[0])
-	if expand["type"] != "expand" {
-		t.Fatalf("block type = %v, want %q", expand["type"], "expand")
-	}
-
-	// Render back to Markdown.
-	md := ADFToMarkdown(doc)
-
-	// Re-parse: should produce the same ADF structure.
-	doc2 := mustADF(t, md)
-	content2 := asSlice(t, doc2["content"])
-	if len(content2) != 1 {
-		t.Fatalf("round-trip doc content len = %d, want 1", len(content2))
-	}
-	expand2 := asMap(t, content2[0])
-	if expand2["type"] != "expand" {
-		t.Fatalf("round-trip block type = %v, want %q", expand2["type"], "expand")
-	}
-
-	// Render again: should be identical to the first render.
-	md2 := ADFToMarkdown(doc2)
-	if md != md2 {
-		t.Errorf("round-trip is not stable:\n  first:  %q\n  second: %q", md, md2)
 	}
 }
