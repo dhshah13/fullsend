@@ -1878,7 +1878,7 @@ gitlab:
 	// The install may report partial failures (e.g. GitLab bot-token
 	// setup requires a real GitLab client), but the scaffold PR is
 	// created before post-install steps run.
-	_ = runReposInstall(context.Background(), &reposInstallConfig{
+	err := runReposInstall(context.Background(), &reposInstallConfig{
 		manifest:               manifestPath,
 		concurrency:            4,
 		roles:                  []string{"triage"},
@@ -1887,6 +1887,7 @@ gitlab:
 		inferenceRegion:        "us-central1",
 		testClient:             fc,
 	})
+	_ = err
 
 	// The scaffoldCommitFn appends [skip ci] to both CommitMsg and
 	// PRTitle for GitLab repos so merged-results pipelines don't
