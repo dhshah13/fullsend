@@ -178,7 +178,7 @@ func ProbeComponents(ctx context.Context, client forge.Client, owner, repo, forg
 		if schedErr != nil {
 			return nil, fmt.Errorf("checking pipeline schedules: %w", schedErr)
 		}
-		for _, spec := range PipelineScheduleSpecs {
+		for _, spec := range pipelineScheduleSpecs {
 			found := false
 			for _, s := range schedules {
 				if s.Description == spec.Description {

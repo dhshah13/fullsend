@@ -102,7 +102,7 @@ func setupGitLabPipelineSchedules(ctx context.Context, client forge.Client, prin
 
 	printer.StepStart("Creating pipeline schedules")
 	var createdIDs []int64
-	for _, spec := range repos.PipelineScheduleSpecs {
+	for _, spec := range repos.PipelineScheduleSpecs() {
 		id, err := client.CreatePipelineSchedule(ctx, owner, repo, defaultBranch,
 			spec.Description, spec.Cron, spec.Variables)
 		if err != nil {

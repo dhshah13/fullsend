@@ -4,7 +4,7 @@ import "github.com/fullsend-ai/fullsend/internal/forge"
 
 // ScheduleSpec defines a fullsend pipeline schedule for GitLab repos.
 // All sites that create, detect, or match pipeline schedules must use
-// PipelineScheduleSpecs to stay in sync.
+// PipelineScheduleSpecs() to stay in sync.
 type ScheduleSpec struct {
 	// ComponentName is the probe component name (e.g., "schedule:slash-poll").
 	ComponentName string
@@ -16,11 +16,13 @@ type ScheduleSpec struct {
 	Variables map[string]string
 }
 
-// PipelineScheduleSpecs is the canonical list of fullsend pipeline
+// pipelineScheduleSpecs is the canonical list of fullsend pipeline
 // schedules for GitLab repos. convergeSchedules, ProbeComponents, and
-// setupGitLabPipelineSchedules all reference this slice so that schedule
-// definitions stay in one place.
-var PipelineScheduleSpecs = []ScheduleSpec{
+// setupGitLabPipelineSchedules all reference this slice (via
+// PipelineScheduleSpecs()) so that schedule definitions stay in one
+// place. Unexported to prevent external mutation; mirrors the pattern
+// used by requiredSecrets/requiredVariables in install.go.
+var pipelineScheduleSpecs = []ScheduleSpec{
 	{
 		ComponentName: "schedule:slash-poll",
 		Description:   "fullsend slash poll",
@@ -35,12 +37,18 @@ var PipelineScheduleSpecs = []ScheduleSpec{
 	},
 }
 
+// PipelineScheduleSpecs returns the canonical list of fullsend pipeline
+// schedules for GitLab repos.
+func PipelineScheduleSpecs() []ScheduleSpec {
+	return pipelineScheduleSpecs
+}
+
 // scheduleSpecByComponent returns the ScheduleSpec for the given
 // component name, or nil if not found.
 func scheduleSpecByComponent(name string) *ScheduleSpec {
-	for i := range PipelineScheduleSpecs {
-		if PipelineScheduleSpecs[i].ComponentName == name {
-			return &PipelineScheduleSpecs[i]
+	for i := range pipelineScheduleSpecs {
+		if pipelineScheduleSpecs[i].ComponentName == name {
+			return &pipelineScheduleSpecs[i]
 		}
 	}
 	return nil
