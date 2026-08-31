@@ -4,46 +4,29 @@ This guide covers building gate binaries — small, statically linked programs t
 
 ## When you need a gate binary
 
-OpenShell's L7 network policy enforces method and path restrictions at the proxy level. These controls are kernel-backed, per-binary, and not bypassable from inside the sandbox. For many access patterns, L7 rules are sufficient — use them when your constraints can be expressed as method + path combinations.
+OpenShell's network policy enforces access control at both L4 (TCP endpoint allowlisting) and L7 (HTTP method and path restrictions) at the proxy level. These controls are kernel-backed, per-binary, and not bypassable from inside the sandbox. For many access patterns, L4/L7 rules are sufficient — use them when your constraints can be expressed as endpoint allowlists or method + path combinations.
 
-Gate binaries are needed when your access constraints go **beyond** what L7 rules can express:
+Gate binaries are needed when your access constraints go **beyond** what L4/L7 rules can express:
 
 - **Body/payload filtering** — validate or restrict fields in request bodies before forwarding (e.g., allow `git push` only to specific branches, where the branch ref is encoded in the request body)
 - **Query validation** — parse and restrict database queries, rejecting forbidden tables, PII columns, or expensive operations
 - **Query parameter enforcement** — restrict which URL query parameters are allowed
-- **Commit signing** — sign commits or tags before pushing
 - **Schema enforcement** — enforce schemas or size limits on outbound requests
-- **Multi-step authorization** — check a condition (e.g., CI status) before allowing an operation
+- **Multi-step authorization** — check a condition before allowing an operation (e.g., verify CI status, sign commits or tags before pushing)
 
-If L7 method/path rules cover your case, prefer those — they are proxy-enforced and immune to code injection.
+If L4/L7 rules cover your case, prefer those — they are proxy-enforced and immune to code injection.
 
 **Why a gate binary instead of a post-script?** Gate binaries are required when the agent needs the operation's result to continue working. A post-script runs after the agent finishes and cannot redirect the agent to reformulate a rejected request. For example, a database query gate binary rejects an unsafe query and returns an error — the agent reads the error, reformulates the query, and retries. A post-script cannot provide this feedback loop.
 
 ## Threat model
 
-The sandbox workspace must be writable and executable for code agents to function — they need to write code, compile, and run tests. This creates two specific threats against gate binaries.
+The sandbox workspace must be writable and executable for code agents to function. This creates two threats against gate binaries:
 
-### LD_PRELOAD injection
+1. **LD_PRELOAD injection** — a dynamically linked binary is vulnerable: an agent can write a `.so` to the workspace and use `LD_PRELOAD` to override the binary's validation logic, while the proxy's process-tree ancestry check still sees the legitimate binary. **Mitigation:** build with static linking — the dynamic linker does not process `LD_PRELOAD` for statically linked executables.
 
-A dynamically linked binary running inside the sandbox is vulnerable to `LD_PRELOAD` injection.
+2. **Whole-binary replacement** — a gate binary on a writable path can be overwritten by a replacement that skips validation. The proxy's ancestry check still passes because the path matches. **Mitigation:** bake the binary into the container image at a Landlock-protected read-only path (e.g., `/usr/local/bin/`).
 
-An agent (or malicious code in a dependency it installs) can:
-
-1. Write a shared object (`.so`) to the writable workspace
-2. Set `LD_PRELOAD` to point to it
-3. Override functions in the gate binary's validation logic
-
-The dynamic linker processes `LD_PRELOAD` before the binary's own code runs, so injected code executes with the binary's identity. OpenShell's L7 process-tree tracking walks `/proc/pid/` ancestry to verify that the connecting process descends from an allowed binary — it still sees the legitimate gate binary in the process tree, meaning the proxy allows the connection — but the binary's validation logic has been bypassed.
-
-**Static linking eliminates this threat.** The dynamic linker does not process `LD_PRELOAD` for statically linked executables. There is no dynamic symbol resolution to intercept.
-
-### Whole-binary replacement
-
-A gate binary placed on a writable path (e.g., `/sandbox/workspace/gate-query`) can be overwritten by the agent. The agent can compile a replacement binary and write it to the same path. OpenShell's L7 process-tree tracking walks `/proc/pid/` ancestry to verify the connecting process descends from an allowed binary — since the replacement binary lives at the same path, it still satisfies the ancestry check. The replacement binary bypasses all validation logic.
-
-This is a simpler attack than `LD_PRELOAD` injection and applies regardless of static linking.
-
-**Baking the binary into the container image on a read-only path eliminates this threat.** Place the gate binary at a Landlock-protected path (e.g., `/usr/local/bin/gate-query`) that the agent cannot write to. The `binaries` field in the provider profile must reference this read-only path.
+For a detailed treatment of the sandbox threat model, see [OpenShell PR #1496](https://github.com/NVIDIA/OpenShell/pull/1496) (binary identity enforcement limitations) and the [OpenShell sandbox policy evaluation experiment](https://github.com/fullsend-ai/experiments/blob/main/0014-openshell-sandbox-evaluation.md).
 
 ## How to build a gate binary
 
@@ -239,6 +222,9 @@ Reference the provider in your harness file. The gate binary is baked into the c
 # harness/code.yaml
 providers:
   - providers/gate-query.yaml
+openshell:
+  profiles:
+    - profiles/gate-query.yaml
 ```
 
 The binary must be added to the container image's Dockerfile at build time:
@@ -253,17 +239,17 @@ This places it on a Landlock-protected read-only path that the agent cannot over
 
 1. **No overlapping access.** Ensure no other provider profile or inline network policy grants access to the guarded endpoint with a different `binaries` pattern or a wildcard. If `psql` can also reach `staging-db.internal:5432`, the gate binary is bypassed.
 
-2. **Binary path must be read-only.** The `binaries` path in the profile must point to a Landlock-protected location (e.g., `/usr/local/bin/`). Do not deliver gate binaries via `host_files` to the writable workspace — an agent can overwrite the binary and bypass validation. See [Whole-binary replacement](#whole-binary-replacement).
+2. **Binary path must be read-only.** The `binaries` path in the profile must point to a Landlock-protected location (e.g., `/usr/local/bin/`). Do not deliver gate binaries via `host_files` to the writable workspace — an agent can overwrite the binary and bypass validation. See [Threat model](#threat-model).
 
 3. **Binary path must be exact.** The `binaries` glob patterns in the profile are matched against the binary path via process-tree ancestry tracking. Use the absolute path where the binary is installed in the container image.
 
 ### Credential collision limitation
 
-If both the gate binary and a general-purpose binary need the same credential environment variable (e.g., both need `PGPASSWORD`), OpenShell rejects the sandbox at creation time: `credential env key is provided by both provider '...' and provider '...'` ([NVIDIA/OpenShell#2330](https://github.com/NVIDIA/OpenShell/issues/2330) tracks composable provider profiles that would solve this).
+If both the gate binary and a general-purpose binary need the same credential environment variable, OpenShell rejects the sandbox at creation time: `credential env key is provided by both provider '...' and provider '...'`. For example, a hypothetical `gate-gh` binary (restricting which repositories can be forked) and the standard `gh` CLI both need `GH_TOKEN` to reach github.com — two providers cannot both declare the same credential key ([NVIDIA/OpenShell#2330](https://github.com/NVIDIA/OpenShell/issues/2330) tracks composable provider profiles that would solve this).
 
 Until OpenShell#2330 lands, use one of these workarounds:
 
-- **Noop credential on the gate binary's provider.** If the gate binary can use a credential that does not collide with other providers (as in the `_NOOP_GATE_QUERY` example above), this avoids the collision. The gate binary manages its own authentication (e.g., `.pgpass` file, connection string, or environment variable injected separately).
+- **Noop credential on the gate binary's provider.** If the gate binary can use a credential that does not collide with other providers (as in the `_NOOP_GATE_QUERY` example above), this avoids the collision. The gate binary manages its own authentication (e.g., a separate token file or environment variable injected outside the provider system).
 - **Single provider for both binaries.** If both binaries must share the same credential, use a single provider with a `binaries` list that includes both. This means the `binaries` field cannot differentiate between them — the gate binary's validation logic is the only enforcement.
 
 ## What the proxy enforces vs. what the binary enforces
@@ -272,8 +258,8 @@ Understanding the enforcement boundary is critical for correct policy design:
 
 | Layer | Enforced by | Bypassable from sandbox? | Examples |
 |-------|-------------|--------------------------|----------|
-| Endpoint allowlist | OpenShell L7 proxy | No — kernel-backed | Which hosts and ports are reachable |
-| Method/path rules | OpenShell L7 proxy | No — kernel-backed | `GET /api/v3/repos/*` only |
+| Endpoint allowlist | OpenShell proxy (L4) | No — kernel-backed | Which hosts and ports are reachable |
+| Method/path rules | OpenShell proxy (L7) | No — kernel-backed | `GET /api/v3/repos/*` only |
 | Binary identity | OpenShell proxy (process-tree ancestry) | No — kernel-backed | Only `gate-query` and its child processes can reach `staging-db.internal:5432` |
 | Binary integrity | Landlock read-only path | No — kernel-backed | Agent cannot overwrite `/usr/local/bin/gate-query` |
 | Application logic | Gate binary code | Only if dynamically linked (`LD_PRELOAD`) | Query validation, table filtering, PII column blocking |
