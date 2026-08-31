@@ -16,7 +16,7 @@ func warnRepoSkillCollisions(repoDir string, harnessSkillDirs []string, printer 
 		if skillDir == "" {
 			continue
 		}
-		if info, err := os.Stat(filepath.Join(skillDir, "SKILL.md")); err == nil && info.Mode().IsRegular() {
+		if isReadableSkillMarker(skillDir) {
 			harnessSkills[filepath.Base(skillDir)] = struct{}{}
 		}
 	}
@@ -32,7 +32,7 @@ func warnRepoSkillCollisions(repoDir string, harnessSkillDirs []string, printer 
 		if _, collision := harnessSkills[name]; !collision {
 			continue
 		}
-		if info, statErr := os.Stat(filepath.Join(projectSkillsDir, name, "SKILL.md")); statErr != nil || !info.Mode().IsRegular() {
+		if !isReadableSkillMarker(filepath.Join(projectSkillsDir, name)) {
 			continue
 		}
 		printer.StepWarn(fmt.Sprintf(
@@ -40,4 +40,18 @@ func warnRepoSkillCollisions(repoDir string, harnessSkillDirs []string, printer 
 			name,
 		))
 	}
+}
+
+func isReadableSkillMarker(skillDir string) bool {
+	marker := filepath.Join(skillDir, "SKILL.md")
+	info, err := os.Stat(marker)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	file, err := os.Open(marker)
+	if err != nil {
+		return false
+	}
+	_ = file.Close()
+	return true
 }
