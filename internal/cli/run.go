@@ -1644,6 +1644,9 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		}
 	}
 	boot := newHarnessBootstrap(h, sandboxName, agentName, forgeEgressEntry)
+	if rt.Name() == "claude" {
+		warnRepoSkillCollisions(hostRepositoryDir, boot.SkillDirs(), printer)
+	}
 	if h.SecurityEnabled() {
 		// Scan all runtime content before upload so warnings surface together.
 		// Host files could change between scan and upload; the runner owns the host FS here.

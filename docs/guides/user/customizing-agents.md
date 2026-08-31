@@ -156,7 +156,8 @@ are actually changing:
    [fullsend-ai/agents](https://github.com/fullsend-ai/agents). Do not guess
    field names or roster lists from memory.
 2. **Unique skill names** — a repo skill with the same directory name as a
-   built-in is ignored (see [skill precedence](customizing-with-skills.md#skill-precedence)).
+   built-in is ignored and produces a warning (see
+   [skill precedence](customizing-with-skills.md#skill-precedence)).
 3. **Specificity wins** — vague augmentations lose to hard default
    instructions. Own exact fields; use word limits and templates.
 4. **Sub-agents are not wrapper skills** — if you need a new review dimension,
