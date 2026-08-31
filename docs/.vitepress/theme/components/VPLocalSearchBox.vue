@@ -39,6 +39,7 @@ import { useData } from "vitepress";
 import { LRUCache } from "vitepress/dist/client/theme-default/support/lru";
 import { createSearchTranslate } from "vitepress/dist/client/theme-default/support/translation";
 import { matchesActiveScopes } from "../searchScopes";
+import { parseSearchQuery, textContainsPhrases } from "../searchQuery";
 
 const emit = defineEmits<{
   (e: "close"): void;
@@ -174,17 +175,41 @@ debouncedWatch(
 
     if (!index) return;
 
-    // Search
+    // Search — use AND so multi-word queries require all terms on the page.
+    // Quoted substrings trigger exact-phrase post-filtering.
     const active = activeScopes.value;
     const scopeList = scopes.value;
-    const searchOpts =
-      active.size > 0
-        ? {
-            filter: (r: SearchResult) => matchesActiveScopes(r.id, scopeList, active),
-          }
-        : {};
-    results.value = index.search(filterTextValue, searchOpts).slice(0, 16) as (SearchResult &
-      Result)[];
+    const { query, phrases } = parseSearchQuery(filterTextValue);
+
+    const searchOpts: Record<string, unknown> = { combineWith: "AND" };
+    if (active.size > 0) {
+      searchOpts.filter = (r: SearchResult) => matchesActiveScopes(r.id, scopeList, active);
+    }
+
+    let searchResults = index.search(query, searchOpts).slice(0, 16) as (SearchResult & Result)[];
+
+    // Post-filter for exact phrase matches when the query contained quotes.
+    if (phrases.length > 0 && searchResults.length > 0) {
+      const pageIds = [...new Set(searchResults.map((r) => r.id.slice(0, r.id.indexOf("#"))))];
+      const pageTextMap = new Map<string, string>();
+      await Promise.all(
+        pageIds.map(async (pid) => {
+          const text = await loadPageText(pid);
+          if (text) pageTextMap.set(pid, text);
+        }),
+      );
+      if (canceled) return;
+
+      searchResults = searchResults.filter((r) => {
+        const pid = r.id.slice(0, r.id.indexOf("#"));
+        const pageText = pageTextMap.get(pid);
+        // Keep results whose page text could not be loaded (graceful degradation).
+        if (!pageText) return true;
+        return textContainsPhrases(pageText, phrases);
+      });
+    }
+
+    results.value = searchResults;
     enableNoResults.value = true;
 
     // Highlighting
@@ -274,6 +299,39 @@ async function fetchExcerpt(id: string) {
   } catch (e) {
     console.error(e);
     return { id, mod: {} };
+  }
+}
+
+/** Render a page module and return its plain-text content for phrase matching. */
+async function loadPageText(pageId: string): Promise<string> {
+  const file = pathToFile(pageId);
+  if (!file) return "";
+  try {
+    const mod = await import(/*@vite-ignore*/ file);
+    const comp = mod.default ?? mod;
+    if (!comp?.render && !comp?.setup) return "";
+    const app = createApp(comp);
+    app.config.warnHandler = () => {};
+    app.provide(dataSymbol, vitePressData);
+    Object.defineProperties(app.config.globalProperties, {
+      $frontmatter: {
+        get() {
+          return vitePressData.frontmatter.value;
+        },
+      },
+      $params: {
+        get() {
+          return vitePressData.page.value.params;
+        },
+      },
+    });
+    const div = document.createElement("div");
+    app.mount(div);
+    const text = div.textContent || "";
+    app.unmount();
+    return text;
+  } catch {
+    return "";
   }
 }
 

@@ -1,0 +1,40 @@
+export interface ParsedQuery {
+  /** The query string with double-quoted phrases stripped of their quotes. */
+  query: string;
+  /** Exact phrases extracted from double-quoted substrings. */
+  phrases: string[];
+}
+
+/**
+ * Parses a search query string, extracting double-quoted phrases.
+ *
+ * Returns the cleaned query (quotes removed, words kept for AND matching)
+ * and an array of exact phrases that must appear adjacent in results.
+ *
+ * Examples:
+ *   parseSearchQuery('eval scenario')
+ *     => { query: 'eval scenario', phrases: [] }
+ *   parseSearchQuery('"eval scenario"')
+ *     => { query: 'eval scenario', phrases: ['eval scenario'] }
+ *   parseSearchQuery('harness "eval scenario" config')
+ *     => { query: 'harness eval scenario config', phrases: ['eval scenario'] }
+ */
+export function parseSearchQuery(raw: string): ParsedQuery {
+  const phrases: string[] = [];
+  const query = raw.replace(/"([^"]+)"/g, (_match, phrase: string) => {
+    const trimmed = phrase.trim();
+    if (trimmed) phrases.push(trimmed);
+    return trimmed;
+  });
+  return { query: query.trim(), phrases };
+}
+
+/**
+ * Returns true when every phrase appears as a case-insensitive
+ * substring in the given text.
+ */
+export function textContainsPhrases(text: string, phrases: string[]): boolean {
+  if (phrases.length === 0) return true;
+  const lower = text.toLowerCase();
+  return phrases.every((p) => lower.includes(p.toLowerCase()));
+}
