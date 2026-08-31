@@ -2,6 +2,7 @@ package jira
 
 import (
 	"fmt"
+	"html"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -141,7 +142,7 @@ var stickyHistorySentinelPattern = regexp.MustCompile(`(?m)^\s*<!--\s*sticky:his
 //     body, and closing tag across separate AST siblings. The function
 //     collects siblings until it finds the </details> closing block.
 //
-// Returns (expandNode, nextSibling) on success, or (nil, nil) if c is
+// Returns (expand, nextSibling) on success, or (nil, nil) if c is
 // not a <details> opener — in which case adfBlockContent processes c
 // normally through convertBlockNode.
 func tryDetailsExpand(c ast.Node, source []byte, depth int) (map[string]any, ast.Node) {
@@ -158,7 +159,7 @@ func tryDetailsExpand(c ast.Node, source []byte, depth int) (map[string]any, ast
 
 	// Single-block case: the entire <details>...</details> is one
 	// HTMLBlock (no blank lines inside the markup).
-	if containsDetailsClose(raw) {
+	if hasDetailsClose(raw) {
 		body := detailsInnerBody(raw)
 		body = stickyHistorySentinelPattern.ReplaceAllString(body, "")
 		body = strings.TrimSpace(body)
@@ -196,8 +197,19 @@ func tryDetailsExpand(c ast.Node, source []byte, depth int) (map[string]any, ast
 		bodyContent = append(bodyContent, convertBlockNode(next, source, depth+1, false)...)
 		next = next.NextSibling()
 	}
-	if !foundClose || len(bodyContent) == 0 {
+	if !foundClose {
 		return nil, nil
+	}
+	// When all siblings between <details> and </details> were sticky
+	// sentinels (or otherwise produced no ADF content), emit an expand
+	// with a single empty paragraph rather than falling through to
+	// raw-text processing, which would render visible HTML in Jira.
+	// ADF expand requires minItems: 1, so we supply one empty paragraph.
+	if len(bodyContent) == 0 {
+		bodyContent = []any{map[string]any{
+			"type":    "paragraph",
+			"content": []any{},
+		}}
 	}
 	return expandNode(title, bodyContent), next
 }
@@ -223,8 +235,8 @@ func isDetailsOpen(raw string) bool {
 	return strings.HasPrefix(lower, "<details>") || strings.HasPrefix(lower, "<details ")
 }
 
-// containsDetailsClose reports whether raw contains </details>.
-func containsDetailsClose(raw string) bool {
+// hasDetailsClose reports whether raw contains a </details> closing tag.
+func hasDetailsClose(raw string) bool {
 	return strings.Contains(strings.ToLower(raw), "</details>")
 }
 
@@ -256,6 +268,11 @@ func extractSummary(raw string) string {
 // detailsInnerBody extracts the body content from a self-contained
 // <details>...</details> HTML block: everything between </summary>
 // (or the <details> opening tag if there's no summary) and </details>.
+//
+// Limitation: the no-summary fallback uses the first ">" to find the
+// end of the opening tag, which would misparse a <details> tag with an
+// attribute value containing ">". The codebase never produces
+// attributed <details> tags, so this is acceptable.
 func detailsInnerBody(raw string) string {
 	body := raw
 	lower := strings.ToLower(body)
@@ -900,7 +917,7 @@ func adfMarkdownBlock(node map[string]any, depth int) string {
 		sb.WriteString("<details>")
 		if title != "" {
 			sb.WriteString("<summary>")
-			sb.WriteString(title)
+			sb.WriteString(html.EscapeString(title))
 			sb.WriteString("</summary>")
 		}
 		sb.WriteString("\n")
