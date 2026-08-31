@@ -1905,7 +1905,9 @@ func TestPostCompletion_ReactionTargetsTriggeringComment(t *testing.T) {
 
 func TestNotifier_ReactionsSkippedForNonReactorTracker(t *testing.T) {
 	// Simulate a tracker.Client that does NOT implement tracker.Reactor
-	// (like a Jira client). Reactions should be silently skipped.
+	// (like a Jira client — Jira Cloud supports comment reactions but not
+	// issue reactions, so JiraClient doesn't implement the full Reactor
+	// interface). Reactions should be silently skipped.
 	jiraFake, err := tracker.NewFakeJiraClient("https://acme.atlassian.net")
 	require.NoError(t, err)
 

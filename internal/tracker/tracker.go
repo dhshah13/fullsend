@@ -91,11 +91,14 @@ type Client interface {
 }
 
 // Reactor is an optional capability for adding and removing emoji
-// reactions on issues and comments. Not all trackers support reactions
-// (e.g. Jira has no emoji-reaction model), so consumers should
-// type-assert their tracker.Client to Reactor before calling reaction
-// methods. Forge-backed tracker clients implement Reactor; Jira clients
-// do not.
+// reactions on issues and comments. Tracker reaction support varies:
+// GitHub and GitLab support reactions on both issues and comments;
+// Jira Cloud supports reactions on comments but not on issues. Because
+// the interface includes issue-level reactions, JiraClient does not
+// implement Reactor currently — adding Jira comment-reaction support
+// is straightforward once needed. Consumers should type-assert their
+// tracker.Client to Reactor before calling reaction methods and
+// silently skip reactions when the tracker does not implement it.
 type Reactor interface {
 	// AddIssueReaction adds an emoji reaction to an issue or pull request.
 	// content is the reaction type (e.g. "eyes", "+1", "confused").

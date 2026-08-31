@@ -8,10 +8,11 @@
 // completion (including cancellation). The two packages share the HTML-marker
 // convention but have different lifecycles and placement heuristics.
 //
-// Status comments are routed to the issue tracker that originated the
-// run (GitHub, GitLab, or Jira) via tracker.Client, independently of
-// the forge used for code output (branches, PRs/MRs). This separation
-// is recorded in ADR 0093.
+// The notification destination is dynamically determined by event
+// provenance: a Jira-triggered run posts status to Jira, a
+// GitHub-triggered run posts to GitHub, independently of the forge
+// used for code output (branches, PRs/MRs). This event-source routing
+// is implemented via tracker.Client and recorded in ADR 0093.
 package statuscomment
 
 import (
@@ -72,11 +73,12 @@ type RunInfo struct {
 }
 
 // Notifier manages status comment lifecycle for a single agent run.
-// It posts status comments to the tracker that originated the run,
-// independently of the forge used for code output (branches, PRs/MRs).
+// The notification destination is dynamically determined by the event
+// source — callers wire in the appropriate tracker.Client adapter based
+// on which system originated the triggering event.
 type Notifier struct {
 	client        tracker.Client
-	reactor       tracker.Reactor // optional; nil when the tracker has no reaction support
+	reactor       tracker.Reactor // optional; nil when the tracker does not implement Reactor
 	clientFactory ClientFactory
 	cfg           config.StatusNotificationConfig
 	project       string
@@ -287,7 +289,7 @@ func (n *Notifier) PostStart(ctx context.Context, description string) error {
 // instead of the issue/PR when this run was invoked by a slash command.
 // See SetTriggerCommentID.
 //
-// Returns (0, nil) when the tracker does not support reactions.
+// Returns (0, nil) when the tracker does not implement Reactor.
 func (n *Notifier) addReaction(ctx context.Context, content string) (int64, error) {
 	if n.reactor == nil {
 		return 0, nil
@@ -301,7 +303,7 @@ func (n *Notifier) addReaction(ctx context.Context, content string) (int64, erro
 // deleteReaction removes a previously added reaction, mirroring the
 // comment-vs-issue targeting addReaction uses to add it.
 //
-// No-ops when the tracker does not support reactions.
+// No-ops when the tracker does not implement Reactor.
 func (n *Notifier) deleteReaction(ctx context.Context, reactionID int64) error {
 	if n.reactor == nil {
 		return nil
