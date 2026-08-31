@@ -405,7 +405,7 @@ func TestGetCommentProperty_Found(t *testing.T) {
 	client, mux := setupTest(t)
 	ctx := context.Background()
 
-	mux.HandleFunc("/rest/api/3/issue/PROJ-1/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/rest/api/3/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
 		writeJSON(t, w, http.StatusOK, map[string]any{
 			"key":   "fullsend.sticky-marker",
@@ -446,7 +446,7 @@ func TestSetCommentProperty(t *testing.T) {
 	client, mux := setupTest(t)
 	ctx := context.Background()
 
-	mux.HandleFunc("/rest/api/3/issue/PROJ-1/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/rest/api/3/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPut, r.Method)
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
 
@@ -466,7 +466,7 @@ func TestSetCommentProperty_Error(t *testing.T) {
 	client, mux := setupTest(t)
 	ctx := context.Background()
 
-	mux.HandleFunc("/rest/api/3/issue/PROJ-1/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/rest/api/3/comment/10001/properties/fullsend.sticky-marker", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, http.StatusForbidden, map[string]any{
 			"errorMessages": []string{"Forbidden"},
 		})

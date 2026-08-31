@@ -529,8 +529,8 @@ func (c *LiveClient) UpdateComment(ctx context.Context, issueIDOrKey, commentID,
 // comment. Returns forge.ErrNotFound (wrapped) if the property does not
 // exist.
 func (c *LiveClient) GetCommentProperty(ctx context.Context, issueIDOrKey, commentID, propertyKey string) (json.RawMessage, error) {
-	path := fmt.Sprintf("/issue/%s/comment/%s/properties/%s",
-		url.PathEscape(issueIDOrKey), url.PathEscape(commentID), url.PathEscape(propertyKey))
+	path := fmt.Sprintf("/comment/%s/properties/%s",
+		url.PathEscape(commentID), url.PathEscape(propertyKey))
 	var prop EntityPropertyValue
 	if err := c.do(ctx, http.MethodGet, path, nil, &prop); err != nil {
 		return nil, fmt.Errorf("get comment property %s on comment %s of %s: %w", propertyKey, commentID, issueIDOrKey, err)
@@ -542,8 +542,8 @@ func (c *LiveClient) GetCommentProperty(ctx context.Context, issueIDOrKey, comme
 // comment. Used to store sticky-comment markers in a location invisible
 // to Jira users.
 func (c *LiveClient) SetCommentProperty(ctx context.Context, issueIDOrKey, commentID, propertyKey string, value any) error {
-	path := fmt.Sprintf("/issue/%s/comment/%s/properties/%s",
-		url.PathEscape(issueIDOrKey), url.PathEscape(commentID), url.PathEscape(propertyKey))
+	path := fmt.Sprintf("/comment/%s/properties/%s",
+		url.PathEscape(commentID), url.PathEscape(propertyKey))
 	body, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("marshal comment property value: %w", err)
