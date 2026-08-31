@@ -1917,6 +1917,291 @@ func TestConverge_GitLab_SeedsMissingPollVariables(t *testing.T) {
 	}
 }
 
+func TestConverge_GitLab_CreatesMissingSchedules(t *testing.T) {
+	fc := newFakeClientForBatch("acme/api")
+	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("  ref: v2.5.0\n")
+	// All variables present.
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFull] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFull] = "{}"
+	fc.Secrets["acme/api/"+forge.SecretGCPProjectID] = true
+	fc.Secrets["acme/api/"+forge.SecretGCPWIFProvider] = true
+	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
+	// No pipeline schedules — simulates partial install failure.
+
+	m := &Manifest{
+		Version: 1,
+		GitLab: &PlatformConfig{
+			URL:         "https://gitlab.example.com",
+			FullsendRef: "v2.5.0",
+			Repos:       []RepoEntry{{Name: "acme/api"}},
+		},
+	}
+	cfg := ConvergeConfig{
+		Manifest:               m,
+		MaxConcurrency:         4,
+		Roles:                  []string{"triage"},
+		Direct:                 true,
+		InferenceProject:       "test-inference",
+		InferenceProjectNumber: "123456789",
+		InferenceRegion:        "us-central1",
+	}
+
+	sc := &fakeScaffoldCommit{}
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	if len(result.Converged()) != 1 {
+		t.Fatalf("expected 1 converged repo, got %d", len(result.Converged()))
+	}
+
+	// Verify schedule creation actions.
+	createdSchedules := map[string]bool{}
+	for _, a := range result.Results[0].Actions {
+		if a.Action == "add" && strings.HasPrefix(a.Component, "schedule:") {
+			createdSchedules[a.Component] = true
+		}
+	}
+	if !createdSchedules["schedule:slash-poll"] {
+		t.Error("expected schedule:slash-poll to be created")
+	}
+	if !createdSchedules["schedule:event-poll"] {
+		t.Error("expected schedule:event-poll to be created")
+	}
+
+	// Verify schedules were actually created on the fake client.
+	schedules := fc.PipelineSchedules["acme/api"]
+	if len(schedules) != 2 {
+		t.Fatalf("expected 2 pipeline schedules, got %d", len(schedules))
+	}
+	descs := map[string]bool{}
+	for _, s := range schedules {
+		descs[s.Description] = true
+	}
+	if !descs["fullsend slash poll"] {
+		t.Error("expected slash poll schedule to exist")
+	}
+	if !descs["fullsend event poll"] {
+		t.Error("expected event poll schedule to exist")
+	}
+}
+
+func TestConverge_GitLab_SchedulesAlreadyPresent(t *testing.T) {
+	fc := newFakeClientForBatch("acme/api")
+	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("  ref: v2.5.0\n")
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFull] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFull] = "{}"
+	fc.Secrets["acme/api/"+forge.SecretGCPProjectID] = true
+	fc.Secrets["acme/api/"+forge.SecretGCPWIFProvider] = true
+	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
+	// Schedules already present.
+	fc.PipelineSchedules["acme/api"] = []forge.PipelineSchedule{
+		{ID: 1, Description: "fullsend slash poll", Active: true},
+		{ID: 2, Description: "fullsend event poll", Active: true},
+	}
+
+	m := &Manifest{
+		Version: 1,
+		GitLab: &PlatformConfig{
+			URL:         "https://gitlab.example.com",
+			FullsendRef: "v2.5.0",
+			Repos:       []RepoEntry{{Name: "acme/api"}},
+		},
+	}
+	cfg := ConvergeConfig{
+		Manifest:               m,
+		MaxConcurrency:         4,
+		Roles:                  []string{"triage"},
+		Direct:                 true,
+		InferenceProject:       "test-inference",
+		InferenceProjectNumber: "123456789",
+		InferenceRegion:        "us-central1",
+	}
+
+	sc := &fakeScaffoldCommit{}
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	// When schedules are present, no schedule creation actions should appear.
+	for _, a := range result.Results[0].Actions {
+		if strings.HasPrefix(a.Component, "schedule:") && a.Action != "none" {
+			t.Errorf("expected no schedule actions, got %s %s", a.Component, a.Action)
+		}
+	}
+
+	// No new schedules should have been created.
+	if len(fc.CreatedSchedules) != 0 {
+		t.Errorf("expected 0 created schedules, got %d", len(fc.CreatedSchedules))
+	}
+}
+
+func TestConverge_GitLab_MissingSchedules_DryRun(t *testing.T) {
+	fc := newFakeClientForBatch("acme/api")
+	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("  ref: v2.5.0\n")
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFull] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFull] = "{}"
+	fc.Secrets["acme/api/"+forge.SecretGCPProjectID] = true
+	fc.Secrets["acme/api/"+forge.SecretGCPWIFProvider] = true
+	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
+	// No pipeline schedules.
+
+	m := &Manifest{
+		Version: 1,
+		GitLab: &PlatformConfig{
+			URL:         "https://gitlab.example.com",
+			FullsendRef: "v2.5.0",
+			Repos:       []RepoEntry{{Name: "acme/api"}},
+		},
+	}
+	cfg := ConvergeConfig{
+		Manifest:               m,
+		MaxConcurrency:         4,
+		Roles:                  []string{"triage"},
+		Direct:                 true,
+		DryRun:                 true,
+		InferenceProject:       "test-inference",
+		InferenceProjectNumber: "123456789",
+		InferenceRegion:        "us-central1",
+	}
+
+	sc := &fakeScaffoldCommit{}
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	// Dry-run should report "add" actions but not actually create schedules.
+	addCount := 0
+	for _, a := range result.Results[0].Actions {
+		if strings.HasPrefix(a.Component, "schedule:") && a.Action == "add" {
+			addCount++
+			if !strings.HasPrefix(a.Detail, "would add") {
+				t.Errorf("expected dry-run detail to start with 'would add', got %q", a.Detail)
+			}
+		}
+	}
+	if addCount != 2 {
+		t.Errorf("expected 2 schedule add actions in dry-run, got %d", addCount)
+	}
+	if len(fc.CreatedSchedules) != 0 {
+		t.Errorf("dry-run should not create schedules, got %d", len(fc.CreatedSchedules))
+	}
+}
+
+func TestConverge_GitLab_ScheduleCreationError(t *testing.T) {
+	fc := newFakeClientForBatch("acme/api")
+	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("  ref: v2.5.0\n")
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFull] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFull] = "{}"
+	fc.Secrets["acme/api/"+forge.SecretGCPProjectID] = true
+	fc.Secrets["acme/api/"+forge.SecretGCPWIFProvider] = true
+	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
+	fc.Errors["CreatePipelineSchedule"] = fmt.Errorf("schedule API error")
+
+	m := &Manifest{
+		Version: 1,
+		GitLab: &PlatformConfig{
+			URL:         "https://gitlab.example.com",
+			FullsendRef: "v2.5.0",
+			Repos:       []RepoEntry{{Name: "acme/api"}},
+		},
+	}
+	cfg := ConvergeConfig{
+		Manifest:               m,
+		MaxConcurrency:         4,
+		Roles:                  []string{"triage"},
+		Direct:                 true,
+		InferenceProject:       "test-inference",
+		InferenceProjectNumber: "123456789",
+		InferenceRegion:        "us-central1",
+	}
+
+	sc := &fakeScaffoldCommit{}
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	if len(result.Failed()) != 1 {
+		t.Fatalf("expected 1 failed repo, got %d", len(result.Failed()))
+	}
+	if result.Results[0].Error == nil {
+		t.Error("expected error on result")
+	}
+}
+
+func TestConverge_GitLab_GetRepoError_ScheduleCreation(t *testing.T) {
+	fc := newFakeClientForBatch("acme/api")
+	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("  ref: v2.5.0\n")
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
+	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarDispatchedKeysFull] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFast] = "{}"
+	fc.VariableValues["acme/api/"+forge.VarFailedKeysFull] = "{}"
+	fc.Secrets["acme/api/"+forge.SecretGCPProjectID] = true
+	fc.Secrets["acme/api/"+forge.SecretGCPWIFProvider] = true
+	fc.Secrets["acme/api/"+forge.SecretForgeToken] = true
+	fc.Errors["GetRepo"] = fmt.Errorf("repo not found")
+
+	m := &Manifest{
+		Version: 1,
+		GitLab: &PlatformConfig{
+			URL:         "https://gitlab.example.com",
+			FullsendRef: "v2.5.0",
+			Repos:       []RepoEntry{{Name: "acme/api"}},
+		},
+	}
+	cfg := ConvergeConfig{
+		Manifest:               m,
+		MaxConcurrency:         4,
+		Roles:                  []string{"triage"},
+		Direct:                 true,
+		InferenceProject:       "test-inference",
+		InferenceProjectNumber: "123456789",
+		InferenceRegion:        "us-central1",
+	}
+
+	sc := &fakeScaffoldCommit{}
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	if len(result.Failed()) != 1 {
+		t.Fatalf("expected 1 failed repo, got %d", len(result.Failed()))
+	}
+	// Verify the error mentions the schedule/repo issue.
+	errMsg := result.Results[0].Error.Error()
+	if !strings.Contains(errMsg, "schedule") {
+		t.Errorf("expected error to mention schedules, got: %s", errMsg)
+	}
+}
+
 // TestConverge_BranchRefIdempotent verifies that convergence with a
 // branch fullsend_ref (e.g. "main") is idempotent: the second run
 // reports "already current" with zero scaffold writes. This is the
