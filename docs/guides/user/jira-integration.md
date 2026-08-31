@@ -23,7 +23,6 @@ The same conventions work across forges:
 | Comment starting with `/fs-triage` | triage |
 | Comment starting with `/fs-code` | code |
 | Label `ready-to-code` added | code |
-| Comment on an issue with `needs-info` label | triage |
 
 A slash command is only recognized as the **first token of the comment's first line**; the rest of that line becomes the instruction passed to the agent. A command buried mid-sentence ("please /fs-triage this") or on a later line does not trigger. Slash commands follow the `/fs-{agent}` pattern for stages that can legitimately run against a bare Jira issue. `review`, `fix`, and `retro` are **not** among them: per the [jira-poll adapter spec](../../normative/normalized-event/v1/jira-poll-adapter.md#state), those stages are change-proposal-scoped (they act on an existing PR) and harness CEL triggers for them MUST require `entity.kind == 'change_proposal'` — which a Jira issue comment alone never has. A `/fs-review` comment on a Jira issue is not expected to dispatch anything.
 
