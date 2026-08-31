@@ -1852,3 +1852,46 @@ gitlab:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to uninstall")
 }
+
+func TestRunReposInstall_GitLabPRTitleIncludesSkipCI(t *testing.T) {
+	gitlabManifest := `version: 1
+gitlab:
+  url: https://gitlab.example.com
+  fullsend_ref: v1.0.0
+  repos:
+    - name: group/project
+`
+	manifestPath := writeTestManifest(t, gitlabManifest)
+
+	fc := forge.NewFakeClient()
+	fc.InstallationToken = true
+	fc.AuthenticatedUser = "fullsend-app[bot]"
+	fc.CollaboratorPermissions = map[string]string{
+		"group/project/fullsend-app[bot]": "write",
+	}
+	fc.Repos = []forge.Repository{{
+		FullName:      "group/project",
+		Name:          "project",
+		DefaultBranch: "main",
+	}}
+
+	// The install may report partial failures (e.g. GitLab bot-token
+	// setup requires a real GitLab client), but the scaffold PR is
+	// created before post-install steps run.
+	_ = runReposInstall(context.Background(), &reposInstallConfig{
+		manifest:               manifestPath,
+		concurrency:            4,
+		roles:                  []string{"triage"},
+		inferenceProject:       "inf-proj",
+		inferenceProjectNumber: "123456789",
+		inferenceRegion:        "us-central1",
+		testClient:             fc,
+	})
+
+	// The scaffoldCommitFn appends [skip ci] to both CommitMsg and
+	// PRTitle for GitLab repos so merged-results pipelines don't
+	// trigger the dispatch job on scaffold MRs (#6818).
+	require.NotEmpty(t, fc.CreatedProposals, "expected a scaffold PR to be created")
+	assert.Contains(t, fc.CreatedProposals[0].Title, "[skip ci]",
+		"GitLab scaffold MR title must include [skip ci] to suppress dispatch")
+}

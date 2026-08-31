@@ -700,6 +700,7 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 			repos.ScaffoldMetadataOpts{GuardInstalled: &installed})
 		if rc.Forge == repos.ForgeGitLab {
 			meta.CommitMsg += " [skip ci]"
+			meta.PRTitle += " [skip ci]"
 		}
 		_, commitErr := layers.CommitScaffoldFiles(ctx, fc.Client, printer, owner, repo,
 			targetRepo.DefaultBranch, meta, files, direct, nil)
