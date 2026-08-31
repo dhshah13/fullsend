@@ -120,6 +120,12 @@ func adfBlockContent(parent ast.Node, source []byte, depth int, restricted bool)
 // for extracting the expand title from a <details> block.
 var summaryTagPattern = regexp.MustCompile(`(?is)<summary>(.*?)</summary>`)
 
+// htmlTagPattern matches HTML tags for stripping from extracted content.
+// Used by extractSummary to ensure the ADF expand title contains only
+// plain text — nested HTML tags like <b>, <a>, <script>, or <img> inside
+// the <summary> element are removed, leaving just the text content.
+var htmlTagPattern = regexp.MustCompile(`<[^>]*>`)
+
 // stickyHistorySentinelPattern matches sticky history sentinel comments
 // on their own line, for stripping from <details> body content before
 // re-parsing as Markdown. These sentinels are metadata used by
@@ -256,17 +262,24 @@ func isStickyHistorySentinel(raw string) bool {
 }
 
 // extractSummary extracts the text content of the first <summary> tag in
-// raw, or "" if none is present. HTML entities are decoded so the title
-// stored in the ADF expand node is plain text; the read-side
-// (adfMarkdownBlock's expand case) re-encodes with html.EscapeString,
-// keeping the round-trip correct without double-encoding pre-existing
-// entities like "&amp;" → "&amp;amp;".
+// raw, or "" if none is present. HTML entities are decoded and any nested
+// HTML tags are stripped so the title stored in the ADF expand node is
+// guaranteed plain text. The read-side (adfMarkdownBlock's expand case)
+// re-encodes with html.EscapeString, keeping the round-trip correct
+// without double-encoding pre-existing entities like "&amp;" → "&amp;amp;".
+//
+// Stripping tags prevents HTML injection: without it, a <summary> like
+// <summary><img src=x onerror=alert(1)></summary> would store the raw
+// <img> tag in the ADF title attribute, which could be interpreted as
+// HTML by the consuming renderer.
 func extractSummary(raw string) string {
 	match := summaryTagPattern.FindStringSubmatch(raw)
 	if match == nil {
 		return ""
 	}
-	return html.UnescapeString(strings.TrimSpace(match[1]))
+	decoded := html.UnescapeString(strings.TrimSpace(match[1]))
+	stripped := htmlTagPattern.ReplaceAllString(decoded, "")
+	return strings.TrimSpace(stripped)
 }
 
 // detailsInnerBody extracts the body content from a self-contained

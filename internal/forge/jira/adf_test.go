@@ -2119,6 +2119,67 @@ func TestMarkdownToADF_DetailsSummaryWithHTMLEntities(t *testing.T) {
 	}
 }
 
+func TestMarkdownToADF_DetailsSummaryStripsHTMLTags(t *testing.T) {
+	// A <summary> containing nested HTML tags (e.g. <b>, <a>, <img>,
+	// <script>) must have those tags stripped so the ADF expand title is
+	// plain text. Without stripping, HTML tags in the summary would be
+	// stored verbatim in the ADF title attribute, creating an injection
+	// risk if the consuming renderer interprets the title as HTML.
+	tests := []struct {
+		name  string
+		input string
+		title string
+	}{
+		{
+			name:  "bold tag",
+			input: "<details><summary><b>Bold</b> Title</summary>\nbody\n</details>",
+			title: "Bold Title",
+		},
+		{
+			name:  "anchor tag",
+			input: "<details><summary>Click <a href=\"http://example.com\">here</a></summary>\nbody\n</details>",
+			title: "Click here",
+		},
+		{
+			name:  "img tag with onerror",
+			input: "<details><summary>Title<img src=x onerror=alert(1)></summary>\nbody\n</details>",
+			title: "Title",
+		},
+		{
+			name:  "script tag",
+			input: "<details><summary><script>alert(1)</script></summary>\nbody\n</details>",
+			title: "alert(1)",
+		},
+		{
+			name:  "entity-encoded tags decoded then stripped",
+			input: "<details><summary>&lt;script&gt;alert(1)&lt;/script&gt;</summary>\nbody\n</details>",
+			title: "alert(1)",
+		},
+		{
+			name:  "mixed text and tags",
+			input: "<details><summary>Hello <em>world</em> &amp; <strong>friends</strong></summary>\nbody\n</details>",
+			title: "Hello world & friends",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := mustADF(t, tc.input)
+			content := asSlice(t, doc["content"])
+			if len(content) != 1 {
+				t.Fatalf("doc content len = %d, want 1", len(content))
+			}
+			expand := asMap(t, content[0])
+			if expand["type"] != "expand" {
+				t.Fatalf("block type = %v, want %q", expand["type"], "expand")
+			}
+			attrs := asMap(t, expand["attrs"])
+			if attrs["title"] != tc.title {
+				t.Errorf("expand attrs.title = %v, want %q", attrs["title"], tc.title)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ADFToMarkdown — expand → <details>
 // ---------------------------------------------------------------------------
