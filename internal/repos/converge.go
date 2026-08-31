@@ -54,7 +54,7 @@ type ConvergeConfig struct {
 // ComponentAction describes an action taken (or planned) on a single
 // installation component during convergence.
 type ComponentAction struct {
-	Component string // e.g., "workflow", "thin-caller:<path>", "var:MINT_URL", "ref"
+	Component string // e.g., "workflow", "thin-caller:<path>", "var:MINT_URL", "schedule:<name>", "ref"
 	Action    string // "none", "add", "update", "upgrade", "orphan", "error"
 	Detail    string // human-readable detail
 }
