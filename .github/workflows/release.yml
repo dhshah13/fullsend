@@ -64,16 +64,13 @@ jobs:
     #   id-token: write      — GCP WIF auth in functional-tests
     #   pull-requests: write — gate job (pull_request_target only; skipped
     #                          on tag pushes, but still validated)
-    #   checks: read         — functional-tests-complete roll-up on agents
-    #                          main (not used by the pinned gate yet;
-    #                          granted now so a pin bump cannot
-    #                          reintroduce the startup failure)
+    #   checks: read         — functional-tests-complete roll-up job
     permissions:
       contents: read
       id-token: write
       pull-requests: write
       checks: read
-    uses: fullsend-ai/agents/.github/workflows/functional-tests.yml@a8566cd5305fe094b96588690118022967ad0061 # main
+    uses: fullsend-ai/agents/.github/workflows/functional-tests.yml@beed20e7e85f7f7cf9678a78fd1f440755560ca3 # main (includes agents#1010 cross-repo checkout fix)
     with:
       fullsend_ref: ${{ github.ref_name }}
     secrets:
@@ -85,13 +82,11 @@ jobs:
       EVAL_GH_TOKEN: ${{ secrets.EVAL_GH_TOKEN }}
 
   resolve-agents:
-    # Resolve the agents tree to tag exactly once, when the release starts.
-    # tag-agents previously re-resolved agents main at tag time, so anything
-    # merged into agents while the gate ran was tagged unvalidated (#6512).
-    # Until the agents gate exposes the SHA it checked out as a
-    # workflow_call output, validate-agents still exercises the pinned
-    # gate's agents tree; this at least makes the tagged tree deterministic
-    # from the moment the release begins.
+    # Resolve agents main once at release start. Since agents#1010 the gate
+    # itself reports the SHA it validated (validate-agents' agents_sha
+    # output), and tag-agents prefers that; this job's resolution is the
+    # fallback if that output is ever empty, and the input for the
+    # informational pin-drift check below (#6512).
     needs: release
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -129,8 +124,10 @@ jobs:
     # Sync the version tag to fullsend-ai/agents. Runs for all tags
     # including pre-releases — agents' own release.yml handles
     # pre-release semantics. Only runs after agents functional tests
-    # pass against the release tag. Tags the SHA resolve-agents captured
-    # at release start — never re-resolves main here (#6512).
+    # pass against the release tag. Tags the SHA the gate actually
+    # validated (validate-agents' agents_sha output, agents#1010), falling
+    # back to the SHA resolve-agents captured at release start — never
+    # re-resolves main here (#6512).
     needs: [release, validate-agents, resolve-agents]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -148,13 +145,19 @@ jobs:
       - name: Push tag to fullsend-ai/agents
         env:
           GH_TOKEN: ${{ steps.agents-token.outputs.token }}
-          AGENTS_SHA: ${{ needs.resolve-agents.outputs.agents_sha }}
+          GATE_SHA: ${{ needs.validate-agents.outputs.agents_sha }}
+          RESOLVED_SHA: ${{ needs.resolve-agents.outputs.agents_sha }}
         run: |
           set -euo pipefail
+          AGENTS_SHA="${GATE_SHA:-${RESOLVED_SHA}}"
           if [[ ! "${AGENTS_SHA}" =~ ^[a-f0-9]{40}$ ]]; then
-            echo "::error::resolve-agents output is not a commit SHA: ${AGENTS_SHA//::/}"
+            echo "::error::no usable agents SHA (gate='${GATE_SHA//::/}' resolved='${RESOLVED_SHA//::/}')"
             exit 1
           fi
+          if [[ -n "${GATE_SHA}" && "${GATE_SHA}" != "${RESOLVED_SHA}" ]]; then
+            echo "::notice::tagging the gate-validated SHA ${GATE_SHA} (agents main was ${RESOLVED_SHA} at release start)"
+          fi
+          echo "Tagging fullsend-ai/agents at ${AGENTS_SHA} (source: $([[ -n "${GATE_SHA}" ]] && echo validate-agents || echo resolve-agents))"
           TAG="${GITHUB_REF_NAME}"
 
           HTTP_CODE=$(gh api "repos/fullsend-ai/agents/git/ref/tags/${TAG}" \
