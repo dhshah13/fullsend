@@ -137,8 +137,8 @@ func (a AgentEntry) DerivedName() string {
 const (
 	// DefaultUpstreamRepo is the canonical fullsend repository for layered workflow calls.
 	DefaultUpstreamRepo = "fullsend-ai/fullsend"
-	// DefaultUpstreamRef is the default tag for layered upstream workflow calls.
-	DefaultUpstreamRef = "v0"
+	// DefaultUpstreamRef is the default ref for layered upstream workflow calls.
+	DefaultUpstreamRef = "main"
 	// DefaultGHRunner is the default GitHub Actions runner image for scaffold workflows.
 	DefaultGHRunner = "ubuntu-24.04"
 )

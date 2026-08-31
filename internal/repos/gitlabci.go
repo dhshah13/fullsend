@@ -43,6 +43,97 @@ type workflowRule struct {
 	If string
 }
 
+// HasFullsendEntries reports whether existing .gitlab-ci.yml content
+// already contains all fullsend CI entries. It performs semantic drift
+// detection by checking:
+//
+//  1. include: contains the fullsend-pipeline.yml entry
+//  2. If stages: exists, it contains dispatch, poll, agent
+//     (if no stages: key, the included pipeline provides them)
+//  3. If workflow: exists, it must have a rules: sequence containing
+//     fullsend's three if: conditions. If workflow: exists without
+//     rules:, that is drift — MergeGitLabCI would add them.
+//     (if no workflow: block at all, fullsend's jobs self-filter)
+//
+// Used by the installer to skip unnecessary .gitlab-ci.yml writes when
+// all entries are already present, avoiding YAML formatting churn.
+func HasFullsendEntries(existing []byte) bool {
+	if len(bytes.TrimSpace(existing)) == 0 {
+		return false
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(existing, &doc); err != nil {
+		return false
+	}
+
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return false
+	}
+
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return false
+	}
+
+	// 1. The include: key must exist and contain fullsend-pipeline.yml.
+	includeVal := findMappingValue(root, "include")
+	if includeVal == nil {
+		return false
+	}
+	if includeVal.Kind == yaml.SequenceNode {
+		if !slices.ContainsFunc(includeVal.Content, isFullsendPipelineInclude) {
+			return false
+		}
+	} else if !isFullsendPipelineInclude(includeVal) {
+		return false
+	}
+
+	// 2. If stages: exists, it must contain all fullsend stages.
+	stagesVal := findMappingValue(root, "stages")
+	if stagesVal != nil && stagesVal.Kind == yaml.SequenceNode {
+		existingStages := make(map[string]bool)
+		for _, item := range stagesVal.Content {
+			if item.Kind == yaml.ScalarNode {
+				existingStages[item.Value] = true
+			}
+		}
+		for _, stage := range fullsendStages {
+			if !existingStages[stage] {
+				return false
+			}
+		}
+	}
+
+	// 3. If workflow: exists, rules: must be present and contain
+	//    fullsend's if: conditions. A workflow: block without rules:
+	//    is drift — MergeGitLabCI would add them.
+	workflowVal := findMappingValue(root, "workflow")
+	if workflowVal != nil && workflowVal.Kind == yaml.MappingNode {
+		rulesVal := findMappingValue(workflowVal, "rules")
+		if rulesVal == nil || rulesVal.Kind != yaml.SequenceNode {
+			// workflow: exists but has no rules: sequence —
+			// MergeGitLabCI would add rules here.
+			return false
+		}
+		existingRules := make(map[string]bool)
+		for _, item := range rulesVal.Content {
+			if item.Kind == yaml.MappingNode {
+				if v := findMappingValue(item, "if"); v != nil {
+					existingRules[v.Value] = true
+				}
+			}
+		}
+		for _, r := range fullsendWorkflowRules {
+			if !existingRules[r.If] {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 // MergeGitLabCI merges fullsend's CI configuration into an existing
 // .gitlab-ci.yml. It uses yaml.v3's Node API to preserve comments and
 // formatting in the existing file.
@@ -529,20 +620,6 @@ func marshalNode(doc *yaml.Node) ([]byte, error) {
 		return nil, fmt.Errorf("closing YAML encoder: %w", err)
 	}
 	return buf.Bytes(), nil
-}
-
-// mergeGitLabRootCI fetches the existing .gitlab-ci.yml from the repo
-// and merges fullsend's include and workflow rules into it. If the file
-// does not exist, returns a minimal .gitlab-ci.yml.
-func mergeGitLabRootCI(ctx context.Context, client forge.Client, owner, repo string) ([]byte, error) {
-	existing, err := client.GetFileContent(ctx, owner, repo, ".gitlab-ci.yml")
-	if err != nil {
-		if forge.IsNotFound(err) {
-			return MergeGitLabCI(nil)
-		}
-		return nil, fmt.Errorf("reading existing .gitlab-ci.yml: %w", err)
-	}
-	return MergeGitLabCI(existing)
 }
 
 // unmergeGitLabRootCI fetches the existing .gitlab-ci.yml from the repo

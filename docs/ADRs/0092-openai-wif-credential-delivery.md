@@ -242,3 +242,4 @@ credential. What remains:
 - #6532 — GPT / Azure OpenAI / Bedrock providers for pi
 - #6464 — pi runtime tracker
 - #1952 — Anthropic WIF sibling design
+- ADR 0095 — mapping scope: repository-only by default (#6782)
