@@ -95,10 +95,6 @@ func (r *HarnessRouter) routeSlashCommand(event *NormalizedEvent, cmd string) ([
 		return nil, nil
 	}
 
-	if !HasRole(event.Actor.Role, "write") {
-		return nil, nil
-	}
-
 	if event.Entity.Kind == "change_proposal" && isForkOrUnknown(event.State) {
 		return nil, nil
 	}
@@ -112,7 +108,29 @@ func (r *HarnessRouter) routeSlashCommand(event *NormalizedEvent, cmd string) ([
 		return nil, nil
 	}
 
+	// Observation stages (triage, review) accept the triage role;
+	// mutation stages (code, fix, etc.) require write per ADR 0054.
+	minRole := "write"
+	if isObservationStage(stage) {
+		minRole = "triage"
+	}
+
+	if !HasRole(event.Actor.Role, minRole) {
+		// Entity-author bypass: issue reporters can trigger observation
+		// stages on their own work_item entities even with read-only
+		// access. Does not apply to change_proposal entities.
+		if !(isObservationStage(stage) && event.Entity.Kind == "work_item" && event.Actor.IsEntityAuthor) {
+			return nil, nil
+		}
+	}
+
 	return []string{stage}, nil
+}
+
+// isObservationStage reports whether stage is a read-only observation
+// stage that accepts the triage role per ADR 0054.
+func isObservationStage(stage string) bool {
+	return stage == "triage" || stage == "review"
 }
 
 func (r *HarnessRouter) routeLabel(event *NormalizedEvent) ([]string, error) {
