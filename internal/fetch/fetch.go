@@ -17,8 +17,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/netutil"
@@ -67,9 +67,12 @@ type FetchPolicy struct {
 }
 
 const (
-	// defaultMaxRetries is the default number of retry attempts for
-	// transient errors when MaxRetries is nil (unset by caller).
-	defaultMaxRetries = 3
+	// defaultMaxAttempts is the total number of request attempts
+	// (1 initial + retries) when MaxRetries is nil. This matches the
+	// codebase convention where the retry constant controls loop
+	// iterations directly (e.g. github.go, gitlab.go, jira.go all
+	// use `for attempt := range maxRetries`).
+	defaultMaxAttempts = 4
 
 	// defaultRetryBackoff is the base backoff duration used when
 	// RetryBackoff is zero or negative.
@@ -101,7 +104,7 @@ var DefaultPolicy = FetchPolicy{
 	AllowedDomains: []string{"github.com", "raw.githubusercontent.com"},
 	MaxSizeBytes:   10 * 1024 * 1024, // 10 MB
 	Timeout:        30 * time.Second,
-	// MaxRetries: nil → uses default (3 retries).
+	// MaxRetries: nil → uses default (4 total attempts).
 }
 
 var (
@@ -114,14 +117,6 @@ var (
 	errNoAddrs        = errors.New("fetch: DNS resolution returned no addresses")
 	errNonOK          = errors.New("fetch: non-200 status code")
 	errTooLarge       = errors.New("fetch: response body exceeds size limit")
-
-	// transientErrorPatterns are substrings of network errors that indicate
-	// a transient condition worth retrying.
-	transientErrorPatterns = []string{
-		"connection reset by peer",
-		"connection refused",
-		"i/o timeout",
-	}
 )
 
 // HTTPStatusError is returned when FetchURL gets a non-200 response.
@@ -234,11 +229,11 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 	}
 
 	// 9. Execute request with retry for transient errors.
-	maxRetries := defaultMaxRetries
+	maxAttempts := defaultMaxAttempts
 	if policy.MaxRetries != nil {
-		maxRetries = *policy.MaxRetries
-		if maxRetries < 0 {
-			maxRetries = 0
+		maxAttempts = *policy.MaxRetries + 1
+		if maxAttempts < 1 {
+			maxAttempts = 1
 		}
 	}
 	baseBackoff := policy.RetryBackoff
@@ -247,7 +242,7 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 	}
 
 	var lastErr error
-	for attempt := range maxRetries + 1 {
+	for attempt := range maxAttempts {
 		if attempt > 0 {
 			delay := retryBackoff(baseBackoff, attempt-1)
 			select {
@@ -259,7 +254,7 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 
 		resp, doErr := client.Do(req)
 		if doErr != nil {
-			if isTransientRequestError(ctx, doErr) && attempt < maxRetries {
+			if isTransientRequestError(ctx, doErr) && attempt < maxAttempts-1 {
 				lastErr = doErr
 				continue
 			}
@@ -273,7 +268,7 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			httpErr := HTTPStatusError{Status: resp.StatusCode}
-			if isTransientStatusCode(resp.StatusCode) && attempt < maxRetries {
+			if isTransientStatusCode(resp.StatusCode) && attempt < maxAttempts-1 {
 				lastErr = httpErr
 				continue
 			}
@@ -342,7 +337,8 @@ func isTransientRequestError(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	// HTTP client timeout (e.g. net/http.Client.Timeout exceeded).
+	// HTTP client timeout (e.g. net/http.Client.Timeout exceeded) and
+	// i/o timeouts — both surface via the Timeout() interface.
 	var te interface{ Timeout() bool }
 	if errors.As(err, &te) && te.Timeout() {
 		return true
@@ -351,13 +347,13 @@ func isTransientRequestError(ctx context.Context, err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	// String-match transient network conditions from the error message.
-	// These are surfaced by the net package as *net.OpError wrapping
-	// syscall errors whose types vary by OS.
-	msg := err.Error()
-	return slices.ContainsFunc(transientErrorPatterns, func(pattern string) bool {
-		return strings.Contains(msg, pattern)
-	})
+	// Transient connection errors. Use typed syscall sentinels instead
+	// of string matching — these are stable across platforms (Go maps
+	// OS-specific codes to syscall.Errno on all supported targets).
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	return false
 }
 
 // isTransientStatusCode reports whether an HTTP status code represents a

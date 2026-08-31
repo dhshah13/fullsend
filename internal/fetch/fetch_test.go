@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,6 +19,14 @@ import (
 )
 
 func intPtr(n int) *int { return &n }
+
+// timeoutErr is a test helper that implements the Timeout() interface
+// used by net/http to identify timeout errors.
+type timeoutErr struct{ msg string }
+
+func (e *timeoutErr) Error() string   { return e.msg }
+func (e *timeoutErr) Timeout() bool   { return true }
+func (e *timeoutErr) Temporary() bool { return true } //nolint:staticcheck // Required by net.Error interface.
 
 // newTestServer creates an HTTPS test server and returns it along with a
 // FetchPolicy configured to trust the server's TLS certificate, allow
@@ -113,6 +122,7 @@ func TestFetchURL(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		}))
 		policy.Timeout = 100 * time.Millisecond
+		policy.MaxRetries = intPtr(0) // Disable retries to keep test fast.
 
 		_, err := FetchURL(context.Background(), srv.URL+"/slow", policy)
 		if err == nil {
@@ -459,14 +469,14 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 		var attempts int
 		srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			attempts++
-			if attempts <= defaultMaxRetries {
+			if attempts < defaultMaxAttempts {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, "ok")
 		}))
-		// MaxRetries is nil by default from NewTestPolicy → uses defaultMaxRetries.
+		// MaxRetries is nil by default from NewTestPolicy → uses defaultMaxAttempts.
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		data, err := FetchURL(context.Background(), srv.URL+"/default-retries", policy)
@@ -476,8 +486,8 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 		if string(data) != "ok" {
 			t.Fatalf("unexpected body: %q", string(data))
 		}
-		if attempts != defaultMaxRetries+1 {
-			t.Fatalf("expected %d attempts, got %d", defaultMaxRetries+1, attempts)
+		if attempts != defaultMaxAttempts {
+			t.Fatalf("expected %d attempts, got %d", defaultMaxAttempts, attempts)
 		}
 	})
 }
@@ -486,21 +496,23 @@ func TestIsTransientRequestError(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("ConnectionReset", func(t *testing.T) {
-		err := fmt.Errorf("read tcp: connection reset by peer")
+		// Use the typed syscall error that net.OpError wraps.
+		err := fmt.Errorf("read tcp 127.0.0.1:443: %w", syscall.ECONNRESET)
 		if !isTransientRequestError(ctx, err) {
 			t.Fatal("expected connection reset to be transient")
 		}
 	})
 
 	t.Run("ConnectionRefused", func(t *testing.T) {
-		err := fmt.Errorf("dial tcp: connection refused")
+		err := fmt.Errorf("dial tcp 127.0.0.1:443: %w", syscall.ECONNREFUSED)
 		if !isTransientRequestError(ctx, err) {
 			t.Fatal("expected connection refused to be transient")
 		}
 	})
 
 	t.Run("IOTimeout", func(t *testing.T) {
-		err := fmt.Errorf("read tcp: i/o timeout")
+		// i/o timeouts are caught by the Timeout() interface check.
+		err := &net.OpError{Op: "read", Net: "tcp", Err: &timeoutErr{msg: "i/o timeout"}}
 		if !isTransientRequestError(ctx, err) {
 			t.Fatal("expected i/o timeout to be transient")
 		}
