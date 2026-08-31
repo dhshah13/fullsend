@@ -1207,7 +1207,7 @@ func verifyPolicy(name, output, requestedPolicy string) error {
 // openshell sandbox get output. Returns "sandbox", "global", or ""
 // if the field is not present.
 func parsePolicySource(output string) string {
-	for line := range strings.SplitSeq(output, "\n") {
+	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if val, ok := strings.CutPrefix(line, "Policy source:"); ok {
 			return strings.TrimSpace(val)
@@ -1217,11 +1217,14 @@ func parsePolicySource(output string) string {
 }
 
 // hasPolicySection checks whether the output contains a standalone
-// "Policy:" section header, indicating an active policy with YAML
-// content follows. This distinguishes the section header from the
-// "Policy source:" metadata field.
+// "Policy:" section header, indicating that a policy is active.
+// This is intentionally a presence-only check — it does not compare the
+// policy content against the requested policy YAML. The goal is to
+// detect the case where no policy was applied at all (missing section),
+// not to verify byte-for-byte content equality. This distinguishes the
+// section header from the "Policy source:" metadata field.
 func hasPolicySection(output string) bool {
-	for line := range strings.SplitSeq(output, "\n") {
+	for _, line := range strings.Split(output, "\n") {
 		if strings.TrimSpace(line) == "Policy:" {
 			return true
 		}
