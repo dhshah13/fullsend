@@ -1887,7 +1887,7 @@ gitlab:
 		inferenceRegion:        "us-central1",
 		testClient:             fc,
 	})
-	_ = err
+	t.Logf("runReposInstall: %v", err)
 
 	// The scaffoldCommitFn appends [skip ci] to both CommitMsg and
 	// PRTitle for GitLab repos so merged-results pipelines don't
