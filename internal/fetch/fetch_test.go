@@ -332,6 +332,33 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 		}
 	})
 
+	t.Run("ExhaustedRetriesIncludeLastTransientError", func(t *testing.T) {
+		var attempts int
+		srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts++
+			if attempts <= 2 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			// Third attempt returns a non-transient error.
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		policy.MaxRetries = intPtr(3)
+		policy.RetryBackoff = 10 * time.Millisecond
+
+		_, err := FetchURL(context.Background(), srv.URL+"/mixed-errors", policy)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		errMsg := err.Error()
+		if !strings.Contains(errMsg, "last transient error") {
+			t.Fatalf("expected error to include last transient error context, got: %v", err)
+		}
+		if !strings.Contains(errMsg, "after 3 attempt(s)") {
+			t.Fatalf("expected attempt count in error, got: %v", err)
+		}
+	})
+
 	t.Run("NoRetryOn404", func(t *testing.T) {
 		var attempts int
 		srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -408,6 +435,23 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 		// Verify that DefaultPolicy uses the default retry count (nil = default).
 		if DefaultPolicy.MaxRetries != nil {
 			t.Fatalf("expected DefaultPolicy.MaxRetries to be nil (use default), got %d", *DefaultPolicy.MaxRetries)
+		}
+	})
+
+	t.Run("NegativeMaxRetriesClampsToZero", func(t *testing.T) {
+		var attempts int
+		srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts++
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		policy.MaxRetries = intPtr(-1)
+
+		_, err := FetchURL(context.Background(), srv.URL+"/negative", policy)
+		if err == nil {
+			t.Fatal("expected error with negative MaxRetries")
+		}
+		if attempts != 1 {
+			t.Fatalf("expected 1 attempt with negative MaxRetries (clamped to 0), got %d", attempts)
 		}
 	})
 

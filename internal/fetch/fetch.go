@@ -237,6 +237,9 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 	maxRetries := defaultMaxRetries
 	if policy.MaxRetries != nil {
 		maxRetries = *policy.MaxRetries
+		if maxRetries < 0 {
+			maxRetries = 0
+		}
 	}
 	baseBackoff := policy.RetryBackoff
 	if baseBackoff <= 0 {
@@ -261,7 +264,7 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 				continue
 			}
 			if lastErr != nil {
-				return nil, fmt.Errorf("fetch: request failed: %w (after %d attempt(s))", doErr, attempt+1)
+				return nil, fmt.Errorf("fetch: request failed: %w (after %d attempt(s), last transient error: %v)", doErr, attempt+1, lastErr)
 			}
 			return nil, fmt.Errorf("fetch: request failed: %w", doErr)
 		}
@@ -275,7 +278,7 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 				continue
 			}
 			if lastErr != nil {
-				return nil, fmt.Errorf("%w (after %d attempt(s))", httpErr, attempt+1)
+				return nil, fmt.Errorf("%w (after %d attempt(s), last transient error: %v)", httpErr, attempt+1, lastErr)
 			}
 			return nil, httpErr
 		}
