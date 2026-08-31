@@ -279,12 +279,12 @@ func TestJiraClient_CreateCommentWithMarker(t *testing.T) {
 	if !ok {
 		t.Fatal("expected comment properties to be set")
 	}
-	var stored string
+	var stored stickyMarkerProperty
 	if err := json.Unmarshal(props[stickyPropertyKey], &stored); err != nil {
 		t.Fatalf("unmarshal property value: %v", err)
 	}
-	if stored != marker {
-		t.Errorf("stored marker = %q, want %q", stored, marker)
+	if stored.Marker != marker {
+		t.Errorf("stored marker = %q, want %q", stored.Marker, marker)
 	}
 }
 
@@ -376,12 +376,12 @@ func TestJiraClient_MigrateAndUpdateComment(t *testing.T) {
 	if !ok {
 		t.Fatal("expected comment properties to be set after migration")
 	}
-	var stored string
+	var stored stickyMarkerProperty
 	if err := json.Unmarshal(props[stickyPropertyKey], &stored); err != nil {
 		t.Fatalf("unmarshal property value: %v", err)
 	}
-	if stored != marker {
-		t.Errorf("stored marker = %q, want %q", stored, marker)
+	if stored.Marker != marker {
+		t.Errorf("stored marker = %q, want %q", stored.Marker, marker)
 	}
 }
 

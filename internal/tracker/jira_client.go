@@ -37,6 +37,12 @@ func parseJiraTimestamp(s string) (time.Time, error) {
 // collisions with other Jira apps.
 const stickyPropertyKey = "fullsend.sticky-marker"
 
+// stickyMarkerProperty is object-shaped because Jira rejects top-level JSON
+// strings in the properties array of the create-comment request.
+type stickyMarkerProperty struct {
+	Marker string `json:"marker"`
+}
+
 // jiraClient is the Jira API surface this adapter needs. Implemented by
 // jira.LiveClient; faked in tests.
 type jiraClient interface {
@@ -141,7 +147,7 @@ func (c *JiraClient) CreateComment(ctx context.Context, project string, number i
 // would render the marker as plain text).
 func (c *JiraClient) CreateCommentWithMarker(ctx context.Context, project string, number int, body Body, marker string) (*Comment, error) {
 	key := issueKey(project, number)
-	markerValue, err := json.Marshal(marker)
+	markerValue, err := json.Marshal(stickyMarkerProperty{Marker: marker})
 	if err != nil {
 		return nil, fmt.Errorf("marshal sticky marker: %w", err)
 	}
@@ -170,8 +176,8 @@ func (c *JiraClient) FindCommentByMarkerProperty(comments []jira.Comment, marker
 	for i := range comments {
 		for _, prop := range comments[i].Properties {
 			if prop.Key == stickyPropertyKey {
-				var storedMarker string
-				if json.Unmarshal(prop.Value, &storedMarker) == nil && storedMarker == marker {
+				var stored stickyMarkerProperty
+				if json.Unmarshal(prop.Value, &stored) == nil && stored.Marker == marker {
 					return &comments[i]
 				}
 			}
@@ -207,7 +213,7 @@ func (c *JiraClient) MigrateAndUpdateComment(ctx context.Context, project string
 	// still find the comment via its property and can retry. The
 	// reverse order risks losing the marker from both the body (which
 	// was just stripped) and the property (which was never set).
-	if err := c.jira.SetCommentProperty(ctx, key, commentID, stickyPropertyKey, marker); err != nil {
+	if err := c.jira.SetCommentProperty(ctx, key, commentID, stickyPropertyKey, stickyMarkerProperty{Marker: marker}); err != nil {
 		return fmt.Errorf("setting sticky marker property on comment %s of %s: %w", commentID, key, err)
 	}
 	if err := c.jira.UpdateComment(ctx, key, commentID, string(body)); err != nil {
