@@ -170,7 +170,7 @@ If the query is rejected, the binary prints the reason to stderr and exits non-z
 gate-query: rejected — query must include a LIMIT clause
 ```
 
-> **Production note:** The string-matching validation above is intentionally simple for illustration. It blocks obvious cases — including multi-statement injection via semicolons — but cannot catch all bypass vectors (e.g., `dblink()` calls that query forbidden tables on a remote server, `pg_read_file()` to read arbitrary files, CTEs, or subqueries that reference forbidden tables indirectly). A production gate binary should use a SQL parser (e.g., `github.com/pingcap/tidb/parser` or `github.com/kyleconroy/sqlc`) to reliably detect table references, column selections, JOINs on non-indexed columns, and ORDER BY clauses targeting unindexed columns.
+> **Production note:** The string-matching validation above is intentionally simple for illustration. It blocks obvious cases — including multi-statement injection via semicolons — but cannot catch all bypass vectors (e.g., `dblink()` calls that query forbidden tables on a remote server, `pg_read_file()` to read arbitrary files, CTEs, or subqueries that reference forbidden tables indirectly). A production gate binary should use a SQL parser (e.g., `github.com/pingcap/tidb/parser` or `github.com/sqlc-dev/sqlc`) to reliably detect table references, column selections, JOINs on non-indexed columns, and ORDER BY clauses targeting unindexed columns.
 
 ## Configuring the sandbox policy
 
@@ -264,7 +264,7 @@ Understanding the enforcement boundary is critical for correct policy design:
 |-------|-------------|--------------------------|----------|
 | Endpoint allowlist | OpenShell proxy (L4) | No — kernel-backed | Which hosts and ports are reachable |
 | Method/path rules | OpenShell proxy (L7) | No — kernel-backed | `GET /api/v3/repos/*` only |
-| Binary identity | OpenShell proxy (process-tree ancestry) | No — kernel-backed | Only `gate-query` and its child processes can reach `staging-db.internal:5432` |
+| Binary identity | OpenShell proxy (process-tree ancestry) | No — proxy-enforced via unforgeable `/proc` data | Only `gate-query` and its child processes can reach `staging-db.internal:5432` |
 | Binary integrity | Landlock read-only path | No — kernel-backed | Agent cannot overwrite `/usr/local/bin/gate-query` |
 | Application logic | Gate binary code | Only if dynamically linked (`LD_PRELOAD`) | Query validation, table filtering, PII column blocking |
 
