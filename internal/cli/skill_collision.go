@@ -13,7 +13,10 @@ import (
 func warnRepoSkillCollisions(repoDir string, harnessSkillDirs []string, printer *ui.Printer) {
 	harnessSkills := make(map[string]struct{}, len(harnessSkillDirs))
 	for _, skillDir := range harnessSkillDirs {
-		if skillDir != "" {
+		if skillDir == "" {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(skillDir, "SKILL.md")); err == nil && info.Mode().IsRegular() {
 			harnessSkills[filepath.Base(skillDir)] = struct{}{}
 		}
 	}

@@ -89,7 +89,7 @@ Repo skills **extend** the agent's skill set. They do not replace built-in
 skills. If a repo skill has the same name as a built-in skill, the built-in
 version takes precedence and the repo version is ignored. Fullsend warns about
 the collision before the agent starts. Use a unique name to extend the agent,
-or use a derived harness with `base:` composition for an intentional override.
+or intentionally replace it through [`base:` harness composition](#overriding-built-in-skills).
 
 ### Skill precedence
 
