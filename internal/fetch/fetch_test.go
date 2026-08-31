@@ -17,6 +17,8 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/netutil"
 )
 
+func intPtr(n int) *int { return &n }
+
 // newTestServer creates an HTTPS test server and returns it along with a
 // FetchPolicy configured to trust the server's TLS certificate, allow
 // its hostname, and skip internal-IP checks (the server listens on 127.0.0.1).
@@ -239,7 +241,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, "ok")
 		}))
-		policy.MaxRetries = 3
+		policy.MaxRetries = intPtr(3)
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		data, err := FetchURL(context.Background(), srv.URL+"/retry", policy)
@@ -265,7 +267,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, "recovered")
 		}))
-		policy.MaxRetries = 2
+		policy.MaxRetries = intPtr(2)
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		data, err := FetchURL(context.Background(), srv.URL+"/retry502", policy)
@@ -291,7 +293,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, "ok")
 		}))
-		policy.MaxRetries = 2
+		policy.MaxRetries = intPtr(2)
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		data, err := FetchURL(context.Background(), srv.URL+"/retry429", policy)
@@ -312,7 +314,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 			attempts++
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}))
-		policy.MaxRetries = 2
+		policy.MaxRetries = intPtr(2)
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		_, err := FetchURL(context.Background(), srv.URL+"/always503", policy)
@@ -336,7 +338,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 			attempts++
 			w.WriteHeader(http.StatusNotFound)
 		}))
-		policy.MaxRetries = 3
+		policy.MaxRetries = intPtr(3)
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		_, err := FetchURL(context.Background(), srv.URL+"/missing", policy)
@@ -357,7 +359,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 			attempts++
 			w.WriteHeader(http.StatusUnauthorized)
 		}))
-		policy.MaxRetries = 3
+		policy.MaxRetries = intPtr(3)
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		_, err := FetchURL(context.Background(), srv.URL+"/unauth", policy)
@@ -375,7 +377,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 			attempts++
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}))
-		policy.MaxRetries = 0
+		policy.MaxRetries = intPtr(0)
 
 		_, err := FetchURL(context.Background(), srv.URL+"/no-retry", policy)
 		if err == nil {
@@ -390,7 +392,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 		srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}))
-		policy.MaxRetries = 3
+		policy.MaxRetries = intPtr(3)
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -403,13 +405,13 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 	})
 
 	t.Run("DefaultPolicyHasRetries", func(t *testing.T) {
-		// Verify that DefaultPolicy uses the default retry count.
-		if DefaultPolicy.MaxRetries >= 0 {
-			t.Fatalf("expected DefaultPolicy.MaxRetries < 0 (use default), got %d", DefaultPolicy.MaxRetries)
+		// Verify that DefaultPolicy uses the default retry count (nil = default).
+		if DefaultPolicy.MaxRetries != nil {
+			t.Fatalf("expected DefaultPolicy.MaxRetries to be nil (use default), got %d", *DefaultPolicy.MaxRetries)
 		}
 	})
 
-	t.Run("NegativeMaxRetriesUsesDefault", func(t *testing.T) {
+	t.Run("NilMaxRetriesUsesDefault", func(t *testing.T) {
 		var attempts int
 		srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			attempts++
@@ -420,7 +422,7 @@ func TestFetchURL_RetriesTransientErrors(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprint(w, "ok")
 		}))
-		policy.MaxRetries = -1
+		// MaxRetries is nil by default from NewTestPolicy → uses defaultMaxRetries.
 		policy.RetryBackoff = 10 * time.Millisecond
 
 		data, err := FetchURL(context.Background(), srv.URL+"/default-retries", policy)
@@ -484,9 +486,21 @@ func TestIsTransientRequestError(t *testing.T) {
 	})
 
 	t.Run("ContextDeadlineNotTransient", func(t *testing.T) {
+		deadlineCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
 		err := context.DeadlineExceeded
-		if isTransientRequestError(ctx, err) {
-			t.Fatal("expected context.DeadlineExceeded to NOT be transient")
+		if isTransientRequestError(deadlineCtx, err) {
+			t.Fatal("expected context.DeadlineExceeded to NOT be transient when caller context expired")
+		}
+	})
+
+	t.Run("ClientTimeoutIsTransient", func(t *testing.T) {
+		// HTTP client timeouts wrap context.DeadlineExceeded from an
+		// internal context, but the caller's context is still active.
+		// These per-request timeouts are transient and worth retrying.
+		err := fmt.Errorf("request timeout: %w", context.DeadlineExceeded)
+		if !isTransientRequestError(ctx, err) {
+			t.Fatal("expected client timeout to be transient when caller context is active")
 		}
 	})
 
@@ -546,6 +560,19 @@ func TestRetryBackoff(t *testing.T) {
 		d := retryBackoff(base, 2)
 		if d < 200*time.Millisecond || d > 400*time.Millisecond {
 			t.Fatalf("attempt 2 backoff %v out of range [200ms, 400ms]", d)
+		}
+	}
+}
+
+func TestRetryBackoff_Capped(t *testing.T) {
+	base := 500 * time.Millisecond
+
+	// At attempt 50, math.Pow(2, 50) * 500ms would overflow int64.
+	// The backoff should be capped at maxBackoff (30s), jittered [15s, 30s].
+	for range 20 {
+		d := retryBackoff(base, 50)
+		if d < maxBackoff/2 || d > maxBackoff {
+			t.Fatalf("attempt 50 backoff %v out of capped range [%v, %v]", d, maxBackoff/2, maxBackoff)
 		}
 	}
 }

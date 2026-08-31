@@ -45,14 +45,14 @@ type FetchPolicy struct {
 	Offline bool
 
 	// MaxRetries is the number of retry attempts for transient errors
-	// (connection resets, timeouts, HTTP 429/502/503). Zero means no
-	// retries. A negative value uses the defaultMaxRetries (3).
-	MaxRetries int
+	// (connection resets, timeouts, HTTP 429/502/503). Nil uses the
+	// default of 3 retries. Zero disables retries.
+	MaxRetries *int
 
 	// RetryBackoff is the base duration for exponential backoff between
-	// retries. Zero or negative uses defaultRetryBackoff (500ms). The
-	// actual delay is jittered between 50–100% of the computed backoff
-	// to avoid thundering-herd effects.
+	// retries. Zero or negative uses the default of 500 ms. The actual
+	// delay is jittered between 50–100% of the computed backoff to avoid
+	// thundering-herd effects.
 	RetryBackoff time.Duration
 
 	// tlsConfig is an optional TLS configuration, used in tests to trust
@@ -65,6 +65,20 @@ type FetchPolicy struct {
 	// Set via NewTestPolicy.
 	skipIPCheck bool
 }
+
+const (
+	// defaultMaxRetries is the default number of retry attempts for
+	// transient errors when MaxRetries is nil (unset by caller).
+	defaultMaxRetries = 3
+
+	// defaultRetryBackoff is the base backoff duration used when
+	// RetryBackoff is zero or negative.
+	defaultRetryBackoff = 500 * time.Millisecond
+
+	// maxBackoff caps the computed backoff to prevent overflow when
+	// attempt counts are large.
+	maxBackoff = 30 * time.Second
+)
 
 // NewTestPolicy returns a FetchPolicy configured for use with
 // httptest.NewTLSServer. Testing only — do not use in production code.
@@ -82,22 +96,12 @@ func NewTestPolicy(tlsConfig *tls.Config, allowedDomains, allowedPorts []string)
 	}
 }
 
-const (
-	// defaultMaxRetries is the default number of retry attempts for
-	// transient errors when MaxRetries is negative (unset by caller).
-	defaultMaxRetries = 3
-
-	// defaultRetryBackoff is the base backoff duration used when
-	// RetryBackoff is zero or negative.
-	defaultRetryBackoff = 500 * time.Millisecond
-)
-
 // DefaultPolicy is a sensible default policy allowing GitHub content hosts.
 var DefaultPolicy = FetchPolicy{
 	AllowedDomains: []string{"github.com", "raw.githubusercontent.com"},
 	MaxSizeBytes:   10 * 1024 * 1024, // 10 MB
 	Timeout:        30 * time.Second,
-	MaxRetries:     -1, // use defaultMaxRetries
+	// MaxRetries: nil → uses default (3 retries).
 }
 
 var (
@@ -110,6 +114,14 @@ var (
 	errNoAddrs        = errors.New("fetch: DNS resolution returned no addresses")
 	errNonOK          = errors.New("fetch: non-200 status code")
 	errTooLarge       = errors.New("fetch: response body exceeds size limit")
+
+	// transientErrorPatterns are substrings of network errors that indicate
+	// a transient condition worth retrying.
+	transientErrorPatterns = []string{
+		"connection reset by peer",
+		"connection refused",
+		"i/o timeout",
+	}
 )
 
 // HTTPStatusError is returned when FetchURL gets a non-200 response.
@@ -222,9 +234,9 @@ func FetchURL(ctx context.Context, rawURL string, policy FetchPolicy) ([]byte, e
 	}
 
 	// 9. Execute request with retry for transient errors.
-	maxRetries := policy.MaxRetries
-	if maxRetries < 0 {
-		maxRetries = defaultMaxRetries
+	maxRetries := defaultMaxRetries
+	if policy.MaxRetries != nil {
+		maxRetries = *policy.MaxRetries
 	}
 	baseBackoff := policy.RetryBackoff
 	if baseBackoff <= 0 {
@@ -318,16 +330,16 @@ func portAllowed(port string, allowed []string) bool {
 // isTransientRequestError reports whether a client.Do error is transient
 // and worth retrying. Context cancellation and deadline errors are never
 // transient — the caller chose to stop waiting.
+//
+// We check ctx.Err() rather than errors.Is(err, context.DeadlineExceeded)
+// because http.Client.Timeout wraps context.DeadlineExceeded from an
+// internal context even when the caller's context is still active. Such
+// per-request timeouts on slow servers are transient and worth retrying.
 func isTransientRequestError(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return false
-	}
 	// HTTP client timeout (e.g. net/http.Client.Timeout exceeded).
-	// Guard: context.DeadlineExceeded implements Timeout() returning
-	// true, but we already excluded context errors above.
 	var te interface{ Timeout() bool }
 	if errors.As(err, &te) && te.Timeout() {
 		return true
@@ -345,14 +357,6 @@ func isTransientRequestError(ctx context.Context, err error) bool {
 	})
 }
 
-// transientErrorPatterns are substrings of network errors that indicate
-// a transient condition worth retrying.
-var transientErrorPatterns = []string{
-	"connection reset by peer",
-	"connection refused",
-	"i/o timeout",
-}
-
 // isTransientStatusCode reports whether an HTTP status code represents a
 // transient server-side failure that may succeed on retry.
 func isTransientStatusCode(code int) bool {
@@ -363,9 +367,13 @@ func isTransientStatusCode(code int) bool {
 
 // retryBackoff calculates the delay before the next retry attempt using
 // exponential backoff with jitter. The delay is jittered between 50–100%
-// of the computed backoff to prevent thundering-herd effects.
+// of the computed backoff to prevent thundering-herd effects. The result
+// is capped at maxBackoff to prevent overflow at high attempt counts.
 func retryBackoff(base time.Duration, attempt int) time.Duration {
 	backoff := base * time.Duration(math.Pow(2, float64(attempt)))
+	if backoff <= 0 || backoff > maxBackoff {
+		backoff = maxBackoff
+	}
 	half := backoff / 2
 	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
