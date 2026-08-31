@@ -24,9 +24,11 @@ export function parseSearchQuery(raw: string): ParsedQuery {
   const query = raw.replace(/"([^"]+)"/g, (_match, phrase: string) => {
     const trimmed = phrase.trim();
     if (trimmed) phrases.push(trimmed);
-    return trimmed;
+    // Pad with spaces so adjacent quoted phrases don't fuse tokens
+    // (e.g. "foo bar""baz qux" → "foo bar baz qux", not "foo barbaz qux").
+    return " " + trimmed + " ";
   });
-  return { query: query.trim(), phrases };
+  return { query: query.replace(/\s+/g, " ").trim(), phrases };
 }
 
 /**

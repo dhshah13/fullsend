@@ -181,7 +181,9 @@ debouncedWatch(
     const scopeList = scopes.value;
     const { query, phrases } = parseSearchQuery(filterTextValue);
 
-    const searchOpts: Record<string, unknown> = { combineWith: "AND" };
+    const searchOpts: { combineWith: string; filter?: (r: SearchResult) => boolean } = {
+      combineWith: "AND",
+    };
     if (active.size > 0) {
       searchOpts.filter = (r: SearchResult) => matchesActiveScopes(r.id, scopeList, active);
     }

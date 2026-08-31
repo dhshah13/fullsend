@@ -71,6 +71,13 @@ describe("parseSearchQuery", () => {
       phrases: ["harness"],
     });
   });
+
+  it("separates adjacent quoted phrases without whitespace", () => {
+    expect(parseSearchQuery('"foo bar""baz qux"')).toEqual({
+      query: "foo bar baz qux",
+      phrases: ["foo bar", "baz qux"],
+    });
+  });
 });
 
 describe("textContainsPhrases", () => {
