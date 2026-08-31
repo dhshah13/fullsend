@@ -645,6 +645,13 @@ func TestHarnessRouter_SlashCommandTriageRoleObservationStage(t *testing.T) {
 			actor:   Actor{ID: "triager", Role: "triage"},
 			want:    nil,
 		},
+		{
+			name:    "triage role dispatches /fs-review on same-project change_proposal",
+			command: "/fs-review",
+			entity:  Entity{Kind: "change_proposal", ID: 10},
+			actor:   Actor{ID: "triager", Role: "triage"},
+			want:    []string{"review"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -693,6 +700,13 @@ func TestHarnessRouter_SlashCommandEntityAuthorBypass(t *testing.T) {
 			entity:  Entity{Kind: "work_item", ID: 5},
 			actor:   Actor{ID: "author", Role: "read", IsEntityAuthor: true},
 			want:    []string{"triage"},
+		},
+		{
+			name:    "read-only entity author dispatches /fs-review on work_item",
+			command: "/fs-review",
+			entity:  Entity{Kind: "work_item", ID: 5},
+			actor:   Actor{ID: "author", Role: "read", IsEntityAuthor: true},
+			want:    []string{"review"},
 		},
 		{
 			name:    "read-only entity author rejected for /fs-triage on change_proposal",
