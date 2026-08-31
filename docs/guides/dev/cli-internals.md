@@ -27,10 +27,23 @@ fullsend
 │       ├── --repos <list>                   #   Comma-separated repo names
 │       ├── --mint-url <url>                 #   Mint service URL ($FULLSEND_MINT_URL)
 │       └── --audience <string>              #   OIDC audience (default: fullsend-mint)
-├── inference                                # GCP: inference WIF management
+├── inference                                # Inference credentials (GCP Vertex, OpenAI)
 │   ├── provision    <org|owner/repo>        # Create WIF pool/provider for Agent Platform
 │   ├── deprovision  <org|owner/repo>        # Remove WIF access for org or repo
-│   └── status       <org|owner/repo>        # Check WIF health, print config
+│   ├── status       <org|owner/repo>        # Check WIF health, print config
+│   └── openai                               # OpenAI WIF enrolment (GPT on pi)
+│       ├── request  <owner/repo>[,...]      # Generate the provider/mapping request for an admin
+│       │   ├── --audience <string>          #   Provider audience (default: fullsend://<owner>)
+│       │   ├── --project <name|id>          #   OpenAI project to bill the runs to
+│       │   ├── --service-account <id>       #   Map an existing service account
+│       │   ├── --ref <ref>                  #   Tighten to a ref: emits this ref + refs/pull/*
+│       │   ├── --format <json|md>           #   Document format
+│       │   └── --out <file>                 #   Write to a file instead of stdout
+│       ├── import   [reply.json]            # Record the admin's reply in config.yaml
+│       │   ├── --audience/--identity-provider-id/--service-account-id
+│       │   ├── --variables                  #   Set FULLSEND_OPENAI_* repo variables instead
+│       │   └── --repo <owner/repo>          #   Select from a multi-repo reply; target for --variables
+│       └── status   <owner/repo>            # Resolved identifiers, and the exchange inside Actions
 ├── github                                   # GitHub-only configuration
 │   ├── setup        <org|owner/repo>        # Configure fullsend (no GCP needed)
 │   ├── enroll       <org> [repo...]         # Enable repos for agent workflows
@@ -594,10 +607,10 @@ fullsend-repo/                      (embedded template)
 | Category | Installed? | Source | Purpose |
 |----------|-----------|--------|---------|
 | **Installed** | Yes | Scaffold → `.fullsend` repo | Workflows, configs, static files |
-| **Layered** | No (runtime) or yes with `--vendor` | Upstream `@v0` sparse checkout, or vendored at install | agents/, skills/, harness/, plugins/, policies/, scripts/, schemas/, env/ |
+| **Layered** | No (runtime) or yes with `--vendor` | Upstream `@main` sparse checkout, or vendored at install | agents/, skills/, harness/, plugins/, policies/, scripts/, schemas/, env/ |
 | **Upstream-only** | No (layered) or yes with `--vendor` | Referenced directly or vendored at install | .github/actions/, .github/scripts/ |
 
-Runtime skips upstream fetch when `.defaults/action.yml` is present (vendored); layered installs sparse-checkout `fullsend-ai/fullsend@v0` into `.defaults/`.
+Runtime skips upstream fetch when `.defaults/action.yml` is present (vendored); layered installs sparse-checkout `fullsend-ai/fullsend@main` into `.defaults/`.
 
 ### File Mode Tracking
 
@@ -682,7 +695,8 @@ var executableFiles = map[string]struct{}{
 | `internal/cli/root.go` | ~34 | CLI entry point, command registration |
 | `internal/cli/admin.go` | ~2415 | Install/uninstall/analyze/enable/disable |
 | `internal/cli/mint.go` | ~1022 | Mint deploy/enroll/unenroll/status |
-| `internal/cli/inference.go` | ~408 | Inference WIF provision/status |
+| `internal/cli/inference.go` | ~408 | Inference WIF provision/status (GCP) |
+| `internal/cli/inference_openai.go` | ~900 | OpenAI WIF enrolment: request document, reply import, status/exchange |
 | `internal/cli/github.go` | ~966 | GitHub setup/set/status/uninstall/sync-scaffold/enroll/unenroll |
 | `internal/cli/issues.go` | ~430 | Issue read/write commands (`fullsend issues get`, `post-comment`) |
 | `internal/cli/tracker_client.go` | ~122 | Tracker client factory (GitHub/GitLab/Jira) |

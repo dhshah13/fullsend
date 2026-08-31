@@ -1,3 +1,7 @@
+---
+description: How the fullsend triage agent inspects new GitHub issues, assesses information sufficiency, asks clarifying questions, and produces a structured triage decision.
+---
+
 # Triage Agent
 
 ![Triage agent icon](icons/triage.png)
