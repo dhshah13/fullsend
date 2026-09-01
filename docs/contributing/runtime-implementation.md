@@ -50,7 +50,7 @@ content that must be updated whenever a runtime is added or renamed.
 **Tests:**
 
 - [ ] `internal/runtime/registry_test.go` — add a `Resolve("<name>")`
-  sub-test to `TestResolve` (and to `TestResolveFromConfig` /
+  assertion block to `TestResolve` (and to `TestResolveFromConfig` /
   `TestResolveFromPerRepoConfig` if the runtime is user-selectable).
 - [ ] `internal/config/config_test.go` — update any assertion on
   `ValidRuntimes()` to include the new name.
@@ -63,8 +63,8 @@ content that must be updated whenever a runtime is added or renamed.
   prompt.
 - [ ] `internal/cli/run.go` — update the `--runtime` flag description
   to list the new runtime name.
-- [ ] `internal/cli/admin.go` — check for any `--runtime` flag
-  descriptions or hardcoded runtime lists and update them.
+- [ ] `internal/cli/admin.go` — update the `--runtime` flag description
+  in `newInstallCmd()` to include the new runtime name.
 
 **Documentation:**
 
