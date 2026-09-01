@@ -976,9 +976,13 @@ func CreateWithRetry(name string, providers []string, image, policy string, maxA
 		}
 
 		// A global policy source is a stable mismatch — retrying with a
-		// new sandbox will not change the gateway-level policy. Return
-		// immediately without deleting and recreating.
+		// new sandbox will not change the gateway-level policy. Clean up
+		// the running sandbox (it reached Ready before verifyPolicy
+		// detected the mismatch) and return immediately.
 		if errors.Is(lastErr, errPolicyGlobal) {
+			if delErr := Delete(name); delErr != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: cleanup of sandbox %s failed: %v\n", name, delErr)
+			}
 			return lastErr
 		}
 
@@ -1097,6 +1101,27 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 	deadline := time.Now().Add(timeout)
 	var lastOutput, lastStderr string
 	var lastPolicyErr error
+
+	// checkPolicy runs verifyPolicy against the latest output. It returns:
+	//   - (true, nil)  when the policy is verified — createOnce should return nil.
+	//   - (true, err)  when the mismatch is stable — createOnce should return err.
+	//   - (false, nil) when policy fields may not yet be populated — continue polling.
+	checkPolicy := func() (done bool, err error) {
+		policyErr := verifyPolicy(name, lastOutput, policy)
+		if policyErr == nil {
+			return true, nil
+		}
+		// A global policy source is a stable mismatch that re-polling
+		// cannot fix — return immediately.
+		if errors.Is(policyErr, errPolicyGlobal) {
+			return true, policyErr
+		}
+		// Policy fields may not yet be populated; record the error and
+		// continue polling until the deadline.
+		lastPolicyErr = policyErr
+		return false, nil
+	}
+
 	for time.Now().Before(deadline) {
 		check := exec.CommandContext(ctx, "openshell", "sandbox", "get", name)
 		var stdoutBuf, stderrBuf strings.Builder
@@ -1119,26 +1144,12 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 		if checkErr == nil {
 			switch phase := sandboxPhase(lastOutput); {
 			case phase == readySandboxPhase:
-				if policyErr := verifyPolicy(name, lastOutput, policy); policyErr != nil {
-					// A global policy source is a stable mismatch that
-					// re-polling cannot fix — return immediately.
-					if errors.Is(policyErr, errPolicyGlobal) {
-						return policyErr
-					}
-					// Policy fields may not yet be populated; record the
-					// error and continue polling until the deadline.
-					lastPolicyErr = policyErr
-				} else {
-					return nil
+				if done, err := checkPolicy(); done {
+					return err
 				}
 			case phase == "" && strings.Contains(lastOutput, readySandboxPhase):
-				if policyErr := verifyPolicy(name, lastOutput, policy); policyErr != nil {
-					if errors.Is(policyErr, errPolicyGlobal) {
-						return policyErr
-					}
-					lastPolicyErr = policyErr
-				} else {
-					return nil
+				if done, err := checkPolicy(); done {
+					return err
 				}
 			}
 			// Detect terminal phases and fail immediately instead of
