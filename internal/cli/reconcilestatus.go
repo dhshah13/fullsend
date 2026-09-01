@@ -11,6 +11,7 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
 	gl "github.com/fullsend-ai/fullsend/internal/forge/gitlab"
+	"github.com/fullsend-ai/fullsend/internal/forge/jira"
 	"github.com/fullsend-ai/fullsend/internal/mintclient"
 	"github.com/fullsend-ai/fullsend/internal/statuscomment"
 	"github.com/fullsend-ai/fullsend/internal/tracker"
@@ -28,20 +29,37 @@ var reconcileNewTrackerClient = func(fc forge.Client) tracker.Client {
 	return tracker.NewForgeClient(fc)
 }
 
+// reconcileNewJiraTrackerClient creates a tracker.Client backed by Jira.
+// Extracted as a package-level var so tests can replace it.
+var reconcileNewJiraTrackerClient = func(baseURL, token, email string) (tracker.Client, error) {
+	var opts []jira.Option
+	opts = append(opts, jira.WithBaseURL(baseURL))
+	if email != "" {
+		opts = append(opts, jira.WithEmail(email))
+	}
+	jc, err := jira.New(token, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return tracker.NewJiraClient(jc, baseURL)
+}
+
 func newReconcileStatusCmd() *cobra.Command {
 	var (
-		repo        string
-		number      int
-		runID       string
-		runURL      string
-		sha         string
-		reason      string
-		mintURL     string
-		role        string
-		forgeFlag   string
-		fullsendDir string
-		jobStatus   string
-		wasSkipped  bool
+		repo           string
+		number         int
+		runID          string
+		runURL         string
+		sha            string
+		reason         string
+		mintURL        string
+		role           string
+		forgeFlag      string
+		fullsendDir    string
+		jobStatus      string
+		wasSkipped     bool
+		trackerSource  string
+		trackerProject string
 	)
 
 	cmd := &cobra.Command{
@@ -61,33 +79,58 @@ finalized, this is a no-op.`,
 				return fmt.Errorf("--number must be a positive integer, got %d", number)
 			}
 
-			parts := strings.SplitN(repo, "/", 2)
-			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-				return fmt.Errorf("--repo must be in owner/repo format, got %q", repo)
-			}
-			owner, repoName := parts[0], parts[1]
+			var tc tracker.Client
+			var project string
 
-			forgePlatform, err := detectForgePlatform(forgeFlag, nil)
-			if err != nil {
-				return err
-			}
-
-			var forgeClient forge.Client
-			if forgePlatform == "gitlab" {
-				var gitlabErr error
-				forgeClient, gitlabErr = newGitLabClientFromEnv("status reconciliation")
-				if gitlabErr != nil {
-					return gitlabErr
+			// Event-source routing (ADR 0093): when the event came from
+			// Jira, construct a Jira tracker client instead of wrapping
+			// a forge client.
+			if trackerSource == "jira" {
+				baseURL := os.Getenv("JIRA_BASE_URL")
+				if baseURL == "" {
+					return fmt.Errorf("JIRA_BASE_URL required when --tracker-source is jira")
 				}
+				token := os.Getenv("JIRA_TOKEN")
+				if token == "" {
+					return fmt.Errorf("JIRA_TOKEN required when --tracker-source is jira")
+				}
+				email := os.Getenv("JIRA_USER_EMAIL")
+				var jErr error
+				tc, jErr = reconcileNewJiraTrackerClient(baseURL, token, email)
+				if jErr != nil {
+					return fmt.Errorf("creating Jira tracker client: %w", jErr)
+				}
+				project = trackerProject
 			} else {
-				var githubErr error
-				forgeClient, githubErr = reconcileGitHubClient(cmd, mintURL, role, repoName)
-				if githubErr != nil {
-					return githubErr
+				parts := strings.SplitN(repo, "/", 2)
+				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+					return fmt.Errorf("--repo must be in owner/repo format, got %q", repo)
 				}
-			}
+				owner, repoName := parts[0], parts[1]
 
-			tc := reconcileNewTrackerClient(forgeClient)
+				forgePlatform, err := detectForgePlatform(forgeFlag, nil)
+				if err != nil {
+					return err
+				}
+
+				var forgeClient forge.Client
+				if forgePlatform == "gitlab" {
+					var gitlabErr error
+					forgeClient, gitlabErr = newGitLabClientFromEnv("status reconciliation")
+					if gitlabErr != nil {
+						return gitlabErr
+					}
+				} else {
+					var githubErr error
+					forgeClient, githubErr = reconcileGitHubClient(cmd, mintURL, role, repoName)
+					if githubErr != nil {
+						return githubErr
+					}
+				}
+
+				tc = reconcileNewTrackerClient(forgeClient)
+				project = owner + "/" + repoName
+			}
 
 			var termReason statuscomment.TerminationReason
 			switch reason {
@@ -119,12 +162,11 @@ finalized, this is a no-op.`,
 
 			agentDescription := titleCase(strings.ReplaceAll(role, "-", " "))
 
-			project := owner + "/" + repoName
 			return reconcileOrphaned(cmd.Context(), tc, project, number, runID, runURL, sha, termReason, completionMode, jobStatus, wasSkipped, agentDescription)
 		},
 	}
 
-	cmd.Flags().StringVar(&repo, "repo", "", "repository in owner/repo format (required)")
+	cmd.Flags().StringVar(&repo, "repo", "", "repository in owner/repo format (required for GitHub/GitLab; unused when --tracker-source is jira)")
 	cmd.Flags().IntVar(&number, "number", 0, "issue or pull request number (required)")
 	cmd.Flags().StringVar(&runID, "run-id", "", "workflow run ID used in the status comment marker (required)")
 	cmd.Flags().StringVar(&runURL, "run-url", "", "URL to the workflow run (optional)")
@@ -136,7 +178,8 @@ finalized, this is a no-op.`,
 	cmd.Flags().StringVar(&fullsendDir, "fullsend-dir", "", "path to fullsend config directory (used to detect completion mode for orphan synthesis)")
 	cmd.Flags().StringVar(&jobStatus, "job-status", "", "job outcome from the CI runner (e.g. success, failure, cancelled)")
 	cmd.Flags().BoolVar(&wasSkipped, "was-skipped", false, "whether the pre-script decided to skip the run (forces synthesis under on_failure even when --job-status is success)")
-	_ = cmd.MarkFlagRequired("repo")
+	cmd.Flags().StringVar(&trackerSource, "tracker-source", "", `event source system (e.g. "jira"); when set to "jira", uses Jira client instead of forge client`)
+	cmd.Flags().StringVar(&trackerProject, "tracker-project", "", `Jira project key (e.g. "PROJ"); required when --tracker-source is jira`)
 	_ = cmd.MarkFlagRequired("number")
 	_ = cmd.MarkFlagRequired("run-id")
 

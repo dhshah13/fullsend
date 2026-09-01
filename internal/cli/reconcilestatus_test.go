@@ -562,3 +562,84 @@ func TestNewReconcileStatusCmd_AgentDescription_DerivedFromRole(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Code Review", gotDescription)
 }
+
+func TestNewReconcileStatusCmd_Jira(t *testing.T) {
+	// Verify that --tracker-source jira constructs a Jira tracker client
+	// and uses --tracker-project as the project identifier.
+	var gotProject string
+	origReconcile := reconcileOrphaned
+	origJira := reconcileNewJiraTrackerClient
+	reconcileOrphaned = func(_ context.Context, _ tracker.Client, project string, _ int, _, _, _ string, _ statuscomment.TerminationReason, _, _ string, _ bool, _ string) error {
+		gotProject = project
+		return nil
+	}
+	reconcileNewJiraTrackerClient = func(baseURL, token, email string) (tracker.Client, error) {
+		assert.Equal(t, "https://acme.atlassian.net", baseURL)
+		assert.NotEmpty(t, token)
+		return tracker.NewForgeClient(gh.New("fake")), nil // stub; type doesn't matter for this test
+	}
+	t.Cleanup(func() {
+		reconcileOrphaned = origReconcile
+		reconcileNewJiraTrackerClient = origJira
+	})
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "jira-test-token")
+	t.Setenv("JIRA_USER_EMAIL", "bot@example.com")
+
+	cmd := newReconcileStatusCmd()
+	cmd.SetArgs([]string{
+		"--number", "123",
+		"--run-id", "run-1",
+		"--tracker-source", "jira",
+		"--tracker-project", "PROJ",
+	})
+
+	err := cmd.Execute()
+	require.NoError(t, err)
+	assert.Equal(t, "PROJ", gotProject)
+}
+
+func TestNewReconcileStatusCmd_Jira_NoBaseURL(t *testing.T) {
+	t.Setenv("JIRA_BASE_URL", "")
+	t.Setenv("JIRA_TOKEN", "jira-test-token")
+
+	cmd := newReconcileStatusCmd()
+	cmd.SetArgs([]string{
+		"--number", "123",
+		"--run-id", "run-1",
+		"--tracker-source", "jira",
+		"--tracker-project", "PROJ",
+	})
+
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JIRA_BASE_URL required")
+}
+
+func TestNewReconcileStatusCmd_Jira_NoToken(t *testing.T) {
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "")
+
+	cmd := newReconcileStatusCmd()
+	cmd.SetArgs([]string{
+		"--number", "123",
+		"--run-id", "run-1",
+		"--tracker-source", "jira",
+		"--tracker-project", "PROJ",
+	})
+
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JIRA_TOKEN required")
+}
+
+func TestNewReconcileStatusCmd_HasTrackerFlags(t *testing.T) {
+	cmd := newReconcileStatusCmd()
+
+	for _, name := range []string{"tracker-source", "tracker-project"} {
+		f := cmd.Flags().Lookup(name)
+		require.NotNil(t, f, "flag %q should exist", name)
+		assert.Equal(t, "", f.DefValue)
+	}
+}
