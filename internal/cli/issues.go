@@ -194,7 +194,7 @@ func newIssuesPostCommentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "post-comment",
 		Short: "Post or update a sticky comment on an issue",
-		Long: `Posts a comment with a hidden HTML marker on an issue. On first
+		Long: `Posts a comment with a sticky marker on an issue. On first
 run, creates a new comment. On re-runs, finds the existing comment
 by its marker and edits in-place, collapsing old content into
 <details> blocks. This prevents comment flooding on re-runs.
@@ -203,9 +203,9 @@ Works across GitHub, GitLab, and Jira via --tracker.
 
 The --marker flag identifies this agent's comments. Each agent
 should use a unique marker (e.g. "<!-- fullsend:triage-agent -->").
-For --tracker jira, the marker must not contain backslash, *, _,
-backtick, [, ], or & — Jira's markdown round-trip escapes those
-characters, which would break marker re-detection on later runs.
+For --tracker jira, the marker is stored as an invisible comment
+entity property rather than embedded in the visible comment body,
+so marker character restrictions do not apply.
 
 Trust model: marker-based comment lookup does not verify the comment
 author. In a trusted CI environment (the intended deployment) this
@@ -229,7 +229,7 @@ The --result flag accepts a file path or "-" for stdin.`,
 	cmd.Flags().StringVar(&cfg.trackerName, "tracker", "", "tracker backend: github, gitlab, or jira (required unless a default is set via config)")
 	cmd.Flags().StringVar(&cfg.project, "project", "", "project identifier: owner/repo (GitHub/GitLab) or project key (Jira) (required)")
 	cmd.Flags().IntVar(&cfg.number, "number", 0, "issue number (required)")
-	cmd.Flags().StringVar(&cfg.marker, "marker", "", "hidden HTML marker to identify this agent's comments (required)")
+	cmd.Flags().StringVar(&cfg.marker, "marker", "", "sticky marker to identify this agent's comments (required)")
 	cmd.Flags().StringVar(&cfg.result, "result", "-", "path to comment body file, or '-' for stdin")
 	cmd.Flags().StringVar(&cfg.token, "token", "", "API token (default: env var per tracker)")
 	cmd.Flags().StringVar(&cfg.jiraURL, "jira-url", "", "Jira instance URL (default: $JIRA_BASE_URL)")
@@ -259,12 +259,6 @@ func runIssuesPostComment(ctx context.Context, cfg *issuesPostCommentConfig) err
 	trackerName, err := resolveTracker(cfg.trackerName, cfg.fullsendDir, cfg.testConfigReader)
 	if err != nil {
 		return err
-	}
-
-	if trackerName == trackerJira {
-		if err := validateJiraMarker(cfg.marker); err != nil {
-			return err
-		}
 	}
 
 	body := cfg.testBody
@@ -300,8 +294,86 @@ func runIssuesPostComment(ctx context.Context, cfg *issuesPostCommentConfig) err
 		// staying under the limit that will actually be enforced.
 		stickyCfg.MaxSize = jira.MaxMarkdownBytes
 	}
-	_, err = postTrackerStickyComment(ctx, tc, cfg.project, cfg.number, body, stickyCfg, printer)
+
+	// Jira stores sticky markers as comment entity properties instead
+	// of embedding them in the visible ADF body (Jira has no HTML
+	// comments — the marker would be visible to users). When the
+	// tracker.Client is a *tracker.JiraClient, use the property-based
+	// path; otherwise fall back to the body-embedded path used by
+	// GitHub/GitLab.
+	if jc, ok := tc.(*tracker.JiraClient); ok {
+		_, err = postJiraStickyComment(ctx, jc, cfg.project, cfg.number, body, stickyCfg, printer)
+	} else {
+		_, err = postTrackerStickyComment(ctx, tc, cfg.project, cfg.number, body, stickyCfg, printer)
+	}
 	return err
+}
+
+// postJiraStickyComment implements the sticky comment lifecycle for Jira
+// using comment entity properties to store the marker, keeping it out
+// of the visible ADF body. Jira has no HTML comment equivalent, so
+// without this the marker would be visible to users.
+//
+// On create, the marker is stored as a comment property via the Jira
+// comment-create API's properties array. On lookup, comments are fetched
+// with ?expand=properties and matched by property value. On update, the
+// property is (re)set to handle legacy migration from body-embedded
+// markers.
+func postJiraStickyComment(ctx context.Context, jc *tracker.JiraClient, project string, number int, body string, cfg sticky.Config, printer *ui.Printer) (string, error) {
+	if strings.TrimSpace(body) == "" {
+		return "", fmt.Errorf("comment body is empty")
+	}
+	if strings.TrimSpace(cfg.Marker) == "" {
+		return "", fmt.Errorf("marker is empty")
+	}
+
+	jiraComments, err := jc.ListJiraComments(ctx, project, number)
+	if err != nil {
+		return "", fmt.Errorf("listing comments: %w", err)
+	}
+
+	existing := jc.FindCommentByMarkerProperty(jiraComments, cfg.Marker)
+
+	if existing != nil {
+		printer.StepStart("Found existing comment, updating in-place")
+
+		// Build the updated body using sticky's history-collapsing
+		// logic. The old body is read from Jira as Markdown (via
+		// ADFToMarkdown). BuildUpdatedBody uses cfg.Marker to strip
+		// the marker from oldBody (handling both legacy body-embedded
+		// markers and the property-based path where oldBody has no
+		// marker). The new body is passed without the marker prefix
+		// because the marker lives in a property, not the visible body.
+		oldBody := jira.ADFToMarkdown(existing.Body)
+		newBody := sticky.BuildUpdatedBody(oldBody, body, cfg)
+
+		if cfg.DryRun {
+			printer.StepInfo("Dry run — would update comment " + existing.ID)
+			printer.StepInfo(fmt.Sprintf("Body length: %d", len(newBody)))
+			return "", nil
+		}
+
+		if err := jc.MigrateAndUpdateComment(ctx, project, number, existing.ID, tracker.Body(newBody), cfg.Marker); err != nil {
+			return "", fmt.Errorf("updating comment: %w", err)
+		}
+		printer.StepDone("Comment updated")
+		return "", nil // Jira has no stable comment permalink
+	}
+
+	printer.StepStart("No existing comment found, creating new one")
+
+	if cfg.DryRun {
+		printer.StepInfo("Dry run — would create new comment")
+		printer.StepInfo(fmt.Sprintf("Body length: %d", len(body)))
+		return "", nil
+	}
+
+	created, err := jc.CreateCommentWithMarker(ctx, project, number, tracker.Body(body), cfg.Marker)
+	if err != nil {
+		return "", fmt.Errorf("creating comment: %w", err)
+	}
+	printer.StepDone("Comment created")
+	return created.HTMLURL, nil
 }
 
 // postTrackerStickyComment implements the sticky comment lifecycle using
@@ -404,24 +476,6 @@ func validateTrackerName(name string) (string, error) {
 		return "", fmt.Errorf("unsupported --tracker value %q: must be one of %s", name, strings.Join(knownTrackers, ", "))
 	}
 	return normalized, nil
-}
-
-// jiraUnsafeMarkerChars are the characters jira's mdEscaper backslash-
-// escapes when a Jira comment body is read back as Markdown
-// (ADFToMarkdown). A --marker containing one of them would come back
-// escaped (e.g. "post_review" as "post\_review"), so the substring match
-// in findMarkedTrackerComment would never match it again on a later run
-// — every run would create a new comment instead of updating in place.
-const jiraUnsafeMarkerChars = `\*_` + "`" + `[]&`
-
-// validateJiraMarker rejects a --marker value that contains a character
-// Jira's ADF round-trip would escape, since such a marker can never be
-// re-detected on a later run (see jiraUnsafeMarkerChars).
-func validateJiraMarker(marker string) error {
-	if i := strings.IndexAny(marker, jiraUnsafeMarkerChars); i != -1 {
-		return fmt.Errorf("--marker %q contains %q, which Jira's markdown round-trip escapes on read-back — this would break marker re-detection on later runs; avoid %s in --marker for --tracker jira", marker, marker[i:i+1], jiraUnsafeMarkerChars)
-	}
-	return nil
 }
 
 // findMarkedTrackerComment returns the first tracker comment whose body
