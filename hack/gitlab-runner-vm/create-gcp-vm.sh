@@ -91,7 +91,7 @@ fi
 OPENSHELL_VERSION="${OPENSHELL_VERSION:-0.0.116}"
 PREFIX="fullsend-gitlab-runner"
 
-# Common flags for gcloud compute ssh/scp: IAP tunneling (no public IP) and
+# Common flags for gcloud compute ssh: IAP tunneling (no public IP) and
 # suppressed host key prompts (ephemeral VMs have no stable host key).
 GCE_SSH_FLAGS=(
   --tunnel-through-iap
@@ -99,6 +99,16 @@ GCE_SSH_FLAGS=(
   --ssh-flag="-o UserKnownHostsFile=/dev/null"
   --ssh-flag="-o ConnectTimeout=10"
   --ssh-flag="-o LogLevel=ERROR"
+)
+
+# Equivalent flags for gcloud compute scp, which requires --scp-flag (not
+# --ssh-flag) for SSH options passed through to the underlying scp/ssh process.
+GCE_SCP_FLAGS=(
+  --tunnel-through-iap
+  --scp-flag="-o StrictHostKeyChecking=no"
+  --scp-flag="-o UserKnownHostsFile=/dev/null"
+  --scp-flag="-o ConnectTimeout=10"
+  --scp-flag="-o LogLevel=ERROR"
 )
 
 # shellcheck source=lib.sh
@@ -415,14 +425,14 @@ gcloud compute scp --recurse \
   "${vm_name}:~/gitlab-runner-vm/" \
   --project="${GCP_PROJECT}" \
   --zone="${GCP_ZONE}" \
-  "${GCE_SSH_FLAGS[@]}" \
+  "${GCE_SCP_FLAGS[@]}" \
   --quiet
 gcloud compute scp --recurse \
   "${_stage_dir}/.github" \
   "${vm_name}:~/gitlab-runner-vm/" \
   --project="${GCP_PROJECT}" \
   --zone="${GCP_ZONE}" \
-  "${GCE_SSH_FLAGS[@]}" \
+  "${GCE_SCP_FLAGS[@]}" \
   --quiet
 
 rm -rf "${_stage_dir}"
