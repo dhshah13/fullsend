@@ -40,3 +40,19 @@ export function textContainsPhrases(text: string, phrases: string[]): boolean {
   const lower = text.toLowerCase();
   return phrases.every((p) => lower.includes(p.toLowerCase()));
 }
+
+/**
+ * Filters search results by requiring every phrase to appear in the
+ * result's concatenated title + text content.  Results with no text
+ * content are kept (graceful degradation).
+ */
+export function filterByPhrases<
+  T extends { text?: string; title?: string; titles?: string[] },
+>(results: T[], phrases: string[]): T[] {
+  if (phrases.length === 0) return results;
+  return results.filter((r) => {
+    const content = [...(r.titles || []), r.title || "", r.text || ""].join(" ");
+    if (!content.trim()) return true;
+    return textContainsPhrases(content, phrases);
+  });
+}

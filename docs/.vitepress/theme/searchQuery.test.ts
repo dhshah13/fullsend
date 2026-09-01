@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSearchQuery, textContainsPhrases } from "./searchQuery";
+import { filterByPhrases, parseSearchQuery, textContainsPhrases } from "./searchQuery";
 
 describe("parseSearchQuery", () => {
   it("returns the raw query and no phrases when there are no quotes", () => {
@@ -123,5 +123,60 @@ describe("textContainsPhrases", () => {
 
   it("returns false when text is empty and phrases are not", () => {
     expect(textContainsPhrases("", ["eval scenario"])).toBe(false);
+  });
+});
+
+describe("filterByPhrases", () => {
+  const results = [
+    { title: "Getting Started", titles: ["Guides"], text: "The eval scenario runner starts here." },
+    { title: "Config Reference", titles: ["Guides"], text: "Harness config and eval options." },
+    { title: "Eval Overview", titles: ["Concepts"], text: "Each scenario runs independently." },
+  ];
+
+  it("returns all results when there are no phrases", () => {
+    expect(filterByPhrases(results, [])).toEqual(results);
+  });
+
+  it("keeps only results whose text contains the exact phrase", () => {
+    const filtered = filterByPhrases(results, ["eval scenario"]);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].title).toBe("Getting Started");
+  });
+
+  it("requires all phrases to match", () => {
+    const filtered = filterByPhrases(results, ["eval scenario", "harness config"]);
+    expect(filtered).toHaveLength(0);
+  });
+
+  it("matches phrases against titles as well as text", () => {
+    const filtered = filterByPhrases(results, ["eval overview"]);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].title).toBe("Eval Overview");
+  });
+
+  it("matches phrases spanning title and text content", () => {
+    const filtered = filterByPhrases(
+      [{ title: "Scenario", titles: ["Eval"], text: "runner starts here" }],
+      ["eval scenario"],
+    );
+    expect(filtered).toHaveLength(1);
+  });
+
+  it("keeps results with no text content (graceful degradation)", () => {
+    const sparse = [{ title: "", titles: [], text: undefined as unknown as string }];
+    expect(filterByPhrases(sparse, ["anything"])).toHaveLength(1);
+  });
+
+  it("is case-insensitive", () => {
+    const filtered = filterByPhrases(results, ["EVAL SCENARIO"]);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].title).toBe("Getting Started");
+  });
+
+  it("works end-to-end with parseSearchQuery", () => {
+    const { phrases } = parseSearchQuery('"eval scenario" guide');
+    const filtered = filterByPhrases(results, phrases);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].title).toBe("Getting Started");
   });
 });
