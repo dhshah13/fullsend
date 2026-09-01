@@ -16,7 +16,7 @@ Gate binaries are needed when your access constraints go **beyond** what L4/L7 r
 
 If L4/L7 rules cover your case, prefer those — they are proxy-enforced and immune to code injection.
 
-**Why a gate binary instead of a post-script?** Gate binaries are required when the agent needs the operation's result to continue working. A post-script runs after the agent finishes and cannot redirect the agent to reformulate a rejected request. For example, a database query gate binary rejects an unsafe query and returns an error — the agent reads the error, reformulates the query, and retries. A post-script cannot provide this feedback loop.
+**Why a gate binary?** Gate binaries sit in the request path and provide a feedback loop — the agent gets an immediate error, can reformulate, and retry. That's the key distinction from enforcement mechanisms that run outside the agent's control flow.
 
 ## Threat model
 
