@@ -1984,6 +1984,36 @@ func TestMarkdownToADF_DetailsWithoutSummary(t *testing.T) {
 	}
 }
 
+func TestMarkdownToADF_DetailsSingleBlockEmptyBody(t *testing.T) {
+	// When a single-block <details> has an empty body (or the body
+	// becomes empty after sentinel stripping), the function should emit
+	// an expand node with a single empty paragraph, consistent with
+	// the multi-block path's handling.
+	doc := mustADF(t, "before\n\n<details><summary>Title</summary></details>\n\nafter")
+
+	content := asSlice(t, doc["content"])
+	if len(content) != 3 {
+		t.Fatalf("doc content len = %d, want 3 (paragraph, expand, paragraph)", len(content))
+	}
+
+	expand := asMap(t, content[1])
+	if expand["type"] != "expand" {
+		t.Fatalf("block 1 type = %v, want %q", expand["type"], "expand")
+	}
+	attrs := asMap(t, expand["attrs"])
+	if attrs["title"] != "Title" {
+		t.Errorf("expand attrs.title = %v, want %q", attrs["title"], "Title")
+	}
+	expandContent := asSlice(t, expand["content"])
+	if len(expandContent) != 1 {
+		t.Fatalf("expand content len = %d, want 1 (empty paragraph)", len(expandContent))
+	}
+	para := asMap(t, expandContent[0])
+	if para["type"] != "paragraph" {
+		t.Errorf("expand content[0] type = %v, want %q", para["type"], "paragraph")
+	}
+}
+
 func TestMarkdownToADF_DetailsMultiBlockEmptyBody(t *testing.T) {
 	// When all siblings between <details> and </details> are sticky
 	// sentinels (producing no ADF content), the function should still

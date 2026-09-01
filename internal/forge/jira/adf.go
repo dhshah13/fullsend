@@ -120,11 +120,11 @@ func adfBlockContent(parent ast.Node, source []byte, depth int, restricted bool)
 // for extracting the expand title from a <details> block.
 var summaryTagPattern = regexp.MustCompile(`(?is)<summary>(.*?)</summary>`)
 
-// htmlTagPattern matches HTML tags for stripping from extracted content.
-// Used by extractSummary to ensure the ADF expand title contains only
+// summaryInnerTagPattern matches HTML tags inside <summary> element content
+// for stripping in extractSummary. Ensures the ADF expand title contains only
 // plain text — nested HTML tags like <b>, <a>, <script>, or <img> inside
 // the <summary> element are removed, leaving just the text content.
-var htmlTagPattern = regexp.MustCompile(`<[^>]*>`)
+var summaryInnerTagPattern = regexp.MustCompile(`<[^>]*>`)
 
 // stickyHistorySentinelPattern matches sticky history sentinel comments
 // on their own line, for stripping from <details> body content before
@@ -175,8 +175,15 @@ func tryDetailsExpand(c ast.Node, source []byte, depth int) (map[string]any, ast
 			doc := goldmark.DefaultParser().Parse(text.NewReader(src))
 			adfContent = adfBlockContent(doc, src, depth+1, false)
 		}
+		// When the body is empty (or becomes empty after sentinel
+		// stripping), emit an expand with a single empty paragraph
+		// rather than falling through to raw-text processing. This
+		// mirrors the multi-block path and satisfies ADF's minItems: 1.
 		if len(adfContent) == 0 {
-			return nil, nil
+			adfContent = []any{map[string]any{
+				"type":    "paragraph",
+				"content": []any{},
+			}}
 		}
 		return expandNode(title, adfContent), c.NextSibling()
 	}
@@ -278,7 +285,7 @@ func extractSummary(raw string) string {
 		return ""
 	}
 	decoded := html.UnescapeString(strings.TrimSpace(match[1]))
-	stripped := htmlTagPattern.ReplaceAllString(decoded, "")
+	stripped := summaryInnerTagPattern.ReplaceAllString(decoded, "")
 	return strings.TrimSpace(stripped)
 }
 
