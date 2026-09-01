@@ -762,7 +762,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// Save original values and restore on return so tests that don't
 	// t.Setenv these vars aren't affected by leaked values (#6874).
 	flagEnvOriginals := make(map[string]string)
-	flagEnvSet := []string{}
+	var flagEnvSet []string
 	setFlagEnv := func(key, val string) {
 		if _, ok := flagEnvOriginals[key]; !ok {
 			if v, exists := os.LookupEnv(key); exists {
