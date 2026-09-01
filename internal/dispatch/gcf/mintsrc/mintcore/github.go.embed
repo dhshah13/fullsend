@@ -597,6 +597,8 @@ func isPublicGitHubAPI(githubBaseURL string) bool {
 	return host == "api.github.com" || host == "github.com"
 }
 
+// installationAcceptHint returns a human-readable message directing an admin to
+// Accept the pending App permission update for the given installation.
 func installationAcceptHint(githubBaseURL, org string, installationID int64) string {
 	if isPublicGitHubAPI(githubBaseURL) {
 		return fmt.Sprintf("an installation admin should Accept the pending App permission update at https://github.com/organizations/%s/settings/installations/%d", org, installationID)
@@ -704,6 +706,7 @@ func postInstallationAccessToken(ctx context.Context, githubBaseURL, jwt string,
 	return tokenResp.Token, tokenResp.ExpiresAt, granted, resp.StatusCode, "", nil
 }
 
+// copyPermissionsWithout returns a shallow copy of perms with the omit key removed.
 func copyPermissionsWithout(perms map[string]string, omit string) map[string]string {
 	out := make(map[string]string, len(perms))
 	for k, v := range perms {
@@ -715,6 +718,8 @@ func copyPermissionsWithout(perms map[string]string, omit string) map[string]str
 	return out
 }
 
+// truncateForLog trims whitespace and truncates s to max runes, appending "…"
+// if truncation occurs.
 func truncateForLog(s string, max int) string {
 	s = strings.TrimSpace(s)
 	if max <= 0 {
