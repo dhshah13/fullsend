@@ -8,6 +8,8 @@
 #     #6464) + the pi-anthropic-vertex extension
 #     (tag + SHA256 pinned under /usr/local/share/pi-extensions)
 #   - jq (JSON parsing in agent scripts and skills)
+#   - ripgrep + fd (backends of pi's built-in grep/find tools; SHA256-verified
+#     static builds, versions asserted at build time)
 #   - gitleaks (secret scanner, SHA256-verified)
 #   - acli (Atlassian CLI for Jira issue queries)
 #   - pre-commit + gitlint (repo hook runner + commit message validator)
@@ -81,6 +83,10 @@ RUN NPM_CLAUDE="$(npm prefix -g)/bin/claude" \
 # in-sandbox fixture capture run against a pinned, reviewed version
 # (internal/runtime/testdata/pi/regen.sh reads the pin from this file).
 #
+# 0.84.4 is the floor for Gemini on Vertex: 0.84.3 bundles https-proxy-agent
+# without its named export, so every google-vertex request fails with
+# "HttpsProxyAgent is not a constructor" whenever HTTPS_PROXY is set — which
+# the OpenShell sandbox always does (earendil-works/pi#8610, fixed in 0.84.4).
 # To update: bump PI_VERSION; renovate tracks this ARG via a customManagers
 # regex entry in renovate.json. pi releases ~weekly minors and has changed
 # its --mode json wire shape within a minor before (0.84.0) — the pi stream
@@ -227,6 +233,47 @@ RUN case "$TARGETARCH" in \
     && tar xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks \
     && chmod +x /usr/local/bin/gitleaks \
     && rm /tmp/gitleaks.tar.gz
+
+# ---------------------------------------------------------------------------
+# ripgrep + fd — the search backends of pi's built-in `grep` and `find`
+# tools (packages/coding-agent/src/utils/tools-manager.ts resolves `rg` and
+# `fd` from PATH). Without them both tools fail with "<tool> is not available
+# and could not be downloaded": the runtime exports PI_OFFLINE=1, which makes
+# pi skip its GitHub-release download, and the egress policy would block that
+# download anyway. Static musl builds; pinned version + per-arch SHA256 like
+# gitleaks. Claude Code bundles its own ripgrep, so only pi needs these,
+# but they sit on PATH for every runtime. Release tarballs rather than
+# apt: Debian installs fd as `fdfind`, which pi accepts, but the musl builds
+# are static and version-asserted below.
+# To update: bump the versions and refresh the SHA256s from
+#   https://github.com/BurntSushi/ripgrep/releases/download/<ver>/ripgrep-<ver>-<arch>-unknown-linux-musl.tar.gz.sha256
+#   sha256sum <(curl -fsSL https://github.com/sharkdp/fd/releases/download/v<ver>/fd-v<ver>-<arch>-unknown-linux-musl.tar.gz)
+ARG RIPGREP_VERSION=15.2.0
+ARG RIPGREP_SHA256_AMD64=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+ARG RIPGREP_SHA256_ARM64=800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915
+ARG FD_VERSION=10.5.0
+ARG FD_SHA256_AMD64=761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7
+ARG FD_SHA256_ARM64=d76c4317f7d5dba69f8a2a15856c90c777e7f0dd4e85f0de8c76de6992c374d4
+RUN case "$TARGETARCH" in \
+      amd64) RS_ARCH="x86_64";  RG_SHA="$RIPGREP_SHA256_AMD64"; FD_SHA="$FD_SHA256_AMD64" ;; \
+      arm64) RS_ARCH="aarch64"; RG_SHA="$RIPGREP_SHA256_ARM64"; FD_SHA="$FD_SHA256_ARM64" ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL --retry 3 --retry-delay 5 \
+      "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-${RS_ARCH}-unknown-linux-musl.tar.gz" \
+      -o /tmp/ripgrep.tar.gz \
+    && echo "${RG_SHA}  /tmp/ripgrep.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/ripgrep.tar.gz -C /usr/local/bin --strip-components=1 "ripgrep-${RIPGREP_VERSION}-${RS_ARCH}-unknown-linux-musl/rg" \
+    && rm /tmp/ripgrep.tar.gz \
+    && curl -fsSL --retry 3 --retry-delay 5 \
+      "https://github.com/sharkdp/fd/releases/download/v${FD_VERSION}/fd-v${FD_VERSION}-${RS_ARCH}-unknown-linux-musl.tar.gz" \
+      -o /tmp/fd.tar.gz \
+    && echo "${FD_SHA}  /tmp/fd.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/fd.tar.gz -C /usr/local/bin --strip-components=1 "fd-v${FD_VERSION}-${RS_ARCH}-unknown-linux-musl/fd" \
+    && rm /tmp/fd.tar.gz \
+    && chmod 755 /usr/local/bin/rg /usr/local/bin/fd \
+    && rg --version | grep -q "^ripgrep ${RIPGREP_VERSION} " \
+    && fd --version | grep -q "^fd ${FD_VERSION}$"
 
 # ---------------------------------------------------------------------------
 # pre-commit + gitlint — pre-commit runs repo-defined hooks (formatting,

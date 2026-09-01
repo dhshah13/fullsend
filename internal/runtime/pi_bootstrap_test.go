@@ -110,6 +110,7 @@ func TestPiRuntimeBootstrap_WritesConfigAndManifest(t *testing.T) {
 	require.NoError(t, json.Unmarshal(storedUpload(t, store, cfg+"/settings.json"), &settings))
 	assert.Equal(t, "never", settings["defaultProjectTrust"])
 	assert.Equal(t, false, settings["enableSkillCommands"])
+	assert.Equal(t, []any{"read", "bash", "edit", "write", "grep", "find", "ls"}, settings["defaultTools"])
 
 	ext := string(storedUpload(t, store, cfg+"/fullsend-hooks.js"))
 	assert.Contains(t, ext, "export default function")
@@ -157,6 +158,10 @@ func TestPiRuntimeBootstrap_NoSecurityNoHooks(t *testing.T) {
 	require.NoError(t, json.Unmarshal(storedUpload(t, store, PiRuntime{}.ConfigDir()+"/fullsend-manifest.json"), &m))
 	assert.Nil(t, m.Hooks)
 	assert.Nil(t, m.Tools)
+	var settings map[string]any
+	require.NoError(t, json.Unmarshal(storedUpload(t, store, PiRuntime{}.ConfigDir()+"/settings.json"), &settings))
+	assert.Equal(t, []any{"read", "bash", "edit", "write", "grep", "find", "ls"}, settings["defaultTools"],
+		"an agent without tools: frontmatter gets every built-in through defaultTools, not pi's four-tool default")
 	assert.Equal(t, "enforce", m.BashAllowlistMode, "FULLSEND_PI_BASH_ALLOWLIST=enforce opts into blocking")
 	_, err := os.Stat(filepath.Join(store, strings.ReplaceAll(PiRuntime{}.ConfigDir()+"/fullsend-hooks.js", "/", "_")))
 	assert.True(t, os.IsNotExist(err), "no hook extension without security config")
@@ -419,4 +424,23 @@ func TestPiRuntimeClearIterationArtifacts(t *testing.T) {
 	log, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(log), "rm -rf '/sandbox/workspace'/output/* '/sandbox/pi-config/sessions'/* '/sandbox/workspace/pi-debug.log'")
+}
+
+// TestPiDefaultTools_CoversToolMap keeps the settings.json default set and
+// the Claude→pi tool map from drifting apart: every pi tool an agent can
+// name must be active when it lists no tools.
+func TestPiDefaultTools_CoversToolMap(t *testing.T) {
+	defaults := map[string]bool{}
+	for _, name := range piDefaultTools {
+		defaults[name] = true
+	}
+	for claudeName, piName := range piToolForClaude {
+		assert.Truef(t, defaults[piName], "pi tool %q (mapped from %s) is missing from piDefaultTools", piName, claudeName)
+	}
+	// And the reverse: every default pi tool has a Claude name for the hook
+	// adapter, so hook scripts never see a raw pi tool name.
+	for _, name := range piDefaultTools {
+		_, ok := claudeToolForPi[name]
+		assert.Truef(t, ok, "default pi tool %q has no claudeToolForPi entry", name)
+	}
 }

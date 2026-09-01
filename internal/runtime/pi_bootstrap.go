@@ -40,7 +40,8 @@ type piManifest struct {
 	Description string `json:"description,omitempty"`
 	// Model is the agent definition's model; the harness model wins at Run.
 	Model string `json:"model,omitempty"`
-	// Tools are pi tool names for --tools; nil means pi's default set.
+	// Tools are pi tool names for --tools; nil means the settings.json
+	// defaultTools set (piDefaultTools).
 	Tools []string `json:"tools"`
 	// BashAllowlist is the Bash(a,b) first-token allowlist from the agent
 	// definition. Under Claude Code it is steering, not a security control
@@ -232,17 +233,27 @@ const piNoSubagentNote = "\n## Runtime note\n\n" +
 	"sub-agent definition yourself, in the listed order, with the same context package, " +
 	"and treat each output as that sub-agent's result.\n"
 
+// piDefaultTools is the built-in tool set activated when the agent lists
+// no tools: pi 0.84.x itself starts with only read, bash, edit and write
+// (packages/coding-agent/src/core/sdk.ts defaultActiveToolNames — grep,
+// find and ls are registered but inactive), which left the search tools
+// unavailable to every agent without `tools:` frontmatter. The sandbox
+// image ships rg and fd for grep/find (images/sandbox/Containerfile).
+var piDefaultTools = []string{"read", "bash", "edit", "write", "grep", "find", "ls"}
+
 // piSettingsJSON is the locked-down global settings for the sandbox run.
 // defaultProjectTrust "never" means a repo-owned .pi/ (settings, extensions,
 // SYSTEM.md) is never loaded in non-interactive modes; skills as slash
 // commands are irrelevant headless; retry/compaction stay on so a transient
 // provider error or a long session does not end the run
-// (parsePiStream models both).
+// (parsePiStream models both); defaultTools activates every non-Windows
+// built-in (see piDefaultTools; pi also ships powershell) — --tools, when Run emits it, still replaces this.
 func piSettingsJSON() ([]byte, error) {
 	settings := map[string]any{
 		"defaultProjectTrust": "never",
 		"quietStartup":        true,
 		"enableSkillCommands": false,
+		"defaultTools":        piDefaultTools,
 		"retry":               map[string]any{"enabled": true},
 		"compaction":          map[string]any{"enabled": true},
 	}

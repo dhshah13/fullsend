@@ -180,7 +180,9 @@ func parseClaudeToolSpecs(specs []string) (tools, bashAllowlist []string) {
 
 // piToolForClaude maps the Claude Code tool names an agent definition may
 // list to pi's built-in tools (packages/coding-agent/src/core/tools/index.ts:
-// read, bash, edit, write, grep, find, ls). Claude tools without a pi
+// read, bash, edit, write, grep, find, ls — every non-Windows built-in; pi
+// also has powershell — all activated via settings.json defaultTools, since
+// pi alone starts with only the first four). Claude tools without a pi
 // counterpart are reported as unsupported; Skill maps to no tool (pi's
 // skills are prompt-driven), and Bootstrap adds read for it, since pi only
 // emits the skills section of the system prompt when read is active.
