@@ -975,6 +975,13 @@ func CreateWithRetry(name string, providers []string, image, policy string, maxA
 			return nil
 		}
 
+		// A global policy source is a stable mismatch — retrying with a
+		// new sandbox will not change the gateway-level policy. Return
+		// immediately without deleting and recreating.
+		if errors.Is(lastErr, errPolicyGlobal) {
+			return lastErr
+		}
+
 		if delErr := Delete(name); delErr != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: cleanup of sandbox %s failed: %v\n", name, delErr)
 		}
@@ -1089,6 +1096,7 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 	// Wait for sandbox to be fully ready (image pull can take a while).
 	deadline := time.Now().Add(timeout)
 	var lastOutput, lastStderr string
+	var lastPolicyErr error
 	for time.Now().Before(deadline) {
 		check := exec.CommandContext(ctx, "openshell", "sandbox", "get", name)
 		var stdoutBuf, stderrBuf strings.Builder
@@ -1111,15 +1119,27 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 		if checkErr == nil {
 			switch phase := sandboxPhase(lastOutput); {
 			case phase == readySandboxPhase:
-				if err := verifyPolicy(name, lastOutput, policy); err != nil {
-					return err
+				if policyErr := verifyPolicy(name, lastOutput, policy); policyErr != nil {
+					// A global policy source is a stable mismatch that
+					// re-polling cannot fix — return immediately.
+					if errors.Is(policyErr, errPolicyGlobal) {
+						return policyErr
+					}
+					// Policy fields may not yet be populated; record the
+					// error and continue polling until the deadline.
+					lastPolicyErr = policyErr
+				} else {
+					return nil
 				}
-				return nil
 			case phase == "" && strings.Contains(lastOutput, readySandboxPhase):
-				if err := verifyPolicy(name, lastOutput, policy); err != nil {
-					return err
+				if policyErr := verifyPolicy(name, lastOutput, policy); policyErr != nil {
+					if errors.Is(policyErr, errPolicyGlobal) {
+						return policyErr
+					}
+					lastPolicyErr = policyErr
+				} else {
+					return nil
 				}
-				return nil
 			}
 			// Detect terminal phases and fail immediately instead of
 			// polling through the full timeout.
@@ -1137,9 +1157,21 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 
 	containerLogs := collectPodmanLogs(name)
 
+	if lastPolicyErr != nil {
+		return fmt.Errorf("sandbox %q policy verification failed after %s: %w\ncreate output: %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
+			name, timeout, lastPolicyErr, createOutput, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
+	}
+
 	return fmt.Errorf("sandbox %q not ready after %s\ncreate output: %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
 		name, timeout, createOutput, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
 }
+
+// errPolicyGlobal is returned by verifyPolicy when the sandbox's policy
+// source is "global" instead of "sandbox". This is a stable mismatch that
+// re-polling and re-creation cannot fix — the global policy is a
+// gateway-level setting, not a per-sandbox override. CreateWithRetry
+// classifies it as non-retryable and returns immediately.
+var errPolicyGlobal = errors.New("sandbox policy source is global, not sandbox-level")
 
 // ErrProviderNotFound is returned by DeleteProvider when the gateway has no
 // provider of that name — already gone, which callers treat as done.
@@ -1175,14 +1207,21 @@ func DeleteProvider(name string) error {
 }
 
 // verifyPolicy checks that the sandbox has an active policy applied at the
-// sandbox level when one was requested at creation time. It parses the real
-// openshell sandbox get output which reports policy metadata as:
+// sandbox level when one was requested at creation time. The openshell CLI
+// wraps field labels in ANSI escape sequences (even when stdout is not a
+// terminal), so the output is stripped via stripANSI (defined in
+// gateway_endpoint.go) before text parsing. The output format reports
+// policy metadata as:
 //
 //	Policy source: sandbox|global
 //	Policy:
 //	  <yaml>
 //
 // When no policy was requested (empty string), the check is skipped.
+//
+// Returns errPolicyGlobal when the source is "global" — a stable mismatch
+// that re-polling and re-creation cannot fix. Other errors indicate
+// conditions where the policy fields may not yet be populated.
 func verifyPolicy(name, output, requestedPolicy string) error {
 	if requestedPolicy == "" {
 		return nil
@@ -1190,17 +1229,30 @@ func verifyPolicy(name, output, requestedPolicy string) error {
 	// The openshell CLI emits ANSI colour codes unconditionally (even
 	// when stdout is not a terminal), so strip them before parsing.
 	output = stripANSI(output)
+	truncated := truncatePolicyOutput(output, 512)
 	source := parsePolicySource(output)
 	if source == "" {
-		return fmt.Errorf("sandbox %q is ready but no policy source reported (expected policy %q)", name, requestedPolicy)
+		return fmt.Errorf("sandbox %q is ready but no policy source reported (expected policy %q); output: %s", name, requestedPolicy, truncated)
+	}
+	if source == "global" {
+		return fmt.Errorf("%w: sandbox %q policy source is %q, expected %q (requested policy %q); output: %s", errPolicyGlobal, name, source, "sandbox", requestedPolicy, truncated)
 	}
 	if source != "sandbox" {
-		return fmt.Errorf("sandbox %q policy source is %q, expected %q (requested policy %q)", name, source, "sandbox", requestedPolicy)
+		return fmt.Errorf("sandbox %q policy source is %q, expected %q (requested policy %q); output: %s", name, source, "sandbox", requestedPolicy, truncated)
 	}
 	if !hasPolicySection(output) {
-		return fmt.Errorf("sandbox %q reports policy source %q but no policy content found (expected policy %q)", name, source, requestedPolicy)
+		return fmt.Errorf("sandbox %q reports policy source %q but no policy content found (expected policy %q); output: %s", name, source, requestedPolicy, truncated)
 	}
 	return nil
+}
+
+// truncatePolicyOutput limits output to maxLen bytes for inclusion in error
+// messages, appending an ellipsis if truncated.
+func truncatePolicyOutput(output string, maxLen int) string {
+	if len(output) <= maxLen {
+		return output
+	}
+	return output[:maxLen] + "..."
 }
 
 // parsePolicySource extracts the "Policy source:" field value from

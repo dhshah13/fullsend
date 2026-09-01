@@ -932,6 +932,7 @@ func TestVerifyPolicy_GlobalWhenSandboxExpected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "policy source")
 	assert.Contains(t, err.Error(), "global")
+	assert.ErrorIs(t, err, errPolicyGlobal)
 }
 
 func TestVerifyPolicy_NoPolicyRequested(t *testing.T) {
@@ -964,24 +965,25 @@ func TestVerifyPolicy_SourceButNoPolicyContent(t *testing.T) {
 
 func TestCreateOnce_PolicyMatch(t *testing.T) {
 	dir := t.TempDir()
-	script := `#!/bin/sh
-if [ "$2" = "create" ]; then exit 0; fi
-if [ "$2" = "get" ]; then
-  echo "Sandbox:"
-  echo ""
-  echo "  Name: test-sandbox"
-  echo "  Phase: Ready"
-  echo "  Policy source: sandbox"
-  echo "  Revision: 1"
-  echo ""
-  echo "Policy:"
-  echo ""
-  echo "  net:"
-  echo "    outbound: block"
-  exit 0
-fi
-exit 1
-`
+	// The fake openshell emits ANSI-wrapped labels to exercise the
+	// stripANSI path end-to-end, matching real CLI output.
+	script := "#!/bin/sh\n" +
+		"if [ \"$2\" = \"create\" ]; then exit 0; fi\n" +
+		"if [ \"$2\" = \"get\" ]; then\n" +
+		"  echo \"Sandbox:\"\n" +
+		"  echo \"\"\n" +
+		"  echo \"  Name: test-sandbox\"\n" +
+		"  echo \"  Phase: Ready\"\n" +
+		"  printf '  \\033[2mPolicy source:\\033[0m sandbox\\n'\n" +
+		"  echo \"  Revision: 1\"\n" +
+		"  echo \"\"\n" +
+		"  printf '\\033[1;36mPolicy:\\033[0m\\n'\n" +
+		"  echo \"\"\n" +
+		"  echo \"  net:\"\n" +
+		"  echo \"    outbound: block\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
 	t.Setenv("PATH", dir)
 
@@ -991,29 +993,30 @@ exit 1
 
 func TestCreateOnce_PolicySourceGlobal(t *testing.T) {
 	dir := t.TempDir()
-	script := `#!/bin/sh
-if [ "$2" = "create" ]; then exit 0; fi
-if [ "$2" = "get" ]; then
-  echo "Sandbox:"
-  echo ""
-  echo "  Name: test-sandbox"
-  echo "  Phase: Ready"
-  echo "  Policy source: global"
-  echo ""
-  echo "Policy:"
-  echo ""
-  echo "  net:"
-  echo "    outbound: allow"
-  exit 0
-fi
-exit 1
-`
+	// ANSI-wrapped labels to exercise the stripANSI path end-to-end.
+	script := "#!/bin/sh\n" +
+		"if [ \"$2\" = \"create\" ]; then exit 0; fi\n" +
+		"if [ \"$2\" = \"get\" ]; then\n" +
+		"  echo \"Sandbox:\"\n" +
+		"  echo \"\"\n" +
+		"  echo \"  Name: test-sandbox\"\n" +
+		"  echo \"  Phase: Ready\"\n" +
+		"  printf '  \\033[2mPolicy source:\\033[0m global\\n'\n" +
+		"  echo \"\"\n" +
+		"  printf '\\033[1;36mPolicy:\\033[0m\\n'\n" +
+		"  echo \"\"\n" +
+		"  echo \"  net:\"\n" +
+		"  echo \"    outbound: allow\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
 	t.Setenv("PATH", dir)
 
 	err := createOnce("test-sandbox", nil, "", "/path/to/policy.yaml", 10*time.Second)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "policy source")
+	assert.ErrorIs(t, err, errPolicyGlobal)
 }
 
 func TestCreateOnce_NoPolicyRequested(t *testing.T) {
@@ -1052,10 +1055,76 @@ exit 1
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
 	t.Setenv("PATH", dir)
 
-	err := createOnce("test-sandbox", nil, "", "/path/to/policy.yaml", 10*time.Second)
+	// A missing policy source is retryable — createOnce polls until
+	// the timeout, then reports the last policy verification error.
+	err := createOnce("test-sandbox", nil, "", "/path/to/policy.yaml", 3*time.Second)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no policy source reported")
+	assert.Contains(t, err.Error(), "policy verification failed")
 }
+
+func TestCreateWithRetry_PolicyGlobalNotRetried(t *testing.T) {
+	dir := t.TempDir()
+	attemptsFile := filepath.Join(dir, "attempts")
+
+	// Fake openshell: create succeeds, get always reports global policy.
+	// Logs each "get" invocation to count attempts.
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$2" = "create" ]; then exit 0; fi
+if [ "$2" = "get" ]; then
+  echo "get" >> %s
+  echo "Sandbox:"
+  echo ""
+  echo "  Name: test-sandbox"
+  echo "  Phase: Ready"
+  echo "  Policy source: global"
+  echo ""
+  echo "Policy:"
+  echo ""
+  echo "  net:"
+  echo "    outbound: allow"
+  exit 0
+fi
+if [ "$2" = "delete" ]; then exit 0; fi
+exit 0
+`, attemptsFile)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", dir)
+
+	orig := RetrySleepFn
+	RetrySleepFn = func(d time.Duration) {}
+	t.Cleanup(func() { RetrySleepFn = orig })
+
+	err := CreateWithRetry("test-sandbox", nil, "", "/path/to/policy.yaml", 3, 5*time.Second)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errPolicyGlobal)
+
+	// Should have made only 1 creation attempt — the global source error
+	// is non-retryable, so CreateWithRetry must not delete and recreate.
+	data, readErr := os.ReadFile(attemptsFile)
+	require.NoError(t, readErr)
+	gets := strings.Count(string(data), "get")
+	assert.Equal(t, 1, gets, "global policy error must not trigger retries")
+}
+
+func TestVerifyPolicy_OutputIncludedInErrors(t *testing.T) {
+	output := "  Name: sb\n  Phase: Ready\n"
+	err := verifyPolicy("sb", output, "/path/to/policy.yaml")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "output:")
+	assert.Contains(t, err.Error(), "Name: sb")
+}
+
+func TestTruncatePolicyOutput(t *testing.T) {
+	short := "hello"
+	assert.Equal(t, short, truncatePolicyOutput(short, 512))
+
+	long := strings.Repeat("x", 600)
+	got := truncatePolicyOutput(long, 512)
+	assert.Len(t, got, 515) // 512 + len("...")
+	assert.True(t, strings.HasSuffix(got, "..."))
+}
+
 func TestEffectiveReadyTimeout_CappedAtMax(t *testing.T) {
 	got := effectiveReadyTimeout(999 * time.Second)
 	assert.Equal(t, maxReadyTimeout, got)
