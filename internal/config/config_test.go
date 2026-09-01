@@ -2828,6 +2828,13 @@ func TestModelsAliases_AliasNameAsValueRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "is an alias name")
 	assert.Contains(t, err.Error(), "models.aliases.sonnet")
+
+	// The check is case-insensitive: "Opus" passes ValidModelRef and would
+	// otherwise be sent to the provider as a literal id.
+	cfg.Models.Aliases["sonnet"] = "Opus"
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is an alias name")
 }
 
 func TestModelsAliases_ValidateSeesBaseLayer(t *testing.T) {

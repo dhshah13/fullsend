@@ -129,8 +129,8 @@ func translatePiModel(model string, configAliases map[string]string) string {
 		model = piDefaultModel
 	}
 	// Resolve the alias first, then normalise the *resolved* value: an
-	// alias may map to a provider/id spec (validateModelsConfig accepts
-	// it), and running the xai normalisation and the "/" passthrough on
+	// alias may map to a provider/id spec (config.ValidateModelAliases
+	// accepts it), and running the xai normalisation and the "/" passthrough on
 	// the alias name instead would re-prefix the spec
 	// ("anthropic-vertex/anthropic-vertex/…") and skip the xai-vertex
 	// gate in buildPiRunCommand. The alias table is consulted once: a

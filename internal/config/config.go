@@ -1096,7 +1096,9 @@ func ValidateModelAliases(aliases map[string]string) error {
 		if !ValidModelRef(val) {
 			return fmt.Errorf("models.aliases.%s: invalid model reference %q: must be a model id or provider/id (segments of a-z, A-Z, 0-9, _, -, ., @ joined by /)", key, val)
 		}
-		if slices.Contains(validKeys, val) {
+		// Case-insensitive: "Opus" passes ValidModelRef and would otherwise
+		// reach the provider as a literal id.
+		if slices.ContainsFunc(validKeys, func(k string) bool { return strings.EqualFold(k, val) }) {
 			return fmt.Errorf("models.aliases.%s: value %q is an alias name, not a model id; aliases resolve once, so name the model id (or provider/id) directly", key, val)
 		}
 	}

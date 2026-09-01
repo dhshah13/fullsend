@@ -1047,8 +1047,9 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		printer.StepFail(err.Error())
 		return fmt.Errorf("%s: %w", runCfg.source, err)
 	}
-	// resolvedModel is what the runtime will actually pass on: the alias
-	// target when models.aliases remaps h.Model, h.Model otherwise.
+	// resolvedModel is the alias-table target when models.aliases remaps
+	// h.Model, h.Model otherwise. It is what the echo and the Claude Code
+	// warning look at; pi still prefixes a bare id with its provider.
 	resolvedModel, modelRemapped := h.Model, false
 	if id, ok := configModelAliases[h.Model]; ok {
 		resolvedModel, modelRemapped = id, true
@@ -1095,7 +1096,16 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		printer.KeyValue("Effort", withSource(h.Effort, overrides.effortSource))
 	}
 	if len(overrides.fallbackModels) > 0 {
-		printer.KeyValue("Fallback models", withSource(strings.Join(overrides.fallbackModels, ", "), overrides.fallbackSource))
+		// Show the chain as the runtime will pass it: aliased entries are
+		// remapped by models.aliases (claude.go), so echo the same ids.
+		fallbacks := make([]string, len(overrides.fallbackModels))
+		for i, fb := range overrides.fallbackModels {
+			if id, ok := configModelAliases[fb]; ok {
+				fb = fb + " → " + id
+			}
+			fallbacks[i] = fb
+		}
+		printer.KeyValue("Fallback models", withSource(strings.Join(fallbacks, ", "), overrides.fallbackSource))
 	}
 	printer.KeyValue("Runtime", fmt.Sprintf("%s (from %s)", runtimeBackend.Runtime.Name(), runtimeConfigSource))
 	if h.Image != "" {

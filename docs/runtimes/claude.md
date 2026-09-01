@@ -25,10 +25,11 @@ entry that needs a specific generation names the id.
 
 **Per-repo alias overrides.** `models.aliases` in `.fullsend/config.yaml` remaps an alias for this
 repo (`sonnet: claude-sonnet-5`); fullsend then passes the id, not the alias, to `--model` and
-`--fallback-model`. Syntax and rules are on the [pi page](pi.md#per-repo-alias-overrides-modelsaliases);
-they are the same block. It applies to the run's top-level model only — sub-agent `model:`
-frontmatter still resolves through Claude Code's own table (`ANTHROPIC_DEFAULT_*_MODEL` does not
-steer requests on Vertex), so a sub-agent that needs a specific generation names the id.
+`--fallback-model`. Syntax and rules are on the [pi page](pi.md#per-repo-alias-overrides); they are
+the same block. fullsend remaps the run's top-level model only — it does not rewrite sub-agent
+`model:` frontmatter, which Claude Code resolves itself (upstream has reported that path bypassing
+`ANTHROPIC_DEFAULT_*_MODEL` on Bedrock; not verified on Vertex with the pinned version), so a
+sub-agent that needs a specific generation names the id.
 
 **Fallback chains.** `FULLSEND_FALLBACK_MODELS=a,b` becomes `--fallback-model a,b`, tried in order
 when the primary model is overloaded or retired. This is Claude Code only — pi reports it as

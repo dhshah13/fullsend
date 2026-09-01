@@ -190,7 +190,7 @@ Harness `model:` and `agents:` entry `model:` values accept provider-qualified `
 
 A `models.aliases` map in `.fullsend/config.yaml` overrides fullsend's pinned alias table per key.
 A repo that only wants `sonnet: claude-sonnet-5` does not need to restate `opus`. See
-[Pi › Per-repo alias overrides](runtimes/pi.md#per-repo-alias-overrides-modelsaliases) for the
+[Pi › Per-repo alias overrides](runtimes/pi.md#per-repo-alias-overrides) for the
 syntax and the run-time echo. On Claude Code the same block remaps the run's top-level `--model`
 (and `--fallback-model`) only — sub-agent `model:` frontmatter still resolves through Claude Code's
 own table; see [Claude Code › Models](runtimes/claude.md#models).
@@ -205,7 +205,7 @@ own table; see [Claude Code › Models](runtimes/claude.md#models).
 | OTel span | `fullsend.runtime`, next to `gen_ai.request.model` |
 | `metrics.json` | `runtime`, `requested_runtime`, `runtime_source`, `requested_model`, `override_source` |
 
-`requested_model` is what was handed to the runtime after overrides, and `override_source` says where
+`requested_model` is the model after the per-run overrides — an alias stays the alias name; a `models.aliases` remap is recorded as a `, remapped by … models.aliases` suffix on `override_source` — and `override_source` says where
 it came from — so a silent override is visible after the fact. The reported model is the
 provider-stripped id (`claude-opus-4-6`); for a provider whose ids are publisher-qualified it keeps
 that segment (`xai/grok-4.6`), since that is the wire id.

@@ -326,6 +326,16 @@ func resolveSkillDisplayName(skillPath string) string {
 	return meta.Name
 }
 
+// remapModel returns the models.aliases target for name when the repo
+// configured one, name otherwise (#6882). Shared by --model and
+// --fallback-model so the two cannot drift.
+func remapModel(name string, aliases map[string]string) string {
+	if id, ok := aliases[name]; ok {
+		return id
+	}
+	return name
+}
+
 func buildRunCommand(params RunParams) string {
 	envFile := sandbox.SandboxWorkspace + "/.env"
 	safe := strings.ReplaceAll(params.AgentBaseName, "'", "'\\''")
@@ -349,13 +359,10 @@ func buildRunCommand(params RunParams) string {
 	}
 
 	if params.Model != "" {
-		model := params.Model
 		// When the repo configures models.aliases and the model is an
-		// alias key with an entry, translate it to the id before --model
-		// so the run uses the repo's chosen generation (#6882).
-		if id, ok := params.ModelAliases[model]; ok {
-			model = id
-		}
+		// alias key with an entry, pass the id to --model so the run uses
+		// the repo's chosen generation (#6882).
+		model := remapModel(params.Model, params.ModelAliases)
 		parts = append(parts, fmt.Sprintf("--model '%s'", strings.ReplaceAll(model, "'", "'\\''")))
 	}
 
@@ -364,15 +371,12 @@ func buildRunCommand(params RunParams) string {
 	}
 
 	if len(params.FallbackModels) > 0 {
-		// Same remap as --model: a fallback chain must not land on the
-		// generation the repo retargeted away from.
+		// Same remap as --model, so an *aliased* fallback entry follows the
+		// repo's retarget. A literal id in the chain is passed as written.
 		if len(params.ModelAliases) > 0 {
 			remapped := make([]string, len(params.FallbackModels))
 			for i, fb := range params.FallbackModels {
-				if id, ok := params.ModelAliases[fb]; ok {
-					fb = id
-				}
-				remapped[i] = fb
+				remapped[i] = remapModel(fb, params.ModelAliases)
 			}
 			params.FallbackModels = remapped
 		}

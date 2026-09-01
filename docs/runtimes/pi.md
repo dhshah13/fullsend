@@ -54,7 +54,7 @@ Harness `model:` and `agents:` entry `model:` values accept the `provider/id` fo
 (`xai-vertex/xai/grok-4.6`); a harness can also select a provider with a bare `model:` plus
 `FULLSEND_PI_PROVIDER`.
 
-### Per-repo alias overrides (`models.aliases`)
+### Per-repo alias overrides
 
 The alias table above is a fullsend-owned constant, pinned on purpose: Vertex enables models per
 project, so "latest" is not necessarily accessible. To retarget an alias for one repo — say
