@@ -34,6 +34,7 @@ sequenceDiagram
   R->>S: .env, host files
   R->>S: Bootstrap
   R->>S: OIDC token (4-min refresh)
+  R->>S: clean up stray processes (between iterations)
   R->>S: Run (per iteration)
   S->>A: start + hook wiring
   loop tool-use loop

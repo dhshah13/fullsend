@@ -424,6 +424,31 @@ func TestPiRuntimeClearIterationArtifacts(t *testing.T) {
 	log, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(log), "rm -rf '/sandbox/workspace'/output/* '/sandbox/pi-config/sessions'/* '/sandbox/workspace/pi-debug.log'")
+	// Stray processes from the previous iteration are swept before the
+	// files go, so nothing keeps writing into the cleared directories.
+	sweep := strings.Index(string(log), "ps -o pid= -o ppid=")
+	rm := strings.Index(string(log), "rm -rf '/sandbox/workspace'/output/*")
+	require.NotEqual(t, -1, sweep, "expected the stray-process sweep to run")
+	assert.Less(t, sweep, rm, "sweep must precede the file cleanup")
+}
+
+// A sweep that fails (exit 124 is the only exec failure sandbox.Exec
+// reports) is warning-only: the rm -rf still runs and the result is nil.
+func TestPiRuntimeClearIterationArtifacts_SweepFailureIsNotAnError(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	binDir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> '" + logPath + "'\n" +
+		"for last; do :; done\n" +
+		"case \"$last\" in *\"stray processes killed\"*) echo boom >&2; exit 124 ;; esac\n" +
+		"exit 0\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	require.NoError(t, PiRuntime{}.ClearIterationArtifacts("sb"))
+	log, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(log), "rm -rf '/sandbox/workspace'/output/*", "file cleanup still runs after a failed sweep")
 }
 
 // TestPiDefaultTools_CoversToolMap keeps the settings.json default set and

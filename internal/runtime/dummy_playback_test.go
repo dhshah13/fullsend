@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -59,6 +60,41 @@ func TestDummyPlaybackRuntime_ClearIterationArtifacts(t *testing.T) {
 	rt := DummyPlaybackRuntime{}
 	err := rt.ClearIterationArtifacts("nonexistent-sandbox")
 	require.Error(t, err)
+}
+
+// ClearIterationArtifacts sweeps stray processes before removing files —
+// dummy-playback execs run in the real sandbox, so it gets the same
+// between-iteration hygiene as the agent runtimes.
+func TestDummyPlaybackRuntime_ClearIterationArtifacts_SweepsStraysBeforeFiles(t *testing.T) {
+	t.Parallel()
+
+	var cmds []string
+	rt := DummyPlaybackRuntime{ExecFn: func(_ string, cmd string, _ time.Duration) (string, string, int, error) {
+		cmds = append(cmds, cmd)
+		return "stray processes killed: 0\n", "", 0, nil
+	}}
+	require.NoError(t, rt.ClearIterationArtifacts("sb"))
+	require.Len(t, cmds, 2)
+	assert.Equal(t, killStrayProcessesScript(), cmds[0])
+	assert.Contains(t, cmds[1], "rm -rf")
+}
+
+// A failed sweep (exit 124 is the only exec failure sandbox.Exec reports)
+// is warning-only: the file cleanup still runs and the result is nil.
+func TestDummyPlaybackRuntime_ClearIterationArtifacts_SweepFailureIsNotAnError(t *testing.T) {
+	t.Parallel()
+
+	var cmds []string
+	rt := DummyPlaybackRuntime{ExecFn: func(_ string, cmd string, _ time.Duration) (string, string, int, error) {
+		cmds = append(cmds, cmd)
+		if len(cmds) == 1 {
+			return "", "boom", 124, errors.New("command timed out after 15s")
+		}
+		return "", "", 0, nil
+	}}
+	require.NoError(t, rt.ClearIterationArtifacts("sb"))
+	require.Len(t, cmds, 2)
+	assert.Contains(t, cmds[1], "rm -rf")
 }
 
 func TestLoadPlaylist(t *testing.T) {

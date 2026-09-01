@@ -1924,7 +1924,15 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 
 		// Clear sandbox-side output and transcripts so the next iteration starts fresh.
 		if iteration > 1 {
-			if clearErr := rt.ClearIterationArtifacts(sandboxName); clearErr != nil {
+			// Held across the sweep so a credential refresher's upload/exec
+			// is never caught mid-write (see sandboxMu).
+			clearErr := withSandboxLock(ctx, func(waited time.Duration) {
+				printer.StepInfo(fmt.Sprintf(
+					"Waiting %s for a credential refresh to finish before clearing the sandbox", waited))
+			}, func() error {
+				return rt.ClearIterationArtifacts(sandboxName)
+			})
+			if clearErr != nil {
 				printer.StepWarn("Failed to clear sandbox output: " + clearErr.Error())
 			}
 		}
@@ -3624,6 +3632,81 @@ func readOIDCAuthFile(path string) (string, error) {
 
 var oidcRefreshInterval = 4 * time.Minute
 
+// sandboxMu serializes the between-iteration stray-process sweep
+// (runtime.ClearIterationArtifacts TERM/KILLs every sandbox-user process
+// outside its own exec) against the background credential refreshers that
+// write into the sandbox from the host. refreshOIDCToken's
+// `openshell sandbox upload` runs a sandbox-user `/bin/bash -c 'mkdir -p …
+// && cat | tar xf - -C …'` chain (ppid 1, indistinguishable from a stray)
+// and tar truncates the target on open, so a kill mid-write would leave an
+// empty .gcp-oidc-token until the next 4-minute tick. The whole tick is the
+// expired-token window, not part of it: the truncation destroyed the token
+// that was there, and GHA OIDC tokens live 5 minutes. reseedOpenAIAuth's
+// seed exec is the other writer. Both hold the lock across the write; the
+// iteration loop holds it across ClearIterationArtifacts.
+//
+// Lock-hold budget. The iteration side is the long holder:
+// ClearIterationArtifacts is the sweep exec (runtime's 15s snippet timeout
+// plus sandbox.ExecContext's 10s slack) followed by the file removal (10s
+// plus the same 10s slack), so about 45s worst case. That is how long a
+// refresher can be held off, against a 4-minute OIDC tick and a 5-minute
+// token life. Raising either timeout, or adding a third exec to
+// ClearIterationArtifacts, has to be checked against that margin: once the
+// worst-case hold approaches the tick interval a refresh can miss its slot
+// and the token can expire before the next one lands. Take the lock through
+// withSandboxLock rather than directly, so a panic inside the critical
+// section cannot leave it held — the deferred oidcWg/refreshWg waits would
+// then hang the run instead of surfacing the panic.
+var sandboxMu sync.Mutex
+
+// sandboxLockWarnAfter is how long withSandboxLock waits for the lock
+// before telling the caller's notify that something else holds it;
+// sandboxLockPoll is how often every waiter retries meanwhile. Only the iteration
+// loop passes a notify: a sweep waiting on a refresher stalls visible
+// progress, while a refresher waiting on a sweep is routine.
+var (
+	sandboxLockWarnAfter = 5 * time.Second
+	sandboxLockPoll      = 100 * time.Millisecond
+)
+
+// withSandboxLock runs fn holding sandboxMu (see there for what it
+// protects and for the hold budget); the lock is released even if fn panics.
+// notify, when non-nil, is called once if the lock is still not free after
+// sandboxLockWarnAfter, with the time waited so far. A ctx cancelled while
+// waiting returns ctx.Err() without running fn, so a run shutting down is
+// not held up by a holder's in-flight sandbox exec.
+func withSandboxLock(ctx context.Context, notify func(waited time.Duration), fn func() error) error {
+	if err := acquireSandboxLock(ctx, notify); err != nil {
+		return err
+	}
+	defer sandboxMu.Unlock()
+	return fn()
+}
+
+func acquireSandboxLock(ctx context.Context, notify func(waited time.Duration)) error {
+	if sandboxMu.TryLock() {
+		return nil
+	}
+	// TryLock in a loop rather than Lock, so the wait can be reported while
+	// it is happening and abandoned when ctx is cancelled.
+	start := time.Now()
+	warned := false
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sandboxLockPoll):
+		}
+		if sandboxMu.TryLock() {
+			return nil
+		}
+		if waited := time.Since(start); notify != nil && !warned && waited >= sandboxLockWarnAfter {
+			notify(waited.Round(time.Second))
+			warned = true
+		}
+	}
+}
+
 func runOIDCRefresh(ctx context.Context, sandboxName, oidcURL, oidcAuth string, printer *ui.Printer) {
 	ticker := time.NewTicker(oidcRefreshInterval)
 	defer ticker.Stop()
@@ -3688,8 +3771,13 @@ func refreshOIDCToken(ctx context.Context, sandboxName, oidcURL, oidcAuth string
 	tmpFile.Close()
 
 	remotePath := sandbox.SandboxWorkspace + "/.gcp-oidc-token"
-	if err := sandbox.UploadFile(sandboxName, tmpFile.Name(), remotePath); err != nil {
-		return fmt.Errorf("copying token to sandbox: %w", err)
+	// The upload's in-sandbox tar truncates the token on open; hold the
+	// sandbox lock so the between-iteration sweep cannot kill it mid-write.
+	uploadErr := withSandboxLock(ctx, nil, func() error {
+		return sandbox.UploadFile(sandboxName, tmpFile.Name(), remotePath)
+	})
+	if uploadErr != nil {
+		return fmt.Errorf("copying token to sandbox: %w", uploadErr)
 	}
 
 	return nil

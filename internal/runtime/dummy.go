@@ -138,7 +138,11 @@ func (r DummyRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 	return exitCode, nil
 }
 
+// ClearIterationArtifacts sweeps stray processes (the dummy runtime's ops run
+// in the real sandbox, so it gets the same between-iteration hygiene as the
+// agent runtimes), then removes the previous iteration's output.
 func (r DummyRuntime) ClearIterationArtifacts(sandboxName string) error {
+	clearStrayProcesses(r.execFn(), sandboxName, os.Stderr)
 	clearCmd := fmt.Sprintf("rm -rf %s/output/*", r.WorkspaceDir())
 	_, _, _, err := r.execFn()(sandboxName, clearCmd, 10*time.Second)
 	return err

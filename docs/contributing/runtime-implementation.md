@@ -121,12 +121,14 @@ Harness `security.fail_mode` controls whether critical findings **block** the ru
 
 | Interface | Responsibility |
 |-----------|----------------|
-| `runtime.Runtime` | Name, config dir, env exports, bootstrap, run loop, per-iteration artifact cleanup |
+| `runtime.Runtime` | Name, config dir, env exports, bootstrap, run loop, per-iteration cleanup, user processes cleanup |
 | `runtime.BootstrapInput` | Portable agent name/path, skill dirs, and plugin dirs to upload |
 | `runtime.SandboxHooksBootstrap` | Optional `BootstrapInput` extension — runtime-neutral sandbox tool hook config (`security.SandboxHookConfig`); every runtime should honour it |
 | `runtime.TranscriptHandler` | Extract transcripts/debug logs; parse errors for CI annotations |
 | `runtime.DebugLogNamer` | Optional — names the per-iteration debug-log artifact (default `agent-debug.log`) |
 | `runtime.ContextBridger` | Optional — runtime auto-loads only `CLAUDE.md`, so the runner injects a `CLAUDE.md`→`AGENTS.md` pointer (Claude Code: yes; runtimes that read `AGENTS.md` natively: omit) |
+
+**Per-iteration cleanup contract.** When a validation retry reuses the sandbox, the runner calls `ClearIterationArtifacts` before the next iteration. Every runtime runs the shared `clearStrayProcesses` sweep first (it terminates the processes the previous iteration left running as the sandbox user, sparing the exec channel and the `sandbox.KeepAliveCommand` main process), then deletes the iteration's output, sessions and debug log. A failed sweep is reported as a warning and never fails the iteration. The runner holds its sandbox lock (`withSandboxLock` in `internal/cli/run.go`) across the call so the credential refreshers' uploads are never killed mid-write.
 
 A runtime whose `Bootstrap` does not type-assert `SandboxHooksBootstrap` will **not** install Tirith, SSRF, canary, or the other hook scripts. The primary security boundary is the OpenShell sandbox, its L7 egress policy, and credential placeholders (ADR 0017, ADR 0025); the hooks are defense-in-depth that every runtime should wire rather than silently drop ([ADR 0090](../ADRs/0090-runtime-neutral-sandbox-hooks-contract.md)). Fill in the matrix column above either way.
 

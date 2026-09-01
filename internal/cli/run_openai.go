@@ -136,8 +136,15 @@ var openAIDeleteBackoff = 3 * time.Second
 // sandboxOpenAIPlaceholder returns the OPENAI_API_KEY placeholder a new
 // process in the sandbox receives right now.
 func sandboxOpenAIPlaceholder(ctx context.Context, sandboxName string) (string, error) {
-	// ExecContext already wraps the command in `sh -c`.
-	out, stderr, code, err := sandbox.ExecContext(ctx, sandboxName, `printf %s "${OPENAI_API_KEY:-}"`, openAIPlaceholderExecTimeout)
+	// ExecContext already wraps the command in `sh -c`. Held under the
+	// sandbox lock so the between-iteration sweep never kills this exec.
+	var out, stderr string
+	var code int
+	err := withSandboxLock(ctx, nil, func() error {
+		var execErr error
+		out, stderr, code, execErr = sandbox.ExecContext(ctx, sandboxName, `printf %s "${OPENAI_API_KEY:-}"`, openAIPlaceholderExecTimeout)
+		return execErr
+	})
 	if err != nil {
 		return "", err
 	}
@@ -206,21 +213,39 @@ func reseedOpenAIAuth(ctx context.Context, h openAIProviderHandle, previous stri
 	// starting at this very moment seeds too (from its own exec
 	// environment, which may still carry the previous placeholder), and
 	// whichever write lands last wins. One re-seed closes that window.
-	for attempt := 0; attempt < 2; attempt++ {
-		_, stderr, code, err := sandbox.ExecContext(ctx, h.sandbox, h.authSeed, openAIPlaceholderExecTimeout)
-		if err != nil {
-			return "", fmt.Errorf("re-seeding pi auth.json: %w", err)
+	// Only the write is taken under the sandbox lock, and one exec at a
+	// time: the seed writes atomically (mv -f) but the between-iteration
+	// sweep must not kill it mid-run, whereas the grep below only reads and
+	// costs nothing if it is killed. Each hold is one exec (30s + slack), so
+	// a sweep never waits on the whole retry loop — see sandboxMu's
+	// hold budget.
+	seed := func() error {
+		for attempt := 0; attempt < 2; attempt++ {
+			var stderr string
+			var code int
+			err := withSandboxLock(ctx, nil, func() error {
+				var execErr error
+				_, stderr, code, execErr = sandbox.ExecContext(ctx, h.sandbox, h.authSeed, openAIPlaceholderExecTimeout)
+				return execErr
+			})
+			if err != nil {
+				return fmt.Errorf("re-seeding pi auth.json: %w", err)
+			}
+			if code != 0 {
+				return fmt.Errorf("re-seeding pi auth.json: exit %d: %s", code, strings.TrimSpace(stderr))
+			}
+			if h.authFile == "" {
+				return nil
+			}
+			_, _, code, err = sandbox.ExecContext(ctx, h.sandbox, "command -p grep -qF "+shellQuote(current)+" "+shellQuote(h.authFile), openAIPlaceholderExecTimeout)
+			if err == nil && code == 0 {
+				return nil
+			}
 		}
-		if code != 0 {
-			return "", fmt.Errorf("re-seeding pi auth.json: exit %d: %s", code, strings.TrimSpace(stderr))
-		}
-		if h.authFile == "" {
-			break
-		}
-		_, _, code, err = sandbox.ExecContext(ctx, h.sandbox, "command -p grep -qF "+shellQuote(current)+" "+shellQuote(h.authFile), openAIPlaceholderExecTimeout)
-		if err == nil && code == 0 {
-			break
-		}
+		return nil
+	}
+	if err := seed(); err != nil {
+		return "", err
 	}
 	printer.StepInfo("pi auth.json re-seeded with the refreshed OpenAI placeholder")
 	return current, nil

@@ -569,9 +569,11 @@ func (r PiRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printe
 	return exitCode, nil
 }
 
-// ClearIterationArtifacts removes the previous iteration's outputs and
-// sessions so transcripts and output files are per-iteration.
+// ClearIterationArtifacts terminates processes the previous iteration left
+// running (see killStrayProcesses), then removes its outputs and sessions
+// so transcripts and output files are per-iteration.
 func (r PiRuntime) ClearIterationArtifacts(sandboxName string) error {
+	clearStrayProcesses(sandbox.Exec, sandboxName, os.Stderr)
 	clearCmd := fmt.Sprintf("rm -rf %s/output/* %s/* %s",
 		shellQuote(r.WorkspaceDir()), shellQuote(r.piSessionsDir()), shellQuote(r.WorkspaceDir()+"/"+piDebugLogFile))
 	_, _, _, err := sandbox.Exec(sandboxName, clearCmd, 10*time.Second)
