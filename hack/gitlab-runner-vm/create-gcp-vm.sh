@@ -284,7 +284,7 @@ trap 'cleanup_vm; exit 130' INT
 trap 'cleanup_vm; exit 143' TERM
 
 # ----------------------------------------------------------------------
-# 3. Wait for the VM to boot and accept SSH
+# 3. Wait for the VM to boot, accept SSH, and install packages
 # ----------------------------------------------------------------------
 echo "==> Waiting for ${vm_name} to boot..."
 for i in $(seq 1 60); do
