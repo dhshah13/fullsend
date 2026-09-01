@@ -62,8 +62,9 @@ func TestRunAgent_ModelsAliases_RemapIsEchoedAndReachesSandbox(t *testing.T) {
 		"plan block keeps the alias and its source, then shows the remap")
 }
 
-// Aliased entries in the fallback chain are echoed remapped, the way
-// buildRunCommand passes them; a literal id stays as written.
+// The plan block is a human echo of the fallback chain: an aliased entry
+// is shown as "alias → id" (buildRunCommand passes only the id on
+// --fallback-model; see claude_test.go); a literal id stays as written.
 func TestRunAgent_ModelsAliases_FallbackChainEchoedRemapped(t *testing.T) {
 	usePreScriptStub(t)
 	t.Setenv("FULLSEND_FALLBACK_MODELS", "sonnet,claude-opus-4-6")

@@ -2826,7 +2826,7 @@ func TestModelsAliases_AliasNameAsValueRejected(t *testing.T) {
 	}
 	err := cfg.Validate()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "is an alias name")
+	assert.Contains(t, err.Error(), "is the alias name")
 	assert.Contains(t, err.Error(), "models.aliases.sonnet")
 
 	// The check is case-insensitive: "Opus" passes ValidModelRef and would
@@ -2834,7 +2834,7 @@ func TestModelsAliases_AliasNameAsValueRejected(t *testing.T) {
 	cfg.Models.Aliases["sonnet"] = "Opus"
 	err = cfg.Validate()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "is an alias name")
+	assert.Contains(t, err.Error(), "is the alias name")
 
 	// …and it looks at the id segment of a provider/id spec: pi passes a
 	// "/" value straight through, so "anthropic-vertex/opus" would send the
@@ -2842,7 +2842,7 @@ func TestModelsAliases_AliasNameAsValueRejected(t *testing.T) {
 	cfg.Models.Aliases["sonnet"] = "anthropic-vertex/opus"
 	err = cfg.Validate()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "is an alias name")
+	assert.Contains(t, err.Error(), "is the alias name")
 
 	// A real id whose segment merely contains an alias name is fine.
 	cfg.Models.Aliases["sonnet"] = "anthropic-vertex/claude-opus-4-6"

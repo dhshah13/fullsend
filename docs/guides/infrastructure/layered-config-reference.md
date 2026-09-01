@@ -197,9 +197,10 @@ inference:
 `models.aliases` overrides fullsend's pinned model alias table per key
 (#6882). Keys are the existing alias vocabulary (`opus`, `sonnet`,
 `haiku`, `fable`); values are model ids or `provider/id` specs validated
-with `ValidModelRef`, and never another alias name (aliases resolve
-once, so `sonnet: opus` would reach the provider as the literal id
-`opus`). An unknown key is a config validation error.
+with `ValidModelRef`, and never another alias name — bare or as the id
+segment of a `provider/id` spec (aliases resolve once, so `sonnet: opus`
+or `sonnet: anthropic-vertex/opus` would reach the provider as the
+literal id `opus`). An unknown key is a config validation error.
 
 Merge is per key across layers: an overlay that sets `fable` inherits
 the base's `sonnet` entry without restating it. A `nil` Models block

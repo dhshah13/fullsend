@@ -70,7 +70,8 @@ models:
 Rules: merge is per key (a repo that sets only `sonnet` keeps the fleet default for `opus`, `haiku`
 and `fable`); keys are the alias vocabulary (`opus`, `sonnet`, `haiku`, `fable`); a value is a bare id
 or `provider/id` (`haiku: google-vertex/gemini-3.7-flash` works, and an `xai/…` value takes the same
-Grok normalisation as a direct spec) — never another alias, since aliases resolve once.
+Grok normalisation as a direct spec) — never another alias, bare or as the id segment of a
+`provider/id` spec, since aliases resolve once.
 
 At run time the plan block shows `Model: sonnet (from …) → claude-sonnet-5 (from <config path>
 models.aliases)` and `metrics.json` `override_source` ends with `remapped by <config path>

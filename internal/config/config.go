@@ -1104,7 +1104,7 @@ func ValidateModelAliases(aliases map[string]string) error {
 			idSegment = val[i+1:]
 		}
 		if slices.ContainsFunc(validKeys, func(k string) bool { return strings.EqualFold(k, idSegment) }) {
-			return fmt.Errorf("models.aliases.%s: value %q is an alias name, not a model id; aliases resolve once, so name the model id (or provider/id) directly", key, val)
+			return fmt.Errorf("models.aliases.%s: value %q is the alias name %q, not a model id; aliases resolve once, so name the model id (or provider/id) directly", key, val, idSegment)
 		}
 	}
 	return nil
