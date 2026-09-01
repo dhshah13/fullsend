@@ -192,7 +192,7 @@ debouncedWatch(
     // Uses the stored text from the search index — no async page rendering needed.
     // Phrase filtering runs before the display cap so exact-phrase matches beyond
     // rank 16 are not silently discarded.
-    let searchResults = filterByPhrases(
+    const searchResults = filterByPhrases(
       index.search(query, searchOpts) as (SearchResult & Result)[],
       phrases,
     ).slice(0, 16);
