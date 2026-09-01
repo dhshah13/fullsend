@@ -6,7 +6,7 @@
 #   - VM created from vm.yaml (provides Fedora + podman + gitlab-runner)
 #   - sudo access for the running user
 #
-# Normally called by create-vm.sh. Can also be run standalone:
+# Normally called by create-openshift-vm.sh / create-gcp-vm.sh. Can also be run standalone:
 #   GITLAB_URL=https://gitlab.example.com RUNNER_IMAGE=ghcr.io/org/runner:v1 \
 #     REGISTRATION_TOKEN=glrt-xxx ./setup.sh
 #
@@ -213,7 +213,7 @@ install_gitlab_runner() {
   tmpbin=$(mktemp)
   # Stall detection rather than a hard cap: the binary is tens of megabytes,
   # so --max-time turns a slow-but-working link into a deterministic failure.
-  # Overall runtime is already bounded by create-vm.sh's `timeout`.
+  # Overall runtime is already bounded by create-openshift-vm.sh / create-gcp-vm.sh's `timeout`.
   curl --connect-timeout 10 --speed-limit 10240 --speed-time 60 \
     --retry 3 --retry-connrefused -fsSL -o "${tmpbin}" "${runner_url}"
 

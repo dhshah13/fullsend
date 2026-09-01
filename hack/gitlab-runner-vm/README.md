@@ -1,10 +1,8 @@
 # GitLab Runner VM
 
-Provisions GitLab Runner VMs on OpenShift Virtualization with a Podman custom
-executor and OpenShell gateway for fullsend agent jobs.
-
-> **Requires:** `oc`, `virtctl` (client >= 1.5 — ships with OpenShift Virtualization >= 4.19),
-> `python3`, and a local `ssh` binary (virtctl wraps it via ProxyCommand).
+Provisions GitLab Runner VMs on OpenShift Virtualization or GCE (Google
+Compute Engine) with a Podman custom executor and OpenShell gateway for
+fullsend agent jobs.
 
 ## Architecture
 
@@ -26,7 +24,10 @@ executors but maintains equivalent container-level isolation for agent jobs.
 See also:
 - [ADR 0036: Agent Execution Sandbox](../../docs/ADRs/0036-agent-execution-sandbox.md)
 
-## Quick start
+## Quick start — OpenShift Virtualization
+
+> **Requires:** `oc`, `virtctl` (client >= 1.5 — ships with OpenShift Virtualization >= 4.19),
+> `python3`, and a local `ssh` binary (virtctl wraps it via ProxyCommand).
 
 ```bash
 # 1. Create and provision a VM (auto-numbers):
@@ -34,48 +35,97 @@ GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
   GITLAB_URL=https://gitlab.example.com \
   NAMESPACE=my-namespace \
   RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 \
-  ./create-vm.sh
+  ./create-openshift-vm.sh
 
 # 2. Delete a VM:
 GL_TOKEN=glpat-xxx \
   GITLAB_URL=https://gitlab.example.com \
   NAMESPACE=my-namespace \
-  ./delete-vm.sh fullsend-gitlab-runner-01
+  ./delete-openshift-vm.sh fullsend-gitlab-runner-01
 
 # 3. List VMs:
-NAMESPACE=my-namespace ./delete-vm.sh --list
+NAMESPACE=my-namespace ./delete-openshift-vm.sh --list
+```
+
+## Quick start — GCE (Google Compute Engine)
+
+> **Requires:** `gcloud` CLI (authenticated), `python3`, `curl`.
+> VMs have no public IP — SSH access is tunneled via [IAP](https://cloud.google.com/iap/docs/using-tcp-forwarding)
+> (Cloud IAP API must be enabled; operator needs `roles/iap.tunnelResourceAccessor`).
+
+```bash
+# 1. Create and provision a VM (auto-numbers):
+GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
+  GITLAB_URL=https://gitlab.example.com \
+  GCP_PROJECT=my-gcp-project \
+  RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 \
+  ./create-gcp-vm.sh
+
+# 2. Delete a VM:
+GL_TOKEN=glpat-xxx \
+  GITLAB_URL=https://gitlab.example.com \
+  GCP_PROJECT=my-gcp-project \
+  ./delete-gcp-vm.sh fullsend-gitlab-runner-01
+
+# 3. List VMs:
+GCP_PROJECT=my-gcp-project ./delete-gcp-vm.sh --list
 ```
 
 ## Environment variables
+
+### Shared
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GL_TOKEN` | yes | — | GitLab PAT (Owner role, scopes: `create_runner` + `manage_runner` + `api`) |
 | `PROJECT_ID` | yes (create) | — | GitLab project ID |
 | `GITLAB_URL` | yes | — | GitLab instance URL |
-| `NAMESPACE` | yes (create/delete) | — | OpenShift namespace |
-| `RUNNER_IMAGE` | yes | — | Image pre-pulled as a warm cache; jobs must still set `image:` in `.gitlab-ci.yml` |
+| `RUNNER_IMAGE` | yes (create) | — | Image pre-pulled as a warm cache; jobs must still set `image:` in `.gitlab-ci.yml` |
 | `RUNNER_TAG` | no | `fullsend-gitlab-runner` | Runner tag for job matching |
-| `VM_USER` | no | `fedora` | Cloud-image login user (`cloud-user` on RHEL/CentOS Stream images) |
 | `RUNNER_ACCESS_LEVEL` | no | `not_protected` | `ref_protected` restricts the runner to protected branches and tags, so merge-request pipelines on unprotected source refs never match and sit `pending`. Note the trade-off: with `not_protected`, any job on any branch of the project runs on this VM and can read the mounted gateway credentials (see Security below) — set `ref_protected` if the runner only needs to serve protected refs |
 | `OPENSHELL_VERSION` | no | from `.github/scripts/openshell-version.sh` | OpenShell version (Renovate-tracked) |
 | `GITLAB_RUNNER_VERSION` | no | `19.2.1` | gitlab-runner version |
-| `SSH_PUBLIC_KEY` | no | contents of `~/.ssh/id_rsa.pub` or `id_ed25519.pub` | SSH public key contents (not a path) |
 | `REGISTRATION_TOKEN` | setup only | — | GitLab runner registration token |
+
+### OpenShift-specific
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `NAMESPACE` | yes (create/delete) | — | OpenShift namespace |
+| `VM_USER` | no | `fedora` | Cloud-image login user (`cloud-user` on RHEL/CentOS Stream images) |
+| `SSH_PUBLIC_KEY` | no | contents of `~/.ssh/id_rsa.pub` or `id_ed25519.pub` | SSH public key contents (not a path) |
+
+### GCE-specific
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GCP_PROJECT` | yes | — | GCP project ID |
+| `GCP_ZONE` | no | `us-east1-b` | GCE zone |
+| `GCP_MACHINE_TYPE` | no | `e2-standard-4` | GCE machine type (4 vCPU, 16 GB — closest to the 4 CPU / 14 GiB KubeVirt spec) |
+| `GCP_NETWORK` | no | `gitlab-runners` | VPC network (must have IAP ingress and egress firewall rules) |
+| `GCP_SUBNET` | no | — | VPC subnet (required for custom-mode VPCs; omit for auto-mode) |
+| `GCP_IMAGE_FAMILY` | no | `fedora-cloud-43` | GCE image family |
+| `GCP_IMAGE_PROJECT` | no | `fedora-cloud` | GCE image project |
 
 ## Files
 
-- `create-vm.sh` — end-to-end VM creation + runner registration + setup
-- `delete-vm.sh` — VM teardown + runner deregistration
-- `setup.sh` — standalone VM configuration (called by create-vm.sh)
+- `create-openshift-vm.sh` — end-to-end VM creation on OpenShift + runner registration + setup
+- `delete-openshift-vm.sh` — OpenShift VM teardown + runner deregistration
+- `create-gcp-vm.sh` — end-to-end VM creation on GCE + runner registration + setup
+- `delete-gcp-vm.sh` — GCE VM teardown + runner deregistration
+- `setup.sh` — standalone VM configuration (called by create-openshift-vm.sh / create-gcp-vm.sh)
 - `gitlab-runner-version.sh` — central pin for the gitlab-runner version
-- `vm.yaml` — KubeVirt VirtualMachine template
+- `vm.yaml` — KubeVirt VirtualMachine template (OpenShift only)
 - `executor/prepare.sh` — custom executor prepare stage
 - `executor/run.sh` — custom executor run stage
 - `executor/cleanup.sh` — custom executor cleanup stage
 
 ## Security notes
 
+- GCE VMs are created with `--no-address` (no public IP). SSH access is
+  tunneled through IAP, which requires the operator to have
+  `roles/iap.tunnelResourceAccessor` and authenticates via GCP IAM — mirroring
+  the OpenShift model where SSH is tunneled through the K8s API server.
 - The CA trust bootstrap uses trust-on-first-use (TOFU). For higher assurance,
   provide the CA bundle out-of-band before running setup.sh.
 - The OCI CA-injection hook fires for all containers on the host. It only
