@@ -96,6 +96,19 @@ fi
 OPENSHELL_VERSION="${OPENSHELL_VERSION:-0.0.116}"
 PREFIX="fullsend-gitlab-runner"
 
+# Validate GCP_USE_IAP early — it controls flag construction below, so an
+# invalid value (e.g. "yes") must not silently skip --tunnel-through-iap.
+if [[ "${GCP_USE_IAP}" != "true" && "${GCP_USE_IAP}" != "false" ]]; then
+  echo "ERROR: GCP_USE_IAP must be true or false (got: ${GCP_USE_IAP})" >&2
+  exit 1
+fi
+
+if [ "${GCP_USE_IAP}" = "false" ]; then
+  echo "  WARN: GCP_USE_IAP=false — SSH will connect over the public internet" >&2
+  echo "        with host-key verification disabled (StrictHostKeyChecking=no)." >&2
+  echo "        Secrets (REGISTRATION_TOKEN) are transmitted over this session." >&2
+fi
+
 # Common flags for gcloud compute ssh. IAP tunneling is enabled by default
 # (no public IP); set GCP_USE_IAP=false to SSH directly via an external IP.
 # Host key prompts are suppressed for ephemeral VMs with no stable host key.
@@ -205,10 +218,7 @@ if [[ "${RUNNER_ACCESS_LEVEL}" != "not_protected" && "${RUNNER_ACCESS_LEVEL}" !=
   exit 1
 fi
 
-if [[ "${GCP_USE_IAP}" != "true" && "${GCP_USE_IAP}" != "false" ]]; then
-  echo "ERROR: GCP_USE_IAP must be true or false (got: ${GCP_USE_IAP})" >&2
-  exit 1
-fi
+# GCP_USE_IAP is validated early (before GCE_SSH_FLAGS construction).
 
 # Preflight — every tool and file this run depends on. Without this, a missing
 # executor script or an absent `timeout` is discovered only after the VM has
@@ -490,7 +500,12 @@ done
 # handler that merely returns would swallow the SIGHUP from a dropped SSH
 # connection and let setup.sh keep running while the local side deregisters
 # the runner. Bounded at 20 minutes (image pulls and binary downloads are the
-# bottleneck). Wrapped in with_backoff for IAP tunnel resilience.
+# bottleneck). Wrapped in with_backoff for IAP tunnel resilience — setup.sh
+# is idempotent (each function checks existing state before acting), so
+# retrying the full invocation after a dropped SSH connection is safe.
+# Note: each retry re-transmits REGISTRATION_TOKEN over a new SSH session.
+# The remote EXIT trap (`rm -f .env`) cleans up the token file on disconnect,
+# and umask 077 ensures it is never world-readable between attempts.
 _run_setup_on_vm() {
   {
     printf "REGISTRATION_TOKEN='%s'\n" "${REGISTRATION_TOKEN}"
