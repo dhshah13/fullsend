@@ -19,6 +19,10 @@ func TestResolve(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "dummy", dummy.Runtime.Name())
 
+	dp, err := Resolve("dummy-playback")
+	require.NoError(t, err)
+	assert.Equal(t, "dummy-playback", dp.Runtime.Name())
+
 	oc, err := Resolve("opencode")
 	require.NoError(t, err)
 	assert.Equal(t, "opencode", oc.Runtime.Name())

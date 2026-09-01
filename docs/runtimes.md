@@ -9,6 +9,7 @@ sandbox, the credentials, and the verdict.
 | **[`claude`](runtimes/claude.md)** | Production agent runs (Claude Code) | Default |
 | **[`pi`](runtimes/pi.md)** | Second runtime, opt-in per repo — Claude, Grok and Gemini on Vertex; GPT via OpenAI WIF (wired, not yet exercised live) | Supported for `triage`, `prioritize`, `code`, `fix` |
 | `dummy` | Behaviour tests — scripted ops, no inference | Internal |
+| `dummy-playback` | Behaviour tests — replays canned agent results from a playlist, no inference | Internal |
 | `opencode` | Not yet functional | Stub |
 
 Pick one with `runtime:` in `.fullsend/config.yaml`, or per run with `--runtime`.
@@ -189,6 +190,8 @@ that segment (`xai/grok-4.6`), since that is the wire id.
 ## Harness config keys per runtime
 
 Harness keys are runtime-neutral in YAML; each runtime owns the translation.
+Test-only runtimes (`dummy`, `dummy-playback`) ignore all harness config keys
+and are omitted from this table.
 
 | Harness key | Claude Code | pi |
 |---|---|---|

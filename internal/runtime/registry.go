@@ -18,6 +18,10 @@ func Resolve(name string) (Backend, error) {
 		// Selected only via explicit per-repo/org config (behaviour test orgs).
 		r := DummyRuntime{}
 		return Backend{Runtime: r, Transcripts: r}, nil
+	case "dummy-playback":
+		// Replays canned results from a playlist (behaviour test orgs).
+		r := DummyPlaybackRuntime{}
+		return Backend{Runtime: r, Transcripts: r}, nil
 	case "opencode":
 		r := OpenCodeRuntime{}
 		return Backend{Runtime: r, Transcripts: r}, nil
