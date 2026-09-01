@@ -46,20 +46,18 @@ var reconcileNewJiraTrackerClient = func(baseURL, token, email string) (tracker.
 
 func newReconcileStatusCmd() *cobra.Command {
 	var (
-		repo           string
-		number         int
-		runID          string
-		runURL         string
-		sha            string
-		reason         string
-		mintURL        string
-		role           string
-		forgeFlag      string
-		fullsendDir    string
-		jobStatus      string
-		wasSkipped     bool
-		trackerSource  string
-		trackerProject string
+		repo        string
+		number      int
+		runID       string
+		runURL      string
+		sha         string
+		reason      string
+		mintURL     string
+		role        string
+		forgeFlag   string
+		fullsendDir string
+		jobStatus   string
+		wasSkipped  bool
 	)
 
 	cmd := &cobra.Command{
@@ -82,17 +80,37 @@ finalized, this is a no-op.`,
 			var tc tracker.Client
 			var project string
 
-			// Event-source routing (ADR 0093): when the event came from
-			// Jira, construct a Jira tracker client instead of wrapping
-			// a forge client.
+			// Event-source routing (ADR 0093): read the normalized
+			// event from the same sources as fullsend run—the on-disk
+			// dispatch payload or GITHUB_EVENT_PATH—to determine the
+			// tracker destination. When the event originated from
+			// Jira, construct a Jira tracker client instead of
+			// wrapping a forge client.
+			var trackerSource string
+			eventMap := extractNormalizedEventFromDispatch(fullsendDir)
+			if eventMap != nil {
+				trackerSource = extractMapString(eventMap, "source", "system")
+				if trackerSource == "jira" {
+					if key := extractMapString(eventMap, "entity", "key"); key != "" {
+						if proj, num, ok := parseJiraKey(key); ok {
+							project = proj
+							number = num
+						}
+					}
+				}
+			}
+
 			if trackerSource == "jira" {
+				if project == "" {
+					return fmt.Errorf("Jira event detected but could not derive project key from entity.key in normalized event")
+				}
 				baseURL := os.Getenv("JIRA_BASE_URL")
 				if baseURL == "" {
-					return fmt.Errorf("JIRA_BASE_URL required when --tracker-source is jira")
+					return fmt.Errorf("JIRA_BASE_URL required for Jira event-source routing")
 				}
 				token := os.Getenv("JIRA_TOKEN")
 				if token == "" {
-					return fmt.Errorf("JIRA_TOKEN required when --tracker-source is jira")
+					return fmt.Errorf("JIRA_TOKEN required for Jira event-source routing")
 				}
 				email := os.Getenv("JIRA_USER_EMAIL")
 				var jErr error
@@ -100,7 +118,6 @@ finalized, this is a no-op.`,
 				if jErr != nil {
 					return fmt.Errorf("creating Jira tracker client: %w", jErr)
 				}
-				project = trackerProject
 			} else {
 				parts := strings.SplitN(repo, "/", 2)
 				if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -166,7 +183,7 @@ finalized, this is a no-op.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&repo, "repo", "", "repository in owner/repo format (required for GitHub/GitLab; unused when --tracker-source is jira)")
+	cmd.Flags().StringVar(&repo, "repo", "", "repository in owner/repo format (required for GitHub/GitLab)")
 	cmd.Flags().IntVar(&number, "number", 0, "issue or pull request number (required)")
 	cmd.Flags().StringVar(&runID, "run-id", "", "workflow run ID used in the status comment marker (required)")
 	cmd.Flags().StringVar(&runURL, "run-url", "", "URL to the workflow run (optional)")
@@ -175,11 +192,9 @@ finalized, this is a no-op.`,
 	cmd.Flags().StringVar(&mintURL, "mint-url", "", "mint service URL for on-demand token (default: $FULLSEND_MINT_URL)")
 	cmd.Flags().StringVar(&role, "role", "", "agent role for minting (required with --mint-url)")
 	cmd.Flags().StringVar(&forgeFlag, "forge", "", `forge platform (e.g. "github", "gitlab"); auto-detected from CI env vars when omitted`)
-	cmd.Flags().StringVar(&fullsendDir, "fullsend-dir", "", "path to fullsend config directory (used to detect completion mode for orphan synthesis)")
+	cmd.Flags().StringVar(&fullsendDir, "fullsend-dir", "", "path to fullsend config directory (used to detect completion mode and read normalized event for tracker routing)")
 	cmd.Flags().StringVar(&jobStatus, "job-status", "", "job outcome from the CI runner (e.g. success, failure, cancelled)")
 	cmd.Flags().BoolVar(&wasSkipped, "was-skipped", false, "whether the pre-script decided to skip the run (forces synthesis under on_failure even when --job-status is success)")
-	cmd.Flags().StringVar(&trackerSource, "tracker-source", "", `event source system (e.g. "jira"); when set to "jira", uses Jira client instead of forge client`)
-	cmd.Flags().StringVar(&trackerProject, "tracker-project", "", `Jira project key (e.g. "PROJ"); required when --tracker-source is jira`)
 	_ = cmd.MarkFlagRequired("number")
 	_ = cmd.MarkFlagRequired("run-id")
 

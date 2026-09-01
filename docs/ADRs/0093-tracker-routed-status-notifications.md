@@ -114,9 +114,10 @@ Callers determine the tracker adapter based on the event source:
 
 The `ClientFactory` in the GitHub path returns
 `tracker.NewForgeClient(gh.New(mintedToken))` so each token refresh
-produces a tracker-wrapped client. The plumbing for reading the event
-source from the normalized event and dynamically selecting the tracker
-adapter is a follow-on; the interface is ready for it.
+produces a tracker-wrapped client. Both `fullsend run` and
+`reconcile-status` read the normalized event from the on-disk dispatch
+payload or `GITHUB_EVENT_PATH` and derive the tracker adapter from
+`source.system` and the Jira project/number from `entity.key`.
 
 ### Interface changes
 
@@ -158,8 +159,13 @@ adapter is a follow-on; the interface is ready for it.
 
 - Accepts `tracker.Client` and `(project, number)` instead of
   `forge.Client` and `(owner, repo, number)`.
-- The `reconcile-status` CLI command wraps its forge client in
-  `tracker.NewForgeClient()` before calling `ReconcileOrphaned`.
+- The `reconcile-status` CLI command reads the normalized event from
+  the same sources as `fullsend run` (on-disk dispatch payload or
+  `GITHUB_EVENT_PATH`) to determine the tracker destination. For
+  GitHub/GitLab events it wraps the forge client in
+  `tracker.NewForgeClient()`; for Jira events it constructs a
+  `tracker.JiraClient` using the Jira credentials from environment
+  variables.
 
 ## Consequences
 
