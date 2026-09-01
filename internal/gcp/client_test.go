@@ -574,6 +574,43 @@ func TestDoRequest_RetriesTransientStatusCodes(t *testing.T) {
 	}
 }
 
+func TestDoRequest_DoesNotRetryNonIdempotentOnStatusCode(t *testing.T) {
+	t.Parallel()
+
+	nonIdempotent := []string{http.MethodPost, http.MethodPatch}
+	retryableCodes := []int{
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	}
+
+	for _, method := range nonIdempotent {
+		for _, code := range retryableCodes {
+			t.Run(fmt.Sprintf("%s %d", method, code), func(t *testing.T) {
+				t.Parallel()
+				var calls atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					calls.Add(1)
+					w.WriteHeader(code)
+				}))
+				defer srv.Close()
+
+				c := NewClient()
+				c.tokenFunc = func(_ context.Context) (string, error) { return "test-token", nil }
+				c.retryDelayFn = func(_ int) time.Duration { return 0 }
+
+				resp, err := c.DoRequest(context.Background(), method, srv.URL+"/test", `{"key":"value"}`)
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				assert.Equal(t, code, resp.StatusCode)
+				assert.Equal(t, int32(1), calls.Load(),
+					"%s should not retry %d (non-idempotent)", method, code)
+			})
+		}
+	}
+}
+
 func TestDoRequest_RetryPreservesRequestBody(t *testing.T) {
 	t.Parallel()
 
@@ -596,7 +633,9 @@ func TestDoRequest_RetryPreservesRequestBody(t *testing.T) {
 	c.tokenFunc = func(_ context.Context) (string, error) { return "test-token", nil }
 	c.retryDelayFn = func(_ int) time.Duration { return 0 }
 
-	resp, err := c.DoRequest(context.Background(), http.MethodPost, srv.URL+"/test", `{"key":"value"}`)
+	// Use PUT (idempotent) — non-idempotent methods like POST are not
+	// retried on 5xx status codes to avoid duplicating side effects.
+	resp, err := c.DoRequest(context.Background(), http.MethodPut, srv.URL+"/test", `{"key":"value"}`)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)

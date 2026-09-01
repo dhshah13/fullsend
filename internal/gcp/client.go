@@ -108,12 +108,18 @@ func (c *Client) adcToken(ctx context.Context) (string, error) {
 }
 
 // DoRequest creates and executes an authenticated HTTP request.
-// It retries on retryable HTTP status codes (500, 502, 503, 504) using
-// exponential backoff with jitter. Transient transport errors (connection
-// resets, timeouts, unexpected EOF) are only retried for idempotent HTTP
-// methods (GET, HEAD, PUT, DELETE) to avoid duplicating side effects for
-// non-idempotent requests where the server may have processed the request
-// before the connection was lost.
+// It retries transient failures using exponential backoff with jitter,
+// but only for idempotent HTTP methods (GET, HEAD, PUT, DELETE) to
+// avoid duplicating side effects for non-idempotent requests.
+//
+// Retryable conditions (idempotent methods only):
+//   - HTTP status codes 500, 502, 503, 504
+//   - Transport errors: connection resets, timeouts, unexpected EOF
+//
+// Non-idempotent methods (POST, PATCH) are never retried because the
+// server may have processed the request before returning the error or
+// dropping the connection. For example, retrying AddSecretVersion (POST)
+// after a 500 could create a duplicate secret version.
 //
 // HTTP 429 is not retried here; callers that need 429 retry (e.g.
 // doWIFRequestWithRetry) handle it at a higher level with their own
@@ -163,7 +169,10 @@ func (c *Client) DoRequest(ctx context.Context, method, url, body string) (*http
 		}
 
 		// Retryable HTTP status code (500, 502, 503, 504).
-		if attempt < maxRetries && isRetryableStatusCode(resp.StatusCode) {
+		// Like transport errors, only retry idempotent methods to avoid
+		// duplicating side effects (e.g. AddSecretVersion POST → 500
+		// after the version was created would create a duplicate on retry).
+		if attempt < maxRetries && isIdempotentMethod(method) && isRetryableStatusCode(resp.StatusCode) {
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
 			select {
