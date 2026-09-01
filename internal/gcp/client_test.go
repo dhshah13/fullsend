@@ -449,6 +449,33 @@ func TestDoRequest_RetriesTransientTransportErrors(t *testing.T) {
 		require.Error(t, err)
 		assert.Equal(t, int32(1), transport.totalCalls.Load(), "should not retry non-retryable error")
 	})
+
+	t.Run("does not retry non-idempotent method on transport error", func(t *testing.T) {
+		t.Parallel()
+
+		nonIdempotent := []string{http.MethodPost, http.MethodPatch}
+		for _, method := range nonIdempotent {
+			t.Run(method, func(t *testing.T) {
+				t.Parallel()
+				transport := &retryTestTransport{
+					errCount: 3,
+					err:      fmt.Errorf("read tcp: read: %w", syscall.ECONNRESET),
+					inner:    http.DefaultTransport,
+				}
+
+				c := NewClient()
+				c.tokenFunc = func(_ context.Context) (string, error) { return "test-token", nil }
+				c.httpClient = &http.Client{Transport: transport}
+				c.retryDelayFn = func(_ int) time.Duration { return 0 }
+
+				_, err := c.DoRequest(context.Background(), method, "http://localhost/test", "")
+				require.Error(t, err)
+				assert.ErrorIs(t, err, syscall.ECONNRESET)
+				assert.Equal(t, int32(1), transport.totalCalls.Load(),
+					"%s should not retry transport errors (non-idempotent)", method)
+			})
+		}
+	})
 }
 
 func TestDoRequest_RetriesTransientStatusCodes(t *testing.T) {
@@ -648,6 +675,16 @@ func TestIsRetryableTransportError(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestIsIdempotentMethod(t *testing.T) {
+	t.Parallel()
+	assert.True(t, isIdempotentMethod(http.MethodGet))
+	assert.True(t, isIdempotentMethod(http.MethodHead))
+	assert.True(t, isIdempotentMethod(http.MethodPut))
+	assert.True(t, isIdempotentMethod(http.MethodDelete))
+	assert.False(t, isIdempotentMethod(http.MethodPost))
+	assert.False(t, isIdempotentMethod(http.MethodPatch))
 }
 
 func TestIsRetryableStatusCode(t *testing.T) {

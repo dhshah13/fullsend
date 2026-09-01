@@ -108,11 +108,16 @@ func (c *Client) adcToken(ctx context.Context) (string, error) {
 }
 
 // DoRequest creates and executes an authenticated HTTP request.
-// It retries on transient transport errors (connection resets, timeouts,
-// unexpected EOF) and retryable HTTP status codes (500, 502, 503, 504)
-// using exponential backoff with jitter. HTTP 429 is not retried here;
-// callers that need 429 retry (e.g. doWIFRequestWithRetry) handle it
-// at a higher level with their own backoff strategy.
+// It retries on retryable HTTP status codes (500, 502, 503, 504) using
+// exponential backoff with jitter. Transient transport errors (connection
+// resets, timeouts, unexpected EOF) are only retried for idempotent HTTP
+// methods (GET, HEAD, PUT, DELETE) to avoid duplicating side effects for
+// non-idempotent requests where the server may have processed the request
+// before the connection was lost.
+//
+// HTTP 429 is not retried here; callers that need 429 retry (e.g.
+// doWIFRequestWithRetry) handle it at a higher level with their own
+// backoff strategy.
 func (c *Client) DoRequest(ctx context.Context, method, url, body string) (*http.Response, error) {
 	token, err := c.AccessToken(ctx)
 	if err != nil {
@@ -141,8 +146,12 @@ func (c *Client) DoRequest(ctx context.Context, method, url, body string) (*http
 		resp, doErr := c.httpClient.Do(req)
 
 		// Transport-level error (connection reset, timeout, EOF, etc.).
+		// Only retry idempotent methods — for non-idempotent requests the
+		// server may have processed the request before the connection was
+		// lost, and retrying could duplicate side effects (e.g. creating
+		// an extra secret version via AddSecretVersion).
 		if doErr != nil {
-			if attempt < maxRetries && isRetryableTransportError(ctx, doErr) {
+			if attempt < maxRetries && isIdempotentMethod(method) && isRetryableTransportError(ctx, doErr) {
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -230,6 +239,14 @@ func isRetryableTransportError(ctx context.Context, err error) bool {
 		return true
 	}
 	return false
+}
+
+// isIdempotentMethod reports whether an HTTP method is idempotent —
+// safe to retry without risk of duplicating side effects. Follows the
+// same convention as internal/forge/gitlab and internal/forge/jira.
+func isIdempotentMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead ||
+		method == http.MethodPut || method == http.MethodDelete
 }
 
 // isRetryableStatusCode reports whether an HTTP status code represents
