@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -43,15 +44,21 @@ func warnRepoSkillCollisions(repoDir string, harnessSkillDirs []string, printer 
 }
 
 func isReadableSkillMarker(skillDir string) bool {
-	marker := filepath.Join(skillDir, "SKILL.md")
-	info, err := os.Stat(marker)
-	if err != nil || !info.Mode().IsRegular() {
-		return false
+	return isReadableSkillMarkerFS(os.DirFS(skillDir))
+}
+
+func isReadableSkillMarkerFS(skillFS fs.FS) bool {
+	for _, marker := range skillMarkerNames {
+		info, err := fs.Stat(skillFS, marker)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		file, err := skillFS.Open(marker)
+		if err != nil {
+			continue
+		}
+		_ = file.Close()
+		return true
 	}
-	file, err := os.Open(marker)
-	if err != nil {
-		return false
-	}
-	_ = file.Close()
-	return true
+	return false
 }

@@ -9,6 +9,8 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/security"
 )
 
+var skillMarkerNames = [...]string{"SKILL.md", "skill.md", "Skill.md"}
+
 // scanRuntimeContent runs InputPipeline on agent definition, SKILL.md files, and plugin JSON.
 func scanRuntimeContent(input runtime.BootstrapInput, failClosed bool) error {
 	agentPath := input.AgentPath()
@@ -72,7 +74,7 @@ func scanAgentFile(pipeline *security.Pipeline, agentPath string, failClosed boo
 
 func scanSkillDir(pipeline *security.Pipeline, skillPath string, failClosed bool) error {
 	var skillContent []byte
-	for _, name := range []string{"SKILL.md", "skill.md", "Skill.md"} {
+	for _, name := range skillMarkerNames {
 		if c, err := os.ReadFile(filepath.Join(skillPath, name)); err == nil {
 			skillContent = c
 			break

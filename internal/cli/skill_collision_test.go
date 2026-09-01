@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/fstest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +29,18 @@ func TestWarnRepoSkillCollisions_WarnsForShadowedSkill(t *testing.T) {
 	assert.Contains(t, output.String(), `Repo skill "code-review" is shadowed by a harness skill of the same name`)
 	assert.Contains(t, output.String(), "use a unique skill name to extend it")
 	assert.Contains(t, output.String(), "base: harness composition to override it")
+}
+
+func TestIsReadableSkillMarkerFS_AcceptsSupportedCasing(t *testing.T) {
+	for _, marker := range []string{"SKILL.md", "skill.md", "Skill.md"} {
+		t.Run(marker, func(t *testing.T) {
+			skillFS := fstest.MapFS{
+				marker: &fstest.MapFile{Data: []byte("# Skill")},
+			}
+
+			assert.True(t, isReadableSkillMarkerFS(skillFS))
+		})
+	}
 }
 
 func TestWarnRepoSkillCollisions_DoesNotWarnWithoutCollision(t *testing.T) {
