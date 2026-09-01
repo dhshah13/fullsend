@@ -534,20 +534,14 @@ stages:
 
         # Reuse BOT_USER_ID from bot identity verification if available
         # (api-triggered pipelines); otherwise resolve from the forge token.
-        # Also extract bot username for TRIGGER_SOURCE and GIT_BOT_EMAIL.
+        # Bot username for TRIGGER_SOURCE uses _BOT_USERNAME from the
+        # shared code|fix|review block above.
         BOT_ID="${BOT_USER_ID:-}"
-        _FIX_BOT_USERNAME=""
-        if [ -n "${BOT_RESPONSE:-}" ]; then
-          _FIX_BOT_USERNAME=$(printf '%s' "${BOT_RESPONSE}" | jq -r '.username // empty')
-        fi
         if [ -z "${BOT_ID}" ]; then
           if BOT_RESP=$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors \
             "${CI_API_V4_URL}/user" \
             -H "PRIVATE-TOKEN: ${FULLSEND_FORGE_TOKEN}"); then
             BOT_ID=$(printf '%s' "${BOT_RESP}" | jq -r '.id // empty')
-            if [ -z "${_FIX_BOT_USERNAME}" ]; then
-              _FIX_BOT_USERNAME=$(printf '%s' "${BOT_RESP}" | jq -r '.username // empty')
-            fi
           fi
         fi
 
@@ -652,7 +646,7 @@ stages:
         if [ "${PIPELINE_SOURCE}" = "api" ] && [ -n "${EVENT_PAYLOAD_B64:-}" ]; then
           if [ "${_IS_BOT_TRIGGER}" = "true" ]; then
             # Bot-triggered — use cached bot username.
-            TRIGGER_SOURCE="${_FIX_BOT_USERNAME}"
+            TRIGGER_SOURCE="${_BOT_USERNAME}"
             if [ -z "${TRIGGER_SOURCE}" ]; then
               echo "WARNING: Bot-triggered but could not resolve bot username for TRIGGER_SOURCE"
             fi

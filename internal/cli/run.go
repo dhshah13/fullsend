@@ -805,7 +805,6 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	var minted bool
 	var mintCleanup func()
 	if forgePlatform == "gitlab" {
-		minted = false
 		mintCleanup = func() {}
 	} else {
 		var mintErr error
