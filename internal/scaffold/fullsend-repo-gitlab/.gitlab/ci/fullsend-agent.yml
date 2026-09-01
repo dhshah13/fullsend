@@ -529,7 +529,7 @@ stages:
       # size and non-empty for bot-triggered runs, and exports
       # REVIEW_BODY_FILE for the harness.
       if [ "${STAGE}" = "fix" ]; then
-        MR_IID="${CI_MERGE_REQUEST_IID:-${STATUS_IID:-0}}"
+        # MR_IID is already set by the shared code|fix|review block above.
         REVIEW_BODY_FILE=$(mktemp)
 
         # Reuse BOT_USER_ID from bot identity verification if available
@@ -542,6 +542,12 @@ stages:
             "${CI_API_V4_URL}/user" \
             -H "PRIVATE-TOKEN: ${FULLSEND_FORGE_TOKEN}"); then
             BOT_ID=$(printf '%s' "${BOT_RESP}" | jq -r '.id // empty')
+            # If the shared block's /user curl failed transiently,
+            # _BOT_USERNAME may still be empty — populate it now so
+            # TRIGGER_SOURCE resolves correctly.
+            if [ -z "${_BOT_USERNAME}" ]; then
+              _BOT_USERNAME=$(printf '%s' "${BOT_RESP}" | jq -r '.username // empty')
+            fi
           fi
         fi
 

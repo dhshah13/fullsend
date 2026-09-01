@@ -759,6 +759,13 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// reusable workflow (setup-agent-env.sh); on GitLab the scaffold has
 	// no equivalent, so run.go must provide them (forge-agnostic). #6865.
 	//
+	// NOTE: os.Setenv is not goroutine-safe. This is acceptable because
+	// runAgent is only called from the single-threaded CLI path — the
+	// fullsend binary never runs multiple agents concurrently within a
+	// single process. If that invariant changes, these calls must move
+	// behind a sync guard or be replaced with an env-passing mechanism
+	// that avoids mutating the process environment.
+	//
 	// Save original values and restore on return so tests that don't
 	// t.Setenv these vars aren't affected by leaked values (#6874).
 	flagEnvOriginals := make(map[string]string)
