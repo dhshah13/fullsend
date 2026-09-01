@@ -1096,8 +1096,8 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		printer.KeyValue("Effort", withSource(h.Effort, overrides.effortSource))
 	}
 	if len(overrides.fallbackModels) > 0 {
-		// Show the chain as the runtime will pass it: aliased entries are
-		// remapped by models.aliases (claude.go), so echo the same ids.
+		// Aliased entries are remapped by models.aliases at Run (claude.go),
+		// so show each one as "alias → id"; literal ids print as written.
 		fallbacks := make([]string, len(overrides.fallbackModels))
 		for i, fb := range overrides.fallbackModels {
 			if id, ok := configModelAliases[fb]; ok {

@@ -41,7 +41,8 @@ func TestRunAgent_ModelsAliases_UnknownKeyFailsBeforeSandbox(t *testing.T) {
 }
 
 // A remapped alias is echoed with both its own source and the config
-// remap, and the run proceeds to the sandbox with the resolved id.
+// remap, and the run reaches sandbox creation (the runtime applies the
+// resolved id at Run; that is covered in claude_test.go / pi_run_test.go).
 func TestRunAgent_ModelsAliases_RemapIsEchoedAndReachesSandbox(t *testing.T) {
 	usePreScriptStub(t)
 	dir := newSkipHarnessDir(t, "")
@@ -55,10 +56,28 @@ func TestRunAgent_ModelsAliases_RemapIsEchoedAndReachesSandbox(t *testing.T) {
 	assert.Contains(t, err.Error(), "creating sandbox", "validation passed; the run reached sandbox creation")
 
 	out := buf.String()
-	assert.Contains(t, out, "sonnet", "plan block names the alias")
-	assert.Contains(t, out, "→ claude-sonnet-5", "plan block shows the remap target")
-	assert.Contains(t, out, "models.aliases", "plan block names the config source")
-	assert.Contains(t, out, "--model flag", "the alias's own source is kept, not replaced by the remap")
+	// KeyValue styles only the key, so the value is a stable substring:
+	// the alias name and its own source come first, then the remap.
+	assert.Contains(t, out, "sonnet (from --model flag) → claude-sonnet-5 (from "+filepath.Join(dir, "config.yaml")+" models.aliases)",
+		"plan block keeps the alias and its source, then shows the remap")
+}
+
+// Aliased entries in the fallback chain are echoed remapped, the way
+// buildRunCommand passes them; a literal id stays as written.
+func TestRunAgent_ModelsAliases_FallbackChainEchoedRemapped(t *testing.T) {
+	usePreScriptStub(t)
+	t.Setenv("FULLSEND_FALLBACK_MODELS", "sonnet,claude-opus-4-6")
+	dir := newSkipHarnessDir(t, "")
+	writeModelsAliasesConfig(t, dir, "    sonnet: claude-sonnet-5\n")
+
+	var buf bytes.Buffer
+	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
+	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "", rFlags,
+		statusOpts{}, ui.New(&buf), false, runOverrideFlags{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creating sandbox")
+	assert.Contains(t, buf.String(), "sonnet → claude-sonnet-5, claude-opus-4-6 (from FULLSEND_FALLBACK_MODELS)",
+		"aliased fallback entry is shown remapped, literal id as written")
 }
 
 // An alias that is not remapped keeps the pre-#6882 plan line exactly.

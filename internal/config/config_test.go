@@ -2835,6 +2835,18 @@ func TestModelsAliases_AliasNameAsValueRejected(t *testing.T) {
 	err = cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "is an alias name")
+
+	// …and it looks at the id segment of a provider/id spec: pi passes a
+	// "/" value straight through, so "anthropic-vertex/opus" would send the
+	// wire id "opus".
+	cfg.Models.Aliases["sonnet"] = "anthropic-vertex/opus"
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is an alias name")
+
+	// A real id whose segment merely contains an alias name is fine.
+	cfg.Models.Aliases["sonnet"] = "anthropic-vertex/claude-opus-4-6"
+	require.NoError(t, cfg.Validate())
 }
 
 func TestModelsAliases_ValidateSeesBaseLayer(t *testing.T) {
