@@ -188,11 +188,14 @@ debouncedWatch(
       searchOpts.filter = (r: SearchResult) => matchesActiveScopes(r.id, scopeList, active);
     }
 
-    let searchResults = index.search(query, searchOpts).slice(0, 16) as (SearchResult & Result)[];
-
     // Post-filter for exact phrase matches when the query contained quotes.
     // Uses the stored text from the search index — no async page rendering needed.
-    searchResults = filterByPhrases(searchResults, phrases);
+    // Phrase filtering runs before the display cap so exact-phrase matches beyond
+    // rank 16 are not silently discarded.
+    let searchResults = filterByPhrases(
+      index.search(query, searchOpts) as (SearchResult & Result)[],
+      phrases,
+    ).slice(0, 16);
 
     results.value = searchResults;
     enableNoResults.value = true;
