@@ -810,6 +810,49 @@ func TestReusableDispatchPRHeadSHAPassthrough(t *testing.T) {
 	})
 }
 
+// TestWorkItemKeyEnvCompatibility validates that legacy code dispatch and the
+// common harness-dispatch path expose the forge-neutral key alongside the
+// backwards-compatible GitHub issue number (#6760).
+func TestWorkItemKeyEnvCompatibility(t *testing.T) {
+	t.Run("legacy reusable code", func(t *testing.T) {
+		content := string(loadRepoFile(".github/workflows/reusable-code.yml")(t))
+		section := extractStepSection(t, content, "Run code agent")
+		assert.Contains(t, section,
+			"FULLSEND_WORK_ITEM_URL: ${{ fromJSON(inputs.event_payload).issue.html_url }}")
+		assert.Contains(t, section,
+			"FULLSEND_WORK_ITEM_KEY: ${{ fromJSON(inputs.event_payload).issue.number }}")
+		assert.Contains(t, section,
+			"ISSUE_NUMBER: ${{ fromJSON(inputs.event_payload).issue.number }}")
+	})
+
+	t.Run("route based code", func(t *testing.T) {
+		content := string(loadRepoFile(".github/workflows/reusable-dispatch.yml")(t))
+		section := extractStepSection(t, content, "Run code agent")
+		assert.Contains(t, section,
+			"FULLSEND_WORK_ITEM_KEY: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}")
+		assert.Contains(t, section,
+			"ISSUE_NUMBER: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}")
+	})
+
+	t.Run("harness dispatch", func(t *testing.T) {
+		content := string(loadRepoFile(".github/workflows/reusable-dispatch.yml")(t))
+		exportSection := extractStepSection(t, content, "Export dispatch context env")
+		assert.Contains(t, exportSection,
+			`._normalized_event.entity.key // .issue.number // .pull_request.number // empty`)
+		assert.Contains(t, exportSection,
+			`if ._normalized_event.source.system == "jira" then empty`)
+		assert.Contains(t, exportSection, `echo "work_item_key<<${DELIM}"`)
+		assert.Contains(t, exportSection, `printf '%s' "${WORK_ITEM_KEY}"`)
+		assert.NotContains(t, exportSection, `echo "work_item_key=${WORK_ITEM_KEY}"`)
+
+		runSection := extractStepSection(t, content, "Run harness agent")
+		assert.Contains(t, runSection,
+			"FULLSEND_WORK_ITEM_KEY: ${{ steps.dispatch-env.outputs.work_item_key }}")
+		assert.Contains(t, runSection,
+			"ISSUE_NUMBER: ${{ steps.dispatch-env.outputs.issue_number }}")
+	})
+}
+
 // TestReusableDispatchStatusCommentPassthrough validates that all agent jobs in
 // reusable-dispatch.yml pass run-url, status-repo, and status-number to the
 // action, enabling status comments for every stage (#6397).
@@ -1133,6 +1176,30 @@ func TestOpenAIVariableForwarding(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestHarnessRunResolvesBotIdentity validates that the common matrix path
+// exports the app-derived commit identity before it configures and runs an
+// agent (#6762). Harnesses intentionally require this identity so commits are
+// associated with the GitHub App, including for DCO checks.
+func TestHarnessRunResolvesBotIdentity(t *testing.T) {
+	content := string(loadRepoFile(".github/workflows/reusable-dispatch.yml")(t))
+	harnessStart := strings.Index(content, "  harness-run:\n")
+	require.NotEqual(t, -1, harnessStart, "reusable-dispatch.yml must define harness-run")
+	harnessJob := content[harnessStart:]
+
+	identity := extractStepSection(t, harnessJob, "Resolve bot identity")
+	assert.Contains(t, identity, "GH_TOKEN: ${{ steps.app-token.outputs.token }}")
+	assert.Contains(t, identity, "viewer { login databaseId }")
+	assert.Contains(t, identity, `GIT_BOT_EMAIL="${BOT_USER_ID}+${BOT_LOGIN}@users.noreply.github.com"`)
+	assert.Contains(t, identity, `echo "GIT_BOT_EMAIL=${GIT_BOT_EMAIL}" >> "${GITHUB_ENV}"`)
+	assert.Contains(t, identity, `git config --global user.email "${GIT_BOT_EMAIL}"`)
+	assert.Contains(t, identity, `git config --global user.name "${BOT_LOGIN}"`)
+
+	identityIndex := strings.Index(harnessJob, "      - name: Resolve bot identity\n")
+	setupIndex := strings.Index(harnessJob, "      - name: Setup agent environment\n")
+	require.NotEqual(t, -1, setupIndex, "harness-run must set up the agent environment")
+	assert.Less(t, identityIndex, setupIndex, "harness-run must resolve identity before agent environment setup")
 }
 
 // TestLayeredDirsMatchWorkspacePreparation pins the LAYERED_DIRS list in

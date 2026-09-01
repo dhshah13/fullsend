@@ -99,7 +99,8 @@ func newAgentUpdateCmd() *cobra.Command {
 		Use:   "update <name> [sha]",
 		Short: "Update a URL agent to a new commit SHA",
 		Long: `Re-pin a URL-based agent to a new commit SHA and recompute the
-integrity hash. If no SHA is provided, the default branch HEAD is used.
+integrity hash. If no SHA is provided, the branch ref stored at adoption
+time is re-resolved; if no ref was stored, the default branch HEAD is used.
 
 Only URL agents can be updated — local path agents have nothing to pin.`,
 		Args: cobra.RangeArgs(1, 2),
@@ -253,11 +254,12 @@ func runAgentAdd(ctx context.Context, source, name, fullsendDir string, forgeCli
 	var entry config.AgentEntry
 
 	if urlutil.IsURL(source) {
-		pinnedSource, err := pinAgentURL(ctx, source, forgeClient, printer)
+		pinnedSource, originalRef, err := pinAgentURL(ctx, source, forgeClient, printer)
 		if err != nil {
 			return err
 		}
 		entry.Source = pinnedSource
+		entry.Ref = originalRef
 
 		prefix := allowlistPrefixForURL(pinnedSource)
 		if prefix != "" {
@@ -400,12 +402,19 @@ func runAgentUpdate(ctx context.Context, agentName, explicitSHA, fullsendDir str
 		if forgeClient == nil {
 			return fmt.Errorf("URL agents require a forge client for branch resolution")
 		}
-		repo, err := forgeClient.GetRepo(ctx, info.Owner, info.Repo)
-		if err != nil {
-			return fmt.Errorf("looking up repo %s/%s: %w", info.Owner, info.Repo, err)
+		// Use the stored ref from adoption when available; fall back to
+		// the repo's default branch for backward compatibility with
+		// entries that predate the Ref field.
+		branch := entry.Ref
+		if branch == "" {
+			repo, err := forgeClient.GetRepo(ctx, info.Owner, info.Repo)
+			if err != nil {
+				return fmt.Errorf("looking up repo %s/%s: %w", info.Owner, info.Repo, err)
+			}
+			branch = repo.DefaultBranch
 		}
-		printer.StepStart(fmt.Sprintf("Resolving %s/%s@%s", info.Owner, info.Repo, repo.DefaultBranch))
-		newSHA, err = forgeClient.GetBranchRef(ctx, info.Owner, info.Repo, repo.DefaultBranch)
+		printer.StepStart(fmt.Sprintf("Resolving %s/%s@%s", info.Owner, info.Repo, branch))
+		newSHA, err = forgeClient.GetBranchRef(ctx, info.Owner, info.Repo, branch)
 		if err != nil {
 			return fmt.Errorf("resolving branch ref: %w", err)
 		}
@@ -513,12 +522,15 @@ func isGitHubURL(rawURL string) bool {
 	return strings.Contains(rawURL, "github.com/") || strings.Contains(rawURL, "raw.githubusercontent.com/")
 }
 
-func pinAgentURL(ctx context.Context, source string, forgeClient forge.Client, printer *ui.Printer) (string, error) {
+// pinAgentURL resolves source to a SHA-pinned URL with an integrity hash.
+// It returns the pinned source URL and the original branch/tag ref that was
+// resolved (empty when the URL already contained a commit SHA).
+func pinAgentURL(ctx context.Context, source string, forgeClient forge.Client, printer *ui.Printer) (pinnedSource string, originalRef string, err error) {
 	cleanURL, existingHash, hasExistingHash := urlutil.ParseIntegrityHash(source)
 
 	info, err := parseAgentSourceURL(cleanURL)
 	if err != nil {
-		return "", fmt.Errorf("cannot parse URL %q: %w", source, err)
+		return "", "", fmt.Errorf("cannot parse URL %q: %w", source, err)
 	}
 
 	isGH := isGitHubURL(cleanURL)
@@ -526,30 +538,33 @@ func pinAgentURL(ctx context.Context, source string, forgeClient forge.Client, p
 	sha := info.Ref
 	if !commitSHAPattern.MatchString(sha) {
 		if !isGH {
-			return "", fmt.Errorf("non-GitHub URLs must use a pinned commit SHA in the path")
+			return "", "", fmt.Errorf("non-GitHub URLs must use a pinned commit SHA in the path")
 		}
 		if forgeClient == nil {
-			return "", fmt.Errorf("URL agents require a forge client for branch resolution")
+			return "", "", fmt.Errorf("URL agents require a forge client for branch resolution")
 		}
 
+		originalRef = sha
+
 		printer.StepStart(fmt.Sprintf("Resolving %s/%s@%s", info.Owner, info.Repo, sha))
-		resolvedSHA, err := forgeClient.GetBranchRef(ctx, info.Owner, info.Repo, sha)
-		if err != nil {
-			if !forge.IsNotFound(err) {
-				return "", fmt.Errorf("resolving ref %q: %w", sha, err)
+		resolvedSHA, resolveErr := forgeClient.GetBranchRef(ctx, info.Owner, info.Repo, sha)
+		if resolveErr != nil {
+			if !forge.IsNotFound(resolveErr) {
+				return "", "", fmt.Errorf("resolving ref %q: %w", sha, resolveErr)
 			}
 			repo, repoErr := forgeClient.GetRepo(ctx, info.Owner, info.Repo)
 			if repoErr != nil {
-				return "", fmt.Errorf("looking up repo for ref fallback: %w", repoErr)
+				return "", "", fmt.Errorf("looking up repo for ref fallback: %w", repoErr)
 			}
 			printer.StepInfo(fmt.Sprintf("Ref %q not found, falling back to default branch %q", info.Ref, repo.DefaultBranch))
-			resolvedSHA, err = forgeClient.GetBranchRef(ctx, info.Owner, info.Repo, repo.DefaultBranch)
-			if err != nil {
-				return "", fmt.Errorf("resolving default branch: %w", err)
+			originalRef = repo.DefaultBranch
+			resolvedSHA, resolveErr = forgeClient.GetBranchRef(ctx, info.Owner, info.Repo, repo.DefaultBranch)
+			if resolveErr != nil {
+				return "", "", fmt.Errorf("resolving default branch: %w", resolveErr)
 			}
 		}
 		if !commitSHAPattern.MatchString(resolvedSHA) {
-			return "", fmt.Errorf("resolved ref is not a valid commit SHA: %q", resolvedSHA)
+			return "", "", fmt.Errorf("resolved ref is not a valid commit SHA: %q", resolvedSHA)
 		}
 		sha = resolvedSHA
 		printer.StepDone("Resolved to " + sha[:12])
@@ -564,16 +579,16 @@ func pinAgentURL(ctx context.Context, source string, forgeClient forge.Client, p
 	content, err := fetch.FetchURL(ctx, pinnedURL, fetch.DefaultPolicy)
 	if err != nil {
 		printer.StepFail("Failed to fetch content")
-		return "", fmt.Errorf("fetching %s: %w", pinnedURL, err)
+		return "", "", fmt.Errorf("fetching %s: %w", pinnedURL, err)
 	}
 	hash := fetch.ComputeSHA256(content)
 
 	if hasExistingHash && existingHash != hash {
-		return "", fmt.Errorf("integrity hash mismatch: URL has #sha256=%s but content hashes to %s", existingHash, hash)
+		return "", "", fmt.Errorf("integrity hash mismatch: URL has #sha256=%s but content hashes to %s", existingHash, hash)
 	}
 	printer.StepDone("Integrity hash verified")
 
-	return pinnedURL + "#sha256=" + hash, nil
+	return pinnedURL + "#sha256=" + hash, originalRef, nil
 }
 
 func parseAgentSourceURL(source string) (*forge.ForgeURLInfo, error) {

@@ -410,6 +410,7 @@ func TestValidRuntimes(t *testing.T) {
 	assert.Contains(t, runtimes, "claude")
 	assert.Contains(t, runtimes, "pi")
 	assert.Contains(t, runtimes, "dummy")
+	assert.Contains(t, runtimes, "dummy-playback")
 	assert.NotContains(t, runtimes, "opencode", "opencode is resolved via runtime.Resolve() but not user-selectable until implemented")
 }
 

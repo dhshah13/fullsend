@@ -58,12 +58,12 @@ func promptRuntime(printer *ui.Printer, in io.Reader, interactive bool) (string,
 }
 
 // userRuntimeChoices lists the runtimes offered to a person: every valid
-// runtime except dummy, which exists for behaviour-test installs and is only
-// ever selected with an explicit --runtime dummy.
+// runtime except dummy and dummy-playback, which exist for behaviour-test
+// installs and are only ever selected with an explicit --runtime flag.
 func userRuntimeChoices() []string {
 	var out []string
 	for _, r := range config.ValidRuntimes() {
-		if r != "dummy" {
+		if r != "dummy" && r != "dummy-playback" {
 			out = append(out, r)
 		}
 	}

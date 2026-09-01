@@ -136,6 +136,29 @@ func TestPerRepoConfig_AgentEntries(t *testing.T) {
 	assert.Equal(t, agents, cfg.AgentEntries())
 }
 
+func TestPerRepoConfig_AgentEntries_RefSurvivesLayeredMerge(t *testing.T) {
+	// Parent defines an agent without a Ref (pre-existing entry).
+	parent := &perRepoConfig{
+		Agents: []AgentEntry{{
+			Source: "https://raw.githubusercontent.com/org/repo/abc123/harness/triage.yaml#sha256=aaa",
+			Name:   "triage",
+		}},
+	}
+	// Overlay re-declares the same agent with a Ref from adoption.
+	overlay := &perRepoConfig{
+		parent: parent,
+		Agents: []AgentEntry{{
+			Name: "triage",
+			Ref:  "release-1.0",
+		}},
+	}
+	merged := overlay.AgentEntries()
+	require.Len(t, merged, 1)
+	assert.Equal(t, "release-1.0", merged[0].Ref, "Ref from overlay must survive layered merge")
+	// Source should still come from parent since overlay didn't set it.
+	assert.Contains(t, merged[0].Source, "raw.githubusercontent.com")
+}
+
 func TestPerRepoConfig_IsKillSwitchActive(t *testing.T) {
 	tr := true
 	cfg := &perRepoConfig{KillSwitch: &tr}

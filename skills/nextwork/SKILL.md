@@ -112,7 +112,7 @@ like production dispatch: first whitespace token of the first comment line.
 | `trigger_code` | Stale `ready-to-code` / `/fs-code` / stuck Code start → `/fs-code` | Yes |
 | `trigger_review` | Stale review launch/start, or newer commits since last Review → `/fs-review` | Yes |
 | `trigger_fix` | Unresolved threads all from a review bot and launch/start is stale (or ready to run) → `/fs-fix` | Yes |
-| `needs_info_self` | `needs-info` and you're the author → provide info | Decision |
+| `needs_info_self` | `needs-info` and you're the author → provide info, then `/fs-triage` | Decision |
 | `needs_review_decision` | Manual-review labels, human unresolved threads, failed CI (`FAILURE`/`ERROR`), or `mergeStateStatus=BLOCKED` under `ready-for-merge` | Decision |
 | `ready_to_merge` | `ready-for-merge` **and** `mergeStateStatus` is `CLEAN`/`UNSTABLE`, no unresolved threads, checks settled, review not still required, not yet enqueued | Decision (never auto-merged) |
 | `fix_conflicts` | `mergeStateStatus` is `DIRTY` **or** `mergeable` is `CONFLICTING` | Decision |

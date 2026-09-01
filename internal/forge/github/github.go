@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -31,11 +32,65 @@ type LiveClient struct {
 	token     string
 	baseURL   string
 	afterFunc func(time.Duration) <-chan time.Time
+
+	// rate is the last X-RateLimit-* state seen on any response; see
+	// RateLimit. It is the primary-quota view (secondary limits can
+	// fire with remaining > 0), kept so callers can log how a shared
+	// installation token's budget drains and tell primary exhaustion
+	// from secondary throttling (#6702).
+	rateMu   sync.Mutex
+	rate     forge.RateLimit
+	rateSeen bool
 }
 
 // Compile-time interface checks.
 var _ forge.Client = (*LiveClient)(nil)
 var _ forge.GitHubExtensions = (*LiveClient)(nil)
+var _ forge.RateLimitReporter = (*LiveClient)(nil)
+
+// RateLimit returns the most recent rate-limit state observed on a
+// response from this client, and whether one has been observed yet.
+func (c *LiveClient) RateLimit() (forge.RateLimit, bool) {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	return c.rate, c.rateSeen
+}
+
+// parseRateLimit reads the X-RateLimit-* headers of one response. ok is
+// false when the response carries no X-RateLimit-Remaining (non-GitHub
+// responses from intermediaries, for example).
+func parseRateLimit(h http.Header) (forge.RateLimit, bool) {
+	remaining, err := strconv.Atoi(h.Get("X-RateLimit-Remaining"))
+	if err != nil {
+		return forge.RateLimit{}, false
+	}
+	limit, _ := strconv.Atoi(h.Get("X-RateLimit-Limit"))
+	var reset time.Time
+	if secs, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64); err == nil && secs > 0 {
+		reset = time.Unix(secs, 0)
+	}
+	return forge.RateLimit{
+		Limit:     limit,
+		Remaining: remaining,
+		Reset:     reset,
+		Resource:  h.Get("X-RateLimit-Resource"),
+		Observed:  time.Now(),
+	}, true
+}
+
+// observeRateLimit records the X-RateLimit-* headers of a response as
+// the client-wide last observation. Responses without the headers leave
+// the previous observation in place.
+func (c *LiveClient) observeRateLimit(h http.Header) {
+	rl, ok := parseRateLimit(h)
+	if !ok {
+		return
+	}
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	c.rate = rl
+	c.rateSeen = true
+}
 
 // New creates a new GitHub client with the given personal access token.
 func New(token string) *LiveClient {
@@ -192,6 +247,9 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body any) (*ht
 		}
 
 		resp, err := c.http.Do(req)
+		if err == nil {
+			c.observeRateLimit(resp.Header)
+		}
 		if err != nil {
 			// If the caller's context is done, propagate immediately
 			// — retrying is pointless when the parent has cancelled.
@@ -240,6 +298,26 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body any) (*ht
 				msg += fmt.Sprintf(", Retry-After: %s", retryAfter)
 			}
 			msg += ")"
+			// 429 and retryable 403 are rate limits by construction
+			// (isRetryable). Name the cause so IsRateLimitError matches
+			// and carry the budget the headers reported, so a caller
+			// that only has the error can still tell "rate limited"
+			// from a generic 403.
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+				msg = "rate limit: " + msg
+				// Report the budget from the response that failed —
+				// the client-wide observation may belong to another
+				// goroutine's request. A response without the headers
+				// (secondary limits may omit them) says so, and names
+				// the last observation with its age.
+				if rl, ok := parseRateLimit(resp.Header); ok {
+					msg += " [" + rl.String() + "]"
+				} else if last, seen := c.RateLimit(); seen {
+					msg += fmt.Sprintf(" [rate-limit headers absent; last seen %s, %s ago]", last, time.Since(last.Observed).Round(time.Second))
+				} else {
+					msg += " [rate-limit headers absent; no prior observation]"
+				}
+			}
 			return nil, &APIError{StatusCode: resp.StatusCode, Message: msg}
 		}
 		select {

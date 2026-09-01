@@ -104,9 +104,6 @@ Custom roles can be registered via the standalone mint's `CUSTOM_ROLE_PERMISSION
 | **review** | read | write | write | — | read | — | — | — | read |
 | **retro** | read | write | write | read | — | — | — | — | read |
 | **prioritize** | read | — | write | — | — | — | — | write | read |
-| **e2e** | write | write | write | write | — | write | write | — | read |
-
-The **e2e** role also grants: `administration` (write), `members` (write), `secrets` (write), `organization_actions_variables` (write), `organization_administration` (write). These permissions are omitted from the table above because no other role uses them.
 
 ### Mint Security Controls
 

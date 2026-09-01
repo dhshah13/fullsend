@@ -26,7 +26,8 @@ On this page:
    that ignores it installs **no** sandbox tool hooks.
 3. Fill in every column of the [security feature matrix](#security-feature-matrix)
    for the new runtime — including the cells that are "not wired"; say so
-   explicitly rather than leaving them blank.
+   explicitly rather than leaving them blank. Internal test-only runtimes
+   (e.g. `dummy`, `dummy-playback`) with no LLM interaction are exempt.
 4. Add its row to the config-key table in
    [runtimes.md](../runtimes.md#harness-config-keys-per-runtime).
 5. If the runtime's binary ships in the sandbox image, pin it the way the
@@ -36,6 +37,12 @@ On this page:
 ## Security feature matrix
 
 The sandbox is the containment boundary; everything a runtime does with hooks and tool restrictions is steering inside it ([ADR 0027](../ADRs/0027-allowed-and-disallowed-tools-for-agents.md)). Read the matrix with that picture in mind:
+
+> **Test-only runtimes (`dummy`, `dummy-playback`) are exempt from the
+> matrix tables below.** They perform no LLM interaction, install no sandbox
+> tool hooks, and have no security surface to document — the sandbox boundary
+> is their only control. This exemption applies to all three tables
+> (host-side controls, sandbox tool hooks, bootstrap and artifacts).
 
 ```mermaid
 flowchart TB
@@ -360,6 +367,51 @@ The `dummy` runtime executes a YAML script of operations inside the real sandbox
 | `assert_env` | `VAR_NAME` | Assert env var is set and non-empty in the sandbox |
 | `assert_file` | `path` | Assert file exists and is readable under the workspace |
 | `assert_json` | `path,json_path` | Assert JSON file exists and dot-path field is present and non-null (uses `jq`) |
+
+## Dummy-playback runtime
+
+The `dummy-playback` runtime replays canned agent results from an ordered
+playlist without LLM inference (behaviour tests only). It reads
+`.fullsend/results/playlist.yaml`, serves the current entry's `result.json`
+to the sandbox output directory, copies companion files, and advances the
+playlist position.
+
+### Playlist format
+
+```yaml
+current: 1          # 1-indexed position; the runtime serves results[current-1]
+results:
+  - triage/round-1  # directory name under .fullsend/results/
+  - code/round-1
+  - review/round-1
+```
+
+Each entry names a subdirectory of `.fullsend/results/`. The subdirectory must
+contain a `result.json` (the agent result to replay). Any other files are
+treated as companion files:
+
+- Files under a `repo/` subdirectory are placed relative to the target repo
+  checkout inside the sandbox, simulating code changes the agent would have
+  made.
+- All other files are placed relative to the sandbox workspace root.
+
+### Playback comment tracking
+
+When a `.fullsend/playback-comment-url` file exists, the runtime reads the
+current playlist position from a forge comment (via `gh api` or `glab api`)
+instead of the local `playlist.yaml`. After serving a result, it updates the
+comment with the new position. The file format is `<cli>\n<api-path>` (e.g.
+`gh\n/repos/owner/repo/issues/comments/123`). Legacy single-line files
+default to `gh`.
+
+### Security
+
+- Path traversal: entry names are validated to stay within the results
+  directory.
+- Argument injection: the `playback-comment-url` API path must start with `/`
+  to prevent flag injection into `gh`/`glab` CLI calls.
+- Context propagation: forge API calls use `context.WithTimeout` to prevent
+  indefinite blocking.
 
 ## pi runtime internals (#6464)
 

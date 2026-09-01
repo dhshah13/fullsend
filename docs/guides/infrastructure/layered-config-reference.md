@@ -92,8 +92,12 @@ the overlay → base → code defaults chain.
 
 ### Per-agent `runtime`, `model`, `effort` on `agents:` entries
 
-An `agents:` entry may set `runtime`, `model` and `effort` for that agent. An
-enabled entry without `source:` is an *override-only* entry that tunes a
+An `agents:` entry may set `runtime`, `model` and `effort` for that agent.
+The `ref` field records the branch or tag that was resolved when the agent was
+adopted via `agent add`; `agent update` re-resolves against this ref instead
+of the default branch when it is present (empty for SHA-pinned or legacy entries).
+
+An enabled entry without `source:` is an *override-only* entry that tunes a
 built-in agent by name (or, in an overlay, a custom agent registered in the
 base layer). The keyed merge by `DerivedName()` carries the three settings
 field by field: the overlay's non-empty value wins, an empty value inherits
@@ -125,7 +129,8 @@ unset, the accessor falls through to the base layer, then to code defaults.
 - **`version`**: Schema version string. Unset (`""`) falls through to parent.
   Code default is `"1"`.
 - **`runtime`**: Agent runtime identifier. Unset (`""`) falls through to
-  parent. Code default is `"claude"`. Valid values: `claude`, `pi`, `dummy`.
+  parent. Code default is `"claude"`. Valid values: `claude`, `pi`, `dummy`,
+  `dummy-playback`.
 - **`kill_switch`**: Pointer to bool (`*bool`). Using a pointer allows
   distinguishing between three states:
   - `nil` (key omitted) — unset, falls through to parent.

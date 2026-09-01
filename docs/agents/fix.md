@@ -1,3 +1,7 @@
+---
+description: How the fullsend fix agent reads PR review feedback, implements targeted fixes, runs tests and linters, and commits the result.
+---
+
 # Fix Agent
 
 ![Fix agent icon](icons/coder.png)

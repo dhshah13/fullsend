@@ -266,6 +266,9 @@ func (c *perRepoConfig) AgentEntries() []AgentEntry {
 			if oi.entry.Source != "" {
 				merged.Source = oi.entry.Source
 			}
+			if oi.entry.Ref != "" {
+				merged.Ref = oi.entry.Ref
+			}
 			if oi.entry.Enabled != nil {
 				merged.Enabled = oi.entry.Enabled
 			}
