@@ -161,8 +161,9 @@ type aggregateMetrics struct {
 	Iterations int    `json:"iterations"`
 	ToolCalls  int    `json:"tool_calls"`
 	Model      string `json:"model,omitempty"`
-	// Runtime is the backend that ran the iterations (claude, pi, dummy),
-	// so artifacts record which runtime a per-repo `runtime:` selected.
+	// Runtime is the backend that ran the iterations (claude, pi, dummy,
+	// dummy-playback), so artifacts record which runtime a per-repo
+	// `runtime:` selected.
 	Runtime string `json:"runtime,omitempty"`
 	// RequestedRuntime is the runtime selected for the run (config file or a
 	// --runtime/FULLSEND_RUNTIME override); Runtime is what actually ran.
@@ -456,7 +457,7 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().IntVar(&sOpts.statusNum, "status-number", 0, "issue/PR number for status comments")
 	cmd.Flags().IntVar(&sOpts.statusComment, "status-comment-id", 0, "ID of the triggering comment, for comment-scoped reactions on slash-command runs (optional)")
 	cmd.Flags().StringVar(&sOpts.mintURL, "mint-url", "", "mint service URL for on-demand status tokens (default: $FULLSEND_MINT_URL)")
-	cmd.Flags().StringVar(&oFlags.runtime, "runtime", "", "override the agent runtime from config.yaml for this run (claude, pi or dummy; also $FULLSEND_RUNTIME)")
+	cmd.Flags().StringVar(&oFlags.runtime, "runtime", "", "override the agent runtime from config.yaml for this run (claude, pi, dummy or dummy-playback; also $FULLSEND_RUNTIME)")
 	cmd.Flags().StringVar(&oFlags.model, "model", "", "override the harness/agent model for this run (alias such as opus/sonnet/haiku, a model id, or provider/id on pi; also $FULLSEND_MODEL)")
 	cmd.Flags().StringVar(&oFlags.effort, "effort", "", "override the harness effort level for this run (low, medium, high, xhigh, max; also $FULLSEND_EFFORT)")
 	_ = cmd.MarkFlagRequired("fullsend-dir")
@@ -1972,6 +1973,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			Timeout:           timeout,
 			OutputPath:        filepath.Join(iterDir, "output.jsonl"),
 			Prompt:            agentPrompt,
+			Forge:             forgePlatform,
 			OnEvent:           contentEventHandler(agentruntime.NewEventRenderer(printer).Handle, collector),
 		}, printer, agentStart, &metrics)
 		close(heartbeatDone)

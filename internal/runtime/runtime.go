@@ -59,6 +59,10 @@ type RunParams struct {
 	// retries this field exists to remove. Runtime support is tracked in the
 	// key support matrix in docs/runtimes.md.
 	Prompt string
+	// Forge is the forge platform identifier ("github" or "gitlab").
+	// Empty defaults to "github". Used by runtimes that need
+	// forge-specific environment variable resolution.
+	Forge string
 }
 
 // TranscriptError holds extracted error information from a runtime transcript.
