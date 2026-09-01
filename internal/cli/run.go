@@ -17,7 +17,6 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -759,14 +758,37 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// REPO_FULL_NAME, and ISSUE_NUMBER. On GitHub these are set by the
 	// reusable workflow (setup-agent-env.sh); on GitLab the scaffold has
 	// no equivalent, so run.go must provide them (forge-agnostic). #6865.
+	//
+	// Save original values and restore on return so tests that don't
+	// t.Setenv these vars aren't affected by leaked values (#6874).
+	flagEnvOriginals := make(map[string]string)
+	flagEnvSet := []string{}
+	setFlagEnv := func(key, val string) {
+		if _, ok := flagEnvOriginals[key]; !ok {
+			if v, exists := os.LookupEnv(key); exists {
+				flagEnvOriginals[key] = v
+			}
+			flagEnvSet = append(flagEnvSet, key)
+		}
+		os.Setenv(key, val)
+	}
+	defer func() {
+		for _, k := range flagEnvSet {
+			if orig, ok := flagEnvOriginals[k]; ok {
+				os.Setenv(k, orig)
+			} else {
+				os.Unsetenv(k)
+			}
+		}
+	}()
 	if targetRepo != "" {
-		os.Setenv("TARGET_REPO_DIR", targetRepo)
+		setFlagEnv("TARGET_REPO_DIR", targetRepo)
 	}
 	if sOpts.statusRepo != "" {
-		os.Setenv("REPO_FULL_NAME", sOpts.statusRepo)
+		setFlagEnv("REPO_FULL_NAME", sOpts.statusRepo)
 	}
 	if sOpts.statusNum != 0 {
-		os.Setenv("ISSUE_NUMBER", strconv.Itoa(sOpts.statusNum))
+		setFlagEnv("ISSUE_NUMBER", fmt.Sprintf("%d", sOpts.statusNum))
 	}
 
 	// Mint agent token when a mint URL and harness role are both available.

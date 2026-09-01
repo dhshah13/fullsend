@@ -355,28 +355,44 @@ func TestGitLabAgentTemplateFixReviewBodyPreFetch(t *testing.T) {
 	assert.Contains(t, s, "git rev-parse HEAD")
 	// Forge.gitlab env vars for fix post-script — REPO_FULL_NAME is now
 	// set by run.go from --status-repo (#6865); PUSH_TOKEN, PUSH_TOKEN_SOURCE,
-	// and GIT_BOT_EMAIL are in the shared code|fix block.
+	// GIT_BOT_EMAIL, MR_NUMBER, and GITLAB_MR_URL are in the shared
+	// code|fix|review block (#6865).
 	assert.NotContains(t, s[strings.Index(s, `"fix"`):], "export REPO_FULL_NAME")
-	assert.Contains(t, s, "export MR_NUMBER")
-	assert.Contains(t, s, "export GITLAB_MR_URL")
+	// MR_NUMBER and GITLAB_MR_URL should NOT be in the fix-only block —
+	// they moved to the shared block.
+	fixOnlyMarker := `if [ "${STAGE}" = "fix" ]; then`
+	fixOnlyIdx := strings.Index(s, fixOnlyMarker)
+	require.NotEqual(t, -1, fixOnlyIdx, "fix-only block marker not found")
+	fixBlock := s[fixOnlyIdx:]
+	runIdx := strings.Index(fixBlock, "fullsend run")
+	require.NotEqual(t, -1, runIdx, "fullsend run not found after fix block")
+	fixBlock = fixBlock[:runIdx]
+	assert.NotContains(t, fixBlock, "export MR_NUMBER")
+	assert.NotContains(t, fixBlock, "export GITLAB_MR_URL")
 }
 
 // TestGitLabAgentTemplateSharedCodeFixEnvVars verifies that PUSH_TOKEN,
-// PUSH_TOKEN_SOURCE, and GIT_BOT_EMAIL are exported outside the fix-only
-// conditional so both code and fix stages receive them (#6865).
+// PUSH_TOKEN_SOURCE, GIT_BOT_EMAIL, MR_NUMBER, and GITLAB_MR_URL are
+// exported in the shared code|fix|review block so all three stages
+// receive them (#6865).
 func TestGitLabAgentTemplateSharedCodeFixEnvVars(t *testing.T) {
 	content, err := GitLabPerRepoFile(".gitlab/ci/fullsend-agent.yml")
 	require.NoError(t, err)
 	s := string(content)
 
-	// Shared block guards on code OR fix
+	// Shared block guards on code, fix, or review
 	assert.Contains(t, s, `"${STAGE}" = "code"`)
 	assert.Contains(t, s, `"${STAGE}" = "fix"`)
+	assert.Contains(t, s, `"${STAGE}" = "review"`)
 
 	// PUSH_TOKEN, PUSH_TOKEN_SOURCE, GIT_BOT_EMAIL are in the shared block
 	assert.Contains(t, s, "export PUSH_TOKEN")
 	assert.Contains(t, s, "export PUSH_TOKEN_SOURCE")
 	assert.Contains(t, s, "export GIT_BOT_EMAIL")
+
+	// MR_NUMBER and GITLAB_MR_URL are in the shared block
+	assert.Contains(t, s, "export MR_NUMBER")
+	assert.Contains(t, s, "export GITLAB_MR_URL")
 
 	// Bot username resolution for GIT_BOT_EMAIL (reuses BOT_RESPONSE
 	// from bot identity verification when available)
