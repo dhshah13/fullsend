@@ -90,7 +90,7 @@ flowchart LR
 | Setting | Flag | Env | Config (per-agent) | Config (repo-wide) |
 |---|---|---|---|---|
 | Runtime | `--runtime` | `FULLSEND_RUNTIME` | `runtime:` on the agent's `agents:` entry | `runtime:` in `.fullsend/config.yaml` (repo default) |
-| Model | `--model` | `FULLSEND_MODEL` (`FULLSEND_PI_MODEL` on pi and `FULLSEND_CODEX_MODEL` on codex are lower-precedence aliases) | `model:` on the agent's `agents:` entry | harness `model:`, then agent frontmatter `model:` |
+| Model | `--model` | `FULLSEND_MODEL` (`FULLSEND_PI_MODEL` on pi and `FULLSEND_CODEX_MODEL` on codex are lower-precedence aliases) | `model:` on the agent's `agents:` entry | harness `model:`, then agent frontmatter `model:`; `models.aliases` in `.fullsend/config.yaml` remaps the alias any of these resolve to |
 | Effort | `--effort` | `FULLSEND_EFFORT` | `effort:` on the agent's `agents:` entry | harness `effort:` |
 
 In CI these are repository variables of the same name, plain or role-prefixed
@@ -188,11 +188,12 @@ Harness `model:` and `agents:` entry `model:` values accept provider-qualified `
 
 ### Per-repo alias overrides (`models.aliases`)
 
-A `models.aliases` map in `.fullsend/config.yaml` overrides fullsend's pinned alias table per key,
-on both runtimes. A repo that only wants `sonnet: claude-sonnet-5` does not need to restate `opus`.
-See [Pi › Per-repo alias overrides](runtimes/pi.md#per-repo-alias-overrides-modelsaliases) for the
-full syntax. The same block is used on Claude Code: when a `models.aliases` entry exists for the
-alias, the id is passed to `--model` instead of the alias name.
+A `models.aliases` map in `.fullsend/config.yaml` overrides fullsend's pinned alias table per key.
+A repo that only wants `sonnet: claude-sonnet-5` does not need to restate `opus`. See
+[Pi › Per-repo alias overrides](runtimes/pi.md#per-repo-alias-overrides-modelsaliases) for the
+syntax and the run-time echo. On Claude Code the same block remaps the run's top-level `--model`
+(and `--fallback-model`) only — sub-agent `model:` frontmatter still resolves through Claude Code's
+own table; see [Claude Code › Models](runtimes/claude.md#models).
 
 ## Where the selection appears
 

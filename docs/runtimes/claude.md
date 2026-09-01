@@ -16,9 +16,19 @@ Pass an alias or a model id; Claude Code resolves aliases natively.
 
 | Alias | Resolves to |
 |---|---|
-| `opus`, `sonnet`, `haiku`, `fable` | the current Anthropic model of that tier |
+| `opus`, `sonnet`, `haiku`, `fable` | the current Anthropic model of that tier, as the pinned Claude Code version defines it |
 
-All inference goes to Anthropic models on Vertex AI, on the fleet's WIF credentials.
+All inference goes to Anthropic models on Vertex AI, on the fleet's WIF credentials. Vertex enables
+models **per project**: the tier's current model is not necessarily one your project can serve, and
+a run whose model the project cannot serve fails at the first model call. A harness or `agents:`
+entry that needs a specific generation names the id.
+
+**Per-repo alias overrides.** `models.aliases` in `.fullsend/config.yaml` remaps an alias for this
+repo (`sonnet: claude-sonnet-5`); fullsend then passes the id, not the alias, to `--model` and
+`--fallback-model`. Syntax and rules are on the [pi page](pi.md#per-repo-alias-overrides-modelsaliases);
+they are the same block. It applies to the run's top-level model only — sub-agent `model:`
+frontmatter still resolves through Claude Code's own table (`ANTHROPIC_DEFAULT_*_MODEL` does not
+steer requests on Vertex), so a sub-agent that needs a specific generation names the id.
 
 **Fallback chains.** `FULLSEND_FALLBACK_MODELS=a,b` becomes `--fallback-model a,b`, tried in order
 when the primary model is overloaded or retired. This is Claude Code only — pi reports it as

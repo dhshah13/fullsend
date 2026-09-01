@@ -87,7 +87,7 @@ the overlay → base → code defaults chain.
 | `inference.openai.audience` | `string` (nested) | Scalar override | `""` (empty) |
 | `inference.openai.identity_provider_id` | `string` (nested) | Scalar override | `""` (empty) |
 | `inference.openai.service_account_id` | `string` (nested) | Scalar override | `""` (empty) |
-| `models.aliases.<key>` | `map[string]string` (nested) | Per-key merge | `nil` (fleet defaults) |
+| `models.aliases` | `map[string]string` (nested) | Per-key merge | `nil` (fleet defaults) |
 | `create_issues` | `*CreateIssuesConfig` | Replace whole object if set | `nil` |
 | `status_notifications` | `*StatusNotificationConfig` | Replace whole object if set | `nil` |
 
@@ -380,6 +380,7 @@ compiled-in defaults apply:
 | `inference.project` | `""` (empty — must be provided) |
 | `inference.region` | `"global"` |
 | `inference.wif_provider` | `""` (empty — must be provided) |
+| `models.aliases` | `nil` (fleet alias table compiled into the runtimes) |
 | `create_issues` | `nil` |
 | `status_notifications` | `nil` |
 

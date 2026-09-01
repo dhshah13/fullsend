@@ -17,25 +17,6 @@ A model on pi is `provider/id`. Aliases and bare ids still work — `opus`/`sonn
 resolve through fullsend's pinned alias table, and a bare id gets the provider from
 `FULLSEND_PI_PROVIDER` (default `anthropic-vertex`).
 
-### Per-repo alias overrides (`models.aliases`)
-
-The pinned alias table is a fullsend-owned constant. To retarget an alias for a specific repo —
-e.g. because `claude-sonnet-5` is enabled in that project's Vertex but the fleet still pins
-`claude-sonnet-4-6` — add a `models.aliases` block in `.fullsend/config.yaml`:
-
-```yaml
-models:
-  aliases:
-    sonnet: claude-sonnet-5
-```
-
-Merge is per key: a repo that sets only `sonnet` inherits the fleet default for `opus`, `haiku` and
-`fable`. Keys must be the existing alias vocabulary (`opus`, `sonnet`, `haiku`, `fable`); unknown keys
-are a config validation error. Values are validated with `ValidModelRef` (bare id or `provider/id`).
-
-The plan block echoes the mapping when an alias is remapped, and `metrics.json` records the config
-source in `override_source`.
-
 | Model | Spec | Provider |
 |---|---|---|
 | Claude | `anthropic-vertex/claude-opus-4-6` | vendored extension |
@@ -72,6 +53,32 @@ source in `override_source`.
 Harness `model:` and `agents:` entry `model:` values accept the `provider/id` form directly
 (`xai-vertex/xai/grok-4.6`); a harness can also select a provider with a bare `model:` plus
 `FULLSEND_PI_PROVIDER`.
+
+### Per-repo alias overrides (`models.aliases`)
+
+The alias table above is a fullsend-owned constant, pinned on purpose: Vertex enables models per
+project, so "latest" is not necessarily accessible. To retarget an alias for one repo — say
+`claude-sonnet-5` is enabled in its project while the fleet still pins `claude-sonnet-4-6` — add
+`models.aliases` to `.fullsend/config.yaml`:
+
+```yaml
+models:
+  aliases:
+    sonnet: claude-sonnet-5
+```
+
+Rules: merge is per key (a repo that sets only `sonnet` keeps the fleet default for `opus`, `haiku`
+and `fable`); keys are the alias vocabulary (`opus`, `sonnet`, `haiku`, `fable`); a value is a bare id
+or `provider/id` (`haiku: google-vertex/gemini-3.7-flash` works, and an `xai/…` value takes the same
+Grok normalisation as a direct spec) — never another alias, since aliases resolve once.
+
+At run time the plan block shows `Model: sonnet (from …) → claude-sonnet-5 (from <config path>
+models.aliases)` and `metrics.json` `override_source` ends with `remapped by <config path>
+models.aliases`. The same block applies on Claude Code ([Claude Code](claude.md#models)).
+
+Troubleshooting: an unknown key or a bad value fails `fullsend run` before the sandbox is created,
+naming the key (`models.aliases: unknown alias key "grok"`). An id the project cannot serve is not
+caught here — it fails at the first model call, and there is no fallback on pi.
 
 ### Each provider has its own GCP project
 

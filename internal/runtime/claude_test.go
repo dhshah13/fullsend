@@ -411,6 +411,21 @@ func TestBuildRunCommand_WithConfigAliasNilMap(t *testing.T) {
 		"nil aliases passes the model through")
 }
 
+func TestBuildRunCommand_FallbackModelsUseConfigAlias(t *testing.T) {
+	// The fallback chain goes through the same remap as --model, so a
+	// chain cannot land on the generation the repo retargeted away from.
+	cmd := buildRunCommand(RunParams{
+		AgentBaseName:  "agent",
+		Model:          "opus",
+		FallbackModels: []string{"sonnet", "claude-haiku-4-5"},
+		RepoDir:        "/sandbox/workspace/repo",
+		ModelAliases:   map[string]string{"sonnet": "claude-sonnet-5"},
+	})
+	assert.Contains(t, cmd, "--fallback-model 'claude-sonnet-5,claude-haiku-4-5'",
+		"aliased fallback entries are remapped, bare ids pass through")
+	assert.Contains(t, cmd, "--model 'opus'", "unmapped primary passes through")
+}
+
 func TestBuildPluginConfigs_SinglePlugin(t *testing.T) {
 	dir := t.TempDir()
 	pluginDir := filepath.Join(dir, "gopls-lsp")

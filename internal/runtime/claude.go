@@ -364,6 +364,18 @@ func buildRunCommand(params RunParams) string {
 	}
 
 	if len(params.FallbackModels) > 0 {
+		// Same remap as --model: a fallback chain must not land on the
+		// generation the repo retargeted away from.
+		if len(params.ModelAliases) > 0 {
+			remapped := make([]string, len(params.FallbackModels))
+			for i, fb := range params.FallbackModels {
+				if id, ok := params.ModelAliases[fb]; ok {
+					fb = id
+				}
+				remapped[i] = fb
+			}
+			params.FallbackModels = remapped
+		}
 		// Claude Code accepts a comma-separated chain tried in order when the
 		// primary model is overloaded or retired.
 		parts = append(parts, fmt.Sprintf("--fallback-model '%s'", strings.ReplaceAll(strings.Join(params.FallbackModels, ","), "'", "'\\''")))

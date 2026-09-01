@@ -1071,24 +1071,33 @@ func (c *perRepoConfig) Validate() error {
 			return fmt.Errorf("invalid inference provider %q: must be one of %s", c.Inference.Provider, strings.Join(validProviders, ", "))
 		}
 	}
-	if err := validateModelsConfig(c.Models); err != nil {
+	// Validate the merged view, as ValidateAgentEntries does above: a bad
+	// key in config.base.yaml must not slip through because the overlay
+	// omits models:.
+	if err := ValidateModelAliases(c.ConfigModelAliases()); err != nil {
 		return err
 	}
 	return nil
 }
 
-// validateModelsConfig checks models.aliases keys and values.
-func validateModelsConfig(m *ModelsConfig) error {
-	if m == nil {
-		return nil
-	}
+// ValidateModelAliases checks a models.aliases map: every key is one of
+// ValidModelAliasKeys, every value is a ValidModelRef, and no value is
+// itself an alias key — the runtimes consult the alias table once, so
+// `sonnet: opus` would reach the provider as the literal id "opus".
+// Exported because the run path validates the effective (merged) map
+// (nothing writes the block through the CLI, so Validate on the write
+// paths alone would never see a hand-edited file).
+func ValidateModelAliases(aliases map[string]string) error {
 	validKeys := ValidModelAliasKeys()
-	for key, val := range m.Aliases {
+	for key, val := range aliases {
 		if !slices.Contains(validKeys, key) {
 			return fmt.Errorf("models.aliases: unknown alias key %q: must be one of %s", key, strings.Join(validKeys, ", "))
 		}
 		if !ValidModelRef(val) {
 			return fmt.Errorf("models.aliases.%s: invalid model reference %q: must be a model id or provider/id (segments of a-z, A-Z, 0-9, _, -, ., @ joined by /)", key, val)
+		}
+		if slices.Contains(validKeys, val) {
+			return fmt.Errorf("models.aliases.%s: value %q is an alias name, not a model id; aliases resolve once, so name the model id (or provider/id) directly", key, val)
 		}
 	}
 	return nil

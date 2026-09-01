@@ -83,8 +83,9 @@ type PerRepoConfigReader interface {
 	ConfigInferenceWIFProvider() string
 	ConfigInferenceOpenAI() OpenAIWIFConfig
 	// ConfigModelAliases returns the effective model alias map, merged
-	// per-key through the parent chain. An empty map means no aliases
-	// are configured (all aliases resolve through the fleet defaults).
+	// per-key through the parent chain. nil (the code default) means no
+	// aliases are configured: every alias resolves through the runtime's
+	// compiled-in table.
 	ConfigModelAliases() map[string]string
 }
 

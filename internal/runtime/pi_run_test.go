@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/sandbox"
 )
 
@@ -673,12 +674,23 @@ func TestTranslatePiModel_WithConfigAlias(t *testing.T) {
 		translatePiModel("anthropic/claude-sonnet-4-6", configAliases),
 		"provider/id passes through regardless of config aliases")
 
-	// A config alias may itself remap to a provider/id spec (e.g. an
-	// openai model); the default provider must not be prepended onto an
-	// already-qualified value.
-	assert.Equal(t, "openai/gpt-5.6-luna",
-		translatePiModel("sonnet", map[string]string{"sonnet": "openai/gpt-5.6-luna"}),
-		"config alias remapped to a provider/id spec is not re-prefixed")
+	// An alias may map to a provider/id spec (validation accepts it). The
+	// alias is resolved first and the spec passes through untouched —
+	// not re-prefixed to "anthropic-vertex/anthropic-vertex/…".
+	assert.Equal(t, "anthropic-vertex/claude-sonnet-5",
+		translatePiModel("sonnet", map[string]string{"sonnet": "anthropic-vertex/claude-sonnet-5"}),
+		"provider/id alias value is not re-prefixed")
+	assert.Equal(t, "google-vertex/gemini-3.7-flash",
+		translatePiModel("haiku", map[string]string{"haiku": "google-vertex/gemini-3.7-flash"}),
+		"an alias can retarget to another provider")
+
+	// An alias mapped to Grok goes through the same xai normalisation as
+	// a direct spec, so buildPiRunCommand's xai-vertex gate fires.
+	for _, val := range []string{"xai/grok-4.6", "xai-vertex/xai/grok-4.6", "XAI/grok-4.6"} {
+		assert.Equal(t, "xai-vertex/xai/grok-4.6",
+			translatePiModel("sonnet", map[string]string{"sonnet": val}),
+			"xai alias value is normalised: %s", val)
+	}
 }
 
 func TestMergedPiModelAliases(t *testing.T) {
@@ -697,10 +709,21 @@ func TestMergedPiModelAliases(t *testing.T) {
 
 func TestValidatePiModel_WithConfigAlias(t *testing.T) {
 	t.Setenv(piProviderEnv, "")
-	// A documented alias with a config override still passes.
-	assert.NoError(t, validatePiModel("sonnet", map[string]string{"sonnet": "claude-sonnet-5"}))
-	// Without config alias, the fleet default applies.
-	assert.NoError(t, validatePiModel("sonnet", nil))
+	// Make the guard observable: with "sonnet" removed from the compiled-in
+	// table, validation must fail without a config entry and pass with one
+	// — proving the merged table, not just piModelAliases, is consulted.
+	const alias = "sonnet"
+	id, ok := piModelAliases[alias]
+	require.True(t, ok, "test fixture assumes %q starts mapped", alias)
+	delete(piModelAliases, alias)
+	t.Cleanup(func() { piModelAliases[alias] = id })
+
+	err := validatePiModel(alias, nil)
+	require.Error(t, err, "no compiled-in entry and no config entry")
+	assert.Contains(t, err.Error(), "documented but has no pi mapping")
+
+	assert.NoError(t, validatePiModel(alias, map[string]string{alias: "claude-sonnet-5"}),
+		"a config entry satisfies the guard on its own")
 }
 
 func TestBuildPiRunCommand_WithConfigAlias(t *testing.T) {
@@ -712,4 +735,29 @@ func TestBuildPiRunCommand_WithConfigAlias(t *testing.T) {
 	cmd := buildPiRunCommand(params, m)
 	assert.Contains(t, cmd, "--model 'anthropic-vertex/claude-sonnet-5'",
 		"config alias remaps the model in the build command")
+
+	// An alias retargeted to Grok must trip the xai-vertex gate exactly as
+	// a direct xai spec does: extension loaded, XAI_API_KEY unset. Before
+	// the alias was resolved ahead of normalisation this produced
+	// "anthropic-vertex/xai/grok-4.6" and skipped the gate.
+	params.ModelAliases = map[string]string{"sonnet": "xai/grok-4.6"}
+	cmd = buildPiRunCommand(params, m)
+	assert.Contains(t, cmd, "--model 'xai-vertex/xai/grok-4.6'", "xai alias value is normalised")
+	assert.Contains(t, cmd, "&& unset XAI_API_KEY", "xai-vertex gate fires for an aliased Grok spec")
+	assert.NotContains(t, cmd, "anthropic-vertex/xai", "no double prefix")
+}
+
+// TestPiDocumentedAliasesMatchConfigKeys pins the two hand-maintained
+// copies of the alias vocabulary to each other: config validation accepts
+// exactly the keys the pi runtime treats as aliases. Adding an alias to one
+// side without the other would either reject a working alias in
+// config.yaml or let a config key through that pi never resolves.
+func TestPiDocumentedAliasesMatchConfigKeys(t *testing.T) {
+	t.Parallel()
+	want := config.ValidModelAliasKeys()
+	got := make([]string, 0, len(piDocumentedAliases))
+	for alias := range piDocumentedAliases {
+		got = append(got, alias)
+	}
+	assert.ElementsMatch(t, want, got, "config.ValidModelAliasKeys and piDocumentedAliases drifted")
 }

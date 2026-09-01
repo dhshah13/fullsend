@@ -1039,12 +1039,28 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if runCfg.perRepo != nil {
 		configModelAliases = runCfg.perRepo.ConfigModelAliases()
 	}
+	// The load path does not run Validate (only the write paths do, and
+	// nothing writes this block through the CLI), so check the effective
+	// map here: an unknown key must fail before the sandbox exists, not
+	// become a working alias.
+	if err := config.ValidateModelAliases(configModelAliases); err != nil {
+		printer.StepFail(err.Error())
+		return fmt.Errorf("%s: %w", runCfg.source, err)
+	}
+	// resolvedModel is what the runtime will actually pass on: the alias
+	// target when models.aliases remaps h.Model, h.Model otherwise.
+	resolvedModel, modelRemapped := h.Model, false
+	if id, ok := configModelAliases[h.Model]; ok {
+		resolvedModel, modelRemapped = id, true
+	}
 
 	// provider/id is pi's model form; Claude Code takes an alias or an
 	// Anthropic model id. The syntax is accepted for every runtime (ids are
 	// not a closed set), so flag the likely mismatch instead of rejecting it.
-	if runtimeBackend.Runtime.Name() == "claude" && strings.Contains(h.Model, "/") {
-		printer.StepWarn(fmt.Sprintf("model %q has a provider/id form, which is pi's; Claude Code expects an alias (opus, sonnet, ...) or an Anthropic model id", h.Model))
+	// Check the resolved value: an alias whose entry is a provider/id spec
+	// reaches Claude Code as that spec.
+	if runtimeBackend.Runtime.Name() == "claude" && strings.Contains(resolvedModel, "/") {
+		printer.StepWarn(fmt.Sprintf("model %q has a provider/id form, which is pi's; Claude Code expects an alias (opus, sonnet, ...) or an Anthropic model id", resolvedModel))
 	}
 	if overrides.effort != "" {
 		if !config.ValidEffort(overrides.effort) {
@@ -1068,8 +1084,10 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	}
 	if h.Model != "" {
 		modelDisplay := withSource(h.Model, overrides.modelSource)
-		if id, ok := configModelAliases[h.Model]; ok {
-			modelDisplay = fmt.Sprintf("%s → %s (from %s models.aliases)", h.Model, id, runCfg.source)
+		if modelRemapped {
+			// Keep the alias's own source (e.g. "--model flag") and add
+			// the remap, so neither decision is hidden.
+			modelDisplay = fmt.Sprintf("%s → %s (from %s models.aliases)", modelDisplay, resolvedModel, runCfg.source)
 		}
 		printer.KeyValue("Model", modelDisplay)
 	}
@@ -1767,21 +1785,15 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if overrides.modelSource != "" {
 		fmt.Fprintf(os.Stderr, "model: requested %q from %s\n", h.Model, overrides.modelSource)
 	}
-	if id, ok := configModelAliases[h.Model]; ok {
-		fmt.Fprintf(os.Stderr, "model: alias %q remapped to %q from %s models.aliases\n", h.Model, id, runCfg.source)
+	if modelRemapped {
+		fmt.Fprintf(os.Stderr, "model: alias %q remapped to %q from %s models.aliases\n", h.Model, resolvedModel, runCfg.source)
 	}
 	rt := backend.Runtime
 	aggMetrics.Runtime = rt.Name()
 	aggMetrics.RequestedRuntime = rt.Name()
 	aggMetrics.RuntimeSource = configSource
 	aggMetrics.RequestedModel = h.Model
-	ovrSrc := modelOverrideSource(overrides, h.Model)
-	if _, ok := configModelAliases[h.Model]; ok && ovrSrc != "" {
-		ovrSrc += fmt.Sprintf(", remapped by %s models.aliases", runCfg.source)
-	} else if _, ok := configModelAliases[h.Model]; ok {
-		ovrSrc = fmt.Sprintf("%s models.aliases", runCfg.source)
-	}
-	aggMetrics.OverrideSource = ovrSrc
+	aggMetrics.OverrideSource = aliasOverrideSource(modelOverrideSource(overrides, h.Model), modelRemapped, runCfg.source)
 	tx := backend.Transcripts
 
 	// 6. Start runtime fetch service (Phase 4, ADR-0038).

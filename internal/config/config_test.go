@@ -2813,6 +2813,47 @@ func TestModelsAliases_ProviderIDAccepted(t *testing.T) {
 	require.NoError(t, cfg.Validate())
 }
 
+func TestModelsAliases_AliasNameAsValueRejected(t *testing.T) {
+	t.Parallel()
+	// Aliases resolve once: `sonnet: opus` would reach the provider as the
+	// literal id "opus", so the value must be a model id, not another alias.
+	cfg := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"sonnet": "opus"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is an alias name")
+	assert.Contains(t, err.Error(), "models.aliases.sonnet")
+}
+
+func TestModelsAliases_ValidateSeesBaseLayer(t *testing.T) {
+	t.Parallel()
+	// Validate checks the merged map, so a bad key in config.base.yaml is
+	// caught even when the overlay omits models: entirely.
+	base := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"grok": "grok-4.6"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	overlay := &perRepoConfig{Version: "1", parent: base}
+	err := overlay.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown alias key")
+	assert.Contains(t, err.Error(), "grok")
+}
+
+func TestValidateModelAliases_NilIsValid(t *testing.T) {
+	t.Parallel()
+	require.NoError(t, ValidateModelAliases(nil))
+	require.NoError(t, ValidateModelAliases(map[string]string{}))
+}
+
 func TestModelsAliases_NilReturnsParent(t *testing.T) {
 	t.Parallel()
 	parent := &perRepoConfig{
