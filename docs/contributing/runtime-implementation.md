@@ -326,7 +326,7 @@ slots:
 │  Personal: /sandbox/claude-config/skills/ (fullsend)   │
 │  Project:  <repo>/.claude/skills/ (repo)               │
 │  Precedence: personal > project (name collision →      │
-│              fullsend wins, repo version shadowed)     │
+│              fullsend wins, repo shadowed with warning)│
 │  Repo skills extend the agent; use config-driven       │
 │  agent registration for org-level skill overrides      │
 └────────────────────────────────────────────────────────┘
