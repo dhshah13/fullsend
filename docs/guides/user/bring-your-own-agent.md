@@ -105,7 +105,6 @@ timeout_minutes: 15
 > mint. To use a *new* role or your *own* identity, you need your own mint —
 > see [Custom Agent Identity](custom-agent-identity.md).
 
-
 **`providers/vertex-ai.yaml`** — provider definition (declares a provider by name and type):
 ```yaml
 name: vertex-ai

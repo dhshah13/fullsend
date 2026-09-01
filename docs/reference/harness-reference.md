@@ -8,7 +8,7 @@ agent: agents/my-agent.md           # Path to agent definition
 role: triage                        # A role the mint serves (built-in on the hosted mint); not the agent's name. Format: lowercase letter first, then a-z, 0-9, _, -; no double hyphens
 
 # ── Identity & metadata ──────────────────────────────────────
-slug: my-org-my-role                # install-time App discovery (convention: <org>-<role>); not read by the mint
+slug: my-org-my-role                # Install-time App discovery (convention: <org>-<role>); not read by the mint
 description: One-line summary       # Human-readable description
 doc: docs/agents/my-agent.md        # Source-repo-only; not resolved at runtime
 trigger: "event.entity.kind == 'work_item'"  # Optional CEL expression over NormalizedEvent (see CEL Triggers Reference)
