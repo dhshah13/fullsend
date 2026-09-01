@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# create-vm.sh — Create and provision a GitLab Runner VM in one command.
+# create-openshift-vm.sh — Create and provision a GitLab Runner VM on OpenShift Virtualization.
 #
 # This script:
 #   1. Auto-numbers the VM (fullsend-gitlab-runner-01, -02, ...)
@@ -36,12 +36,12 @@
 #   # Auto-numbers the VM:
 #   GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
 #     GITLAB_URL=https://gitlab.example.com NAMESPACE=my-namespace \
-#     RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 ./create-vm.sh
+#     RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 ./create-openshift-vm.sh
 #
 #   # Explicit runner number:
 #   GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
 #     GITLAB_URL=https://gitlab.example.com NAMESPACE=my-namespace \
-#     RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 ./create-vm.sh 01
+#     RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 ./create-openshift-vm.sh 01
 #
 set -euo pipefail
 
@@ -74,20 +74,8 @@ OPENSHELL_VERSION="${OPENSHELL_VERSION:-0.0.116}"
 TEMPLATE="${SCRIPT_DIR}/vm.yaml"
 PREFIX="fullsend-gitlab-runner"
 
-# Wrap curl with GL_TOKEN passed via a temp config file to avoid
-# exposing the token in /proc/<pid>/cmdline.
-gl_curl() {
-  local config old_umask rc
-  old_umask=$(umask)
-  umask 077
-  config=$(mktemp)
-  umask "${old_umask}"
-  printf 'header = "PRIVATE-TOKEN: %s"\n' "${GL_TOKEN}" > "${config}"
-  rc=0
-  curl --max-time 30 --connect-timeout 10 -sf -K "${config}" "$@" || rc=$?
-  rm -f "${config}"
-  return "${rc}"
-}
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
 
 # ----------------------------------------------------------------------
 # Validate inputs
@@ -116,6 +104,10 @@ fi
 if [ -z "${PROJECT_ID:-}" ]; then
   echo "ERROR: PROJECT_ID is required (GitLab project ID)" >&2
   usage >&2
+  exit 1
+fi
+if ! [[ "${PROJECT_ID}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: PROJECT_ID must be numeric (got: ${PROJECT_ID})" >&2
   exit 1
 fi
 
@@ -163,7 +155,7 @@ for tool in oc virtctl python3 curl timeout sha256sum; do
     _missing=1
   fi
 done
-for _f in setup.sh create-vm.sh vm.yaml gitlab-runner-version.sh \
+for _f in setup.sh create-openshift-vm.sh vm.yaml gitlab-runner-version.sh \
   executor/job_id.sh executor/prepare.sh executor/run.sh executor/cleanup.sh; do
   if [ ! -f "${SCRIPT_DIR}/${_f}" ]; then
     echo "ERROR: required file not found: ${SCRIPT_DIR}/${_f}" >&2
@@ -249,7 +241,7 @@ print(template.replace('__VM_NAME__', sys.argv[1]).replace('__SSH_PUBLIC_KEY__',
 
 cleanup_vm() {
   echo "  NOTE: VM ${vm_name} was created — to clean up run:" >&2
-  echo "    NAMESPACE=${NAMESPACE} GL_TOKEN=\$GL_TOKEN GITLAB_URL=${GITLAB_URL} ./delete-vm.sh ${vm_name}" >&2
+  echo "    NAMESPACE=${NAMESPACE} GL_TOKEN=\$GL_TOKEN GITLAB_URL=${GITLAB_URL} ./delete-openshift-vm.sh ${vm_name}" >&2
 }
 trap cleanup_vm ERR
 # ERR does not fire on Ctrl-C; the boot and cloud-init waits below can take
@@ -328,7 +320,7 @@ cleanup_runner() {
       echo "  WARN: failed to deregister runner ${runner_id} — remove it manually at ${GITLAB_URL}" >&2
     fi
   fi
-  echo "  NOTE: VM ${vm_name} was not cleaned up — run: NAMESPACE=${NAMESPACE} GL_TOKEN=\$GL_TOKEN GITLAB_URL=${GITLAB_URL} ./delete-vm.sh ${vm_name}" >&2
+  echo "  NOTE: VM ${vm_name} was not cleaned up — run: NAMESPACE=${NAMESPACE} GL_TOKEN=\$GL_TOKEN GITLAB_URL=${GITLAB_URL} ./delete-openshift-vm.sh ${vm_name}" >&2
 }
 trap cleanup_runner ERR
 # ERR does not fire on Ctrl-C, and the window below spans a ~20-minute setup
@@ -337,8 +329,16 @@ trap cleanup_runner ERR
 trap 'cleanup_runner; exit 130' INT
 trap 'cleanup_runner; exit 143' TERM
 
-REGISTRATION_TOKEN=$(echo "${runner_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
-runner_id=$(echo "${runner_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+REGISTRATION_TOKEN=$(echo "${runner_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])" 2>&1) || {
+  echo "ERROR: failed to parse registration token from API response (length: ${#runner_json})" >&2
+  cleanup_runner
+  exit 1
+}
+runner_id=$(echo "${runner_json}" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>&1) || {
+  echo "ERROR: failed to parse runner ID from API response (length: ${#runner_json})" >&2
+  cleanup_runner
+  exit 1
+}
 
 echo "  OK: runner ID ${runner_id} created"
 
@@ -351,7 +351,7 @@ virtctl -n "${NAMESPACE}" ssh "${VM_USER}"@vm/"${vm_name}" \
   -t "-o StrictHostKeyChecking=no" -t "-o UserKnownHostsFile=/dev/null" \
   -c "mkdir -p ~/gitlab-runner-vm/executor ~/gitlab-runner-vm/.github/scripts"
 
-for file in setup.sh create-vm.sh vm.yaml gitlab-runner-version.sh; do
+for file in setup.sh create-openshift-vm.sh vm.yaml gitlab-runner-version.sh; do
   virtctl -n "${NAMESPACE}" ssh "${VM_USER}"@vm/"${vm_name}" \
     -t "-o StrictHostKeyChecking=no" -t "-o UserKnownHostsFile=/dev/null" \
     -c "cat > ~/gitlab-runner-vm/${file}" < "${SCRIPT_DIR}/${file}"
@@ -372,14 +372,14 @@ done
 
 virtctl -n "${NAMESPACE}" ssh "${VM_USER}"@vm/"${vm_name}" \
   -t "-o StrictHostKeyChecking=no" -t "-o UserKnownHostsFile=/dev/null" \
-  -c "chmod +x ~/gitlab-runner-vm/setup.sh ~/gitlab-runner-vm/create-vm.sh ~/gitlab-runner-vm/executor/*.sh ~/gitlab-runner-vm/.github/scripts/*.sh"
+  -c "chmod +x ~/gitlab-runner-vm/setup.sh ~/gitlab-runner-vm/create-openshift-vm.sh ~/gitlab-runner-vm/executor/*.sh ~/gitlab-runner-vm/.github/scripts/*.sh"
 
 # `cat > file` exits 0 on a short write, so a dropped SSH channel can leave a
 # truncated setup.sh that then executes an arbitrary prefix of provisioning.
 # Verify every copy against a locally computed manifest before running it.
 echo "==> Verifying copied files"
 {
-  (cd "${SCRIPT_DIR}" && sha256sum setup.sh create-vm.sh vm.yaml gitlab-runner-version.sh \
+  (cd "${SCRIPT_DIR}" && sha256sum setup.sh create-openshift-vm.sh vm.yaml gitlab-runner-version.sh \
     executor/job_id.sh executor/prepare.sh executor/run.sh executor/cleanup.sh)
   (cd "${REPO_ROOT}/.github/scripts" \
     && sha256sum install-openshell.sh openshell-version.sh \
@@ -402,8 +402,8 @@ echo "==> Running setup.sh on ${vm_name}"
 # Write env vars to a file on the VM to avoid exposing secrets in the process list.
 # Values are single-quoted to prevent interpretation of special characters.
 for val in "${REGISTRATION_TOKEN}" "${GITLAB_URL}" "${RUNNER_TAG}" "${RUNNER_IMAGE}" "${OPENSHELL_VERSION}" "${GITLAB_RUNNER_VERSION}"; do
-  if [[ "${val}" == *"'"* ]]; then
-    echo "ERROR: environment variable values must not contain single quotes" >&2
+  if [[ "${val}" == *"'"* ]] || [[ "${val}" == *\\* ]] || [[ "${val}" =~ [[:cntrl:]] ]]; then
+    echo "ERROR: environment variable values must not contain single quotes, backslashes, or control characters" >&2
     cleanup_runner
     exit 1
   fi
