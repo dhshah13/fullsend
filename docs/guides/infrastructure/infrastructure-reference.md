@@ -132,7 +132,7 @@ additions do not get the same retry):
 2. Deploy mint code that requests `packages:read` **and** falls back on the
    permissions-not-granted `422` by retrying once without `packages` (with a log
    pointing admins at
-   `https://github.com/settings/installations/<installation-id>` on github.com).
+   `https://github.com/organizations/<org>/settings/installations/<installation-id>` on github.com).
    Lagging installations keep authenticating; they simply lack packages access
    until they Accept.
 3. Tell installation owners to Accept the pending permission update (GitHub also

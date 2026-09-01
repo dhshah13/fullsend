@@ -597,11 +597,11 @@ func isPublicGitHubAPI(githubBaseURL string) bool {
 	return host == "api.github.com" || host == "github.com"
 }
 
-func installationAcceptHint(githubBaseURL string, installationID int64) string {
+func installationAcceptHint(githubBaseURL, org string, installationID int64) string {
 	if isPublicGitHubAPI(githubBaseURL) {
-		return fmt.Sprintf("an installation admin should Accept the pending App permission update at https://github.com/settings/installations/%d", installationID)
+		return fmt.Sprintf("an installation admin should Accept the pending App permission update at https://github.com/organizations/%s/settings/installations/%d", org, installationID)
 	}
-	return fmt.Sprintf("an installation admin should Accept the pending App permission update for installation_id=%d on this GitHub host", installationID)
+	return fmt.Sprintf("an installation admin should Accept the pending App permission update for org=%q installation_id=%d on this GitHub host", org, installationID)
 }
 
 // CreateInstallationToken exchanges a JWT for an installation access token,
@@ -629,7 +629,7 @@ func CreateInstallationToken(ctx context.Context, githubBaseURL, jwt string, ins
 	if status == http.StatusUnprocessableEntity && packagesLevel != "" && installationPermissionsNotGranted(body) {
 		fallback := copyPermissionsWithout(perms, packagesPermissionKey)
 		log.Printf("installation token 422 for org=%q installation_id=%d role=%q; packages=%s not granted on this installation — retrying without packages; %s (response: %s)",
-			org, installationID, role, packagesLevel, installationAcceptHint(githubBaseURL, installationID), truncateForLog(body, 256))
+			org, installationID, role, packagesLevel, installationAcceptHint(githubBaseURL, org, installationID), truncateForLog(body, 256))
 
 		token, expiresAt, granted, status, body, err = postInstallationAccessToken(ctx, githubBaseURL, jwt, installationID, fallback, repos)
 		if err != nil {

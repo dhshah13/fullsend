@@ -341,9 +341,10 @@ func TestInstallationAcceptHint(t *testing.T) {
 	assert.True(t, isPublicGitHubAPI("https://api.github.com/"))
 	assert.False(t, isPublicGitHubAPI("https://github.example.com/api/v3"))
 	assert.False(t, isPublicGitHubAPI("https://evil.example/?x=api.github.com"))
-	assert.Contains(t, installationAcceptHint("https://api.github.com", 42), "https://github.com/settings/installations/42")
-	assert.NotContains(t, installationAcceptHint("https://github.example.com/api/v3", 42), "https://github.com/")
-	assert.Contains(t, installationAcceptHint("https://github.example.com/api/v3", 42), "installation_id=42")
+	assert.Contains(t, installationAcceptHint("https://api.github.com", "myorg", 42), "https://github.com/organizations/myorg/settings/installations/42")
+	assert.NotContains(t, installationAcceptHint("https://github.example.com/api/v3", "myorg", 42), "https://github.com/")
+	assert.Contains(t, installationAcceptHint("https://github.example.com/api/v3", "myorg", 42), "installation_id=42")
+	assert.Contains(t, installationAcceptHint("https://github.example.com/api/v3", "myorg", 42), `org="myorg"`)
 }
 
 func TestCreateInstallationToken_LargeSuccessBody(t *testing.T) {
