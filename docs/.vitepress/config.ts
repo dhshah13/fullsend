@@ -1,4 +1,4 @@
-import { defineConfig } from "vitepress";
+import { defineConfig } from "@lando/vitepress-theme-default-plus/config";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,10 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const docsDir = path.resolve(__dirname, "..");
+
+const version =
+  JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "..", "package.json"), "utf-8"))
+    .version ?? "dev";
 
 function getMarkdownFiles(dir: string, base: string): { text: string; link: string }[] {
   const fullDir = path.resolve(docsDir, dir);
@@ -188,13 +192,17 @@ export default defineConfig({
   },
 
   srcExclude: ["**/agents/icons/**", "**/testing/**"],
-
   ignoreDeadLinks: true,
 
   themeConfig: {
     logo: "/img/logo.png",
     logoLink: { link: "https://fullsend.sh", target: "_self" },
     siteTitle: "Fullsend",
+
+    multiVersionBuild: {
+      satisfies: ">=0.37.0",
+      build: "stable",
+    },
 
     nav: [
       { text: "Docs", link: "/guides/getting-started/", activeMatch: "^/(?!cli/)" },
@@ -382,6 +390,26 @@ export default defineConfig({
       ],
     },
 
+    sidebarEnder: {
+      text: version,
+      collapsed: true,
+      items: [
+        {
+          text: "Other Doc Versions",
+          items: [
+            { rel: "mvb", text: "stable", target: "_blank", link: "/stable/" },
+            { rel: "mvb", text: "edge", target: "_blank", link: "/edge/" },
+            { rel: "mvb", text: "dev", target: "_blank", link: "/dev/" },
+            { text: "<strong>see all versions</strong>", link: "/v/" },
+          ],
+        },
+        {
+          text: "Other Releases",
+          link: "https://github.com/fullsend-ai/fullsend/releases",
+        },
+      ],
+    },
+
     socialLinks: [{ icon: "github", link: "https://github.com/fullsend-ai/fullsend" }],
 
     editLink: {
@@ -393,7 +421,10 @@ export default defineConfig({
       provider: "local",
       options: {
         scopes: [
-          { label: "Guides", prefixes: ["/docs/guides/", "/docs/agents/", "/docs/cli/", "/docs/runtimes"] },
+          {
+            label: "Guides",
+            prefixes: ["/docs/guides/", "/docs/agents/", "/docs/cli/", "/docs/runtimes"],
+          },
           {
             label: "Design Docs",
             prefixes: ["/docs/problems/", "/docs/ADRs/", "/docs/normative/", "/docs/spikes/"],
@@ -458,15 +489,15 @@ export default defineConfig({
     shikiSetup: async (shiki) => {
       await shiki.loadLanguage("toml");
     },
+
     preConfig: (md) => {
       const defaultParse = md.parse.bind(md);
       md.parse = (src: string, env: Record<string, unknown>) => {
+        const rel = (env?.relativePath as string) ?? "";
+        if (rel === "v/index.md") return defaultParse(src, env);
         return defaultParse(escapeVueSyntax(src), env);
       };
     },
-    // Auto-add v-pre to inline code so `{{ }}` inside backticks is safe.
-    // Recommended by VitePress maintainer brc-dd:
-    // https://github.com/vuejs/vitepress/discussions/3724
     config: (md) => {
       const defaultCodeInline = md.renderer.rules.code_inline!;
       md.renderer.rules.code_inline = (tokens, idx, options, env, self) => {
