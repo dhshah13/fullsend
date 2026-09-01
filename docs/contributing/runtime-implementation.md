@@ -43,7 +43,8 @@ content that must be updated whenever a runtime is added or renamed.
 **Registration and config:**
 
 - [ ] `internal/runtime/registry.go` — add a `case` to `Resolve()` that
-  returns the new backend.
+  returns the new backend (mirrors step 1 above — listed here so the
+  walkthrough is self-contained).
 - [ ] `internal/config/config.go` — add the runtime name to the slice
   returned by `ValidRuntimes()`.
 
@@ -65,6 +66,8 @@ content that must be updated whenever a runtime is added or renamed.
   to list the new runtime name.
 - [ ] `internal/cli/admin.go` — update the `--runtime` flag description
   in `newInstallCmd()` to include the new runtime name.
+- [ ] `internal/cli/github.go` — update the `--runtime` flag description
+  in `newGitHubSetupCmd()` to include the new runtime name.
 
 **Documentation:**
 
