@@ -13,9 +13,9 @@ is what changes once you are on it.
 
 ## Models and providers
 
-A model on pi is `provider/id`. Aliases and bare ids still work — `opus`/`sonnet`/`haiku` resolve
-through fullsend's table, and a bare id gets the provider from `FULLSEND_PI_PROVIDER` (default
-`anthropic-vertex`).
+A model on pi is `provider/id`. Aliases and bare ids still work — `opus`/`sonnet`/`haiku`/`fable`
+resolve through fullsend's table, and a bare id gets the provider from `FULLSEND_PI_PROVIDER`
+(default `anthropic-vertex`).
 
 | Model | Spec | Provider |
 |---|---|---|
