@@ -478,6 +478,40 @@ stages:
         export PRIOR_REVIEW_PROVENANCE
       fi
 
+      # Shared environment variables for code and fix stages — push
+      # credentials and git bot identity needed by both stages'
+      # post-scripts. Equivalent to the vars set by setup-agent-env.sh
+      # and the reusable workflows on GitHub. #6865.
+      if [ "${STAGE}" = "code" ] || [ "${STAGE}" = "fix" ]; then
+        # Resolve bot username for GIT_BOT_EMAIL. Reuse BOT_RESPONSE
+        # from bot identity verification (api-triggered pipelines);
+        # otherwise query the /user API.
+        _BOT_USERNAME=""
+        if [ -n "${BOT_RESPONSE:-}" ]; then
+          _BOT_USERNAME=$(printf '%s' "${BOT_RESPONSE}" | jq -r '.username // empty')
+        fi
+        if [ -z "${_BOT_USERNAME}" ]; then
+          if _BOT_RESP=$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors \
+            "${CI_API_V4_URL}/user" \
+            -H "PRIVATE-TOKEN: ${FULLSEND_FORGE_TOKEN}"); then
+            _BOT_USERNAME=$(printf '%s' "${_BOT_RESP}" | jq -r '.username // empty')
+          fi
+        fi
+
+        # Push token — on GitLab the bot PAT (FULLSEND_FORGE_TOKEN)
+        # serves as both the API token and the push token. The
+        # post-script uses PUSH_TOKEN to push commits.
+        export PUSH_TOKEN="${FULLSEND_FORGE_TOKEN}"
+        export PUSH_TOKEN_SOURCE="pat"
+
+        # Bot git identity — construct a noreply-style email from the
+        # bot username. GitLab project access tokens don't have real
+        # email addresses. The post-script uses GIT_BOT_EMAIL to
+        # configure git author/committer identity.
+        GIT_BOT_EMAIL="${_BOT_USERNAME:-fullsend-${STAGE}}@noreply.${CI_SERVER_HOST:-gitlab.com}"
+        export GIT_BOT_EMAIL
+      fi
+
       # Pre-fetch review body for the fix agent — equivalent to the
       # "Pre-fetch review body" step in reusable-fix.yml. Queries the
       # GitLab Notes API for the last review bot comment, validates
@@ -679,28 +713,15 @@ stages:
         PRE_AGENT_HEAD=$(git rev-parse HEAD)
         export PRE_AGENT_HEAD
 
-        # Repository identity and MR URL — used by forge.gitlab env
-        # config and by the fix post-script for pushing and commenting.
-        export REPO_FULL_NAME="${CI_PROJECT_PATH}"
+        # MR identity — used by forge.gitlab env config and by the
+        # fix post-script for pushing and commenting. REPO_FULL_NAME
+        # is set by run.go from --status-repo (#6865).
         export MR_NUMBER="${MR_IID}"
         if [ "${MR_IID}" != "0" ]; then
           export GITLAB_MR_URL="${CI_SERVER_URL}/${CI_PROJECT_PATH}/-/merge_requests/${MR_IID}"
         else
           export GITLAB_MR_URL=""
         fi
-
-        # Push token — on GitLab the bot PAT (FULLSEND_FORGE_TOKEN)
-        # serves as both the API token and the push token. The
-        # post-script uses PUSH_TOKEN to push fix commits.
-        export PUSH_TOKEN="${FULLSEND_FORGE_TOKEN}"
-        export PUSH_TOKEN_SOURCE="pat"
-
-        # Bot git identity — construct a noreply-style email from the
-        # cached bot username. GitLab project access tokens don't have
-        # real email addresses. The post-script uses GIT_BOT_EMAIL to
-        # configure git author/committer identity.
-        GIT_BOT_EMAIL="${_FIX_BOT_USERNAME:-fullsend-fix}@noreply.${CI_SERVER_HOST:-gitlab.com}"
-        export GIT_BOT_EMAIL
       fi
 
       # Run the agent — fullsend run resolves the harness file, reads

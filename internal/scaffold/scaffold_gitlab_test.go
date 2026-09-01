@@ -353,13 +353,46 @@ func TestGitLabAgentTemplateFixReviewBodyPreFetch(t *testing.T) {
 	assert.Contains(t, s, "author_name")
 	// Pre-agent HEAD recorded before agent runs
 	assert.Contains(t, s, "git rev-parse HEAD")
-	// Forge.gitlab env vars for fix post-script
-	assert.Contains(t, s, "export REPO_FULL_NAME")
+	// Forge.gitlab env vars for fix post-script — REPO_FULL_NAME is now
+	// set by run.go from --status-repo (#6865); PUSH_TOKEN, PUSH_TOKEN_SOURCE,
+	// and GIT_BOT_EMAIL are in the shared code|fix block.
+	assert.NotContains(t, s[strings.Index(s, `"fix"`):], "export REPO_FULL_NAME")
 	assert.Contains(t, s, "export MR_NUMBER")
 	assert.Contains(t, s, "export GITLAB_MR_URL")
+}
+
+// TestGitLabAgentTemplateSharedCodeFixEnvVars verifies that PUSH_TOKEN,
+// PUSH_TOKEN_SOURCE, and GIT_BOT_EMAIL are exported outside the fix-only
+// conditional so both code and fix stages receive them (#6865).
+func TestGitLabAgentTemplateSharedCodeFixEnvVars(t *testing.T) {
+	content, err := GitLabPerRepoFile(".gitlab/ci/fullsend-agent.yml")
+	require.NoError(t, err)
+	s := string(content)
+
+	// Shared block guards on code OR fix
+	assert.Contains(t, s, `"${STAGE}" = "code"`)
+	assert.Contains(t, s, `"${STAGE}" = "fix"`)
+
+	// PUSH_TOKEN, PUSH_TOKEN_SOURCE, GIT_BOT_EMAIL are in the shared block
 	assert.Contains(t, s, "export PUSH_TOKEN")
 	assert.Contains(t, s, "export PUSH_TOKEN_SOURCE")
 	assert.Contains(t, s, "export GIT_BOT_EMAIL")
+
+	// Bot username resolution for GIT_BOT_EMAIL (reuses BOT_RESPONSE
+	// from bot identity verification when available)
+	assert.Contains(t, s, "_BOT_USERNAME")
+	assert.Contains(t, s, "BOT_RESPONSE")
+
+	// REPO_FULL_NAME is NOT exported in the scaffold — run.go sets it
+	// from --status-repo (#6865). Verify it does not appear as an
+	// export outside the fullsend run invocation line.
+	lines := strings.Split(s, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "export REPO_FULL_NAME") {
+			t.Error("REPO_FULL_NAME should not be exported in the scaffold — run.go sets it from --status-repo")
+		}
+	}
 }
 
 func TestGitLabAgentTemplateKillSwitch(t *testing.T) {

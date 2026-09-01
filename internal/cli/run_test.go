@@ -5230,6 +5230,106 @@ func TestRunAgent_MintTokenError(t *testing.T) {
 	assert.Contains(t, err.Error(), "agent token minting failed")
 }
 
+// TestRunAgent_GitLabSkipsMint verifies that mintAgentToken is not called
+// when --forge=gitlab. Minting is GitHub-only; on GitLab the bot PAT
+// (FULLSEND_FORGE_TOKEN) serves as the push/API token. #6865.
+func TestRunAgent_GitLabSkipsMint(t *testing.T) {
+	useFakeOpenshell(t)
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "harness"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "agents"), 0o755))
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "agents", "code.md"),
+		[]byte("You are a coding agent."),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "harness", "code.yaml"),
+		[]byte("agent: agents/code.md\nrole: coder\n"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "config.yaml"),
+		[]byte("agents:\n  - harness/code.yaml\n"),
+		0o644,
+	))
+
+	origMint := statusMintToken
+	defer func() { statusMintToken = origMint }()
+
+	statusMintToken = func(_ context.Context, _ mintclient.MintRequest) (*mintclient.MintResult, error) {
+		t.Fatal("mint should not be called on GitLab")
+		return nil, nil
+	}
+
+	t.Setenv("FULLSEND_MINT_URL", "https://mint.example.com")
+	t.Setenv("REPO_FULL_NAME", "org/my-repo")
+
+	var buf bytes.Buffer
+	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
+	printer := ui.New(&buf)
+	repoDir := t.TempDir()
+	err := runAgent(context.Background(), "code", dir, "", repoDir, "", nil, false, "", "gitlab", "", rFlags, statusOpts{}, printer, false, runOverrideFlags{})
+
+	// Expect error from openshell, not from minting
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "openshell")
+	// No "skipping token minting" warning on GitLab
+	assert.NotContains(t, buf.String(), "skipping token minting")
+}
+
+// TestRunAgent_SetsEnvFromFlags verifies that run.go exports TARGET_REPO_DIR,
+// REPO_FULL_NAME, and ISSUE_NUMBER from their CLI flag values before harness
+// env validation runs. #6865.
+func TestRunAgent_SetsEnvFromFlags(t *testing.T) {
+	useFakeOpenshell(t)
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "harness"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "agents"), 0o755))
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "agents", "code.md"),
+		[]byte("You are a coding agent."),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "harness", "code.yaml"),
+		[]byte("agent: agents/code.md\nrole: coder\nrunner_env:\n  MY_REPO: ${REPO_FULL_NAME}\n  MY_TARGET: ${TARGET_REPO_DIR}\n  MY_ISSUE: ${ISSUE_NUMBER}\n"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "config.yaml"),
+		[]byte("agents:\n  - harness/code.yaml\n"),
+		0o644,
+	))
+
+	origMint := statusMintToken
+	defer func() { statusMintToken = origMint }()
+	statusMintToken = func(_ context.Context, _ mintclient.MintRequest) (*mintclient.MintResult, error) {
+		return nil, nil
+	}
+
+	// Clear any existing values
+	t.Setenv("REPO_FULL_NAME", "")
+	t.Setenv("TARGET_REPO_DIR", "")
+	t.Setenv("ISSUE_NUMBER", "")
+	t.Setenv("FULLSEND_MINT_URL", "")
+
+	var buf bytes.Buffer
+	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
+	printer := ui.New(&buf)
+	repoDir := t.TempDir()
+	sOpts := statusOpts{statusRepo: "myorg/myrepo", statusNum: 42}
+	err := runAgent(context.Background(), "code", dir, "", repoDir, "", nil, false, "", "", "", rFlags, sOpts, printer, false, runOverrideFlags{})
+
+	// Expect error from openshell (we get past env validation)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "openshell")
+	// Env validation should not have failed
+	assert.NotContains(t, err.Error(), "validating env")
+}
+
 func TestRunAgent_StatusNotifierSetup(t *testing.T) {
 	useFakeOpenshell(t)
 	dir := t.TempDir()

@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -753,22 +754,49 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		h.Image = resolved
 	}
 
+	// Export flag values to the process environment so harness env
+	// validation can resolve host-variable references for TARGET_REPO_DIR,
+	// REPO_FULL_NAME, and ISSUE_NUMBER. On GitHub these are set by the
+	// reusable workflow (setup-agent-env.sh); on GitLab the scaffold has
+	// no equivalent, so run.go must provide them (forge-agnostic). #6865.
+	if targetRepo != "" {
+		os.Setenv("TARGET_REPO_DIR", targetRepo)
+	}
+	if sOpts.statusRepo != "" {
+		os.Setenv("REPO_FULL_NAME", sOpts.statusRepo)
+	}
+	if sOpts.statusNum != 0 {
+		os.Setenv("ISSUE_NUMBER", strconv.Itoa(sOpts.statusNum))
+	}
+
 	// Mint agent token when a mint URL and harness role are both available.
 	// Runs before env expansion so minted tokens flow into RunnerEnv and
 	// host_files via os.Getenv automatically.
+	// Minting is GitHub-only — on GitLab the bot PAT (FULLSEND_FORGE_TOKEN)
+	// serves as the push/API token, provisioned via CI/CD variables. Skip
+	// minting entirely to avoid a spurious "skipping token minting" warning
+	// and setting PUSH_TOKEN_SOURCE to a GitHub-specific value. #6865.
 	mintURL := sOpts.mintURL
 	if mintURL == "" {
 		mintURL = os.Getenv("FULLSEND_MINT_URL")
 	}
-	minted, mintCleanup, err := mintAgentToken(ctx, h.Role, mintURL, forgePlatform, printer)
-	if err != nil {
-		return fmt.Errorf("agent token minting failed: %w", err)
+	var minted bool
+	var mintCleanup func()
+	if forgePlatform == "gitlab" {
+		minted = false
+		mintCleanup = func() {}
+	} else {
+		var mintErr error
+		minted, mintCleanup, mintErr = mintAgentToken(ctx, h.Role, mintURL, forgePlatform, printer)
+		if mintErr != nil {
+			return fmt.Errorf("agent token minting failed: %w", mintErr)
+		}
+		if !minted && mintURL == "" {
+			printer.StepWarn("No --mint-url provided; skipping token minting for role " + h.Role)
+		}
 	}
 	if mintCleanup != nil {
 		defer mintCleanup()
-	}
-	if !minted && mintURL == "" {
-		printer.StepWarn("No --mint-url provided; skipping token minting for role " + h.Role)
 	}
 
 	// Expand env vars in runner_env values. FULLSEND_DIR is injected so
