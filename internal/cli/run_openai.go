@@ -137,10 +137,10 @@ var openAIDeleteBackoff = 3 * time.Second
 // process in the sandbox receives right now.
 func sandboxOpenAIPlaceholder(ctx context.Context, sandboxName string) (string, error) {
 	// ExecContext already wraps the command in `sh -c`. Held under the
-	// quiesce lock so the between-iteration sweep never kills this exec.
+	// sandbox lock so the between-iteration sweep never kills this exec.
 	var out, stderr string
 	var code int
-	err := withSandboxQuiesce(nil, func() error {
+	err := withSandboxLock(ctx, nil, func() error {
 		var execErr error
 		out, stderr, code, execErr = sandbox.ExecContext(ctx, sandboxName, `printf %s "${OPENAI_API_KEY:-}"`, openAIPlaceholderExecTimeout)
 		return execErr
@@ -213,17 +213,17 @@ func reseedOpenAIAuth(ctx context.Context, h openAIProviderHandle, previous stri
 	// starting at this very moment seeds too (from its own exec
 	// environment, which may still carry the previous placeholder), and
 	// whichever write lands last wins. One re-seed closes that window.
-	// Only the write is taken under the quiesce lock, and one exec at a
+	// Only the write is taken under the sandbox lock, and one exec at a
 	// time: the seed writes atomically (mv -f) but the between-iteration
 	// sweep must not kill it mid-run, whereas the grep below only reads and
 	// costs nothing if it is killed. Each hold is one exec (30s + slack), so
-	// a sweep never waits on the whole retry loop — see sandboxQuiesceMu's
+	// a sweep never waits on the whole retry loop — see sandboxMu's
 	// hold budget.
 	seed := func() error {
 		for attempt := 0; attempt < 2; attempt++ {
 			var stderr string
 			var code int
-			err := withSandboxQuiesce(nil, func() error {
+			err := withSandboxLock(ctx, nil, func() error {
 				var execErr error
 				_, stderr, code, execErr = sandbox.ExecContext(ctx, h.sandbox, h.authSeed, openAIPlaceholderExecTimeout)
 				return execErr

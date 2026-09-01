@@ -34,6 +34,7 @@ sequenceDiagram
   R->>S: .env, host files
   R->>S: Bootstrap
   R->>S: OIDC token (4-min refresh)
+  R->>S: clean up stray processes (between iterations)
   R->>S: Run (per iteration)
   S->>A: start + hook wiring
   loop tool-use loop
@@ -45,16 +46,6 @@ sequenceDiagram
   R->>S: extract artifacts
   R->>R: verdict, metrics.json
 ```
-
-- **Between iterations** (a validation retry reuses the same sandbox), the runner calls the runtime's
-  `ClearIterationArtifacts`. It first terminates any processes the previous iteration left running as
-  the sandbox user — a backgrounded tool command (`nohup … &`) is reparented and survives the agent
-  process's exit (pi's bash tool kills its process tree only on abort/timeout; the same survivors are
-  observed after a Claude Code run), and would otherwise keep holding files, burning CPU and writing
-  into the workspace the next iteration reads — and then removes the previous iteration's output,
-  sessions/transcripts and debug log. The sandbox's keep-alive main process and the exec channel
-  itself are spared, the sweep is serialized against the credential refreshers' writes into the
-  sandbox, and a failed sweep is a warning, never an iteration failure.
 
 ## Choosing between claude and pi
 

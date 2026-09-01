@@ -57,7 +57,7 @@ const killStrayProcessesTimeout = 15 * time.Second
 // target on open, so a kill mid-write would leave an empty .gcp-oidc-token
 // until the next 4-minute tick; reseedOpenAIAuth's execs are the other
 // writer. internal/cli/run.go therefore serializes the sweep against both
-// through sandboxQuiesceMu: the iteration loop holds it across
+// through sandboxMu: the iteration loop holds it across
 // ClearIterationArtifacts and the refreshers hold it across each upload or
 // writing exec. The residual is the OpenAI seed itself, which writes
 // atomically (`printf > tmp && mv -f`) and is retried on

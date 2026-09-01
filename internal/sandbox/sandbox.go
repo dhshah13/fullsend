@@ -43,6 +43,14 @@ const (
 	// each one explicitly with -e.
 	SandboxPiExtensionsDir = "/usr/local/share/pi-extensions"
 
+	// KeepAliveCommand is the sandbox's canonical main process, started by
+	// createOnce so the sandbox stays Ready between `sandbox exec` calls
+	// (OpenShell 0.0.111+ makes a sandbox terminal once its main process
+	// exits). It runs as the sandbox user, so anything that sweeps the
+	// sandbox user's processes (runtime.killStrayProcesses) must spare
+	// exactly this argv — keep the two in sync through this constant.
+	KeepAliveCommand = "sleep infinity"
+
 	readyTimeout    = 120 * time.Second
 	readyPoll       = 2 * time.Second
 	readyCtxBuffer  = 10 * time.Second
@@ -941,14 +949,6 @@ func effectiveReadyTimeout(override time.Duration) time.Duration {
 	}
 	return t
 }
-
-// KeepAliveCommand is the sandbox's canonical main process, started by
-// createOnce so the sandbox stays Ready between `sandbox exec` calls
-// (OpenShell 0.0.111+ makes a sandbox terminal once its main process
-// exits). It runs as the sandbox user, so anything that sweeps the sandbox
-// user's processes (runtime.killStrayProcesses) must spare exactly this
-// argv — keep the two in sync through this constant.
-const KeepAliveCommand = "sleep infinity"
 
 // Create creates a persistent OpenShell sandbox and waits for it to be ready.
 // It retries up to DefaultMaxCreateAttempts times with exponential backoff,

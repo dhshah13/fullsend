@@ -1922,8 +1922,8 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		// Clear sandbox-side output and transcripts so the next iteration starts fresh.
 		if iteration > 1 {
 			// Held across the sweep so a credential refresher's upload/exec
-			// is never caught mid-write (see sandboxQuiesceMu).
-			clearErr := withSandboxQuiesce(func(waited time.Duration) {
+			// is never caught mid-write (see sandboxMu).
+			clearErr := withSandboxLock(ctx, func(waited time.Duration) {
 				printer.StepInfo(fmt.Sprintf(
 					"Waiting %s for a credential refresh to finish before clearing the sandbox", waited))
 			}, func() error {
@@ -3629,7 +3629,7 @@ func readOIDCAuthFile(path string) (string, error) {
 
 var oidcRefreshInterval = 4 * time.Minute
 
-// sandboxQuiesceMu serializes the between-iteration stray-process sweep
+// sandboxMu serializes the between-iteration stray-process sweep
 // (runtime.ClearIterationArtifacts TERM/KILLs every sandbox-user process
 // outside its own exec) against the background credential refreshers that
 // write into the sandbox from the host. refreshOIDCToken's
@@ -3651,49 +3651,53 @@ var oidcRefreshInterval = 4 * time.Minute
 // ClearIterationArtifacts, has to be checked against that margin: once the
 // worst-case hold approaches the tick interval a refresh can miss its slot
 // and the token can expire before the next one lands. Take the lock through
-// withSandboxQuiesce rather than directly, so a panic inside the critical
+// withSandboxLock rather than directly, so a panic inside the critical
 // section cannot leave it held — the deferred oidcWg/refreshWg waits would
 // then hang the run instead of surfacing the panic.
-var sandboxQuiesceMu sync.Mutex
+var sandboxMu sync.Mutex
 
-// sandboxQuiesceWarnAfter is how long withSandboxQuiesce waits for the lock
+// sandboxLockWarnAfter is how long withSandboxLock waits for the lock
 // before telling the caller's notify that something else holds it;
-// sandboxQuiescePoll is how often it retries meanwhile. Only the iteration
+// sandboxLockPoll is how often every waiter retries meanwhile. Only the iteration
 // loop passes a notify: a sweep waiting on a refresher stalls visible
 // progress, while a refresher waiting on a sweep is routine.
 var (
-	sandboxQuiesceWarnAfter = 5 * time.Second
-	sandboxQuiescePoll      = 100 * time.Millisecond
+	sandboxLockWarnAfter = 5 * time.Second
+	sandboxLockPoll      = 100 * time.Millisecond
 )
 
-// withSandboxQuiesce runs fn holding sandboxQuiesceMu (see there for what it
+// withSandboxLock runs fn holding sandboxMu (see there for what it
 // protects and for the hold budget); the lock is released even if fn panics.
 // notify, when non-nil, is called once if the lock is still not free after
-// sandboxQuiesceWarnAfter, with the time waited so far.
-func withSandboxQuiesce(notify func(waited time.Duration), fn func() error) error {
-	acquireSandboxQuiesce(notify)
-	defer sandboxQuiesceMu.Unlock()
+// sandboxLockWarnAfter, with the time waited so far. A ctx cancelled while
+// waiting returns ctx.Err() without running fn, so a run shutting down is
+// not held up by a holder's in-flight sandbox exec.
+func withSandboxLock(ctx context.Context, notify func(waited time.Duration), fn func() error) error {
+	if err := acquireSandboxLock(ctx, notify); err != nil {
+		return err
+	}
+	defer sandboxMu.Unlock()
 	return fn()
 }
 
-func acquireSandboxQuiesce(notify func(waited time.Duration)) {
-	if sandboxQuiesceMu.TryLock() {
-		return
+func acquireSandboxLock(ctx context.Context, notify func(waited time.Duration)) error {
+	if sandboxMu.TryLock() {
+		return nil
 	}
-	if notify == nil {
-		sandboxQuiesceMu.Lock()
-		return
-	}
-	// TryLock in a loop, so the wait can be reported while it is happening
-	// rather than only after the fact.
+	// TryLock in a loop rather than Lock, so the wait can be reported while
+	// it is happening and abandoned when ctx is cancelled.
 	start := time.Now()
 	warned := false
 	for {
-		time.Sleep(sandboxQuiescePoll)
-		if sandboxQuiesceMu.TryLock() {
-			return
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sandboxLockPoll):
 		}
-		if waited := time.Since(start); !warned && waited >= sandboxQuiesceWarnAfter {
+		if sandboxMu.TryLock() {
+			return nil
+		}
+		if waited := time.Since(start); notify != nil && !warned && waited >= sandboxLockWarnAfter {
 			notify(waited.Round(time.Second))
 			warned = true
 		}
@@ -3765,8 +3769,8 @@ func refreshOIDCToken(ctx context.Context, sandboxName, oidcURL, oidcAuth string
 
 	remotePath := sandbox.SandboxWorkspace + "/.gcp-oidc-token"
 	// The upload's in-sandbox tar truncates the token on open; hold the
-	// quiesce lock so the between-iteration sweep cannot kill it mid-write.
-	uploadErr := withSandboxQuiesce(nil, func() error {
+	// sandbox lock so the between-iteration sweep cannot kill it mid-write.
+	uploadErr := withSandboxLock(ctx, nil, func() error {
 		return sandbox.UploadFile(sandboxName, tmpFile.Name(), remotePath)
 	})
 	if uploadErr != nil {
