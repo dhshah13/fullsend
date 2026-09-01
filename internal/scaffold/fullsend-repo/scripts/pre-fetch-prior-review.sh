@@ -96,8 +96,14 @@ echo "prior_review_file=${PRIOR_FILE}" >> "${GITHUB_OUTPUT:-/dev/null}"
 if [[ "${BYTE_COUNT}" -gt 1 ]]; then
     # Extract SHA from current section only (before sticky history sentinels)
     CURRENT_SECTION="$(awk '/<!-- sticky:history-start -->/{exit} {print}' "${PRIOR_FILE}")"
+    # sed -nE, not grep -oP: BSD grep (macOS) has no -P, so the PCRE
+    # lookbehind exited with "invalid option" and the `|| true` swallowed
+    # it — PRIOR_SHA came back empty and the two SHA tests failed on every
+    # macOS checkout. sed -nE is the same expression in POSIX ERE and works
+    # on both. A no-match prints nothing and still exits 0, so this keeps
+    # the no-SHA case off pipefail too (body-without-sha-no-crash).
     PRIOR_SHA="$(echo "${CURRENT_SECTION}" \
-        | grep -oP '(?<=\*\*Head SHA:\*\* )[0-9a-f]{7,64}' | head -1 || true)"
+        | sed -nE 's/.*\*\*Head SHA:\*\* ([0-9a-f]{7,64}).*/\1/p' | head -1)"
     echo "prior_sha=${PRIOR_SHA}" >> "${GITHUB_OUTPUT:-/dev/null}"
     echo "Prior review SHA: ${PRIOR_SHA:-none}"
 else
