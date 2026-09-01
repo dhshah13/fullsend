@@ -640,24 +640,21 @@ start_gateway() {
   done
 
   # Register the gateway with the CLI so openshell commands can find it.
-  # Check for an active gateway (line starting with *).
-  if ! openshell gateway list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -Eq '^[[:space:]]*\*'; then
-    # `gateway add` is not idempotent — it refuses when metadata for the
-    # canonical "openshell" loopback name already exists — so fall back to
-    # selecting that name. Both failing must fail setup: every job's agent
-    # depends on this registration, and verify() only checks the systemd unit.
-    local add_err
-    if ! add_err=$(openshell gateway add --local https://127.0.0.1:17670 2>&1) \
-      && ! openshell gateway select openshell >/dev/null 2>&1; then
-      fail "could not register or select the OpenShell gateway: ${add_err}"
-    fi
-    if ! openshell gateway list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -Eq '^[[:space:]]*\*'; then
-      fail "no active OpenShell gateway after add/select"
-    fi
-    ok "gateway registered and selected"
-  else
-    ok "gateway already registered"
+  # The restart above triggers ExecStartPre which regenerates TLS
+  # certificates. Any existing CLI registration still references the old
+  # certs, so mTLS checks would fail. Remove the stale registration first,
+  # then re-add so the CLI picks up the new certificates.
+  openshell gateway remove openshell >/dev/null 2>&1 || true
+
+  local add_err
+  if ! add_err=$(openshell gateway add --local https://127.0.0.1:17670 2>&1) \
+    && ! openshell gateway select openshell >/dev/null 2>&1; then
+    fail "could not register or select the OpenShell gateway: ${add_err}"
   fi
+  if ! openshell gateway list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -Eq '^[[:space:]]*\*'; then
+    fail "no active OpenShell gateway after add/select"
+  fi
+  ok "gateway registered and selected"
 
   ok "gateway is running"
 }
