@@ -426,7 +426,10 @@ func TestGetCommentProperty_NotFound(t *testing.T) {
 	client, mux := setupTest(t)
 	ctx := context.Background()
 
-	mux.HandleFunc("/rest/api/3/issue/PROJ-1/comment/10001/properties/missing", func(w http.ResponseWriter, r *http.Request) {
+	handlerCalled := false
+	mux.HandleFunc("/rest/api/3/comment/10001/properties/missing", func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled = true
+		assert.Equal(t, http.MethodGet, r.Method)
 		writeJSON(t, w, http.StatusNotFound, map[string]any{
 			"errorMessages": []string{"Property 'missing' not found"},
 		})
@@ -435,6 +438,7 @@ func TestGetCommentProperty_NotFound(t *testing.T) {
 	_, err := client.GetCommentProperty(ctx, "PROJ-1", "10001", "missing")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, forge.ErrNotFound), "expected forge.ErrNotFound, got: %v", err)
+	assert.True(t, handlerCalled, "handler was not called — URL path mismatch")
 }
 
 // ---------------------------------------------------------------------------
