@@ -349,7 +349,14 @@ func buildRunCommand(params RunParams) string {
 	}
 
 	if params.Model != "" {
-		parts = append(parts, fmt.Sprintf("--model '%s'", strings.ReplaceAll(params.Model, "'", "'\\''")))
+		model := params.Model
+		// When the repo configures models.aliases and the model is an
+		// alias key with an entry, translate it to the id before --model
+		// so the run uses the repo's chosen generation (#6882).
+		if id, ok := params.ModelAliases[model]; ok {
+			model = id
+		}
+		parts = append(parts, fmt.Sprintf("--model '%s'", strings.ReplaceAll(model, "'", "'\\''")))
 	}
 
 	if params.Effort != "" {

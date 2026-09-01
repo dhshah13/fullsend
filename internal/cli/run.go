@@ -1031,6 +1031,15 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if overrides.model != "" {
 		h.Model = overrides.model
 	}
+
+	// Resolve per-repo model aliases from config (#6882). The alias map
+	// is passed to RunParams so each runtime can merge it into its own
+	// alias table; the echo here shows the mapping for visibility.
+	var configModelAliases map[string]string
+	if runCfg.perRepo != nil {
+		configModelAliases = runCfg.perRepo.ConfigModelAliases()
+	}
+
 	// provider/id is pi's model form; Claude Code takes an alias or an
 	// Anthropic model id. The syntax is accepted for every runtime (ids are
 	// not a closed set), so flag the likely mismatch instead of rejecting it.
@@ -1058,7 +1067,11 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		printer.KeyValue("Policy", h.Policy)
 	}
 	if h.Model != "" {
-		printer.KeyValue("Model", withSource(h.Model, overrides.modelSource))
+		modelDisplay := withSource(h.Model, overrides.modelSource)
+		if id, ok := configModelAliases[h.Model]; ok {
+			modelDisplay = fmt.Sprintf("%s → %s (from %s models.aliases)", h.Model, id, runCfg.source)
+		}
+		printer.KeyValue("Model", modelDisplay)
 	}
 	if h.Effort != "" {
 		printer.KeyValue("Effort", withSource(h.Effort, overrides.effortSource))
@@ -1368,7 +1381,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			// the Vertex provider without making every run resolve an
 			// OpenAI credential (#6920); the profile is not imported and
 			// the instance is not created or attached.
-			if !agentruntime.NeedsOpenAIProvider(runtimeBackend.Runtime.Name(), h.Model, agentDefModel) {
+			if !agentruntime.NeedsOpenAIProvider(runtimeBackend.Runtime.Name(), h.Model, agentDefModel, configModelAliases) {
 				skippedProviders[pd.Name] = struct{}{}
 				// Counts as handled, so the "declared but no definition
 				// found" warning below does not also fire for it.
@@ -1754,12 +1767,21 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if overrides.modelSource != "" {
 		fmt.Fprintf(os.Stderr, "model: requested %q from %s\n", h.Model, overrides.modelSource)
 	}
+	if id, ok := configModelAliases[h.Model]; ok {
+		fmt.Fprintf(os.Stderr, "model: alias %q remapped to %q from %s models.aliases\n", h.Model, id, runCfg.source)
+	}
 	rt := backend.Runtime
 	aggMetrics.Runtime = rt.Name()
 	aggMetrics.RequestedRuntime = rt.Name()
 	aggMetrics.RuntimeSource = configSource
 	aggMetrics.RequestedModel = h.Model
-	aggMetrics.OverrideSource = modelOverrideSource(overrides, h.Model)
+	ovrSrc := modelOverrideSource(overrides, h.Model)
+	if _, ok := configModelAliases[h.Model]; ok && ovrSrc != "" {
+		ovrSrc += fmt.Sprintf(", remapped by %s models.aliases", runCfg.source)
+	} else if _, ok := configModelAliases[h.Model]; ok {
+		ovrSrc = fmt.Sprintf("%s models.aliases", runCfg.source)
+	}
+	aggMetrics.OverrideSource = ovrSrc
 	tx := backend.Transcripts
 
 	// 6. Start runtime fetch service (Phase 4, ADR-0038).
@@ -2145,6 +2167,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			OutputPath:        filepath.Join(iterDir, "output.jsonl"),
 			Prompt:            agentPrompt,
 			Forge:             forgePlatform,
+			ModelAliases:      configModelAliases,
 			OnEvent:           contentEventHandler(agentruntime.NewEventRenderer(printer).Handle, collector),
 		}, printer, agentStart, &metrics)
 		close(heartbeatDone)

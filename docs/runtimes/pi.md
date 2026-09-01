@@ -14,8 +14,27 @@ is what changes once you are on it.
 ## Models and providers
 
 A model on pi is `provider/id`. Aliases and bare ids still work — `opus`/`sonnet`/`haiku`/`fable`
-resolve through fullsend's table, and a bare id gets the provider from `FULLSEND_PI_PROVIDER`
-(default `anthropic-vertex`).
+resolve through fullsend's pinned alias table, and a bare id gets the provider from
+`FULLSEND_PI_PROVIDER` (default `anthropic-vertex`).
+
+### Per-repo alias overrides (`models.aliases`)
+
+The pinned alias table is a fullsend-owned constant. To retarget an alias for a specific repo —
+e.g. because `claude-sonnet-5` is enabled in that project's Vertex but the fleet still pins
+`claude-sonnet-4-6` — add a `models.aliases` block in `.fullsend/config.yaml`:
+
+```yaml
+models:
+  aliases:
+    sonnet: claude-sonnet-5
+```
+
+Merge is per key: a repo that sets only `sonnet` inherits the fleet default for `opus`, `haiku` and
+`fable`. Keys must be the existing alias vocabulary (`opus`, `sonnet`, `haiku`, `fable`); unknown keys
+are a config validation error. Values are validated with `ValidModelRef` (bare id or `provider/id`).
+
+The plan block echoes the mapping when an alias is remapped, and `metrics.json` records the config
+source in `override_source`.
 
 | Model | Spec | Provider |
 |---|---|---|

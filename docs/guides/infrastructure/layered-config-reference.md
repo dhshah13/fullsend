@@ -87,6 +87,7 @@ the overlay → base → code defaults chain.
 | `inference.openai.audience` | `string` (nested) | Scalar override | `""` (empty) |
 | `inference.openai.identity_provider_id` | `string` (nested) | Scalar override | `""` (empty) |
 | `inference.openai.service_account_id` | `string` (nested) | Scalar override | `""` (empty) |
+| `models.aliases.<key>` | `map[string]string` (nested) | Per-key merge | `nil` (fleet defaults) |
 | `create_issues` | `*CreateIssuesConfig` | Replace whole object if set | `nil` |
 | `status_notifications` | `*StatusNotificationConfig` | Replace whole object if set | `nil` |
 
@@ -189,6 +190,32 @@ inference:
 #   inference.project: my-project (from overlay)
 #   inference.region: us-central1 (from base)
 #   inference.wif_provider: ...base... (from base)
+```
+
+### `models.aliases` — per-key merge
+
+`models.aliases` overrides fullsend's pinned model alias table per key
+(#6882). Keys are the existing alias vocabulary (`opus`, `sonnet`,
+`haiku`, `fable`); values are model ids or `provider/id` specs validated
+with `ValidModelRef`. An unknown key is a config validation error.
+
+Merge is per key across layers: an overlay that sets `fable` inherits
+the base's `sonnet` entry without restating it. A `nil` Models block
+(key omitted from YAML) falls through to the parent layer.
+
+```yaml
+# config.base.yaml
+models:
+  aliases:
+    sonnet: claude-sonnet-5
+
+# config.yaml (overlay)
+models:
+  aliases:
+    fable: claude-fable-5-1
+
+# Effective: sonnet → claude-sonnet-5 (from base), fable → claude-fable-5-1 (from overlay),
+# opus and haiku → fleet defaults (compiled-in).
 ```
 
 ### `tracker` — scalar override

@@ -186,6 +186,14 @@ Harness `model:` and `agents:` entry `model:` values accept provider-qualified `
 (e.g. `google-vertex/gemini-3.7-flash`). On pi, a harness can also select a provider with a bare
 `model:` plus `FULLSEND_PI_PROVIDER`.
 
+### Per-repo alias overrides (`models.aliases`)
+
+A `models.aliases` map in `.fullsend/config.yaml` overrides fullsend's pinned alias table per key,
+on both runtimes. A repo that only wants `sonnet: claude-sonnet-5` does not need to restate `opus`.
+See [Pi › Per-repo alias overrides](runtimes/pi.md#per-repo-alias-overrides-modelsaliases) for the
+full syntax. The same block is used on Claude Code: when a `models.aliases` entry exists for the
+alias, the id is passed to `--model` instead of the alias name.
+
 ## Where the selection appears
 
 | Surface | What it shows |
@@ -209,7 +217,7 @@ and are omitted from this table.
 
 | Harness key | Claude Code | pi | codex |
 |---|---|---|---|
-| `model` | `--model` | alias table, then `provider/id`; see [Models](#models) | `--model <id>`; OpenAI ids only |
+| `model` | `--model` | alias table (merged with `models.aliases`), then `provider/id`; see [Models](#models) | `--model <id>`; OpenAI ids only |
 | `effort` | `--effort` | `--thinking` (superset of the harness levels; `high` when unset) | `model_reasoning_effort` (same levels) |
 | `tools:` | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | No native allowlist. `Bash(...)` lists are recorded but not enforced, entries with no codex tool are dropped with a warning, and the tool-allowlist hook is opt-in (`FULLSEND_TOOL_ALLOWLIST`) |
 | `skills` | `CLAUDE_CONFIG_DIR/skills/` | `PI_CODING_AGENT_DIR/skills/`, discovered natively | `CODEX_HOME/skills/`, discovered natively |
