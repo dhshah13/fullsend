@@ -1,11 +1,11 @@
 # Bot Identities
 
-Fullsend agents authenticate as GitHub Apps; the table below also includes non-agent bots that appear in trusted-actor lists. Multiple agent roles may share a single app identity. The GitHub App login is derived from the `slug` field in each harness file (in the [`fullsend-ai/agents`](https://github.com/fullsend-ai/agents) repo).
+Fullsend agents authenticate as GitHub Apps; the table below also includes non-agent bots that appear in trusted-actor lists. Multiple agent roles may share a single app identity. The GitHub App login is determined by the `role` field in each harness file (in the [`fullsend-ai/agents`](https://github.com/fullsend-ai/agents) repo); `slug` is an install-time hint the mint never reads.
 
-| Agent role | GitHub App login | Notes |
+| Agent | GitHub App login | Notes |
 |---|---|---|
-| code | `fullsend-ai-coder[bot]` | Opens PRs from issues |
-| fix | `fullsend-ai-coder[bot]` | Shares the coder app; pushes to existing PR branches |
+| code | `fullsend-ai-coder[bot]` | `role: coder`. Opens PRs from issues |
+| fix | `fullsend-ai-coder[bot]` | `role: coder`. Shares the coder app; pushes to existing PR branches |
 | review | `fullsend-ai-review[bot]` | Posts review comments |
 | triage | `fullsend-ai-triage[bot]` | Posts triage summaries on issues |
 | retro | `fullsend-ai-retro[bot]` | Files retro issues, posts PR comments |

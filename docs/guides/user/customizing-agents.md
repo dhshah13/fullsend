@@ -263,7 +263,11 @@ Reference the skill in your harness's `skills:` list. The skill is available to 
 
 ## Agent roles
 
-Each agent role has its own identity, permissions, and purpose:
+On the hosted mint, agents run as one of a **fixed** set of built-in roles.
+Each role is a GitHub App identity with a fixed permission ceiling. An agent's
+name is separate from its role — the `code` and `fix` agents both run as the
+`coder` role. To pick a role for a custom agent, or to use your own identity or
+a custom role, see [Custom Agent Identity](custom-agent-identity.md).
 
 | Role | GitHub App | Purpose |
 |------|------------|---------|
