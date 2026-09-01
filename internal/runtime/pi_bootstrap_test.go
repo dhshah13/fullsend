@@ -437,4 +437,10 @@ func TestPiDefaultTools_CoversToolMap(t *testing.T) {
 	for claudeName, piName := range piToolForClaude {
 		assert.Truef(t, defaults[piName], "pi tool %q (mapped from %s) is missing from piDefaultTools", piName, claudeName)
 	}
+	// And the reverse: every default pi tool has a Claude name for the hook
+	// adapter, so hook scripts never see a raw pi tool name.
+	for _, name := range piDefaultTools {
+		_, ok := claudeToolForPi[name]
+		assert.Truef(t, ok, "default pi tool %q has no claudeToolForPi entry", name)
+	}
 }
