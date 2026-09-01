@@ -481,6 +481,8 @@ Vendoring commit messages use title + body (upload and stale delete). `github st
 │  │                                          │                   │
 │  │ Phase 1 — inline validation:             │                   │
 │  │ for i := 1; i <= max_iterations; i++ {   │                   │
+│  │   if i > 1: ClearIterationArtifacts      │                   │
+│  │     (sweep stray processes, clear output)│                   │
 │  │   run agent → extract output             │                   │
 │  │   SafeDownload repo (non-fatal on fail)  │                   │
 │  │   run validation script                  │                   │

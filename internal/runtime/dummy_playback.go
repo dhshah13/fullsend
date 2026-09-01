@@ -288,7 +288,11 @@ func (r DummyPlaybackRuntime) commitToCurrentBranch(sandboxName, repoDir, entryN
 	return nil
 }
 
+// ClearIterationArtifacts sweeps stray processes (dummy-playback execs run in
+// the real sandbox, so it gets the same between-iteration hygiene as the
+// agent runtimes), then removes the previous iteration's output.
 func (r DummyPlaybackRuntime) ClearIterationArtifacts(sandboxName string) error {
+	clearStrayProcesses(r.execFn(), sandboxName, os.Stderr)
 	clearCmd := fmt.Sprintf("rm -rf %s/output/*", r.WorkspaceDir())
 	_, _, _, err := r.execFn()(sandboxName, clearCmd, 10*time.Second)
 	return err
