@@ -335,7 +335,7 @@ allowed_remote_resources:
 ```
 
 **Notes:**
-- `roles` controls which built-in agent roles are enabled. Valid values: `fullsend`, `triage`, `coder`, `review`, `fix`, `retro`, `prioritize`, `e2e`. Custom agents registered via `agents:` do not need to appear in this list.
+- `roles` controls which built-in agent roles are enabled. Valid values: `fullsend`, `triage`, `coder`, `review`, `fix`, `retro`, `prioritize`. Custom agents registered via `agents:` do not need to appear in this list.
 - URL entries are automatically pinned with `#sha256=...` by `fullsend agent add`.
 - URLs must be covered by `allowed_remote_resources` in the same config.
 - On name collision, config-registered agents take precedence over built-in agents.
