@@ -20,11 +20,14 @@ OpenAI Responses API, so there is no Claude, Gemini or Grok on codex.
 codex refuses them rather than picking a GPT model on your behalf:
 
 ```
-codex serves OpenAI models only; "opus" names a Claude model — use openai/<id>
+codex takes OpenAI model ids only, and the Claude model aliases do not apply to it: "opus" is one
+of them. To run this agent on codex, set FULLSEND_CODEX_MODEL=openai/<id> for the repo, or
+model: openai/<id> on the agent's agents: entry or the harness
 ```
 
-<!-- TODO(D): replace the message above with the exact refusal text the runtime prints (the alias
-     case, which is the one a repo on fleet harnesses actually hits). Quote it; do not paraphrase. -->
+A model carrying another provider's prefix, and a run with no model named at all, fail the same way
+and name the same two fixes. Nothing is remapped: the per-repo `models.aliases` overrides are not
+consulted on codex either, so a Claude alias can never resolve to a GPT model behind your back.
 
 That matters because the fleet harnesses ship `model: opus`. You do not need to edit them — there
 are two places to name a model for a repo on codex.
@@ -70,7 +73,7 @@ warning, as it is on pi.
 |---|---|
 | Credentials | A runner-exchanged OpenAI WIF token in CI, or your `OPENAI_API_KEY` on the runner locally — never in the sandbox. Codex reads a placeholder from a runner-owned token file and re-reads it when the credential is refreshed ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)) |
 | Unattended | Approvals off; codex's own sandbox off, because OpenShell is the boundary. A missing credential exits before the agent starts |
-| Artifacts | `output.jsonl` (the `codex exec --json` stream), `transcripts/<agent>-<rollout>.jsonl`, `last-message.txt`, `metrics.json` with `runtime: codex`, plus `codex-debug.log` with `--debug` |
+| Artifacts | `output.jsonl` (the `codex exec --json` stream), `transcripts/<agent>-<rollout>.jsonl`, `metrics.json` with `runtime: codex`, plus `codex-debug.log` with `--debug`. The agent's final message is in the stream; `--output-last-message` also drops it in the runner-owned config directory inside the sandbox, which is a convenience when inspecting a kept sandbox rather than a downloaded artifact |
 | Extra knobs | `FULLSEND_CODEX_MODEL` (the runner-side model default for codex runs; see [Models](#models)) |
 | Not supported | Sub-agents, `plugins:`, fallback chains, non-OpenAI providers |
 
@@ -105,10 +108,13 @@ bare — and `metrics.json` records the same (`runtime`, `runtime_source`, `requ
     Runtime: codex (from --runtime flag)
 ...
 runtime: selected "codex" from --runtime flag
+...
+→ Agent: gpt-5.6-luna (v0.152.1)
+  ✓ Agent exited with code 0
 ```
 
-<!-- TODO(D): replace the plan block above with the real transcript from PR D's local smoke run,
-     including the "→ Agent: … (v…)" and "→ Result: …" lines, once that evidence exists. -->
+The version on the `Agent:` line is the codex CLI the sandbox image carries, captured by
+Bootstrap's `codex --version` preflight — not the model's.
 
 To keep an agent on codex (or off it) without passing flags every time, set `runtime:`/`model:` on
 its `agents:` entry in `config.yaml` — see [per-agent
@@ -116,8 +122,11 @@ settings](../runtimes.md#per-agent-runtime-model-and-effort).
 
 What a local codex run needs, beyond the guide:
 
+- **fullsend from the release that carries `CODEX_VERSION`** — the first one cut after the codex
+  runtime lands. The release download and the container image both work as-is.
 - **A sandbox image that includes codex** — `ghcr.io/fullsend-ai/fullsend-sandbox` built with
-  `CODEX_VERSION`. A stale image fails preflight; `podman pull
+  `CODEX_VERSION` (0.152.1 today). A stale image fails Bootstrap's preflight before the agent
+  starts, with ``codex preflight: `codex --version` exited 127``; `podman pull
   ghcr.io/fullsend-ai/fullsend-sandbox:latest` fixes it.
 - **A harness that declares the provider and a policy** — `providers: [openai]` and
   `policy: policies/base.yaml`. The fleet's agents already carry both; a custom harness needs the
@@ -126,9 +135,9 @@ What a local codex run needs, beyond the guide:
 - **Debugging** — `--debug='*'` (the `=` is required); sandbox-side failures land in
   `codex-debug.log` inside the run directory, next to the transcripts, not in the runner's output.
 
-<!-- TODO(D): add the fullsend version floor (the first release carrying the codex runtime), the
-     exact preflight error text for a stale image, and the platform line ("verified end to end on
-     macOS Apple Silicon and Fedora with rootless Podman") once PR D's smoke runs are recorded. -->
+- **Platforms** — the runtime was brought up and smoke-tested on macOS Apple Silicon (podman
+  machine, Homebrew `openshell`, arm64 image); the local guide's platform notes otherwise apply
+  unchanged.
 
 ## Behaviour differences worth knowing
 
@@ -141,13 +150,32 @@ What a local codex run needs, beyond the guide:
   directory it has been told to trust, and fullsend does not trust the cloned repo — so a target
   repo cannot change how the agent runs.
 - **Two tools, not a menu.** Codex works through a shell and `apply_patch`, so a harness `tools:`
-  list has no native allowlist to map onto. Enforcement is the same pre-tool allowlist hook the
-  other runtimes use, plus a warning naming the entries codex has no tool for.
-- **PostToolUse hooks detect and block, but do not rewrite.** Codex accepts a block decision from a
-  post-tool hook, but not replacement output for a built-in tool. A sanitizer that would have
-  redacted something reports that fact to the model instead of silently changing the output.
-- **Skills** come from the runner-owned `CODEX_HOME/skills/`; the repository's `.agents/skills` is
-  discovered by codex natively.
+  list has no native allowlist to map onto. A `Bash(...)` allowlist is **recorded but not enforced**
+  on codex, and the run says so:
+
+  ```
+  Agent Bash allowlist (gh, curl, jq) is recorded but not enforced on codex
+  ```
+
+  Entries with no codex equivalent are dropped from the hook wiring with their own note — `WebFetch`,
+  for instance, because codex does that through the shell. The sandbox and its egress policy, not the
+  tool list, remain the boundary.
+- **A blocked tool call reads as *declined*, not failed.** A PreToolUse block reaches the model as
+  `Command blocked by PreToolUse hook: <reason>`, so the agent understands it was refused rather
+  than that the command broke — in a smoke run it summarised the block as "blocked by a safety hook"
+  and moved on.
+- **PostToolUse hooks block rather than rewrite.** Codex accepts a block decision from a post-tool
+  hook but not replacement output for a built-in tool, so a result that trips a sanitizer is
+  **withheld from the model entirely** rather than passed through redacted. The two protections are
+  separate and both apply: the hooks guard what the model sees, and the run's artifacts
+  (`output.jsonl` and the extracted transcripts) get pattern redaction on the way to disk, so raw
+  tool output does not reach an uploaded artifact either.
+- **Skills** come from the runner-owned `CODEX_HOME/skills/`, and the repository's own
+  `.agents/skills` are discovered too (the same as Claude Code; leaving the project untrusted
+  suppresses `.codex/` config, not skills). Repo-supplied `SKILL.md` files are covered by the
+  host-side content scan and the in-sandbox `scan context` pass. Codex's own bundled skills
+  (`skill-installer`, `imagegen` and friends) are switched off, so an agent sees only the harness's
+  skills and the image's.
 - **No cost in metrics** — see [At a glance](#at-a-glance).
 
 ## Not yet exercised
@@ -161,13 +189,38 @@ coverage. Pilot on a disposable repo with `triage`/`prioritize` before `code`/`f
 Sub-agent rosters are not available: codex has no sub-agent tool in this version, so `review` and
 `retro` — which rely on a parallel persona roster — should stay on Claude Code.
 
-<!-- TODO(D): state exactly what was run and where, from PR D's smoke evidence (OpenShell and codex
-     versions, model, which artifacts were confirmed), replacing the general wording above. -->
+**What has been run.** Locally on macOS (arm64, codex-cli 0.152.1 in the sandbox image), on
+`openai/gpt-5.6-luna` with a static `OPENAI_API_KEY` on the runner:
+
+- A hook-level smoke run — the credential stayed outside the sandbox, both hook phases fired, a
+  blocked command was reported as declined, and a PostToolUse block withheld the output. Detail in
+  [codex runtime internals](../contributing/runtime-implementation.md#codex-runtime-internals-6920).
+- The fleet's own `triage` and `review` harnesses, run unmodified except for the sandbox image, the
+  `openai` provider in place of Vertex, and dropping the Vertex-only host files. Both completed with
+  a schema-valid result and a passing validation loop; the run-scoped provider was created and
+  deleted, and `triage`'s post-script wrote its labels and comment. `review`'s agent completed the
+  same way.
+
+What that leaves untested is the WIF exchange itself — there is no OpenAI organization mapped yet —
+and any run driven by CI rather than by hand.
 
 ## Troubleshooting
 
-**Preflight fails on the codex binary.** The sandbox image predates the `CODEX_VERSION` pin. Pull a
-current `ghcr.io/fullsend-ai/fullsend-sandbox` image.
+**``codex preflight: `codex --version` exited 127``.** The sandbox image predates the
+`CODEX_VERSION` pin, so there is no codex to run. Pull a current
+`ghcr.io/fullsend-ai/fullsend-sandbox` image.
+
+**Denied requests in the sandbox egress log at startup.** Expected noise, not failures. Codex
+probes on the way up and the policy refuses what the run does not need:
+
+| Denied | Why it appears |
+|---|---|
+| `GET /v1/models` on `api.openai.com` | Codex refreshes its model catalog on a custom provider. The `fullsend-openai` profile allows only `POST /v1/responses`, so the probe is denied at L7 — once, plus an immediate retry. The first allowed `POST` follows about 100 ms later. |
+| `chatgpt.com:443` | A sign-in/account probe the agent run has no use for; denied at L4. |
+| `api.github.com:443` | Denied at L4 from codex itself — the agent reaches GitHub through the `gh` CLI and its own provider, not from the model client. |
+
+None of these stop the run. What *would* is a denial on `POST /v1/responses`, which means the
+profile or the policy is wrong.
 
 **`provider auth command ... exited`.** Codex could not read the credential. The runner-owned token
 file is missing, or it does not hold a gateway placeholder — check that the harness declares
@@ -177,33 +230,46 @@ file is missing, or it does not hold a gateway placeholder — check that the ha
 admits `api.openai.com:443` without protocol inspection, so the gateway refuses to carry the
 credential over it. Add `policy: policies/base.yaml` to the harness.
 
-**`codex serves OpenAI models only`.** The model carries another provider's prefix. Use
-`openai/<id>` or a bare id.
+**`codex takes OpenAI model ids only ...`.** The resolved model is a Claude alias (`opus` and
+friends), carries another provider's prefix, or is missing entirely. The message names both fixes:
+`FULLSEND_CODEX_MODEL=openai/<id>` for the repo, or `model: openai/<id>` on the agent's `agents:`
+entry or the harness. See [Models](#models).
 
-**The run stops with a hook guard error.** The runner-written hook wiring under `CODEX_HOME` was
-missing or modified. This is fail-closed by design — codex will not run unhooked.
+**`codex config, hook adapter or auth script missing or modified ... refusing to run`** (exit 97).
+Something changed the runner-written files under `CODEX_HOME` between iterations. Fail-closed by
+design: codex will not run unhooked. A sibling guard refuses the run when `config.toml` no longer
+pins the run-scoped provider endpoint, its auth command, or the untrusted project — that one is a
+credential-leak guard.
 
 **`--debug "..."` fails with `accepts 1 arg(s)`.** `--debug` takes an optional value: write
 `--debug='*'` (with `=`).
 
-**The agent fails with nothing in the terminal.** Sandbox-side codex failures land in
-`codex-debug.log` inside the run directory, next to the transcripts; kept sandboxes must be removed
-manually (`openshell sandbox delete <name>`).
+**The model answers, then the run fails anyway.** A model your account cannot serve on the Responses
+API surfaces as several `error` reconnect events and a `turn.failed` carrying the 404 — not as a
+startup error. `codex exec` can still exit 0 there, so fullsend takes the verdict from the stream
+rather than the exit code, and the run fails as it should.
+
+**`Run-scoped provider ... expired in place instead of deleted`.** The run finished and deleted its
+sandbox, but OpenShell still reported the provider attached to it, so fullsend expired the
+credential rather than leaving a live one behind and printed the `openshell provider delete` command
+to finish the job. The credential is dead either way; run that command to tidy up. Under
+`--keep-sandbox` the same expire-in-place is deliberate, because the sandbox you kept still
+references the provider.
+
+**The agent fails with nothing in the terminal.** Codex has no debug flag of its own, so
+`--debug='*'` makes the runner export `RUST_LOG` and capture codex's stderr to `codex-debug.log` in
+the run directory, next to the transcripts. Kept sandboxes must be removed manually
+(`openshell sandbox delete <name>`).
 
 **The run used Claude instead of codex.** The runtime falls back to `claude` when neither the
 config's `runtime:` (repo-wide or on the agent's `agents:` entry) nor `--runtime`/`FULLSEND_RUNTIME`
 selects codex; the plan block's `Runtime:` line and stderr's `runtime: selected ...` show which one
 ran and why.
 
-<!-- TODO(D): verify each symptom above against PR D's smoke run and replace the paraphrases with
-     the exact message text the runner prints. -->
-
 ## See also
 
 - [Agent runtimes](../runtimes.md) — choosing and selecting a runtime
 - [Running agents locally](../guides/user/running-agents-locally.md) — the local-run flow that [Running it locally](#running-it-locally) builds on
 - [OpenAI Workload Identity](../guides/infrastructure/openai-workload-identity.md) — the CI credential path
-
-<!-- TODO(D): add the "codex runtime internals" link into
-     ../contributing/runtime-implementation.md and the ADR 0099 link once PR D lands them; the
-     markdown-link linter rejects them while the targets do not exist. -->
+- [codex runtime internals](../contributing/runtime-implementation.md#codex-runtime-internals-6920) — config layers, the hook adapter contract, and what to re-check on a `CODEX_VERSION` bump
+- [ADR 0099](../ADRs/0099-codex-agent-runtime.md) — why codex uses a custom model provider, a runner-seeded token file and a translating hook adapter
