@@ -4,7 +4,7 @@ This guide covers building gate binaries — small, statically linked programs t
 
 ## When you need a gate binary
 
-OpenShell's network policy enforces access control at both L4 (TCP endpoint allowlisting) and L7 (HTTP method and path restrictions) at the proxy level. These controls are kernel-backed, per-binary, and not bypassable from inside the sandbox. For many access patterns, L4/L7 rules are sufficient — use them when your constraints can be expressed as endpoint allowlists or method + path combinations.
+OpenShell's network policy enforces access control at both L4 (TCP endpoint allowlisting) and L7 (HTTP method and path restrictions). L4 enforcement is kernel-backed via network namespace isolation. L7 enforcement is performed by the OpenShell proxy, which inspects HTTP traffic in userspace. Both are per-binary and not bypassable from inside the sandbox. For many access patterns, L4/L7 rules are sufficient — use them when your constraints can be expressed as endpoint allowlists or method + path combinations.
 
 Gate binaries are needed when your access constraints go **beyond** what L4/L7 rules can express:
 
@@ -170,7 +170,7 @@ If the query is rejected, the binary prints the reason to stderr and exits non-z
 gate-query: rejected — query must include a LIMIT clause
 ```
 
-> **Production note:** The string-matching validation above is intentionally simple for illustration. It blocks obvious cases — including multi-statement injection via semicolons — but cannot catch all bypass vectors (e.g., `dblink()` calls that query forbidden tables on a remote server, `pg_read_file()` to read arbitrary files, CTEs, or subqueries that reference forbidden tables indirectly). A production gate binary should use a SQL parser (e.g., `github.com/pingcap/tidb/parser` or `github.com/sqlc-dev/sqlc`) to reliably detect table references, column selections, JOINs on non-indexed columns, and ORDER BY clauses targeting unindexed columns.
+> **Production note:** The string-matching validation above is intentionally simple for illustration. It blocks obvious cases — including multi-statement injection via semicolons — but has two categories of limitation. **False positives (safe direction):** the semicolon check rejects semicolons inside SQL string literals (e.g., `SELECT name FROM t WHERE bio LIKE '%;%' LIMIT 10`), which are safe but rejected. **False negatives (bypass vectors):** it cannot catch `dblink()` calls that query forbidden tables on a remote server, `pg_read_file()` to read arbitrary files, CTEs, or subqueries that reference forbidden tables indirectly. A production gate binary should use a SQL parser (e.g., `github.com/pingcap/tidb/parser` or `github.com/sqlc-dev/sqlc`) to reliably detect table references, column selections, JOINs on non-indexed columns, and ORDER BY clauses targeting unindexed columns.
 
 ## Configuring the sandbox policy
 
@@ -262,8 +262,8 @@ Understanding the enforcement boundary is critical for correct policy design:
 
 | Layer | Enforced by | Bypassable from sandbox? | Examples |
 |-------|-------------|--------------------------|----------|
-| Endpoint allowlist | OpenShell proxy (L4) | No — kernel-backed | Which hosts and ports are reachable |
-| Method/path rules | OpenShell proxy (L7) | No — kernel-backed | `GET /api/v3/repos/*` only |
+| Endpoint allowlist | Kernel (network namespace) | No — kernel-backed | Which hosts and ports are reachable |
+| Method/path rules | OpenShell proxy (L7) | No — proxy-enforced | `GET /api/v3/repos/*` only |
 | Binary identity | OpenShell proxy (process-tree ancestry) | No — proxy-enforced via unforgeable `/proc` data | Only `gate-query` and its child processes can reach `staging-db.internal:5432` |
 | Binary integrity | Landlock read-only path | No — kernel-backed | Agent cannot overwrite `/usr/local/bin/gate-query` |
 | Application logic | Gate binary code | Only if dynamically linked (`LD_PRELOAD`) | Query validation, table filtering, PII column blocking |
