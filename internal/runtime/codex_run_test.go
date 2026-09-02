@@ -27,10 +27,16 @@ func TestTranslateCodexModel(t *testing.T) {
 		{name: "openai prefix stripped", in: "openai/gpt-5.6-luna", want: "gpt-5.6-luna"},
 		{name: "prefix matched case-insensitively", in: "OpenAI/gpt-5.6-luna", want: "gpt-5.6-luna"},
 		{name: "whitespace trimmed", in: "  openai/gpt-5.6-luna  ", want: "gpt-5.6-luna"},
-		{name: "foreign provider rejected", in: "anthropic-vertex/claude-opus-4-6", wantErr: "codex serves OpenAI models only"},
-		{name: "vertex prefix rejected", in: "xai-vertex/xai/grok-4.6", wantErr: "codex serves OpenAI models only"},
+		{name: "foreign provider rejected", in: "anthropic-vertex/claude-opus-4-6", wantErr: "codex takes OpenAI model ids only"},
+		{name: "vertex prefix rejected", in: "xai-vertex/xai/grok-4.6", wantErr: "codex takes OpenAI model ids only"},
 		{name: "empty id after prefix", in: "openai/", wantErr: "empty model id"},
-		{name: "empty spec", in: "", wantErr: "codex requires a model"},
+		{name: "empty spec", in: "", wantErr: "no model was named"},
+		// Claude aliases deliberately do not apply to codex, and are never
+		// remapped onto a GPT model: the error names both fixes instead.
+		{name: "claude alias opus rejected", in: "opus", wantErr: "the Claude model aliases do not apply"},
+		{name: "claude alias is case-insensitive", in: "Sonnet", wantErr: "the Claude model aliases do not apply"},
+		{name: "haiku rejected", in: "haiku", wantErr: "FULLSEND_CODEX_MODEL"},
+		{name: "fable rejected", in: "fable", wantErr: "agents: entry or the harness"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

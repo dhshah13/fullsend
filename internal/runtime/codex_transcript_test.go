@@ -171,7 +171,7 @@ func TestCodexRun_RejectsForeignModelBeforeSpending(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Equal(t, -1, exit)
-	assert.Contains(t, err.Error(), "codex serves OpenAI models only")
+	assert.Contains(t, err.Error(), "codex takes OpenAI model ids only")
 	assert.NotContains(t, readFileString(t, logPath), "exec --json", "the run must not start")
 }
 
@@ -244,4 +244,53 @@ func sanitizeStorePath(p string) string {
 		out = append(out, r)
 	}
 	return string(out)
+}
+
+// TestCodexRun_FallsBackToTheAgentDefinitionModel pins codex to the same model
+// fallback chain NeedsOpenAIProvider uses (EffectiveModel). Resolving it any
+// other way would let the run call a model the provider decision did not
+// account for.
+func TestCodexRun_FallsBackToTheAgentDefinitionModel(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	storeDir := t.TempDir()
+	r := CodexRuntime{}
+	// The manifest carries the agent definition's frontmatter model; the run
+	// params name none.
+	seedCodexManifest(t, storeDir, r, nil)
+	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
+
+	metrics := &RunMetrics{}
+	exit, err := r.Run(context.Background(), RunParams{
+		SandboxName: "sb",
+		RepoDir:     "/sandbox/workspace/repo",
+		Timeout:     time.Minute,
+	}, ui.New(&bytes.Buffer{}), time.Now(), metrics)
+
+	require.NoError(t, err)
+	assert.Equal(t, 0, exit)
+	assert.Equal(t, "gpt-5.6-luna", metrics.Model, "the manifest's openai/ spec, prefix stripped")
+	assert.Contains(t, readFileString(t, logPath), "--model 'gpt-5.6-luna'")
+}
+
+func TestCodexRun_RequiresAModelWhenNothingNamesOne(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	storeDir := t.TempDir()
+	r := CodexRuntime{}
+	seedCodexManifest(t, storeDir, r, nil)
+	// Drop the manifest's model so neither side names one.
+	data, err := os.ReadFile(filepath.Join(storeDir, sanitizeStorePath(r.codexManifestPath())))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(storeDir, sanitizeStorePath(r.codexManifestPath())),
+		bytes.Replace(data, []byte(`"model": "openai/gpt-5.6-luna",`), nil, 1), 0o644))
+	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1")
+
+	_, err = r.Run(context.Background(), RunParams{
+		SandboxName: "sb",
+		RepoDir:     "/sandbox/workspace/repo",
+		Timeout:     time.Minute,
+	}, ui.New(&bytes.Buffer{}), time.Now(), &RunMetrics{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no model was named")
+	assert.NotContains(t, readFileString(t, logPath), "exec --json")
 }

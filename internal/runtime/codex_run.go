@@ -74,29 +74,46 @@ func codexEffortFor(effort string) (string, bool) {
 	return "", false
 }
 
-// translateCodexModel resolves the harness/agent model spec into codex's
-// --model value. A bare id passes through; an "openai/" prefix is stripped;
-// any other provider prefix is an error naming the rule, because codex would
+// codexClaudeAliases are the Claude-vocabulary model aliases a fleet harness
+// or an agents: entry may carry (docs/runtimes.md). They are Claude models and
+// deliberately do not apply to codex: a repo on `runtime: codex` names an
+// OpenAI id instead. Keeping them out is a decision, not an omission — codex
+// must not consult the per-repo `models.aliases` overrides either, so a Claude
+// alias can never resolve to a GPT model behind the operator's back.
+var codexClaudeAliases = map[string]bool{"opus": true, "sonnet": true, "haiku": true, "fable": true}
+
+// codexModelHelp names both ways to give codex a model it can serve.
+const codexModelHelp = "set FULLSEND_CODEX_MODEL=" + codexOpenAIProvider +
+	"/<id> for the repo, or model: " + codexOpenAIProvider +
+	"/<id> on the agent's agents: entry or the harness"
+
+// translateCodexModel resolves a model spec into codex's --model value: a bare
+// id passes through and an `openai/` prefix is stripped. A Claude alias or any
+// other provider prefix is an error naming both fixes, because codex would
 // otherwise send the whole string as a model id and get a 404 from OpenAI with
-// nothing to tune.
+// nothing to tune — which is exactly what the local smoke showed: five error
+// reconnects and a turn.failed carrying "Model not found".
 func translateCodexModel(model string) (string, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return "", fmt.Errorf(
-			"codex requires a model: set model: on the agent or harness, or pass --model (codex serves OpenAI models only, e.g. %q)",
-			codexOpenAIProvider+"/gpt-5.6-luna")
+		return "", fmt.Errorf("codex takes OpenAI model ids only and no model was named: %s", codexModelHelp)
 	}
 	provider, id, hasSlash := strings.Cut(model, "/")
 	if !hasSlash {
+		if codexClaudeAliases[strings.ToLower(model)] {
+			return "", fmt.Errorf(
+				"codex takes OpenAI model ids only, and the Claude model aliases do not apply to it: %q is one of them. To run this agent on codex, %s",
+				model, codexModelHelp)
+		}
 		return model, nil
 	}
 	if !strings.EqualFold(provider, codexOpenAIProvider) {
 		return "", fmt.Errorf(
-			"model %q is not available on the codex runtime: codex serves OpenAI models only, so the spec must be a bare id or %q-prefixed",
-			model, codexOpenAIProvider)
+			"codex takes OpenAI model ids only, so %q is not available on it: %s",
+			model, codexModelHelp)
 	}
 	if strings.TrimSpace(id) == "" {
-		return "", fmt.Errorf("model %q has an empty model id after the %q prefix", model, codexOpenAIProvider)
+		return "", fmt.Errorf("model %q has an empty model id after the %q prefix: %s", model, codexOpenAIProvider, codexModelHelp)
 	}
 	return id, nil
 }
@@ -301,11 +318,11 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			r.codexManifestPath())
 	}
 
-	model := params.Model
-	if model == "" {
-		model = m.Model
-	}
-	modelID, err := translateCodexModel(model)
+	// The same fallback chain NeedsOpenAIProvider decides from, so the launch
+	// and the provider decision cannot disagree about which model this run
+	// calls — a disagreement would either strand a frontmatter-pinned OpenAI
+	// agent without a credential or attach one to a run that never uses it.
+	modelID, err := translateCodexModel(EffectiveModel(params.Model, m.Model))
 	if err != nil {
 		return -1, err
 	}
