@@ -153,8 +153,8 @@ fullsend
 │   ├── --offline                            #   Reject network fetches (local manifest only)
 │   └── --out-dir <path>                     #   Output dir (default: telemetry directory)
 └── reconcile-status                         # Finalize orphaned status comments
-    ├── --repo <owner/repo>                  #   Repository in owner/repo format
-    ├── --number <int>                       #   Issue/PR number
+    ├── --repo <owner/repo>                  #   Repository in owner/repo format (required for GitHub/GitLab)
+    ├── --number <int>                       #   Issue/PR number (required for GitHub/GitLab; derived from entity.key for Jira)
     ├── --run-id <string>                    #   Workflow run ID (marker key)
     ├── --run-url <url>                      #   Workflow run URL (optional)
     ├── --sha <string>                       #   Commit SHA (optional)
@@ -162,7 +162,7 @@ fullsend
     ├── --mint-url <url>                     #   Mint service URL for on-demand token (default: $FULLSEND_MINT_URL)
     ├── --role <string>                      #   Agent role for minting (required with --mint-url)
     ├── --forge <platform>                   #   Forge platform (github, gitlab); auto-detected from CI env
-    ├── --fullsend-dir <path>                #   Path to fullsend config directory (completion mode detection)
+    ├── --fullsend-dir <path>                #   Path to fullsend config directory (completion mode detection and tracker routing)
     ├── --job-status <string>                #   Job outcome from CI runner (e.g. success, failure, cancelled)
     └── --was-skipped                        #   Pre-script decided to skip the run; forces synthesis under on_failure
 ```

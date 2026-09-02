@@ -4415,6 +4415,160 @@ func TestSetupStatusNotifier_GitLab_NoMintURLNeeded(t *testing.T) {
 	assert.NotNil(t, n)
 }
 
+func TestSetupStatusNotifier_Jira(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	// Simulate a Jira-originated event: trackerSource and trackerProject
+	// are extracted from the normalized event by runAgent and threaded
+	// through statusOpts.
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "jira-test-token")
+	t.Setenv("JIRA_USER_EMAIL", "bot@example.com")
+
+	n, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.NoError(t, err)
+	assert.NotNil(t, n)
+	// Jira uses a static client (like GitLab), not a factory.
+	assert.False(t, n.HasClientFactory(), "Jira should use a static client, not a factory")
+}
+
+func TestSetupStatusNotifier_Jira_NoBaseURL(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "")
+	t.Setenv("JIRA_TOKEN", "jira-test-token")
+
+	_, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JIRA_BASE_URL required")
+}
+
+func TestSetupStatusNotifier_Jira_NoToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "")
+
+	_, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JIRA_TOKEN required")
+}
+
+func TestSetupStatusNotifier_Jira_NoEmail(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "jira-test-token")
+	t.Setenv("JIRA_USER_EMAIL", "")
+
+	_, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JIRA_USER_EMAIL required")
+}
+
+func TestParseJiraKey(t *testing.T) {
+	tests := []struct {
+		key  string
+		proj string
+		num  int
+		ok   bool
+	}{
+		{"PROJ-123", "PROJ", 123, true},
+		{"MY-PROJECT-1", "MY-PROJECT", 1, true},
+		{"A-999", "A", 999, true},
+		{"", "", 0, false},
+		{"PROJ", "", 0, false},
+		{"PROJ-", "", 0, false},
+		{"-123", "", 0, false},
+		{"PROJ-0", "", 0, false},
+		{"PROJ-abc", "", 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			proj, num, ok := parseJiraKey(tt.key)
+			assert.Equal(t, tt.ok, ok)
+			if ok {
+				assert.Equal(t, tt.proj, proj)
+				assert.Equal(t, tt.num, num)
+			}
+		})
+	}
+}
+
+func TestSetupStatusNotifier_Jira_UsesGitHubRunID(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "test-token")
+	t.Setenv("JIRA_USER_EMAIL", "bot@example.com")
+	t.Setenv("GITHUB_RUN_ID", "98765")
+
+	n, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.NoError(t, err)
+	assert.NotNil(t, n)
+}
+
+func TestSetupStatusNotifier_Jira_FallsBackToSyntheticRunID(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "jira-test-token")
+	t.Setenv("JIRA_USER_EMAIL", "bot@example.com")
+	t.Setenv("GITHUB_RUN_ID", "") // unset
+
+	n, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.NoError(t, err)
+	assert.NotNil(t, n)
+}
+
 func TestEmitDiagnostic_Warning(t *testing.T) {
 	var buf bytes.Buffer
 	printer := ui.New(&buf)

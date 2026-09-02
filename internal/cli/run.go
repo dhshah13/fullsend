@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,7 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/security"
 	"github.com/fullsend-ai/fullsend/internal/statuscomment"
 	"github.com/fullsend-ai/fullsend/internal/telemetry"
+	"github.com/fullsend-ai/fullsend/internal/tracker"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -145,6 +147,17 @@ type statusOpts struct {
 	statusNum     int
 	statusComment int
 	mintURL       string
+
+	// trackerSource is the event source system ("github", "gitlab",
+	// "jira"), extracted from the normalized event's source.system field.
+	// When set to "jira", status notifications route to Jira instead of
+	// the code-hosting forge (ADR 0093). Empty means unset (falls back to
+	// forgePlatform).
+	trackerSource string
+	// trackerProject is the Jira project key (e.g. "PROJ"), extracted
+	// from the normalized event's entity.key. Only meaningful when
+	// trackerSource is "jira".
+	trackerProject string
 }
 
 // aggregateMetrics holds accumulated behavioral metrics across retry iterations.
@@ -545,6 +558,22 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		if mapErr != nil {
 			return fmt.Errorf("converting event to map: %w", mapErr)
 		}
+
+		// Extract tracker provenance for status routing (ADR 0093).
+		// When the event originated from Jira, status notifications
+		// should be posted to Jira, not to the code-hosting forge.
+		sOpts.trackerSource = string(ev.Source.System)
+		if ev.Source.System == normevent.SystemJira {
+			if ev.Entity.Key == "" {
+				return fmt.Errorf("Jira event from --event-file is missing entity.key")
+			}
+			proj, num, ok := parseJiraKey(ev.Entity.Key)
+			if !ok {
+				return fmt.Errorf("Jira event from --event-file has unparseable entity.key %q", ev.Entity.Key)
+			}
+			sOpts.trackerProject = proj
+			sOpts.statusNum = num
+		}
 	}
 	// Fallback: extract _normalized_event from the dispatch event-payload
 	// channel when --event-file is not provided. The Go dispatch path
@@ -554,6 +583,24 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// workflow_call path where event_payload is nested in inputs).
 	if eventMap == nil {
 		eventMap = extractNormalizedEventFromDispatch(absFullsendDir)
+	}
+
+	// For the fallback path, also extract tracker provenance from the
+	// event map if not already set from --event-file.
+	if sOpts.trackerSource == "" && eventMap != nil {
+		sOpts.trackerSource = extractMapString(eventMap, "source", "system")
+		if sOpts.trackerSource == "jira" {
+			key := extractMapString(eventMap, "entity", "key")
+			if key == "" {
+				return fmt.Errorf("Jira event from dispatch payload is missing entity.key")
+			}
+			proj, num, ok := parseJiraKey(key)
+			if !ok {
+				return fmt.Errorf("Jira event from dispatch payload has unparseable entity.key %q", key)
+			}
+			sOpts.trackerProject = proj
+			sOpts.statusNum = num
+		}
 	}
 
 	composeOpts := harness.ComposeOpts{
@@ -4393,13 +4440,11 @@ func titleCase(s string) string {
 //     CI_PIPELINE_ID, constructs a GitLab client
 //   - default (including "github" and ""): uses mint URL, reads
 //     GITHUB_SHA and GITHUB_RUN_ID, constructs a GitHub client
+//
+// When sOpts.trackerSource is "jira" (set from the normalized event's
+// source.system), status notifications route to Jira instead of the
+// code-hosting forge (ADR 0093).
 func setupStatusNotifier(fullsendDir string, role string, forgePlatform string, sOpts statusOpts, printer *ui.Printer) (*statuscomment.Notifier, error) {
-	parts := strings.SplitN(sOpts.statusRepo, "/", 2)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("--status-repo must be in owner/repo format, got %q", sOpts.statusRepo)
-	}
-	owner, repo := parts[0], parts[1]
-
 	var notifyCfg config.StatusNotificationConfig
 	orgConfigPath := filepath.Join(fullsendDir, "config.yaml")
 	if fsCfg := tryLoadFullsendConfig(orgConfigPath, printer); fsCfg != nil {
@@ -4409,6 +4454,20 @@ func setupStatusNotifier(fullsendDir string, role string, forgePlatform string, 
 			notifyCfg = *sn
 		}
 	}
+
+	// Event-source routing (ADR 0093): when the normalized event
+	// identifies Jira as the source, route status notifications to Jira
+	// instead of the code-hosting forge. This check comes before the
+	// owner/repo parsing because Jira uses project-key addressing.
+	if sOpts.trackerSource == "jira" {
+		return setupStatusNotifierJira(notifyCfg, sOpts, printer)
+	}
+
+	parts := strings.SplitN(sOpts.statusRepo, "/", 2)
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("--status-repo must be in owner/repo format, got %q", sOpts.statusRepo)
+	}
+	owner, repo := parts[0], parts[1]
 
 	if forgePlatform == "gitlab" {
 		return setupStatusNotifierGitLab(notifyCfg, owner, repo, sOpts, printer)
@@ -4442,16 +4501,17 @@ func setupStatusNotifierGitHub(notifyCfg config.StatusNotificationConfig, owner,
 		runID = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 
-	n := statuscomment.New(nil, notifyCfg, owner, repo, sOpts.statusNum, sOpts.runURL, sha, runID)
+	project := owner + "/" + repo
+	n := statuscomment.New(nil, notifyCfg, project, sOpts.statusNum, sOpts.runURL, sha, runID)
 	n.SetWarnFunc(func(format string, args ...any) {
 		printer.StepWarn(fmt.Sprintf(format, args...))
 	})
 	if sOpts.statusComment != 0 {
-		n.SetTriggerCommentID(sOpts.statusComment)
+		n.SetTriggerCommentID(strconv.Itoa(sOpts.statusComment))
 	}
 
 	canonRole := resolveRole(role)
-	n.SetClientFactory(func(ctx context.Context) (forge.Client, error) {
+	n.SetClientFactory(func(ctx context.Context) (tracker.Client, error) {
 		result, err := statusMintToken(ctx, mintclient.MintRequest{
 			MintURL: mintURL,
 			Role:    canonRole,
@@ -4466,7 +4526,7 @@ func setupStatusNotifierGitHub(notifyCfg config.StatusNotificationConfig, owner,
 		if os.Getenv("GITHUB_ACTIONS") == "true" {
 			fmt.Fprintf(os.Stderr, "::add-mask::%s\n", result.Token)
 		}
-		return gh.New(result.Token), nil
+		return tracker.NewForgeClient(gh.New(result.Token)), nil
 	})
 
 	return n, nil
@@ -4496,12 +4556,78 @@ func setupStatusNotifierGitLab(notifyCfg config.StatusNotificationConfig, owner,
 		runID = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 
-	n := statuscomment.New(client, notifyCfg, owner, repo, sOpts.statusNum, sOpts.runURL, sha, runID)
+	project := owner + "/" + repo
+	n := statuscomment.New(tracker.NewForgeClient(client), notifyCfg, project, sOpts.statusNum, sOpts.runURL, sha, runID)
 	n.SetWarnFunc(func(format string, args ...any) {
 		printer.StepWarn(fmt.Sprintf(format, args...))
 	})
 
 	return n, nil
+}
+
+// setupStatusNotifierJira creates a status notifier for Jira. Unlike the
+// GitHub/GitLab paths, Jira has no commit SHA or CI run ID equivalents, so a
+// synthetic run ID is generated from the current time when no CI run ID is
+// available.
+func setupStatusNotifierJira(notifyCfg config.StatusNotificationConfig, sOpts statusOpts, printer *ui.Printer) (*statuscomment.Notifier, error) {
+	tc, err := newJiraTrackerClientFromEnv()
+	if err != nil {
+		return nil, err
+	}
+
+	// Prefer the CI run ID when available (e.g. GITHUB_RUN_ID) so the
+	// status-comment marker matches the value passed to reconcile-status
+	// --run-id, enabling orphan reconciliation to find the comment.
+	// Fall back to a synthetic timestamp when no CI run ID is set.
+	runID := os.Getenv("GITHUB_RUN_ID")
+	if runID == "" {
+		runID = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+
+	n := statuscomment.New(tc, notifyCfg, sOpts.trackerProject, sOpts.statusNum, sOpts.runURL, "", runID)
+	n.SetWarnFunc(func(format string, args ...any) {
+		printer.StepWarn(fmt.Sprintf(format, args...))
+	})
+
+	return n, nil
+}
+
+// parseJiraKey splits a Jira issue key like "PROJ-123" into the project
+// key ("PROJ") and issue number (123). Returns false if the key is not
+// in the expected format.
+func parseJiraKey(key string) (string, int, bool) {
+	i := strings.LastIndex(key, "-")
+	if i < 1 || i >= len(key)-1 {
+		return "", 0, false
+	}
+	num, err := strconv.Atoi(key[i+1:])
+	if err != nil || num <= 0 {
+		return "", 0, false
+	}
+	return key[:i], num, true
+}
+
+// extractMapString extracts a nested string value from a map[string]any.
+// For example, extractMapString(m, "source", "system") returns
+// m["source"].(map[string]any)["system"].(string).
+func extractMapString(m map[string]any, keys ...string) string {
+	var current any = m
+	for i, k := range keys {
+		mm, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		v, exists := mm[k]
+		if !exists {
+			return ""
+		}
+		if i == len(keys)-1 {
+			s, _ := v.(string)
+			return s
+		}
+		current = v
+	}
+	return ""
 }
 
 // prHeadSHAFromEventPath extracts pull_request.head.sha from the event
