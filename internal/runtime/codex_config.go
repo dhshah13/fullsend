@@ -92,6 +92,15 @@ const codexAuthTimeoutMS = 5000
 //   - `openai_base_url` — it only affects the built-in provider, and its
 //     presence is a placeholder-leak vector the run guard rejects.
 //
+// `[skills.bundled] enabled = false` drops the skills codex ships with
+// (skill-installer, plugin-creator, imagegen, ...): fullsend controls neither
+// their content nor their version, and the harness's own skills are what
+// Bootstrap uploads. Verified against a live 0.152.1 run, where they otherwise
+// appear in the agent's skill list. It is the codex counterpart of pi's
+// `enableSkillCommands: false`. A repo's own `.agents/skills` are still
+// discovered — the same Claude Code parity, and covered by the same host-side
+// and sandbox `scan context` passes over SKILL.md.
+//
 // `web_search` must be stated: codex's default is "cached", not off.
 // `history.persistence` governs `history.jsonl` (the prompt history) only —
 // session rollouts under sessions/, which are the transcripts, are unaffected.
@@ -114,6 +123,9 @@ enabled = false
 
 [history]
 persistence = "none"
+
+[skills.bundled]
+enabled = false
 
 [model_providers.{{ .ProviderID }}]
 name = "OpenAI via the fullsend run-scoped provider"

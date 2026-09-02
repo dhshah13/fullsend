@@ -107,6 +107,9 @@ func TestRenderCodexConfig_PinsProviderAndHygieneKeys(t *testing.T) {
 		`web_search = "disabled"`,
 		`check_for_update_on_startup = false`,
 		`persistence = "none"`,
+		// codex's own bundled skills (skill-installer, plugin-creator, ...) are
+		// outside the harness's control; verified present without this.
+		"[skills.bundled]",
 		`wire_api = "responses"`,
 		`base_url = "` + codexBaseURL + `"`,
 		`refresh_interval_ms = 30000`,
