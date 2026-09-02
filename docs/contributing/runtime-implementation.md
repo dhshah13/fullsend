@@ -281,8 +281,9 @@ The sandbox has two key directories that map to Claude Code's config levels (plu
 │   ├── fullsend-manifest.json          Agent tools/allowlist, HookPlan, pi version — read by Run and the extension
 │   └── sessions/                       PI_CODING_AGENT_SESSION_DIR (session JSONL → transcripts)
 │
-├── codex-config/                    ← CODEX_HOME (codex runtime; written by CodexRuntime.Bootstrap, #6920)
-│                                       Created by the sandbox image (codex will not start without it)
+├── codex-config/                    ← CODEX_HOME (codex runtime)
+│                                       Created by the sandbox image (codex will not start without it);
+│                                       populated by CodexRuntime.Bootstrap (#6920, follow-up PR)
 │
 ├── claude-config/                   ← CLAUDE_CONFIG_DIR (personal level)
 │   ├── agents/
