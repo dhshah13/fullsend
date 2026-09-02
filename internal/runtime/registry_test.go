@@ -30,6 +30,11 @@ func TestResolve(t *testing.T) {
 	_, isOC := oc.Transcripts.(OpenCodeRuntime)
 	assert.True(t, isOC, "Transcripts should be OpenCodeRuntime")
 
+	cx, err := Resolve("codex")
+	require.NoError(t, err)
+	assert.Equal(t, "codex", cx.Runtime.Name())
+	assert.IsType(t, CodexRuntime{}, cx.Transcripts)
+
 	pb, err := Resolve("pi")
 	require.NoError(t, err)
 	assert.Equal(t, "pi", pb.Runtime.Name())
@@ -89,9 +94,9 @@ func TestResolveFromPerRepoConfig(t *testing.T) {
 func TestResolveFromPerRepoConfig_RejectsStubRuntimes(t *testing.T) {
 	t.Parallel()
 
-	// Stub runtimes like "opencode" are resolvable via Resolve() for
-	// dev/testing, but must be rejected when coming through config.
-	for _, name := range []string{"opencode"} {
+	// Stub runtimes like "opencode" and "codex" are resolvable via Resolve()
+	// for dev/testing, but must be rejected when coming through config.
+	for _, name := range []string{"opencode", "codex"} {
 		ocCfg := config.NewPerRepoConfig(nil, "")
 		ocCfg.SetRuntime(name)
 		_, err := ResolveFromPerRepoConfig(ocCfg)
@@ -100,30 +105,34 @@ func TestResolveFromPerRepoConfig_RejectsStubRuntimes(t *testing.T) {
 	}
 
 	// Direct Resolve() still works for dev/testing.
-	rt, err := Resolve("opencode")
-	require.NoError(t, err)
-	assert.Equal(t, "opencode", rt.Runtime.Name())
+	for _, name := range []string{"opencode", "codex"} {
+		rt, err := Resolve(name)
+		require.NoError(t, err)
+		assert.Equal(t, name, rt.Runtime.Name())
+	}
 }
 
 func TestResolveFromConfig_RejectsStubRuntimes(t *testing.T) {
 	t.Parallel()
 
 	// Org config with a stub runtime should fail at resolution time.
-	cfg, parseErr := config.ParseOrgConfig([]byte(`version: "1"
+	for _, name := range []string{"opencode", "codex"} {
+		cfg, parseErr := config.ParseOrgConfig([]byte(`version: "1"
 dispatch:
   platform: github-actions
 defaults:
   roles: [triage]
-  runtime: opencode
+  runtime: ` + name + `
 repos: {}
 `))
-	// ParseOrgConfig calls Validate() which also rejects "opencode",
-	// so this may fail at parse time.  If parsing succeeds (e.g. because
-	// Validate() is not called), ResolveFromConfig must still reject it.
-	if parseErr == nil {
-		_, err := ResolveFromConfig(cfg)
-		require.Error(t, err, "stub runtime %q should fail via org config path", "opencode")
-		assert.Contains(t, err.Error(), "invalid runtime")
+		// ParseOrgConfig calls Validate() which also rejects the stubs,
+		// so this may fail at parse time.  If parsing succeeds (e.g. because
+		// Validate() is not called), ResolveFromConfig must still reject it.
+		if parseErr == nil {
+			_, err := ResolveFromConfig(cfg)
+			require.Error(t, err, "stub runtime %q should fail via org config path", name)
+			assert.Contains(t, err.Error(), "invalid runtime")
+		}
 	}
 }
 
@@ -166,8 +175,8 @@ agents:
 func TestResolveForAgent_RejectsStubRuntimes(t *testing.T) {
 	t.Parallel()
 	// A per-agent value is validated like the repo-wide key: stub runtimes
-	// (opencode) and unknown names cannot be activated through config.
-	for _, name := range []string{"opencode", "invalid"} {
+	// (opencode, codex) and unknown names cannot be activated through config.
+	for _, name := range []string{"opencode", "codex", "invalid"} {
 		agents := []config.AgentEntry{{Name: "code", Runtime: name}}
 		_, _, err := ResolveForAgent(agents, "pi", "code")
 		require.Error(t, err, name)
@@ -178,6 +187,8 @@ func TestResolveForAgent_RejectsStubRuntimes(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "pi", backend.Runtime.Name(), "other agents unaffected")
 	}
-	_, _, err := ResolveForAgent(nil, "opencode", "code")
-	require.Error(t, err, "repo-wide stub runtime is rejected too")
+	for _, name := range []string{"opencode", "codex"} {
+		_, _, err := ResolveForAgent(nil, name, "code")
+		require.Error(t, err, "repo-wide stub runtime %q is rejected too", name)
+	}
 }

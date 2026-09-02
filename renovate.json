@@ -184,6 +184,16 @@
     },
     {
       "customType": "regex",
+      "description": "Track the Codex CLI version pin in the sandbox image (#6920). The OpenShell base image ships its own @openai/codex under the same npm prefix, so the pinned install replaces it and the build asserts `codex --version`; a bump must re-verify the codex stream parser fixtures once they land (#6920).",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG CODEX_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "@openai/codex",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
       "description": "Track tirith CLI version pin in the sandbox image. SHA256 checksums are updated automatically by postUpgradeTasks (scripts/renovate/update-tirith-checksums.sh).",
       "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
       "matchStrings": [

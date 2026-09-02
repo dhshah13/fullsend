@@ -18,6 +18,7 @@ func TestDebugLogNameFor(t *testing.T) {
 	assert.Equal(t, "claude-debug.log", DebugLogNameFor(ClaudeRuntime{}))
 	assert.Equal(t, DefaultDebugLogName, DebugLogNameFor(OpenCodeRuntime{}))
 	assert.Equal(t, piDebugLogFile, DebugLogNameFor(PiRuntime{}))
+	assert.Equal(t, codexDebugLogFile, DebugLogNameFor(CodexRuntime{}))
 	assert.Equal(t, DefaultDebugLogName, DebugLogNameFor(DummyRuntime{}))
 	assert.Equal(t, "other.log", DebugLogNameFor(namedDebugLog{name: "other.log"}))
 	// An empty name falls back to the default rather than producing "".
