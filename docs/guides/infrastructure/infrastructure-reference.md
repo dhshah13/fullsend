@@ -59,13 +59,16 @@ The mint exchanges GitHub OIDC tokens for scoped GitHub App installation tokens.
 │  │     └─ 10-minute expiry                                  │   │
 │  │                                                          │   │
 │  │  5. Find Installation                                    │   │
-│  │     ├─ GET /app/installations                            │   │
-│  │     └─ Match by org login                                │   │
+│  │     ├─ GET /repos/{org}/{repo}/installation              │   │
+│  │     │  or GET /orgs/{org}/installation                   │   │
+│  │     ├─ Verify the installation account matches the org   │   │
+│  │     └─ Read the granted permissions map                  │   │
 │  │                                                          │   │
 │  │  6. Create Scoped Installation Token                     │   │
-│  │     ├─ POST /installations/{id}/access_tokens            │   │
+│  │     ├─ POST /app/installations/{id}/access_tokens        │   │
 │  │     ├─ Scope to requested repos[]                        │   │
-│  │     └─ Apply RolePermissions() minimum set               │   │
+│  │     ├─ Intersect with granted permissions                │   │
+│  │     └─ Drop only explicitly optional rollout scopes      │   │
 │  │                                                          │   │
 │  └──────────┬───────────────────────────────────────────────┘   │
 │             │                                                   │
@@ -77,15 +80,21 @@ The mint exchanges GitHub OIDC tokens for scoped GitHub App installation tokens.
 
 ### Agent → Mint Role Mapping
 
-Each dispatch stage mints a token for a specific **mint role**. The `code` and `fix` agents share the same GitHub App and PEM (the **coder** App), but `fix` has its own mint role with a narrower permission set (no `checks:read`). All other built-in agents use the role matching their name. `scribe` is a mint role without a built-in dispatch stage.
+Each dispatch stage mints a token for a specific **mint role**. The `code` and
+`fix` agents both mint the `coder` role and share the same GitHub App and PEM
+(the **coder** App). `fix` is not a separate dispatch-time role. All other
+built-in agents use the role matching their name. `scribe` is a mint role
+without a built-in dispatch stage.
 
-To change App-level permissions for the `code` or `fix` agent, update the coder App registration. To change token-level permissions, update the corresponding role (`coder` or `fix`) in `canonicalRolePermissions`.
+To change App-level permissions for the `code` or `fix` agent, update the coder
+App registration. To change token-level permissions for dispatch, update the
+`coder` entry in `canonicalRolePermissions`.
 
 | Agent | Mint Role |
 |-------|-----------|
 | triage | triage |
 | code | coder |
-| fix | fix |
+| fix | coder |
 | review | review |
 | retro | retro |
 | prioritize | prioritize |
@@ -101,7 +110,7 @@ Custom roles can be registered via the standalone mint's `CUSTOM_ROLE_PERMISSION
 | **triage** | read | — | — | write | — | — | — | — | — | read |
 | **scribe** | read | — | — | write | — | — | — | — | — | read |
 | **coder** | write | read | write | write | — | read | — | — | — | read |
-| **fix** | write | read | write | write | — | — | — | — | — | read |
+| **fix** *(direct callers only)* | write | read | write | write | — | — | — | — | — | read |
 | **review** | read | — | write | write | — | read | — | — | — | read |
 | **retro** | read | — | write | write | read | — | — | — | — | read |
 | **prioritize** | read | — | — | write | — | — | — | — | write | read |
@@ -109,8 +118,14 @@ Custom roles can be registered via the standalone mint's `CUSTOM_ROLE_PERMISSION
 
 The **e2e** role also grants: `administration` (write), `members` (write), `secrets` (write), `organization_actions_variables` (write), `organization_administration` (write). These permissions are omitted from the table above because no other role uses them.
 
-### Roll Out `packages:read` (coder / fix)
+The `fix` row is retained for direct callers that request the canonical `fix`
+role. The built-in fix dispatch stage uses `coder`, so the `coder` row and coder
+App registration control the code/fix rollout for normal dispatches.
 
+### Roll Out a GitHub App Permission
+
+Use this sequence for any new role permission; the current example is
+`packages:read` for the `coder` role (which covers both code and fix stages).
 Changing the mint's role map does not update existing GitHub App installations.
 GitHub rejects the entire installation-token request (`422`) when mint asks for a
 permission the installation has not approved yet — there is no partial downscope.
@@ -122,29 +137,43 @@ New installations of an already-updated App receive the new permission at instal
 time. Self-managed App owners update their own App registration, then Accept on
 their installation.
 
-The mint reads the installation's currently granted `permissions` from the
-installation lookup it already performs. Before the token POST, it checks the
-role's requested permissions against that granted set. Only permissions
-explicitly listed in `optionalRolePermissions` (currently `packages` for
-`coder` and `fix`) may be omitted when ungranted — all other permissions are
-required and fail hard if missing, preserving the pre-existing behavior where
-GitHub's `422` surfaced immediately. Dropped optional permissions are logged
-with `org=` and `installation_id=`. This avoids a second token request during
-the rollout window without silently degrading permissions the agent needs.
+The implementation sequence is: update `canonicalRolePermissions`, the GCF
+embedded mint source, and `AgentAppConfig` together; have mint intersect the
+requested role map with the installation's granted `permissions`; and have CLI
+`checkPermissions` warn with the installing org's Accept URL instead of
+failing. Only permissions explicitly listed in `optionalRolePermissions`
+(currently `packages` for `coder` and direct `fix`-role callers) may be omitted when ungranted — all
+other permissions remain required and fail before the token POST, preserving
+the pre-existing behavior where GitHub's `422` surfaced immediately. Dropped
+optional permissions are logged with `org=` and `installation_id=`. The
+preflight avoids the two token-creation POSTs that the earlier
+packages-specific retry would incur for each lagging installation.
 
-Recommended operator order for adding **`packages:read`** to `coder` / `fix`:
+When an installation lookup omits the `permissions` field, mint preserves the
+requested map for compatibility with older or incomplete GitHub responses and
+lets GitHub validate it at token creation time; the granted-set preflight
+applies only when that map is present.
+
+This opt-in degradation means a caller that needs the omitted optional
+permission may receive a later GitHub `403`; it does not silently drop any
+other permission. Missing non-optional permissions fail once with a `422`, the
+missing scopes, and guidance covering both App registration and installation
+approval.
+
+Recommended operator order for adding **`packages:read`** to `coder` (code / fix):
 
 1. Add **Packages: Read-only** on the GitHub App's **Permissions & events** page
    (hosted: `https://github.com/organizations/fullsend-ai/settings/apps/<app-slug>/permissions`).
    Optionally include a short note to users explaining why.
-2. Update the e2e test App `fullsend-test-coder` as well, and have each
+2. Update the App used by the pool installations as well, and have each
    `halfsend-01` … `halfsend-12` installation owner Accept its pending update.
-   The test App and pool-org installations must not be left permanently on
-   permission-drop warnings.
+   For the test-app setup, that is `fullsend-test-coder`; for pools using the
+   shared hosted App, update `fullsend-ai-coder`. Neither app set should be
+   left permanently on permission-drop warnings.
 3. Deploy mint. Lagging installations keep authenticating; they simply omit
    `packages:read` until they Accept. The preflight avoids the two-POST retry
    volume that the old rollout path incurred.
-4. Release the CLI after the mint change. `fullsend github setup` reports
+4. Release the CLI after the App registration and mint change. `fullsend github setup` reports
    pending permissions as warnings with the installing org's Accept URL, so a
    CLI release is not blocked on every installation accepting at once.
 5. Tell installation owners to Accept the pending permission update (GitHub also
@@ -153,9 +182,10 @@ Recommended operator order for adding **`packages:read`** to `coder` / `fix`:
 Do **not** block mint or CLI deploy on every installation reporting
 `packages:read` — inactive or unreachable installs would stall the platform.
 Permission-drop logs and setup warnings are outreach signals during rollout,
-not deploy gates. To add another optional permission in the future, add an
-entry to `optionalRolePermissions` alongside the `canonicalRolePermissions`
-change; remove it once all installations have accepted.
+not deploy gates. To add another permission in the future, add it to
+`canonicalRolePermissions`, the matching App config and GCF embed; add it to
+`optionalRolePermissions` only when it is explicitly safe to omit during
+rollout. Remove that optional entry once all installations have accepted.
 
 ### Mint Security Controls
 

@@ -3106,6 +3106,63 @@ func TestHandler_LogsRequestedPermissionNotGranted(t *testing.T) {
 	}
 }
 
+func TestHandler_RequiredPermissionFailureReturns422BeforeTokenPost(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	var tokenCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 99,
+				Permissions: map[string]string{
+					"contents": "write",
+					"metadata": "read",
+				},
+				Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/app/installations/99/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			t.Errorf("token POST should not happen when required permissions are missing")
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if tokenCalls != 0 {
+		t.Fatalf("expected no token POSTs, got %d", tokenCalls)
+	}
+	if !strings.Contains(rec.Body.String(), "issues:write") {
+		t.Fatalf("response should contain missing issues:write: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "installation_id=99") {
+		t.Fatalf("response should contain installation guidance: %s", rec.Body.String())
+	}
+}
+
 func TestHandler_SameOrgExplicitTargetOrg(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
 

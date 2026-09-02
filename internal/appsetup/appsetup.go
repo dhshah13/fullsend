@@ -15,6 +15,7 @@ import (
 	"html"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -244,17 +245,20 @@ func (s *Setup) Run(ctx context.Context, org, role string) (*AppCredentials, err
 		if err := s.ensureInstalled(ctx, org, recovered.Slug); err != nil {
 			return nil, fmt.Errorf("ensuring installation: %w", err)
 		}
-		// Resolve AppID from the installation so ROLE_APP_IDS gets updated.
+		// Re-read the installation after recovery so permission drift is
+		// reported just like it is on every other existing-app path.
+		inst, found, err := s.findExistingInstallation(ctx, org, role, recovered.Slug)
+		if err != nil {
+			return nil, fmt.Errorf("looking up recovered app installation: %w", err)
+		}
+		if !found {
+			return nil, fmt.Errorf("recovered app %s was installed but not found in installations list", recovered.Slug)
+		}
 		if recovered.AppID == 0 {
-			inst, found, err := s.findExistingInstallation(ctx, org, role, recovered.Slug)
-			if err != nil {
-				return nil, fmt.Errorf("looking up recovered app installation: %w", err)
-			}
-			if !found {
-				return nil, fmt.Errorf("recovered app %s was installed but not found in installations list", recovered.Slug)
-			}
+			// Resolve AppID from the installation so ROLE_APP_IDS gets updated.
 			recovered.AppID = inst.AppID
 		}
+		s.checkPermissions(inst, org, role)
 		return recovered, nil
 	}
 
@@ -632,7 +636,10 @@ func (s *Setup) handleExistingApp(ctx context.Context, inst *forge.Installation,
 		}, nil
 	}
 
-	// No secretExists function — can't check, assume reuse.
+	// No secretExists function — assume the remote mint owns the credentials,
+	// but still report permission drift so remote-only setup has the same
+	// rollout visibility as local credential paths.
+	s.checkPermissions(inst, org, role)
 	s.ui.StepDone(fmt.Sprintf("Reusing existing app %s", inst.AppSlug))
 	return &AppCredentials{
 		AppID:    inst.AppID,
@@ -654,12 +661,58 @@ func (s *Setup) PermissionErrors() error {
 	return fmt.Errorf("apps have stale permissions:\n  %s", strings.Join(s.permErrors, "\n  "))
 }
 
+// Keep this ranking in sync with mintcore.permissionLevelAtLeast. GitHub's
+// app-permissions schema defines read, write, and admin; unknown or empty
+// levels intentionally fail closed as not granted.
 var permRank = map[string]int{"read": 1, "write": 2, "admin": 3}
 
 func permLevelAtLeast(granted, requested string) bool {
 	g, gok := permRank[granted]
 	r, rok := permRank[requested]
 	return gok && rok && g >= r
+}
+
+func grantedPermissionLevel(granted map[string]string, permission string) string {
+	level := granted[permission]
+	if permission == "metadata" && level == "" {
+		// GitHub implicitly grants metadata:read to every App installation.
+		return "read"
+	}
+	return level
+}
+
+// githubWebBaseURL returns the browser-facing GitHub host for installation
+// approval links. GitHub Actions exposes GITHUB_SERVER_URL; when it is not
+// available, derive the web host from GITHUB_API_URL for GitHub Enterprise.
+func githubWebBaseURL() string {
+	if serverURL := strings.TrimRight(strings.TrimSpace(os.Getenv("GITHUB_SERVER_URL")), "/"); serverURL != "" {
+		return serverURL
+	}
+	return githubWebBaseURLFromAPI(os.Getenv("GITHUB_API_URL"))
+}
+
+func githubWebBaseURLFromAPI(rawAPIURL string) string {
+	apiURL := strings.TrimRight(strings.TrimSpace(rawAPIURL), "/")
+	if apiURL == "" || apiURL == "https://api.github.com" {
+		return "https://github.com"
+	}
+	parsed, err := url.Parse(apiURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "https://github.com"
+	}
+	parsed.Path = strings.TrimSuffix(strings.TrimRight(parsed.Path, "/"), "/api/v3")
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func (s *Setup) githubWebBaseURL() string {
+	if provider, ok := s.client.(interface{ BaseURL() string }); ok {
+		if baseURL := strings.TrimSpace(provider.BaseURL()); baseURL != "" {
+			return githubWebBaseURLFromAPI(baseURL)
+		}
+	}
+	return githubWebBaseURL()
 }
 
 func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
@@ -676,14 +729,14 @@ func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
 		if level == "" {
 			continue
 		}
-		if !permLevelAtLeast(inst.Permissions[perm], level) {
+		if !permLevelAtLeast(grantedPermissionLevel(inst.Permissions, perm), level) {
 			missing = append(missing, fmt.Sprintf("%s:%s", perm, level))
 		}
 	}
 	if len(missing) == 0 {
 		return
 	}
-	installURL := fmt.Sprintf("https://github.com/organizations/%s/settings/installations/%d", org, inst.ID)
+	installURL := fmt.Sprintf("%s/organizations/%s/settings/installations/%d", s.githubWebBaseURL(), org, inst.ID)
 	s.ui.StepWarn(fmt.Sprintf("app %s missing permissions: %s — if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
 		inst.AppSlug, strings.Join(missing, ", "), installURL))
 }

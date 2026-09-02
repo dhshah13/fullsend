@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/fullsend-ai/fullsend/internal/forge"
+	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
@@ -366,20 +367,24 @@ func TestSetup_ExistingApp_OrgOwned_NoSecret_EntersRecovery(t *testing.T) {
 	assert.Contains(t, err.Error(), "private key secret is missing")
 }
 
-func TestSetup_ExistingApp_NoSecretExistsFunc_ReuseSilently(t *testing.T) {
+func TestSetup_ExistingApp_NoSecretExistsFunc_StillChecksPermissions(t *testing.T) {
 	// When no secretExists callback is configured (e.g. github setup in
 	// OIDC mint mode with no local GCP project), existing apps should be
-	// reused silently without prompting for a PEM file.
+	// reused without prompting for a PEM file while still reporting permission
+	// drift.
 	client := &forge.FakeClient{
 		Installations: []forge.Installation{
-			{ID: 100, AppID: 10, AppSlug: "fullsend-triage"},
+			{ID: 100, AppID: 10, AppSlug: "fullsend-triage", Permissions: map[string]string{
+				"contents": "read",
+			}},
 		},
 		AppClientIDs: map[string]string{
 			"fullsend-triage": "Iv1.triage123",
 		},
 	}
 	prompter := &fakePrompter{}
-	printer := ui.New(&discardWriter{})
+	var output bytes.Buffer
+	printer := ui.New(&output)
 
 	s := NewSetup(client, prompter, newFakeBrowser(), printer).
 		WithAppSet("fullsend")
@@ -394,6 +399,8 @@ func TestSetup_ExistingApp_NoSecretExistsFunc_ReuseSilently(t *testing.T) {
 	assert.Empty(t, creds.PEM, "PEM should be empty to signal reuse")
 	assert.False(t, prompter.confirmCalled, "should not prompt for PEM recovery")
 	assert.False(t, prompter.readLineCalled, "should not ask for PEM file path")
+	assert.Contains(t, output.String(), "issues:write")
+	assert.Contains(t, output.String(), "/settings/installations/100")
 }
 
 func TestIsOrgOwned(t *testing.T) {
@@ -643,10 +650,14 @@ func TestSetup_RecoverCreatedApp_ResolvesAppID(t *testing.T) {
 	}
 	browser := &installOnOpenBrowser{
 		client: client,
-		inst:   forge.Installation{ID: 1, AppID: 99, AppSlug: "fullsend-coder"},
-		urlCh:  make(chan string, 1),
+		inst: forge.Installation{
+			ID: 1, AppID: 99, AppSlug: "fullsend-coder",
+			Permissions: map[string]string{"contents": "write"},
+		},
+		urlCh: make(chan string, 1),
 	}
-	printer := ui.New(&discardWriter{})
+	var output bytes.Buffer
+	printer := ui.New(&output)
 
 	s := NewSetup(client, &fakePrompter{}, browser, printer).
 		WithAppSet("fullsend").
@@ -657,6 +668,7 @@ func TestSetup_RecoverCreatedApp_ResolvesAppID(t *testing.T) {
 	assert.Equal(t, 99, creds.AppID, "AppID should be resolved from installation")
 	assert.Equal(t, "fullsend-coder", creds.Slug)
 	assert.Equal(t, "Iv1.coder456", creds.ClientID)
+	assert.Contains(t, output.String(), "missing permissions")
 }
 
 func TestSetup_NoExistingApp(t *testing.T) {
@@ -770,6 +782,51 @@ func TestManifestFlow_HTMLForm(t *testing.T) {
 
 	// Wait for the flow to finish (context timeout).
 	<-errCh
+}
+
+func TestPermLevelAtLeast(t *testing.T) {
+	tests := []struct {
+		granted, requested string
+		want               bool
+	}{
+		{"admin", "write", true},
+		{"admin", "read", true},
+		{"read", "write", false},
+		{"", "read", false},
+		{"bogus", "read", false},
+	}
+	for _, tc := range tests {
+		assert.Equal(t, tc.want, permLevelAtLeast(tc.granted, tc.requested),
+			"permLevelAtLeast(%q, %q)", tc.granted, tc.requested)
+	}
+}
+
+func TestGithubWebBaseURL(t *testing.T) {
+	t.Run("uses configured client base URL", func(t *testing.T) {
+		t.Setenv("GITHUB_SERVER_URL", "")
+		t.Setenv("GITHUB_API_URL", "")
+		client := gh.New("").WithBaseURL("https://github.example.com/api/v3")
+		setup := NewSetup(client, nil, nil, nil)
+		assert.Equal(t, "https://github.example.com", setup.githubWebBaseURL())
+	})
+
+	t.Run("server URL takes precedence", func(t *testing.T) {
+		t.Setenv("GITHUB_SERVER_URL", "https://github.example.com/")
+		t.Setenv("GITHUB_API_URL", "https://ignored.example.com/api/v3")
+		assert.Equal(t, "https://github.example.com", githubWebBaseURL())
+	})
+
+	t.Run("derives enterprise web URL from API URL", func(t *testing.T) {
+		t.Setenv("GITHUB_SERVER_URL", "")
+		t.Setenv("GITHUB_API_URL", "https://github.example.com/api/v3/")
+		assert.Equal(t, "https://github.example.com", githubWebBaseURL())
+	})
+
+	t.Run("defaults to github.com", func(t *testing.T) {
+		t.Setenv("GITHUB_SERVER_URL", "")
+		t.Setenv("GITHUB_API_URL", "")
+		assert.Equal(t, "https://github.com", githubWebBaseURL())
+	})
 }
 
 func TestSetup_StalePermissions_AllRolesChecked(t *testing.T) {

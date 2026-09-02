@@ -121,10 +121,13 @@ func RegisterCustomRolePermissions(perms map[string]map[string]string) error {
 		if _, ok := canonicalRolePermissions[role]; ok {
 			return fmt.Errorf("custom role %q collides with built-in role", role)
 		}
+		if len(p) == 0 {
+			return fmt.Errorf("custom role %q: no permissions defined", role)
+		}
 		cp := make(map[string]string, len(p))
 		for k, v := range p {
-			if v != "read" && v != "write" {
-				return fmt.Errorf("custom role %q: permission %q has invalid level %q (must be read or write)", role, k, v)
+			if v != "read" && v != "write" && v != "admin" {
+				return fmt.Errorf("custom role %q: permission %q has invalid level %q (must be read, write, or admin)", role, k, v)
 			}
 			cp[k] = v
 		}
@@ -608,7 +611,7 @@ func installationAcceptHint(githubBaseURL, org string, installationID int64) str
 	if isPublicGitHubAPI(githubBaseURL) {
 		return fmt.Sprintf("if the App already requests these permissions, Accept the pending update at https://github.com/organizations/%s/settings/installations/%d; otherwise the App owner must add them first", org, installationID)
 	}
-	return fmt.Sprintf("if the App already requests these permissions, Accept the pending update for org=%q installation_id=%d; otherwise the App owner must add them first", org, installationID)
+	return fmt.Sprintf("if the App already requests these permissions, an admin should Accept the pending update for org=%q installation_id=%d on this GitHub host; otherwise the App owner must add them first", org, installationID)
 }
 
 // optionalRolePermissions lists permissions that may be omitted during a
@@ -625,12 +628,24 @@ var optionalRolePermissions = map[string]map[string]bool{
 // when the installation lacks a non-optional permission for the role.
 var ErrRequiredPermissionsMissing = errors.New("required permissions missing")
 
+// GitHub's app-permissions schema currently defines read, write, and admin
+// levels (see https://github.com/github/rest-api-description/blob/main/descriptions/api.github.com/api.github.com.yaml).
+// Unknown or empty levels intentionally fail closed as not granted.
 var permRank = map[string]int{"read": 1, "write": 2, "admin": 3}
 
 func permissionLevelAtLeast(granted, requested string) bool {
 	g, gok := permRank[granted]
 	r, rok := permRank[requested]
 	return gok && rok && g >= r
+}
+
+func grantedPermissionLevel(granted map[string]string, permission string) string {
+	level := granted[permission]
+	if permission == "metadata" && level == "" {
+		// GitHub implicitly grants metadata:read to every App installation.
+		return "read"
+	}
+	return level
 }
 
 // effectiveInstallationPermissions builds the permission map for a token POST.
@@ -641,7 +656,11 @@ func permissionLevelAtLeast(granted, requested string) bool {
 // did not provide permission information, so the full requested set is preserved.
 func effectiveInstallationPermissions(role string, requested, granted map[string]string) (map[string]string, []string, error) {
 	if granted == nil {
-		return copyPermissions(requested), nil, nil
+		effective := copyPermissions(requested)
+		if len(effective) == 0 {
+			return nil, nil, fmt.Errorf("%w for role %q: no permissions remain", ErrRequiredPermissionsMissing, role)
+		}
+		return effective, nil, nil
 	}
 
 	optional := optionalRolePermissions[role]
@@ -649,7 +668,7 @@ func effectiveInstallationPermissions(role string, requested, granted map[string
 	var dropped []string
 	var missingRequired []string
 	for perm, level := range requested {
-		if permissionLevelAtLeast(granted[perm], level) {
+		if permissionLevelAtLeast(grantedPermissionLevel(granted, perm), level) {
 			effective[perm] = level
 			continue
 		}
@@ -663,6 +682,9 @@ func effectiveInstallationPermissions(role string, requested, granted map[string
 	if len(missingRequired) > 0 {
 		sort.Strings(missingRequired)
 		return nil, nil, fmt.Errorf("%w for role %q: %s", ErrRequiredPermissionsMissing, role, strings.Join(missingRequired, ", "))
+	}
+	if len(effective) == 0 {
+		return nil, nil, fmt.Errorf("%w for role %q: no permissions remain", ErrRequiredPermissionsMissing, role)
 	}
 
 	sort.Strings(dropped)
@@ -698,7 +720,7 @@ func createInstallationToken(ctx context.Context, githubBaseURL, jwt string, ins
 
 	perms, dropped, err := effectiveInstallationPermissions(role, requested, granted)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, fmt.Errorf("%w; %s", err, installationAcceptHint(githubBaseURL, org, installationID))
 	}
 	if len(dropped) > 0 {
 		log.Printf("installation permissions not granted: org=%q installation_id=%d role=%q dropped=%s; %s",

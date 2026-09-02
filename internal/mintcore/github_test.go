@@ -260,6 +260,7 @@ func TestCreateInstallationTokenWithGrantedPermissions_DownscopesWithoutRetry(t 
 		_, hasPackages := perms["packages"]
 		assert.False(t, hasPackages, "ungranted packages permission must be omitted before POST")
 		assert.Equal(t, "write", perms["contents"])
+		assert.Equal(t, "read", perms["metadata"], "metadata:read remains in the token scope when omitted from the installation response")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(installationTokenResponse{
 			Token:     "ghs_downscoped_token",
@@ -277,7 +278,6 @@ func TestCreateInstallationTokenWithGrantedPermissions_DownscopesWithoutRetry(t 
 		"issues":        "write",
 		"pull_requests": "write",
 		"checks":        "read",
-		"metadata":      "read",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, calls)
@@ -325,6 +325,7 @@ func TestCreateInstallationTokenWithGrantedPermissions_NonOptionalPermissionFail
 	assert.Contains(t, err.Error(), "issues:write")
 	assert.Contains(t, err.Error(), "pull_requests:write")
 	assert.Contains(t, err.Error(), "checks:read")
+	assert.Contains(t, err.Error(), "installation_id=99")
 }
 
 func TestCreateInstallationToken_422UnrelatedBodyDoesNotFallback(t *testing.T) {
@@ -395,6 +396,7 @@ func TestPermissionLevelAtLeast(t *testing.T) {
 		{"", "read", false},
 		{"", "write", false},
 		{"bogus", "read", false},
+		{"maintain", "read", false},
 		{"read", "", false},
 		{"read", "bogus", false},
 	}
@@ -455,6 +457,15 @@ func TestEffectiveInstallationPermissions_CustomRoleAllMissing(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrRequiredPermissionsMissing)
 	assert.Contains(t, err.Error(), "security_events:write")
+}
+
+func TestEffectiveInstallationPermissions_EmptyRequestedFails(t *testing.T) {
+	_, _, err := effectiveInstallationPermissions("scanner", map[string]string{}, map[string]string{
+		"contents": "read",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrRequiredPermissionsMissing)
+	assert.Contains(t, err.Error(), "no permissions remain")
 }
 
 func TestInstallationAcceptHint(t *testing.T) {
@@ -707,6 +718,28 @@ func TestCustomRolePermissions_RejectsBuiltinCollision(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "collides with built-in role")
+}
+
+func TestCustomRolePermissions_AllowsAdminLevel(t *testing.T) {
+	t.Cleanup(func() { _ = RegisterCustomRolePermissions(nil) })
+
+	require.NoError(t, RegisterCustomRolePermissions(map[string]map[string]string{
+		"project-admin": {"organization_projects": "admin"},
+	}))
+	assert.Equal(t, "admin", RolePermissionsFor("project-admin")["organization_projects"])
+}
+
+func TestCustomRolePermissions_RejectsEmptyPermissions(t *testing.T) {
+	t.Cleanup(func() { _ = RegisterCustomRolePermissions(nil) })
+
+	for _, permissions := range []map[string]map[string]string{
+		{"scanner": {}},
+		{"scanner": nil},
+	} {
+		err := RegisterCustomRolePermissions(permissions)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `custom role "scanner": no permissions defined`)
+	}
 }
 
 func TestCustomRolePermissions_RejectsInvalidName(t *testing.T) {
