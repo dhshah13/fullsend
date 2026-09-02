@@ -5,7 +5,7 @@
 # This script:
 #   1. Auto-numbers the VM (fullsend-gitlab-runner-01, -02, ...)
 #   2. Creates a GCE VM via gcloud compute instances create
-#   3. Waits for SSH readiness
+#   3. Waits for SSH readiness, then installs packages via dnf
 #   4. Registers a new project runner via the GitLab API
 #   5. Copies setup files and runs setup.sh to configure the custom
 #      executor, OpenShell gateway, and pre-pull images
@@ -255,23 +255,6 @@ if ! [[ "${vm_name}" =~ ^[a-z0-9-]+$ ]]; then
   exit 1
 fi
 
-# Build cloud-init user-data to install packages on first boot.
-# Note: unlike the KubeVirt vm.yaml cloud-init, this omits the bootcmd that
-# disables Fedora metalink repos — GCE VMs have standard internet egress so
-# metalink resolution succeeds, and setup.sh's fix_fedora_repos() provides a
-# fallback if it ever fails.
-cloudinit_file=$(mktemp)
-trap 'rm -f "${cloudinit_file}"' EXIT
-cat > "${cloudinit_file}" <<'CLOUDINIT'
-#cloud-config
-packages:
-  - podman
-  - curl
-  - git
-  - python3
-  - openssl
-CLOUDINIT
-
 subnet_flag=()
 if [ -n "${GCP_SUBNET}" ]; then
   subnet_flag=(--subnet="${GCP_SUBNET}")
@@ -289,22 +272,19 @@ gcloud compute instances create "${vm_name}" \
   --image-project="${GCP_IMAGE_PROJECT}" \
   --boot-disk-size="20GB" \
   --boot-disk-type="pd-balanced" \
-  --metadata-from-file="user-data=${cloudinit_file}" \
   --quiet
 cleanup_vm() {
   echo "  NOTE: VM ${vm_name} was created — to clean up run:" >&2
   echo "    GCP_PROJECT=${GCP_PROJECT} GCP_ZONE=${GCP_ZONE} GL_TOKEN=\$GL_TOKEN GITLAB_URL=${GITLAB_URL} ./delete-gcp-vm.sh ${vm_name}" >&2
 }
 trap cleanup_vm ERR
-# ERR does not fire on Ctrl-C; the boot and cloud-init waits below can take
-# up to 20 minutes, so print the cleanup hint on interrupt as well.
+# ERR does not fire on Ctrl-C; the boot and package-install waits below can
+# take up to 20 minutes, so print the cleanup hint on interrupt as well.
 trap 'cleanup_vm; exit 130' INT
 trap 'cleanup_vm; exit 143' TERM
-rm -f "${cloudinit_file}"
-trap - EXIT
 
 # ----------------------------------------------------------------------
-# 3. Wait for the VM to boot and accept SSH
+# 3. Wait for the VM to boot, accept SSH, and install packages
 # ----------------------------------------------------------------------
 echo "==> Waiting for ${vm_name} to boot..."
 for i in $(seq 1 60); do
@@ -320,15 +300,16 @@ for i in $(seq 1 60); do
   sleep 10
 done
 
-# Wait for cloud-init to finish installing packages (podman, curl, git, python3).
-# Bounded at 10 minutes to match the SSH readiness loop.
-echo "==> Waiting for cloud-init to complete..."
-if ! timeout 600 gce_ssh "cloud-init status --wait" 2>&1; then
-  echo "ERROR: cloud-init failed or timed out — check cloud-init logs on the VM" >&2
+# Install packages via dnf over SSH. Fedora GCE images ship google-guest-agent,
+# not cloud-init, so #cloud-config user-data is silently ignored. Direct SSH
+# dnf install is the reliable path on all Fedora GCE images.
+echo "==> Installing packages via SSH (dnf)..."
+if ! timeout 600 gce_ssh "sudo dnf install -y podman curl git python3 openssl" 2>&1; then
+  echo "ERROR: dnf install failed or timed out — check the VM for dnf errors" >&2
   cleanup_vm
   exit 1
 fi
-echo "  OK: cloud-init complete"
+echo "  OK: packages installed"
 
 # ----------------------------------------------------------------------
 # 4. Register a runner via the GitLab API
