@@ -467,14 +467,14 @@ func TestCodexPreflightPythonVersion(t *testing.T) {
 	})
 }
 
-// TestCodexBootstrap_RecordsHookScriptDigests pins the anchor: the name to
-// digest map has to reach the runner's memory, since Run cannot re-derive
+// TestCodexBootstrap_RecordsRunnerHeldDigests pins the anchor: the name to
+// digest map has to reach the runner-held digests, since Run cannot re-derive
 // which scripts the harness enabled.
-func TestCodexBootstrap_RecordsHookScriptDigests(t *testing.T) {
+func TestCodexBootstrap_RecordsRunnerHeldDigests(t *testing.T) {
 	storeDir := t.TempDir()
 	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "codex-cli 0.152.1")
-	forgetCodexArtifactHashes("sb")
-	t.Cleanup(func() { forgetCodexArtifactHashes("sb") })
+	forgetRunnerHeldDigests("sb")
+	t.Cleanup(func() { forgetRunnerHeldDigests("sb") })
 
 	r := CodexRuntime{}
 	require.NoError(t, r.Bootstrap(codexHooksBootstrapInput{
@@ -486,7 +486,7 @@ func TestCodexBootstrap_RecordsHookScriptDigests(t *testing.T) {
 		hooks: security.SandboxHookConfigFromHarness(&harness.Harness{}),
 	}))
 
-	got, ok := lookupCodexArtifactHashes("sb")
+	got, ok := lookupRunnerHeldDigests("sb")
 	require.True(t, ok, "Bootstrap must record the digests for Run to guard against")
 	assert.NotEmpty(t, got.ConfigTOML)
 	assert.NotEmpty(t, got.HooksJSON)

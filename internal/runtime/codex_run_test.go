@@ -16,9 +16,9 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/security"
 )
 
-// testCodexHashes stands in for what Bootstrap recorded in the runner's
+// testRunnerHeldDigests stands in for what Bootstrap recorded in the runner's
 // memory for a sandbox.
-var testCodexHashes = codexUploadedHashes{
+var testRunnerHeldDigests = codexRunnerHeldDigestSet{
 	ConfigTOML:  "aaaa000000000000000000000000000000000000000000000000000000000000",
 	HooksJSON:   "bbbb000000000000000000000000000000000000000000000000000000000000",
 	HookScripts: testCodexHookScripts(),
@@ -108,7 +108,7 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 		RepoDir:           sandbox.SandboxWorkspace + "/repo",
 		HooksSettingsPath: "/sandbox/codex-config/hooks.json",
 	}
-	cmd := buildCodexRunCommand(params, "gpt-5.6-luna", "high", true, testCodexHashes)
+	cmd := buildCodexRunCommand(params, "gpt-5.6-luna", "high", true, testRunnerHeldDigests)
 
 	// Everything that must happen before the agent-writable .env is sourced,
 	// in order: nothing can shadow the shell builtins the guards use yet, and
@@ -119,7 +119,7 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 		// The embedded assets, then the per-run files by the digest the
 		// runner recorded, then the credential seed — all before .env.
 		`sha256sum`,
-		testCodexHashes.ConfigTOML,
+		testRunnerHeldDigests.ConfigTOML,
 		`OPENAI_API_KEY`,
 		`. '` + sandbox.SandboxWorkspace + `/.env'`,
 		`export CODEX_HOME=`,
@@ -140,8 +140,8 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 	// digest guard — so that code appears four times.
 	assert.Equal(t, 4, strings.Count(cmd, "exit "+strconv.Itoa(codexHooksMissingExit)))
 	assert.Equal(t, 2, strings.Count(cmd, "exit "+strconv.Itoa(codexConfigTamperedExit)))
-	assert.Equal(t, 2, strings.Count(cmd, testCodexHashes.ConfigTOML))
-	assert.Equal(t, 2, strings.Count(cmd, testCodexHashes.HooksJSON))
+	assert.Equal(t, 2, strings.Count(cmd, testRunnerHeldDigests.ConfigTOML))
+	assert.Equal(t, 2, strings.Count(cmd, testRunnerHeldDigests.HooksJSON))
 
 	// The endpoint and the credential command are pinned as SessionFlags as
 	// well as by the digest: verified against codex 0.152.1 to beat the file.
@@ -188,7 +188,7 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 	// the runner derived from the harness: appendHookEnv wrote the same values
 	// into the agent-writable workspace .env at bootstrap, so without this
 	// iteration 1 could widen the SSRF allowlist for iteration 2.
-	for _, pair := range testCodexHashes.SecurityEnv {
+	for _, pair := range testRunnerHeldDigests.SecurityEnv {
 		at := strings.Index(cmd, "export "+pair.Key+"="+shellQuote(pair.Value))
 		require.Positive(t, at, "security value %s is not re-exported", pair.Key)
 		assert.Greater(t, at, envAt, "%s must be re-exported after .env", pair.Key)
@@ -200,7 +200,7 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 	require.Positive(t, digestAt)
 	assert.Greater(t, digestAt, envAt, "exported after .env so nothing there can move it")
 	assert.Less(t, digestAt, strings.Index(cmd, "exec --json"))
-	for name, digest := range testCodexHashes.HookScripts {
+	for name, digest := range testRunnerHeldDigests.HookScripts {
 		assert.Contains(t, cmd, name+":"+digest)
 	}
 	assert.True(t, strings.HasSuffix(strings.TrimSpace(cmd), "-"), "the command must end with the stdin sentinel")
@@ -210,7 +210,7 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 func TestBuildCodexRunCommand_HooksDisabled(t *testing.T) {
 	t.Parallel()
 
-	cmd := buildCodexRunCommand(RunParams{RepoDir: "/repo"}, "gpt-5.6-luna", "", false, testCodexHashes)
+	cmd := buildCodexRunCommand(RunParams{RepoDir: "/repo"}, "gpt-5.6-luna", "", false, testRunnerHeldDigests)
 
 	// The flag is decided from the runner's own signal, not the manifest.
 	assert.NotContains(t, cmd, "--dangerously-bypass-hook-trust")
@@ -224,7 +224,7 @@ func TestBuildCodexRunCommand_HooksDisabled(t *testing.T) {
 func TestBuildCodexRunCommand_DebugCapturesStderr(t *testing.T) {
 	t.Parallel()
 
-	cmd := buildCodexRunCommand(RunParams{RepoDir: "/repo", Debug: "1"}, "gpt-5.6-luna", "", false, testCodexHashes)
+	cmd := buildCodexRunCommand(RunParams{RepoDir: "/repo", Debug: "1"}, "gpt-5.6-luna", "", false, testRunnerHeldDigests)
 	// codex exec has no --debug flag: tracing goes to stderr behind RUST_LOG.
 	assert.Contains(t, cmd, `export RUST_LOG="${RUST_LOG:-info}"`)
 	assert.Contains(t, cmd, "2>>'"+sandbox.SandboxWorkspace+"/"+codexDebugLogFile+"'")
@@ -236,7 +236,7 @@ func TestBuildCodexRunCommand_HonoursPromptOverride(t *testing.T) {
 	// The validation loop replaces the prompt on a retry iteration to inject
 	// the previous failure (#1050/#6494); a runtime that ignored it would turn
 	// validation_loop.feedback_mode into a silent no-op.
-	cmd := buildCodexRunCommand(RunParams{RepoDir: "/repo", Prompt: "retry: it's broken"}, "m", "", false, testCodexHashes)
+	cmd := buildCodexRunCommand(RunParams{RepoDir: "/repo", Prompt: "retry: it's broken"}, "m", "", false, testRunnerHeldDigests)
 	assert.Contains(t, cmd, `printf '%s' 'retry: it'\''s broken'`)
 	assert.NotContains(t, cmd, DefaultAgentPrompt)
 }
@@ -250,7 +250,7 @@ func TestCodexAssetGuard_Executes(t *testing.T) {
 
 	// The guard names absolute sandbox paths, so run it against a fake root.
 	guard := func() string {
-		return strings.ReplaceAll(codexAssetGuard(r, true, testCodexHashes), sandbox.SandboxCodexConfig, dir)
+		return strings.ReplaceAll(codexAssetGuard(r, true, testRunnerHeldDigests), sandbox.SandboxCodexConfig, dir)
 	}
 	writeAll := func(t *testing.T) {
 		t.Helper()
@@ -373,8 +373,8 @@ func TestCodexConfigGuard_Executes(t *testing.T) {
 
 	good, err := renderCodexConfig(dir, "body")
 	require.NoError(t, err)
-	hashes := codexUploadedHashes{ConfigTOML: codexAssetSHA256(good)}
-	guard := strings.ReplaceAll(codexConfigGuard(r, hashes), sandbox.SandboxCodexConfig, dir)
+	digests := codexRunnerHeldDigestSet{ConfigTOML: codexAssetSHA256(good)}
+	guard := strings.ReplaceAll(codexConfigGuard(r, digests), sandbox.SandboxCodexConfig, dir)
 
 	run := func(t *testing.T, content []byte) error {
 		t.Helper()
@@ -432,8 +432,8 @@ func TestCodexConfigGuard_Executes(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, codexConfigFile), good, 0o644))
 		require.NoError(t, os.WriteFile(hooksPath, []byte(`{"hooks":{}}`), 0o644))
 		withHooks := strings.ReplaceAll(
-			codexConfigGuard(r, codexUploadedHashes{
-				ConfigTOML: hashes.ConfigTOML,
+			codexConfigGuard(r, codexRunnerHeldDigestSet{
+				ConfigTOML: digests.ConfigTOML,
 				HooksJSON:  codexAssetSHA256([]byte(`{"hooks":{}}`)),
 			}), sandbox.SandboxCodexConfig, dir)
 		require.NoError(t, exec.Command("/bin/sh", "-c", withHooks).Run())
@@ -447,7 +447,7 @@ func TestCodexConfigGuard_Executes(t *testing.T) {
 
 // TestCodexHookScriptsGuard_Executes covers the other agent-writable half: the
 // shared hook scripts themselves. Their bytes are embedded in this binary and
-// their names come from the runner's memory, so the guard needs no anchor in
+// their names come from the runner-held digests, so the guard needs no anchor in
 // the sandbox at all.
 func TestCodexHookScriptsGuard_Executes(t *testing.T) {
 	dir := t.TempDir()

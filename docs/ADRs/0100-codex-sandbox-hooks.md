@@ -46,8 +46,9 @@ becomes exit 2 with the reason on stderr, a rewrite the runtime cannot apply bec
 which is a stronger check than the trust hash it replaces.
 
 Because the hook scripts and their directory stay agent-writable between iterations — the residue
-Claude Code and pi also have — codex additionally **re-verifies every script against digests fixed
-in its process environment before each invocation**, pins the interpreter (absolute path, `-I`,
+Claude Code and pi also have — codex additionally **re-verifies every script against runner-held digests
+before each invocation** — digests the runner records outside the sandbox at Bootstrap and injects into the launch command at Run, here carried in the codex process's
+environment, which the agent cannot reach once it is running —, pins the interpreter (absolute path, `-I`,
 `-B`) and `PATH` across the agent-writable `.env`, and re-asserts the hook configuration the runner
 derived from the harness after `.env` so the agent's copy cannot win.
 

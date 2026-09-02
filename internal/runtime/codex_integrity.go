@@ -9,7 +9,7 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/security"
 )
 
-// Integrity anchors for the runner-owned files under CODEX_HOME.
+// Expected digests for the runner-owned files under CODEX_HOME.
 //
 // Everything Bootstrap writes there is agent-writable between iterations — the
 // agent runs as the same user — so a guard is only worth as much as the place
@@ -20,9 +20,10 @@ import (
 //     that the run command carries as a literal. Nothing in the sandbox can
 //     change what the guard compares against.
 //
-//  2. **The runner's own memory.** config.toml and hooks.json are rendered per
-//     run, so no compile-time constant exists for them. Bootstrap records what
-//     it uploaded here, in the host process, and Run reads it back — the
+//  2. **Runner-held digests** — digests the runner records outside the sandbox at Bootstrap and injects into the launch command at Run.
+//     config.toml and hooks.json are rendered per run, so no compile-time
+//     constant exists for them. Bootstrap records what it uploaded here, on
+//     the runner side of the sandbox boundary, and Run reads it back; the
 //     runner calls both within one invocation (internal/cli/run.go).
 //
 // The manifest is deliberately *not* one of those places. It is a file in the
@@ -35,9 +36,9 @@ import (
 // line present. The manifest stays what it always was: information for Run and
 // for an operator reading the sandbox, never authority.
 
-// codexUploadedHashes are the SHA-256 digests of the per-run files Bootstrap
+// codexRunnerHeldDigestSet are the SHA-256 digests of the per-run files Bootstrap
 // uploaded. HooksJSON is empty when the harness has security disabled.
-type codexUploadedHashes struct {
+type codexRunnerHeldDigestSet struct {
 	ConfigTOML string
 	HooksJSON  string
 	// SecurityEnv is the hook configuration the runner derived from the
@@ -90,9 +91,9 @@ func codexSecurityEnv(hooks security.SandboxHookConfig) []codexEnvPair {
 	return env
 }
 
-// codexArtifactHashes maps a sandbox name to the digests Bootstrap recorded.
-// Process-local on purpose (see above); a sync.Map because the runner may
-// bootstrap and run more than one sandbox concurrently.
+// codexRunnerHeldDigests maps a sandbox name to the digests Bootstrap
+// recorded. Held on the runner side on purpose (see above); a sync.Map because
+// the runner may bootstrap and run more than one sandbox concurrently.
 //
 // Entries are keyed by sandbox name rather than kept in a single value, so
 // this does not assume one run per process, and they are never evicted: a
@@ -100,28 +101,28 @@ func codexSecurityEnv(hooks security.SandboxHookConfig) []codexEnvPair {
 // map per entry, and a runner process is a one-shot CLI invocation. If
 // fullsend ever grows a long-lived server that runs many sandboxes, this wants
 // an explicit drop when a run finishes.
-var codexArtifactHashes sync.Map
+var codexRunnerHeldDigests sync.Map
 
-func recordCodexArtifactHashes(sandboxName string, h codexUploadedHashes) {
-	codexArtifactHashes.Store(sandboxName, h)
+func recordRunnerHeldDigests(sandboxName string, h codexRunnerHeldDigestSet) {
+	codexRunnerHeldDigests.Store(sandboxName, h)
 }
 
-// lookupCodexArtifactHashes returns what Bootstrap recorded for this sandbox.
+// lookupRunnerHeldDigests returns what Bootstrap recorded for this sandbox.
 // A miss is fail-closed at the call site rather than a fallback to the
-// manifest: falling back would reintroduce the agent-writable anchor this
-// exists to avoid.
-func lookupCodexArtifactHashes(sandboxName string) (codexUploadedHashes, bool) {
-	v, ok := codexArtifactHashes.Load(sandboxName)
+// manifest: falling back would put the expected value back inside the sandbox,
+// which is what this exists to avoid.
+func lookupRunnerHeldDigests(sandboxName string) (codexRunnerHeldDigestSet, bool) {
+	v, ok := codexRunnerHeldDigests.Load(sandboxName)
 	if !ok {
-		return codexUploadedHashes{}, false
+		return codexRunnerHeldDigestSet{}, false
 	}
-	h, ok := v.(codexUploadedHashes)
+	h, ok := v.(codexRunnerHeldDigestSet)
 	return h, ok
 }
 
-// forgetCodexArtifactHashes drops a sandbox's entry; tests only.
-func forgetCodexArtifactHashes(sandboxName string) {
-	codexArtifactHashes.Delete(sandboxName)
+// forgetRunnerHeldDigests drops a sandbox's entry; tests only.
+func forgetRunnerHeldDigests(sandboxName string) {
+	codexRunnerHeldDigests.Delete(sandboxName)
 }
 
 // codexHookScriptsGuard is the POSIX sh fragment that refuses to run unless the
@@ -146,8 +147,8 @@ func forgetCodexArtifactHashes(sandboxName string) {
 // digest; the directory holds exactly that many entries; and none of them is
 // anything but a regular file. `find` does not follow symlinks, so a symlink
 // to an allowed file — which `test -f` and sha256sum would both accept — is
-// caught by the type check. Expected names come from the runner's memory
-// (recorded by Bootstrap), never from the sandbox.
+// caught by the type check. Expected names are runner-held (recorded by
+// Bootstrap), never read from the sandbox.
 func codexHookScriptsGuard(hooksDir string, scripts map[string]string) string {
 	names := make([]string, 0, len(scripts))
 	for name := range scripts {

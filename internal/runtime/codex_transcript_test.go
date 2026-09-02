@@ -224,16 +224,16 @@ func TestCodexRun_AcceptsManifestHookPlan(t *testing.T) {
 
 // seedCodexManifest puts a manifest into the fake openshell's store so
 // readCodexManifest finds one, and records the artifact digests Bootstrap
-// would have kept in the runner's memory for that sandbox.
+// would have kept in the runner-held digests for that sandbox.
 func seedCodexManifest(t *testing.T, storeDir string, r CodexRuntime, hooks *codexHooksManifest) {
 	t.Helper()
-	hashes := codexUploadedHashes{ConfigTOML: "config0000000000000000000000000000000000000000000000000000000000"}
+	hashes := codexRunnerHeldDigestSet{ConfigTOML: "config0000000000000000000000000000000000000000000000000000000000"}
 	if hooks != nil {
 		hashes.HooksJSON = "hooks00000000000000000000000000000000000000000000000000000000000"
 		hashes.HookScripts = testCodexHookScripts()
 	}
-	recordCodexArtifactHashes("sb", hashes)
-	t.Cleanup(func() { forgetCodexArtifactHashes("sb") })
+	recordRunnerHeldDigests("sb", hashes)
+	t.Cleanup(func() { forgetRunnerHeldDigests("sb") })
 	data, err := json.MarshalIndent(codexManifest{
 		AgentName:    "triage",
 		Model:        "openai/gpt-5.6-luna",
@@ -320,8 +320,8 @@ func TestCodexRun_RefusesInconsistentHookWiring(t *testing.T) {
 	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
 
 	// Bootstrap recorded no hooks.json digest, but the runner says hooks are on.
-	recordCodexArtifactHashes("sb", codexUploadedHashes{ConfigTOML: "deadbeef"})
-	t.Cleanup(func() { forgetCodexArtifactHashes("sb") })
+	recordRunnerHeldDigests("sb", codexRunnerHeldDigestSet{ConfigTOML: "deadbeef"})
+	t.Cleanup(func() { forgetRunnerHeldDigests("sb") })
 
 	_, err := r.Run(t.Context(), RunParams{
 		SandboxName:       "sb",
@@ -337,13 +337,13 @@ func TestCodexRun_RefusesInconsistentHookWiring(t *testing.T) {
 }
 
 // Run cannot fall back to the manifest for the digests, so a sandbox this
-// process never bootstrapped is refused rather than run unguarded.
-func TestCodexRun_RefusesWithoutRecordedDigests(t *testing.T) {
+// runner never bootstrapped is refused rather than run unguarded.
+func TestCodexRun_RefusesWithoutRunnerHeldDigests(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
 	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "codex-cli 0.152.1")
-	forgetCodexArtifactHashes("sb-never-bootstrapped")
+	forgetRunnerHeldDigests("sb-never-bootstrapped")
 
 	_, err := r.Run(t.Context(), RunParams{
 		SandboxName: "sb-never-bootstrapped",
@@ -353,7 +353,7 @@ func TestCodexRun_RefusesWithoutRecordedDigests(t *testing.T) {
 	}, ui.New(&bytes.Buffer{}), time.Now(), &RunMetrics{})
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no recorded config digests")
+	assert.Contains(t, err.Error(), "no runner-held config digests")
 }
 
 // TestCodexExtractTranscripts_DiscardsSpoofedFiles covers the agent-writable

@@ -150,9 +150,9 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	if err := uploadBytes(sandboxName, r.codexConfigPath(), configTOML); err != nil {
 		return fmt.Errorf("writing %s: %w", codexConfigFile, err)
 	}
-	// Recorded in the runner's own memory, not in the manifest: see
-	// codex_integrity.go for why the sandbox has no trustworthy anchor.
-	hashes := codexUploadedHashes{ConfigTOML: codexAssetSHA256(configTOML)}
+	// A runner-held digest, not one recorded in the manifest: see
+	// codex_integrity.go for why nothing inside the sandbox can hold it.
+	digests := codexRunnerHeldDigestSet{ConfigTOML: codexAssetSHA256(configTOML)}
 
 	// uploadBytes does not set a mode, and codex executes this one.
 	if err := uploadBytes(sandboxName, r.codexAuthScriptPath(), codexAuthScriptSH); err != nil {
@@ -211,10 +211,10 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		}
 		// Exactly what was installed, by name: Run cannot re-derive the set
 		// because it does not see the harness's hook config.
-		hashes.SecurityEnv = codexSecurityEnv(hooks)
-		hashes.HookScripts = map[string]string{}
+		digests.SecurityEnv = codexSecurityEnv(hooks)
+		digests.HookScripts = map[string]string{}
 		for name, content := range security.HookFiles(hooks) {
-			hashes.HookScripts[name] = codexAssetSHA256(content)
+			digests.HookScripts[name] = codexAssetSHA256(content)
 		}
 		if err := appendHookEnv(sandboxName, hooks); err != nil {
 			return err
@@ -236,7 +236,7 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		if err := uploadBytes(sandboxName, r.codexHooksPath(), hooksJSON); err != nil {
 			return fmt.Errorf("writing %s: %w", codexHooksFile, err)
 		}
-		hashes.HooksJSON = codexAssetSHA256(hooksJSON)
+		digests.HooksJSON = codexAssetSHA256(hooksJSON)
 		manifest.Hooks = codexHooksManifestFor(r.codexHooksDir(), hooks)
 	}
 
@@ -253,7 +253,7 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	if err := uploadBytes(sandboxName, r.codexManifestPath(), manifestJSON); err != nil {
 		return fmt.Errorf("writing %s: %w", codexManifestFile, err)
 	}
-	recordCodexArtifactHashes(sandboxName, hashes)
+	recordRunnerHeldDigests(sandboxName, digests)
 	return nil
 }
 

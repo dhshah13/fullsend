@@ -734,15 +734,15 @@ Consequences of those, recorded in the matrix and [ADR 0100](../ADRs/0100-codex-
 ### Where the guards' expected values come from
 
 Everything under `CODEX_HOME` is agent-writable between iterations, so a guard is worth only as much
-as the place its expected value comes from. There are two trustworthy places, and the manifest is
-not one of them:
+as the place its expected value comes from. There are two trustworthy places — this binary, and
+**runner-held digests**, meaning digests the runner records outside the sandbox at Bootstrap and injects into the launch command at Run — and the manifest is not one of them:
 
 | File | Anchor | Guard |
 |---|---|---|
 | hook adapter, auth script | **compile-time** — `go:embed`ed, so the digest is a literal in the run command | SHA-256, exit 97 |
-| the shared hook scripts | **compile-time** for the bytes, **the runner's memory** for which names — Bootstrap records the name → digest map for the set the harness enabled | SHA-256 per filename, plus an exhaustive directory check, exit 97 |
-| `config.toml`, `hooks.json` | **the runner's own memory** — rendered per run, so Bootstrap records what it uploaded in the host process and Run reads it back (`codex_integrity.go`) | whole-file SHA-256, exit 98 |
-| `fullsend-manifest.json` | none — it is a file in the same directory | information only; never authority |
+| the shared hook scripts | **compile-time** for the bytes, **runner-held** for which names — Bootstrap records the name → digest map for the set the harness enabled | SHA-256 per filename, plus an exhaustive directory check, exit 97 |
+| `config.toml`, `hooks.json` | **runner-held** — rendered per run, so Bootstrap records what it uploaded outside the sandbox and Run injects it into the launch command (`codex_integrity.go`) | whole-file SHA-256, exit 98 |
+| `fullsend-manifest.json` | none — it is a file in the same agent-writable directory | information only; never authority |
 
 The hook-script check makes codex **stricter than Claude Code and pi**, where the scripts stay
 agent-writable between iterations with no integrity check at all. Each digest is bound to its
@@ -778,8 +778,8 @@ sourcing `.env` and restores it afterwards, and unsets `LD_PRELOAD`, `LD_LIBRARY
 codex's own binary, `tirith`, `git` — before its `main`. The adapter strips `LD_*` and `PYTHON*`
 from the children's environment too, while passing the scripts' own configuration through.
 
-**Why not record the config digest in the manifest.** It would be a hash in the same agent-writable
-directory as the file it describes, so an agent could rewrite both and the guard would pass. That is
+**Why not record the config digest in the manifest.** It would be a digest in the same
+agent-writable directory as the file it describes, so an agent could rewrite both and the guard would pass. That is
 not theoretical: `projects."<repo>".trust_level = "trusted"` in `config.toml` makes codex load the
 target repo's own `.codex/config.toml`, which then supplies `developer_instructions`, `model`, and —
 under `--dangerously-bypass-hook-trust` — repo-authored hooks. Verified against 0.152.1: with the
@@ -871,7 +871,7 @@ Two artefacts of the run are worth knowing about:
   since checking only the first would let a file open with one genuine envelope and carry anything
   after it. Each is downloaded to a staging name, validated, redacted and only then renamed into
   place, so a crash cannot leave raw tool output at the path the artifact collector reads; reads are
-  bounded, so a planted multi-gigabyte file is refused rather than pulled into the runner's memory.
+  bounded, so a planted multi-gigabyte file is refused rather than read into the runner in full.
 - `--dangerously-bypass-hook-trust` emits its warning as an `error`-type *item*, which the stream
   parser correctly treats as a warning rather than a run failure.
 - A model the account cannot serve on the Responses API fails as five `error` reconnect events and a

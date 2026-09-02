@@ -177,7 +177,7 @@ func codexRedactTextFile(path string) error {
 }
 
 // codexReadBounded reads a file the sandbox produced, refusing one larger than
-// codexMaxArtifactBytes rather than pulling it into the runner's memory.
+// codexMaxArtifactBytes rather than reading it into the runner in full.
 func codexReadBounded(path string) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {

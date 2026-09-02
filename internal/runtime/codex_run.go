@@ -173,7 +173,7 @@ func codexBinaryPin() string {
 // `command -p` bypasses shell functions and uses the system default PATH, so
 // nothing left in the environment can stand in for sha256sum or cut; test, [
 // and echo are builtins.
-func codexAssetGuard(r CodexRuntime, hooksEnabled bool, hashes codexUploadedHashes) string {
+func codexAssetGuard(r CodexRuntime, hooksEnabled bool, digests codexRunnerHeldDigestSet) string {
 	checks := []string{
 		"test -f " + shellQuote(r.codexConfigPath()),
 		"test -f " + shellQuote(r.codexAuthScriptPath()),
@@ -200,7 +200,7 @@ func codexAssetGuard(r CodexRuntime, hooksEnabled bool, hashes codexUploadedHash
 			// installed: the scripts are agent-writable between iterations,
 			// and a tirith_check.py rewritten to exit 0 would disable a
 			// control while every other check still passed.
-			codexHookScriptsGuard(r.codexHooksDir(), hashes.HookScripts),
+			codexHookScriptsGuard(r.codexHooksDir(), digests.HookScripts),
 		)
 	}
 	return fmt.Sprintf(
@@ -215,7 +215,7 @@ func codexAssetGuard(r CodexRuntime, hooksEnabled bool, hashes codexUploadedHash
 // comparison is bypassable — swap one handler's command and pad the adapter's
 // path into the free-form `description` field to restore parity. What actually
 // makes hooks.json tamper-evident is codexConfigGuard's whole-file digest,
-// anchored in the runner's memory; this check survives as a cheap, readable
+// a runner-held digest; this check survives as a cheap, readable
 // assertion that fails first and names the wiring rather than the file.
 //
 // The grouping braces are load-bearing: `&&` and `||` are left-associative in
@@ -242,7 +242,7 @@ func codexSHACheck(path, sum string) string {
 
 // codexConfigGuard is the POSIX sh fragment that fails closed when a
 // runner-owned, per-run file under CODEX_HOME is no longer byte-for-byte what
-// Bootstrap uploaded. The expected digests come from the runner's own memory
+// Bootstrap uploaded. The expected values are runner-held digests
 // (codex_integrity.go), so nothing in the agent-writable config directory
 // contributes to the answer.
 //
@@ -257,10 +257,10 @@ func codexSHACheck(path, sum string) string {
 // codex 0.152.1: with the line the repo layer applied, without it it did not,
 // and `-c projects={}` and a `-c` scalar `trust_level="untrusted"` both failed
 // to override it. A whole-file digest has no such blind spot.
-func codexConfigGuard(r CodexRuntime, hashes codexUploadedHashes) string {
-	checks := []string{codexSHACheck(r.codexConfigPath(), hashes.ConfigTOML)}
-	if hashes.HooksJSON != "" {
-		checks = append(checks, codexSHACheck(r.codexHooksPath(), hashes.HooksJSON))
+func codexConfigGuard(r CodexRuntime, digests codexRunnerHeldDigestSet) string {
+	checks := []string{codexSHACheck(r.codexConfigPath(), digests.ConfigTOML)}
+	if digests.HooksJSON != "" {
+		checks = append(checks, codexSHACheck(r.codexHooksPath(), digests.HooksJSON))
 	}
 	return fmt.Sprintf(
 		`{ %s || { echo 'fullsend: codex config.toml or hooks.json is not the file fullsend wrote; refusing to run (a rewritten config can trust the target repo, which loads its .codex/ layer and its hooks)' >&2; exit %d; }; }`,
@@ -288,7 +288,7 @@ func codexConfigGuard(r CodexRuntime, hashes codexUploadedHashes) string {
 //   - whether the hook adapter is required is decided from the runner's own
 //     signal (params.HooksSettingsPath, the same one ClaudeRuntime uses for
 //     --settings), never from the agent-writable manifest.
-func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled bool, hashes codexUploadedHashes) string {
+func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled bool, digests codexRunnerHeldDigestSet) string {
 	r := CodexRuntime{}
 	envFile := sandbox.SandboxWorkspace + "/.env"
 
@@ -303,8 +303,8 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		// that assigns the same name aborts the sourcing shell under a POSIX
 		// sh rather than winning.
 		"&& readonly "+codexPathVar+`="$PATH"`,
-		"&& "+codexAssetGuard(r, hooksEnabled, hashes),
-		"&& "+codexConfigGuard(r, hashes),
+		"&& "+codexAssetGuard(r, hooksEnabled, digests),
+		"&& "+codexConfigGuard(r, digests),
 		"&& "+r.OpenAIAuthSeed(),
 		"&& . "+shellQuote(envFile),
 		// .env is agent-writable; re-pin the runner-owned config location
@@ -328,8 +328,8 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		// cannot shadow, so it restores the real utilities before the second
 		// pass; `command -p` inside the guard defeats a PATH swap.
 		"&& unset -f test command grep cut wc sha256sum printf codex",
-		"&& "+codexAssetGuard(r, hooksEnabled, hashes),
-		"&& "+codexConfigGuard(r, hashes),
+		"&& "+codexAssetGuard(r, hooksEnabled, digests),
+		"&& "+codexConfigGuard(r, digests),
 	)
 	if params.Debug != "" {
 		// codex exec has no --debug flag. Its tracing goes to stderr, at
@@ -351,14 +351,14 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		// Exported after .env so nothing the agent wrote there can move it,
 		// and read by the adapter before every hook script it spawns.
 		parts = append(parts, "&& export "+codexHookDigestsEnv+"="+
-			shellQuote(codexHookDigestsValue(hashes.HookScripts)))
+			shellQuote(codexHookDigestsValue(digests.HookScripts)))
 		// The hook scripts' own configuration, re-asserted from what the
 		// runner derived from the harness. appendHookEnv wrote the same values
 		// into the workspace .env at bootstrap, and that file is
 		// agent-writable: without this, iteration 1 could widen the SSRF
 		// allowlist or clear TIRITH_REQUIRED for iteration 2 and the hooks
 		// would read the agent's values. Reproduced before this was added.
-		for _, pair := range hashes.SecurityEnv {
+		for _, pair := range digests.SecurityEnv {
 			parts = append(parts, "&& export "+pair.Key+"="+shellQuote(pair.Value))
 		}
 	}
@@ -443,14 +443,14 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			sanitizeOutput(strings.Join(params.FallbackModels, ","))))
 	}
 
-	hashes, ok := lookupCodexArtifactHashes(params.SandboxName)
+	digests, ok := lookupRunnerHeldDigests(params.SandboxName)
 	if !ok {
-		// The digests live in this process because the sandbox has no
-		// trustworthy place to keep them; the runner calls Bootstrap and Run
-		// in one invocation, so a miss means the config was never written by
-		// this process and the guards would have nothing to compare against.
+		// The digests are runner-held because the sandbox has no trustworthy
+		// place to keep them; the runner calls Bootstrap and Run in one
+		// invocation, so a miss means the config was never written by this
+		// process and the guards would have nothing to compare against.
 		return -1, fmt.Errorf(
-			"no recorded config digests for sandbox %s: CodexRuntime.Run requires Bootstrap to have run in the same process (internal/cli/run.go does), because the expected hashes cannot be read back from the agent-writable config directory",
+			"no runner-held config digests for sandbox %s: CodexRuntime.Run requires Bootstrap to have run in the same process (internal/cli/run.go does), because the expected digests cannot be read back from the agent-writable config directory",
 			params.SandboxName)
 	}
 	// Both sides derive from the harness's SecurityEnabled() today — the
@@ -462,17 +462,17 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 	// legal on pi too, whose check distinguishes a nil groups array from an
 	// empty one for the same reason. A nil map means Bootstrap never ran the
 	// hooks path at all, which contradicts the runner's signal.
-	if hooksEnabled && hashes.HookScripts == nil {
+	if hooksEnabled && digests.HookScripts == nil {
 		return -1, fmt.Errorf(
 			"codex hook wiring is inconsistent: the runner expects hooks but Bootstrap recorded no hook-script digests; refusing to run rather than fall back to the weaker checks")
 	}
-	if hooksEnabled != (hashes.HooksJSON != "") {
+	if hooksEnabled != (digests.HooksJSON != "") {
 		return -1, fmt.Errorf(
 			"codex hook wiring is inconsistent: the runner %s hooks but Bootstrap %s a hooks.json digest; refusing to run rather than fall back to the weaker checks",
 			map[bool]string{true: "expects", false: "does not expect"}[hooksEnabled],
-			map[bool]string{true: "recorded", false: "recorded no"}[hashes.HooksJSON != ""])
+			map[bool]string{true: "recorded", false: "recorded no"}[digests.HooksJSON != ""])
 	}
-	cmd := buildCodexRunCommand(params, modelID, effort, hooksEnabled, hashes)
+	cmd := buildCodexRunCommand(params, modelID, effort, hooksEnabled, digests)
 
 	stdout, execCmd, cancel, err := sandbox.ExecStreamReader(ctx, params.SandboxName, cmd, params.Timeout, os.Stderr)
 	if err != nil {

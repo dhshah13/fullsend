@@ -10,47 +10,47 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/security"
 )
 
-// The digests are anchored in the runner's own memory because every location
-// in the sandbox is writable by the agent. These cover the anchor itself; the
-// guards it feeds are executed under /bin/sh in codex_run_test.go.
-func TestCodexArtifactHashes_RoundTrip(t *testing.T) {
+// The digests are runner-held because every location in the sandbox is
+// writable by the agent. These cover the record itself; the guards it feeds
+// are executed under /bin/sh in codex_run_test.go.
+func TestRunnerHeldDigests_RoundTrip(t *testing.T) {
 	const name = "sb-round-trip"
-	t.Cleanup(func() { forgetCodexArtifactHashes(name) })
+	t.Cleanup(func() { forgetRunnerHeldDigests(name) })
 
-	_, ok := lookupCodexArtifactHashes(name)
+	_, ok := lookupRunnerHeldDigests(name)
 	assert.False(t, ok, "a sandbox this process never bootstrapped has no entry")
 
-	want := codexUploadedHashes{
+	want := codexRunnerHeldDigestSet{
 		ConfigTOML:  "cfg",
 		HooksJSON:   "hooks",
 		HookScripts: map[string]string{"tirith_check.py": "abc"},
 	}
-	recordCodexArtifactHashes(name, want)
+	recordRunnerHeldDigests(name, want)
 
-	got, ok := lookupCodexArtifactHashes(name)
+	got, ok := lookupRunnerHeldDigests(name)
 	require.True(t, ok)
 	assert.Equal(t, want, got)
 
-	forgetCodexArtifactHashes(name)
-	_, ok = lookupCodexArtifactHashes(name)
+	forgetRunnerHeldDigests(name)
+	_, ok = lookupRunnerHeldDigests(name)
 	assert.False(t, ok)
 }
 
 // Entries are keyed by sandbox name rather than held in a single value: one
-// runner process can bootstrap and run more than one sandbox, and a run must
-// never be guarded against another run's digests.
-func TestCodexArtifactHashes_AreKeyedBySandbox(t *testing.T) {
+// runner can bootstrap and run more than one sandbox, and a run must never be
+// guarded against another run's digests.
+func TestRunnerHeldDigests_AreKeyedBySandbox(t *testing.T) {
 	t.Cleanup(func() {
-		forgetCodexArtifactHashes("sb-a")
-		forgetCodexArtifactHashes("sb-b")
+		forgetRunnerHeldDigests("sb-a")
+		forgetRunnerHeldDigests("sb-b")
 	})
 
-	recordCodexArtifactHashes("sb-a", codexUploadedHashes{ConfigTOML: "a"})
-	recordCodexArtifactHashes("sb-b", codexUploadedHashes{ConfigTOML: "b"})
+	recordRunnerHeldDigests("sb-a", codexRunnerHeldDigestSet{ConfigTOML: "a"})
+	recordRunnerHeldDigests("sb-b", codexRunnerHeldDigestSet{ConfigTOML: "b"})
 
-	a, ok := lookupCodexArtifactHashes("sb-a")
+	a, ok := lookupRunnerHeldDigests("sb-a")
 	require.True(t, ok)
-	b, ok := lookupCodexArtifactHashes("sb-b")
+	b, ok := lookupRunnerHeldDigests("sb-b")
 	require.True(t, ok)
 	assert.Equal(t, "a", a.ConfigTOML)
 	assert.Equal(t, "b", b.ConfigTOML)

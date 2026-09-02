@@ -78,9 +78,10 @@ target repo's own `.codex/` layer, and codex offers no `-c` override for project
   profile denies; it is logged, non-fatal and does not delay the first turn, but "only
   `POST /v1/responses` is attempted" is not true of codex the way it is of pi.
 - Codex reports no cost, so `total_cost_usd` stays 0 for codex runs; token usage is reported.
-- The digests that make the config guard meaningful are anchored in the runner's own memory, since
-  every location in the sandbox is agent-writable — so `Run` requires `Bootstrap` to have run in the
-  same process and fails closed otherwise.
+- The config guard compares against **runner-held digests** — digests the runner records outside the sandbox at Bootstrap and injects into the launch command at Run. The
+  agent-writable manifest was rejected as the anchor for them, since an agent that rewrote
+  `config.toml` could rewrite a digest recorded there to match; so `Run` requires `Bootstrap` to
+  have run in the same process and fails closed otherwise.
 - The pin must be re-checked on every `CODEX_VERSION` bump against `auth.command` semantics and the
   provider config keys; the list is in
   [runtime-implementation.md](../contributing/runtime-implementation.md#codex-runtime-internals-6920).
