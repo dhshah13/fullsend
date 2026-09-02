@@ -482,6 +482,29 @@ func TestCodexHookScriptsGuard_Executes(t *testing.T) {
 		refused(t)
 	})
 
+	// Everything Python would pick up beside a script, none of which a `*.py`
+	// glob sees: a bytecode cache, an extension module, a nested package.
+	for name, plant := range map[string]func(t *testing.T){
+		"__pycache__": func(t *testing.T) {
+			require.NoError(t, os.MkdirAll(filepath.Join(hooksDir, "__pycache__"), 0o755))
+			require.NoError(t, os.WriteFile(
+				filepath.Join(hooksDir, "__pycache__", "hook_io.cpython-312.pyc"), []byte("x"), 0o644))
+		},
+		"an extension module": func(t *testing.T) {
+			require.NoError(t, os.WriteFile(filepath.Join(hooksDir, "json.so"), []byte("x"), 0o755))
+		},
+		"a nested package": func(t *testing.T) {
+			require.NoError(t, os.MkdirAll(filepath.Join(hooksDir, "pkg", "sub"), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(hooksDir, "pkg", "sub", "__init__.py"), []byte("x"), 0o644))
+		},
+	} {
+		t.Run("refuses "+name, func(t *testing.T) {
+			install(t)
+			plant(t)
+			refused(t)
+		})
+	}
+
 	t.Run("refuses a deleted script", func(t *testing.T) {
 		install(t)
 		require.NoError(t, os.Remove(filepath.Join(hooksDir, "tirith_check.py")))

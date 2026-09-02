@@ -95,6 +95,22 @@ def claude_tool_name(codex_name: str) -> str:
     return CLAUDE_TOOL_FOR_CODEX.get(codex_name, codex_name)
 
 
+def _child_env() -> dict[str, str]:
+    """The environment a hook script runs in.
+
+    The scripts read their configuration from it (FULLSEND_CANARY_TOKEN,
+    TIRITH_*, FULLSEND_EGRESS_ALLOWLIST, FULLSEND_TOOL_ALLOWLIST), so it is
+    passed through rather than cleared — but the variables that steer the
+    interpreter itself are dropped. `-I` and `-s` already ignore PYTHONPATH and
+    the user site directory; PYTHONNOUSERSITE closes the same door from the
+    environment side, and the rest cannot be relied on to be absent because
+    codex spawns the hook after the agent-writable .env has been sourced.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
 # How a hook script is executed. `-I` alone is not enough and a bare script
 # path is not safe:
 #
@@ -189,11 +205,12 @@ def run_script(script: str, payload: dict[str, Any]) -> dict[str, Any]:
         }
     try:
         completed = subprocess.run(  # noqa: S603 - runner-owned path, no shell
-            [sys.executable or "python3", "-I", "-c", _CHILD_BOOTSTRAP, path],
+            [sys.executable or "python3", "-I", "-s", "-c", _CHILD_BOOTSTRAP, path],
             input=json.dumps(payload),
             capture_output=True,
             text=True,
             timeout=SCRIPT_TIMEOUT_S,
+            env=_child_env(),
         )
     except Exception as err:  # noqa: BLE001 - any spawn failure must fail closed
         return {
@@ -203,6 +220,26 @@ def run_script(script: str, payload: dict[str, Any]) -> dict[str, Any]:
         }
 
     output = parse_json(completed.stdout)
+    # Output the adapter cannot interpret is a block, not a pass. A script that
+    # printed something it meant to be acted on — a rewrite, a decision — and
+    # had it silently read as "nothing to do" is the failure this whole adapter
+    # exists to prevent.
+    if completed.stdout.strip() != "" and not isinstance(output, dict):
+        return {
+            "block": True,
+            "reason": f"fullsend: hook {script} produced output that is not a "
+            "JSON object (fail closed)",
+            "output": None,
+        }
+    if isinstance(output, dict):
+        specific = output.get("hookSpecificOutput")
+        if specific is not None and not isinstance(specific, dict):
+            return {
+                "block": True,
+                "reason": f"fullsend: hook {script} produced a malformed "
+                "hookSpecificOutput (fail closed)",
+                "output": None,
+            }
     decision = output.get("decision") if isinstance(output, dict) else None
     blocked = completed.returncode != 0 or decision == "block"
     reason = None

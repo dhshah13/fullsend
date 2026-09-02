@@ -160,6 +160,21 @@ func codexRedactFile(path string) error {
 	return os.WriteFile(path, out.Bytes(), mode)
 }
 
+// codexRedactTextFile rewrites a plain-text artifact in place with the shared
+// secret patterns applied. Used on the debug log, which is not JSONL.
+func codexRedactTextFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	info, statErr := os.Stat(path)
+	mode := os.FileMode(0o644)
+	if statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	return os.WriteFile(path, []byte(redactSummary(string(data))), mode)
+}
+
 // codexRolloutEnvelopes are the top-level `type` values a codex rollout line
 // carries (codex-rs/thread-store). They are underscored, where the tee'd
 // `exec --json` stream uses dotted names, so the two never collide.

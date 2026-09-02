@@ -87,7 +87,10 @@ passed as `-c` overrides, which outrank every config layer including the image's
   redactor: a credential is masked there, a canary is not withheld.
 - The runner-owned files under `CODEX_HOME` are only as trustworthy as their digests' anchor, which
   is this binary for the embedded assets and the runner's own memory for the per-run files — so
-  `Run` now requires `Bootstrap` to have run in the same process, and fails closed otherwise.
+  `Run` now requires `Bootstrap` to have run in the same process, and fails closed otherwise. The
+  guard covers `config.toml`, `hooks.json` and **every hook script by name**, not just the adapter
+  and the auth script, and the hooks directory must hold exactly those files — which makes codex
+  stricter about hook integrity than Claude Code and pi, where the scripts stay unchecked.
 - Codex reports no cost (`total_cost_usd` stays 0), `apply_patch` reaches the hook scripts as `Edit`
   so an agent allowlisted only for `Write` is blocked by the opt-in allowlist hook, and the CLI pin
   must be re-checked on every bump against the hook payload shape, `auth.command` semantics and the

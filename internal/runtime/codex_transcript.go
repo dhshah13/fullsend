@@ -56,6 +56,18 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 		if remotePath == "" {
 			continue
 		}
+		// `find` output is a list of paths from an agent-writable directory,
+		// and it goes straight to a download. A name is only followed when it
+		// is plainly inside the sessions directory and free of control
+		// characters: a newline in a filename splits one entry into two here,
+		// and without the prefix check a crafted entry could name any path in
+		// the sandbox for extraction into the run's artifacts. (`find -type f`
+		// above already skips symlinks — a symlink is -type l — so a link to
+		// /sandbox/workspace/.env is not listed in the first place.)
+		if err := codexValidSessionPath(r.codexSessionsDir(), remotePath); err != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] Skipping %s: %v\n", agentLabel, sanitizeOutput(remotePath), err)
+			continue
+		}
 		localName := fmt.Sprintf("%s-%s", agentLabel, filepath.Base(remotePath))
 		f, createErr := root.Create(localName)
 		if createErr != nil {
@@ -95,11 +107,43 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 // ExtractDebugLog downloads the stderr capture Run writes when debug is on.
 // codex exec has no debug flag of its own: its tracing goes to stderr behind
 // the RUST_LOG filter, and Run redirects that to this file.
+//
+// It gets the same pattern redaction as the other artifacts. codex logs at
+// error level by default and raises to whatever RUST_LOG asks for, so this
+// file carries request bodies, hook output and command text — the same
+// material output.jsonl does, and it is uploaded the same way.
 func (r CodexRuntime) ExtractDebugLog(sandboxName, localPath, debug string) error {
 	if debug == "" {
 		return nil
 	}
-	return sandbox.DownloadFile(sandboxName, r.WorkspaceDir()+"/"+codexDebugLogFile, localPath)
+	if err := sandbox.DownloadFile(sandboxName, r.WorkspaceDir()+"/"+codexDebugLogFile, localPath); err != nil {
+		return err
+	}
+	if err := codexRedactTextFile(localPath); err != nil {
+		// Better no debug log than an unredacted one: it is a convenience
+		// artifact, and the run does not depend on it.
+		os.Remove(localPath)
+		return fmt.Errorf("redacting %s: %w", codexDebugLogFile, err)
+	}
+	return nil
+}
+
+// codexValidSessionPath reports whether a path `find` returned is safe to
+// download: inside the sessions directory, and free of the control characters
+// that would mean the listing was split wrong or crafted.
+func codexValidSessionPath(sessionsDir, path string) error {
+	if !strings.HasPrefix(path, sessionsDir+"/") {
+		return fmt.Errorf("not under %s", sessionsDir)
+	}
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("contains a parent-directory segment")
+	}
+	for _, r := range path {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("contains a control character")
+		}
+	}
+	return nil
 }
 
 // ParseTranscriptErrors scans every JSONL file in transcriptDir and reports

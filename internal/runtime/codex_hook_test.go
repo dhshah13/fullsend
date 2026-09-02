@@ -390,8 +390,9 @@ sys.exit(0)`)
 	input := codexBashInput("ls")
 	input["tool_response"] = "out"
 	got := h.run("PostToolUse", input, "weird.py")
-	assert.Contains(t, []int{0, 2}, got.exitCode,
-		"whatever the adapter decides, it must never exit a code codex reads as Failed")
+	assert.Equal(t, 2, got.exitCode,
+		"a script whose output the adapter cannot read is a block, not a pass")
+	assert.NotEmpty(t, strings.TrimSpace(got.stderr))
 
 	// And a genuine crash: the hooks directory replaced by a file makes the
 	// script lookup raise rather than return.

@@ -401,3 +401,51 @@ func TestCodexIsRolloutFile(t *testing.T) {
 		assert.Error(t, err, "%s must be refused", name)
 	}
 }
+
+// TestCodexRun_EmptyStreamIsAnError covers the interrupted-turn shape: codex
+// can exit 0 having emitted no terminal event, and a run with no completed
+// turn is a failure however the process exited.
+func TestCodexRun_EmptyStreamIsAnError(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty stream":     "",
+		"truncated stream": `{"type":"thread.started","thread_id":"t1"}` + "\n" + `{"type":"turn.started"}` + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "openshell.log")
+			storeDir := t.TempDir()
+			r := CodexRuntime{}
+			seedCodexManifest(t, storeDir, r, nil)
+			fixture := filepath.Join(t.TempDir(), "stream.jsonl")
+			require.NoError(t, os.WriteFile(fixture, []byte(body), 0o644))
+			fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", fixture)
+
+			exit, err := r.Run(t.Context(), RunParams{
+				SandboxName: "sb",
+				RepoDir:     "/sandbox/workspace/repo",
+				Model:       "gpt-5-mini",
+				Timeout:     time.Minute,
+			}, ui.New(&bytes.Buffer{}), time.Now(), &RunMetrics{})
+
+			require.NoError(t, err)
+			assert.Equal(t, 1, exit, "the fake exits 0; a stream with no completed turn must still fail the run")
+		})
+	}
+}
+
+func TestCodexValidSessionPath(t *testing.T) {
+	t.Parallel()
+
+	dir := CodexRuntime{}.codexSessionsDir()
+	require.NoError(t, codexValidSessionPath(dir, dir+"/2026/09/02/rollout-x.jsonl"))
+
+	for name, path := range map[string]string{
+		"outside the sessions dir":       "/sandbox/workspace/.env",
+		"a sibling with the same prefix": dir + "-evil/rollout.jsonl",
+		"the directory itself":           dir,
+		"a parent segment":               dir + "/../workspace/.env",
+		"a control character":            dir + "/roll\tout.jsonl",
+		"a newline":                      dir + "/roll\nout.jsonl",
+	} {
+		assert.Error(t, codexValidSessionPath(dir, path), "%s must be refused", name)
+	}
+}
