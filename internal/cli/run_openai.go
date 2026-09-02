@@ -192,7 +192,10 @@ func baselineOpenAIPlaceholder(ctx context.Context, sandboxName string) (string,
 // seeded. previous must be known: with no baseline the wait could not tell
 // the new generation from the old one. A settle timeout is an error —
 // re-seeding the old placeholder would tell the refresher the rotation
-// reached the agent when it did not.
+// reached the agent when it did not — and so is a re-seed whose result
+// cannot be verified after two attempts: the caller then keeps the old
+// placeholder and retries, rather than recording a generation the agent
+// may not hold.
 func reseedOpenAIAuth(ctx context.Context, h openAIProviderHandle, previous string, printer *ui.Printer) (string, error) {
 	if previous == "" {
 		return "", errors.New("re-seeding the OpenAI credential file: the placeholder the agent currently holds is unknown")
@@ -227,7 +230,13 @@ func reseedOpenAIAuth(ctx context.Context, h openAIProviderHandle, previous stri
 	// costs nothing if it is killed. Each hold is one exec (30s + slack), so
 	// a sweep never waits on the whole retry loop — see sandboxMu's
 	// hold budget.
+	// lastErr carries the reason the last verification failed: a re-seed
+	// whose result cannot be confirmed must not report success, or the
+	// refresher records the new placeholder while the file may still name
+	// the old one — and the next settle wait would then compare against a
+	// generation the agent never held.
 	seed := func() error {
+		var lastErr error
 		for attempt := 0; attempt < 2; attempt++ {
 			var stderr string
 			var code int
@@ -249,8 +258,13 @@ func reseedOpenAIAuth(ctx context.Context, h openAIProviderHandle, previous stri
 			if err == nil && code == 0 {
 				return nil
 			}
+			if err != nil {
+				lastErr = fmt.Errorf("verifying the re-seeded OpenAI credential file: %w", err)
+				continue
+			}
+			lastErr = fmt.Errorf("verifying the re-seeded OpenAI credential file: %s does not name the refreshed placeholder (grep exit %d)", h.authFile, code)
 		}
-		return nil
+		return lastErr
 	}
 	if err := seed(); err != nil {
 		return "", err

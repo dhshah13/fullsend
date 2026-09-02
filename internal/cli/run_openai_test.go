@@ -1116,7 +1116,10 @@ func TestReseedOpenAIAuth_VerifiesAndRepeatsTheSeed(t *testing.T) {
 	checks := filepath.Join(binDir, "checks")
 	// The first verification says the file still names the old
 	// placeholder (an iteration seed raced the re-seed); the second passes.
-	script := "#!/bin/sh\ncase \"$*\" in *'printf %s'*) printf '" + ph("v222_OPENAI_API_KEY") + "'; exit 0 ;; *'grep -qF'*) n=$(cat " + shellQuoteForTest(checks) + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + shellQuoteForTest(checks) + "; [ $n -ge 2 ] ;; *'seed auth.json'*) echo seeded >> " + shellQuoteForTest(log) + "; exit 0 ;; esac; exit 1\n"
+	// The branch exits explicitly: without it the case fell through to the
+	// trailing `exit 1` and *every* verification failed, which only looked
+	// like a pass because reseedOpenAIAuth used to return success anyway.
+	script := "#!/bin/sh\ncase \"$*\" in *'printf %s'*) printf '" + ph("v222_OPENAI_API_KEY") + "'; exit 0 ;; *'grep -qF'*) n=$(cat " + shellQuoteForTest(checks) + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " + shellQuoteForTest(checks) + "; if [ $n -ge 2 ]; then exit 0; else exit 1; fi ;; *'seed auth.json'*) echo seeded >> " + shellQuoteForTest(log) + "; exit 0 ;; esac; exit 1\n"
 	require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte(script), 0o755))
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	h := openAIProviderHandle{sandbox: "fs-x", authSeed: "seed auth.json", authFile: "/sandbox/pi-config/auth.json"}
@@ -1125,6 +1128,51 @@ func TestReseedOpenAIAuth_VerifiesAndRepeatsTheSeed(t *testing.T) {
 	assert.Equal(t, ph("v222_OPENAI_API_KEY"), got)
 	data, _ := os.ReadFile(log)
 	assert.Equal(t, "seeded\nseeded\n", string(data), "seeded again after the first verification failed")
+}
+
+// A re-seed whose result cannot be verified is an error, not a success:
+// reporting the new placeholder while the credential file may still name
+// the old one would make the refresher record a generation the agent never
+// held, and the next settle wait would compare against it. The caller keeps
+// the old placeholder and retries instead.
+func TestReseedOpenAIAuth_UnverifiedSeedIsAnError(t *testing.T) {
+	binDir := t.TempDir()
+	log := filepath.Join(binDir, "log")
+	// Every verification says the file does not name the new placeholder.
+	script := "#!/bin/sh\ncase \"$*\" in *'printf %s'*) printf '" + ph("v222_OPENAI_API_KEY") + "'; exit 0 ;; *'grep -qF'*) exit 1 ;; *'seed auth.json'*) echo seeded >> " + shellQuoteForTest(log) + "; exit 0 ;; esac; exit 1\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := openAIProviderHandle{sandbox: "fs-x", authSeed: "seed auth.json", authFile: "/sandbox/pi-config/auth.json"}
+	got, err := reseedOpenAIAuth(context.Background(), h, ph("v111_OPENAI_API_KEY"), ui.New(io.Discard))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "verifying the re-seeded OpenAI credential file")
+	assert.Contains(t, err.Error(), "does not name the refreshed placeholder")
+	assert.Empty(t, got, "no placeholder is reported when the seed could not be confirmed")
+	data, _ := os.ReadFile(log)
+	assert.Equal(t, "seeded\nseeded\n", string(data), "both attempts ran before giving up")
+}
+
+// The same failure seen through refreshOpenAIProvider: the provider is
+// updated, but the returned placeholder stays the one the agent holds, so
+// the refresh loop retries against the right baseline.
+func TestRefreshOpenAIProvider_KeepsTheOldPlaceholderWhenTheReseedCannotBeVerified(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\ncase \"$*\" in *'printf %s'*) printf '" + ph("v222_OPENAI_API_KEY") + "'; exit 0 ;; *'grep -qF'*) exit 1 ;; *'seed auth.json'*) exit 0 ;; 'provider update'*) exit 0 ;; esac; exit 0\n"
+	require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := openAIProviderHandle{
+		name: "openai-feedface", keys: []string{"OPENAI_API_KEY"}, source: "static",
+		sandbox: "fs-x", authSeed: "seed auth.json", authFile: "/sandbox/pi-config/auth.json",
+		sandboxUp: &atomic.Bool{},
+	}
+	h.sandboxUp.Store(true)
+	_, placeholder, err := refreshOpenAIProvider(context.Background(), h, ph("v111_OPENAI_API_KEY"), time.Minute, ui.New(io.Discard))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "was not re-seeded")
+	assert.Equal(t, ph("v111_OPENAI_API_KEY"), placeholder,
+		"the refresher keeps the generation the agent actually holds")
 }
 
 func TestRefreshOpenAIProvider_ReseedsOnlyOnceTheSandboxIsUp(t *testing.T) {
