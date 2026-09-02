@@ -115,13 +115,43 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 		seenStreamEvent bool
 		currentToolName string
 		toolInputJSON   strings.Builder
-		// token tracking for throttled TokensEvent
+		// per-message token tracking for throttled TokensEvent
 		totalInput       int
 		totalOutput      int
 		totalCacheRead   int
 		totalCacheWrite  int
 		lastEmittedTotal int
+		// cumulative token tracking across all API calls so cancelled
+		// runs retain the best-effort total instead of zeros (#6905).
+		cumulativeInput      int
+		cumulativeOutput     int
+		cumulativeCacheRead  int
+		cumulativeCacheWrite int
+		seenResult           bool
 	)
+
+	// Emit a final cumulative TokensEvent when the stream ends without
+	// a ResultEvent (cancelled/killed run) and the cumulative total
+	// exceeds the last emitted snapshot. The deferred call covers
+	// every exit path: EOF, read error, and normal return.
+	defer func() {
+		if seenResult {
+			return
+		}
+		finalInput := cumulativeInput + totalInput
+		finalOutput := cumulativeOutput + totalOutput
+		finalCacheRead := cumulativeCacheRead + totalCacheRead
+		finalCacheWrite := cumulativeCacheWrite + totalCacheWrite
+		total := finalInput + finalOutput + finalCacheRead + finalCacheWrite
+		if total > lastEmittedTotal {
+			onEvent(TokensEvent{
+				InputTokens:  finalInput,
+				OutputTokens: finalOutput,
+				CacheRead:    finalCacheRead,
+				CacheWrite:   finalCacheWrite,
+			})
+		}
+	}()
 
 	for {
 		line, isPrefix, err := br.ReadLine()
@@ -236,6 +266,13 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 					} `json:"message"`
 				}
 				if err := json.Unmarshal(wrapper.Event, &msg); err == nil {
+					// Fold the previous message's final tokens into the
+					// cumulative counters before resetting for the new message.
+					cumulativeInput += totalInput
+					cumulativeOutput += totalOutput
+					cumulativeCacheRead += totalCacheRead
+					cumulativeCacheWrite += totalCacheWrite
+
 					totalInput = msg.Message.Usage.InputTokens
 					totalOutput = 0
 					totalCacheRead = msg.Message.Usage.CacheReadInputTokens
@@ -250,20 +287,22 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 				}
 				if err := json.Unmarshal(wrapper.Event, &md); err == nil && md.Usage.OutputTokens > 0 {
 					totalOutput = md.Usage.OutputTokens
-					total := totalInput + totalOutput + totalCacheRead + totalCacheWrite
+					total := cumulativeInput + totalInput + cumulativeOutput + totalOutput +
+						cumulativeCacheRead + totalCacheRead + cumulativeCacheWrite + totalCacheWrite
 					if total-lastEmittedTotal >= tokenThreshold {
 						lastEmittedTotal = total
 						onEvent(TokensEvent{
-							InputTokens:  totalInput,
-							OutputTokens: totalOutput,
-							CacheRead:    totalCacheRead,
-							CacheWrite:   totalCacheWrite,
+							InputTokens:  cumulativeInput + totalInput,
+							OutputTokens: cumulativeOutput + totalOutput,
+							CacheRead:    cumulativeCacheRead + totalCacheRead,
+							CacheWrite:   cumulativeCacheWrite + totalCacheWrite,
 						})
 					}
 				}
 			}
 
 		case "result":
+			seenResult = true
 			var re resultEvent
 			if err := json.Unmarshal(line, &re); err != nil {
 				continue
@@ -340,6 +379,11 @@ func progressParser(r io.Reader, printer *ui.Printer, metrics *RunMetrics) error
 			if metrics.Model == "" {
 				metrics.Model = e.Model
 			}
+		case TokensEvent:
+			metrics.InputTokens = e.InputTokens
+			metrics.OutputTokens = e.OutputTokens
+			metrics.CacheReadInputTokens = e.CacheRead
+			metrics.CacheCreationInputTokens = e.CacheWrite
 		case ResultEvent:
 			metrics.NumTurns = e.NumTurns
 			metrics.TotalCostUSD = e.TotalCostUSD
