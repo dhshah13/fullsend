@@ -211,6 +211,7 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		}
 		// Exactly what was installed, by name: Run cannot re-derive the set
 		// because it does not see the harness's hook config.
+		hashes.SecurityEnv = codexSecurityEnv(hooks)
 		hashes.HookScripts = map[string]string{}
 		for name, content := range security.HookFiles(hooks) {
 			hashes.HookScripts[name] = codexAssetSHA256(content)

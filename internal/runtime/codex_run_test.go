@@ -22,6 +22,10 @@ var testCodexHashes = codexUploadedHashes{
 	ConfigTOML:  "aaaa000000000000000000000000000000000000000000000000000000000000",
 	HooksJSON:   "bbbb000000000000000000000000000000000000000000000000000000000000",
 	HookScripts: testCodexHookScripts(),
+	SecurityEnv: []codexEnvPair{
+		{"TIRITH_REQUIRED", "1"},
+		{"FULLSEND_EGRESS_ALLOWLIST", "api.github.com:443"},
+	},
 }
 
 // testCodexHookScripts is the name→digest map Bootstrap records for the
@@ -179,6 +183,16 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 	// Loader variables would inject code into any dynamically linked program
 	// the run starts, before its main.
 	assert.Contains(t, cmd, "LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT")
+
+	// The hook scripts' own configuration is re-asserted after .env from what
+	// the runner derived from the harness: appendHookEnv wrote the same values
+	// into the agent-writable workspace .env at bootstrap, so without this
+	// iteration 1 could widen the SSRF allowlist for iteration 2.
+	for _, pair := range testCodexHashes.SecurityEnv {
+		at := strings.Index(cmd, "export "+pair.Key+"="+shellQuote(pair.Value))
+		require.Positive(t, at, "security value %s is not re-exported", pair.Key)
+		assert.Greater(t, at, envAt, "%s must be re-exported after .env", pair.Key)
+	}
 
 	// The digests reach the codex process's environment before it starts, so
 	// the adapter can re-verify each script at every invocation.
@@ -629,4 +643,54 @@ func exitCodeOf(t *testing.T, err error) int {
 	var exitErr *exec.ExitError
 	require.ErrorAs(t, err, &exitErr)
 	return exitErr.ExitCode()
+}
+
+// TestCodexSecurityEnv_PinsWhatTheRunnerKnows covers the values the runtime can
+// re-assert, and is explicit about the ones it cannot.
+func TestCodexSecurityEnv_PinsWhatTheRunnerKnows(t *testing.T) {
+	t.Parallel()
+
+	on := true
+	cfg := security.SandboxHookConfigFromHarness(&harness.Harness{
+		Security: &harness.SecurityConfig{SandboxHooks: &harness.SandboxHooks{
+			Tirith: &harness.TirithConfig{Enabled: &on, FailOn: "medium"},
+		}},
+	})
+	got := codexSecurityEnv(cfg)
+
+	keys := map[string]string{}
+	for _, p := range got {
+		keys[p.Key] = p.Value
+	}
+	assert.Equal(t, "medium", keys["TIRITH_FAIL_ON"])
+
+	// FULLSEND_CANARY_TOKEN and FULLSEND_TOOL_ALLOWLIST come from the
+	// harness's own env/host_files, not from the hook config, so the runtime
+	// has no runner-side copy to re-export — the exposure Claude Code and pi
+	// have stays for those two, which the matrix says.
+	assert.NotContains(t, keys, "FULLSEND_CANARY_TOKEN")
+	assert.NotContains(t, keys, "FULLSEND_TOOL_ALLOWLIST")
+
+	// Stable order, so the launch command does not churn between iterations.
+	for range 5 {
+		assert.Equal(t, got, codexSecurityEnv(cfg))
+	}
+}
+
+// The re-export must beat a .env that sets the same variable: sourcing happens
+// first, so the last export wins. Executed under /bin/sh rather than asserted,
+// because that ordering is the whole control.
+func TestCodexSecurityEnv_BeatsTheAgentsEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, ".env")
+	require.NoError(t, os.WriteFile(envFile,
+		[]byte("export FULLSEND_EGRESS_ALLOWLIST=evil.example:443\n"), 0o644))
+
+	script := ". " + shellQuote(envFile) +
+		" && export FULLSEND_EGRESS_ALLOWLIST=" + shellQuote("api.github.com:443") +
+		` && printf '%s' "$FULLSEND_EGRESS_ALLOWLIST"`
+	out, err := exec.Command("/bin/sh", "-c", script).Output()
+	require.NoError(t, err)
+	assert.Equal(t, "api.github.com:443", string(out),
+		"the runner's value must survive an agent-written .env")
 }

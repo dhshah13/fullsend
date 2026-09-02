@@ -1,16 +1,16 @@
 ---
-title: "99. Codex as an agent runtime — custom provider, runner-seeded token, hook adapter"
+title: "99. Codex credential delivery — custom model provider with a runner-seeded token file"
 status: Accepted
 relates_to:
-  - agent-architecture
   - security-threat-model
+  - agent-infrastructure
 topics:
   - runtime
-  - sandbox
   - security
+  - sandbox
 ---
 
-# 99. Codex as an agent runtime — custom provider, runner-seeded token, hook adapter
+# 99. Codex credential delivery — custom model provider with a runner-seeded token file
 
 Date: 2026-09-02
 
@@ -20,82 +20,69 @@ Accepted
 
 ## Context
 
-Fullsend runs agents on `claude` and `pi` ([ADR 0091](0091-per-agent-runtime-model-effort.md)).
-Adding [openai/codex](https://github.com/openai/codex) needs answers to two questions the runtime
-contract leaves to each backend: how the agent gets an OpenAI credential without one entering the
-sandbox, and how the runtime-neutral sandbox tool hooks ([ADR 0090](0090-runtime-neutral-sandbox-hooks-contract.md))
-reach a CLI with its own hook protocol.
+Adding [openai/codex](https://github.com/openai/codex) as a third agent runtime
+([ADR 0091](0091-per-agent-runtime-model-effort.md)) has to answer one question before anything
+else: how the agent reaches OpenAI without a credential entering the sandbox. The threat model
+treats keeping credentials out of the sandbox as the main limit on an injection's blast radius
+([security-threat-model.md](../problems/security-threat-model.md)), and the sandbox — not the
+runtime — is the containment boundary
+([agent-infrastructure.md](../problems/agent-infrastructure.md)).
 
-The credential half is constrained by [ADR 0092](0092-openai-wif-credential-delivery.md): the runner
-exchanges a WIF assertion for a short-lived token, puts it in a run-scoped OpenShell provider, and
-the sandbox only ever sees a gateway placeholder. Those tokens live minutes, and OpenShell 0.0.115
-pins each placeholder to the credential generation it was issued for, so a running agent must be
-able to pick up a *new* placeholder mid-run. Codex's built-in `openai` provider reads
-`OPENAI_API_KEY` once at startup and built-in provider ids cannot be overridden, so it cannot.
+[ADR 0092](0092-openai-wif-credential-delivery.md) already settled the runner half: exchange the
+job's OIDC token for a short-lived OpenAI token, put it in a run-scoped OpenShell provider, and let
+the sandbox see only a gateway placeholder. Its **in-sandbox** half is written for pi specifically —
+pi's `auth.json`, and a `fullsend-openai` egress profile admitting `**/node`. Codex is a native
+binary that reads its credential differently, so that half needs generalising; this ADR records how,
+and amends 0092 accordingly.
 
-Facts below were verified against `openai/codex` at tag `rust-v0.152.1`; the re-check list on a pin
-bump is in [runtime-implementation.md](../contributing/runtime-implementation.md#codex-runtime-internals-6920).
+The constraint that decides the design: those tokens live minutes, and OpenShell pins each
+placeholder to the credential generation it was issued for, so a running agent must be able to pick
+up a *new* placeholder mid-run. Codex's built-in `openai` provider reads `OPENAI_API_KEY` once at
+startup and built-in provider ids cannot be overridden, so it cannot.
 
 ## Options
 
-**Built-in `openai` provider driven by the environment.** Simplest, and wrong: the process reads the
-variable once, so it keeps using a placeholder that stops resolving at the first refresh.
+**The built-in `openai` provider driven by the environment.** Simplest, and wrong for the reason
+above: the process reads the variable once and keeps using a placeholder that stops resolving at the
+first refresh.
 
-**A managed hook layer baked into `/etc/codex/hooks.json` at image build.** Codex always runs managed
-hooks without a trust prompt, which is attractive. Rejected for v1: it ties hook wiring to image
-releases, so a hook fix would need a fullsend release and a fleet repin before it reached any run.
-
-**Trusting the project directory.** Would let codex load the repo's own `.codex/` layer — including
-repo-authored hooks and instructions — which is precisely the external-injection path the threat
-model ranks highest.
+**A host-side API server the sandbox calls instead of OpenAI.** Would work, but it is tier 3 in
+[ADR 0025](0025-provider-credential-delivery-for-sandboxed-agents.md)'s ordering, which prefers a
+provider whenever one is viable — and here one is.
 
 ## Decision
 
 Codex is configured with a **custom model provider** (`fullsend-openai`, `wire_api = "responses"`)
-whose `auth.command` is a runner-written script that prints the current placeholder from a
-runner-owned token file under `CODEX_HOME`. Codex re-runs that command every
+whose `auth.command` is an absolute path to a runner-written script that prints the current
+placeholder from a runner-owned token file under `CODEX_HOME`. Codex re-runs that command every
 `refresh_interval_ms`, and the runner re-seeds the file after every credential refresh through the
 runtime-neutral `OpenAICredentialSeeder` interface — the same follow-the-refresh shape pi gets from
-re-reading `auth.json`, expressed in codex's own mechanism.
+re-reading `auth.json`, expressed in codex's own mechanism. A value that is not a gateway
+placeholder fails the run rather than being forwarded.
 
-Sandbox hooks are wired through `$CODEX_HOME/hooks.json`, rendered from `security.HookPlan`, with
-every handler invoking one embedded **adapter** that runs the shared hook scripts and translates the
-wire protocol in both directions. The adapter is mandatory rather than optional because codex's
-protocol differs from the scripts' in ways that fail *open* if forwarded verbatim: a hook that exits
-anything but 0 or 2 is recorded as `Failed` and does not block, so the scripts' `exit 1` becomes
-exit 2 with the reason on stderr; and only a synchronous handler can apply control effects, so the
-wiring never carries an `async` key. Hooks are loaded with `--dangerously-bypass-hook-trust`,
-justified by fullsend's own SHA-256 guard over the adapter and the auth script, which is a stronger
-check than the trust hash it replaces. The project is left **untrusted** — enforced by a whole-file digest of the runner's
-`config.toml`, because a single `projects."<repo>".trust_level = "trusted"` line there would load
-the target repo's own `.codex/` layer and there is no `-c` override for trust. Approval policy,
-sandbox mode, the model provider, the provider's `base_url` and its `auth.command` are additionally
-passed as `-c` overrides, which outrank every config layer including the image's managed
-`/etc/codex/config.toml`.
+This **amends ADR 0092**, whose in-sandbox half is pi-specific: the `fullsend-openai` egress profile
+admits `**/codex` as well as `**/node`, and "seed pi's `auth.json`" is one implementation of a
+runtime-neutral seeder interface rather than the mechanism itself.
+
+The endpoint and the auth command are additionally pinned as `-c` SessionFlag overrides, which
+outrank every config layer, and the runner-owned `config.toml` is guarded by a whole-file digest —
+because a single `projects."<repo>".trust_level = "trusted"` line there would make codex load the
+target repo's own `.codex/` layer, and codex offers no `-c` override for project trust.
 
 ## Consequences
 
 - Codex has no Vertex path, so it gets **no default behaviour-CI coverage** until an OpenAI
   organization is mapped to the pool repositories; until then the evidence is unit tests, recorded
-  stream fixtures and local smoke runs.
-- The sanitizer chain **detects and blocks but cannot redact** for the model, because codex allows no
-  output rewrite for built-in tools; and codex has **no hook-driven session halt**, so a canary hit
-  blocks the tool result — which on codex withholds it entirely, unlike Claude Code — but the run
-  continues.
-- Codex's own artifacts keep raw tool output where Claude Code's stream carries the post-hook
-  result, so `output.jsonl` and the extracted rollout are filtered through the shared secret-pattern
-  redactor: a credential is masked there, a canary is not withheld.
-- The runner-owned files under `CODEX_HOME` are only as trustworthy as their digests' anchor, which
-  is this binary for the embedded assets and the runner's own memory for the per-run files — so
-  `Run` now requires `Bootstrap` to have run in the same process, and fails closed otherwise. The
-  guard covers `config.toml`, `hooks.json` and **every hook script by name**, not just the adapter
-  and the auth script, and the hooks directory must hold exactly those files. The adapter then
-  **re-verifies each script against the digests fixed in the codex process's environment before
-  every invocation**, closing the intra-iteration window a once-per-launch check leaves open — so
-  codex is stricter about hook integrity than Claude Code and pi, where the scripts are never
-  checked at all.
-- Codex reports no cost (`total_cost_usd` stays 0), `apply_patch` reaches the hook scripts as `Edit`
-  so an agent allowlisted only for `Write` is blocked by the opt-in allowlist hook, and the CLI pin
-  must be re-checked on every bump against the hook payload shape, `auth.command` semantics and the
-  JSONL event structs — the re-check table is in
+  fixtures and local smoke runs, one of which exercised the full rotate → re-seed → next-turn path.
+- With a custom provider codex also issues `GET /v1/models` at startup, which the `fullsend-openai`
+  profile denies; it is logged, non-fatal and does not delay the first turn, but "only
+  `POST /v1/responses` is attempted" is not true of codex the way it is of pi.
+- Codex reports no cost, so `total_cost_usd` stays 0 for codex runs; token usage is reported.
+- The digests that make the config guard meaningful are anchored in the runner's own memory, since
+  every location in the sandbox is agent-writable — so `Run` requires `Bootstrap` to have run in the
+  same process and fails closed otherwise.
+- The pin must be re-checked on every `CODEX_VERSION` bump against `auth.command` semantics and the
+  provider config keys; the list is in
   [runtime-implementation.md](../contributing/runtime-implementation.md#codex-runtime-internals-6920).
+
+Sandbox tool hooks on codex are a separate decision — see [ADR 0100](0100-codex-sandbox-hooks.md).

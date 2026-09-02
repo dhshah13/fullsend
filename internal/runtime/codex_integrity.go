@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/fullsend-ai/fullsend/internal/security"
 )
 
 // Integrity anchors for the runner-owned files under CODEX_HOME.
@@ -38,11 +40,54 @@ import (
 type codexUploadedHashes struct {
 	ConfigTOML string
 	HooksJSON  string
+	// SecurityEnv is the hook configuration the runner derived from the
+	// harness — the same values appendHookEnv wrote into the workspace .env.
+	// That file is agent-writable, so iteration 1 can rewrite the SSRF
+	// allowlist or clear TIRITH_REQUIRED for iteration 2; re-exporting these
+	// after .env from what the runner knows means the .env copy cannot win.
+	// Ordered so the launch command is stable across iterations.
+	SecurityEnv []codexEnvPair
+
 	// HookScripts maps each installed hook script's filename to its digest.
 	// Bootstrap knows exactly which the harness enabled; Run does not, which
 	// is why the expected names travel with the digests rather than being
 	// re-derived from the binary's full set.
 	HookScripts map[string]string
+}
+
+// codexEnvPair is one runner-owned environment assignment.
+type codexEnvPair struct {
+	Key   string
+	Value string
+}
+
+// codexSecurityEnv returns the hook configuration values the runner can
+// re-assert after .env, in a stable order.
+//
+// Only what SandboxHookConfig knows: FULLSEND_CANARY_TOKEN and
+// FULLSEND_TOOL_ALLOWLIST come from the harness's own env/host_files rather
+// than from the hook config, so the runtime has no runner-side copy of them to
+// re-export and they keep the exposure Claude Code and pi have.
+func codexSecurityEnv(hooks security.SandboxHookConfig) []codexEnvPair {
+	var env []codexEnvPair
+	if failOn := hooks.TirithFailOn(); failOn != "" {
+		env = append(env, codexEnvPair{"TIRITH_FAIL_ON", failOn})
+	}
+	if hooks.TirithRequired() {
+		env = append(env, codexEnvPair{"TIRITH_REQUIRED", "1"})
+	}
+	allowlist := hooks.SSRFEgressAllowlist()
+	if entry := hooks.ForgeEgressEntry(); entry != "" {
+		if allowlist == "" {
+			allowlist = entry
+		} else {
+			allowlist += "," + entry
+		}
+	}
+	if allowlist != "" {
+		env = append(env, codexEnvPair{"FULLSEND_EGRESS_ALLOWLIST", allowlist})
+	}
+	return env
 }
 
 // codexArtifactHashes maps a sandbox name to the digests Bootstrap recorded.
