@@ -29,6 +29,16 @@ const (
 	SandboxWorkspace = "/sandbox/workspace" //nolint:gosec // not a credential
 	// SandboxClaudeConfig is the Claude config directory inside the sandbox.
 	SandboxClaudeConfig = "/sandbox/claude-config" //nolint:gosec // not a credential
+	// SandboxCodexConfig is the codex config directory inside the sandbox.
+	// Exported as CODEX_HOME. Outside the cloned repo tree, like
+	// SandboxClaudeConfig and SandboxPiConfig, so repo contents cannot
+	// pre-seed it and workspace resets do not clear it. It is not a
+	// permission boundary: the agent process runs as the same user, so the
+	// runner-written files under it (config.toml, hooks, the auth helper)
+	// have to be checksum-guarded before every launch rather than trusted.
+	// codex refuses to start when CODEX_HOME does not exist; the sandbox
+	// image creates it (images/sandbox/Containerfile).
+	SandboxCodexConfig = "/sandbox/codex-config" //nolint:gosec // not a credential
 	// SandboxPiConfig is the pi config directory inside the sandbox.
 	// Exported as PI_CODING_AGENT_DIR. Outside the cloned repo tree, like
 	// SandboxClaudeConfig, so repo contents cannot pre-seed it and workspace
@@ -42,16 +52,6 @@ const (
 	// PI_CODING_AGENT_DIR so pi never auto-loads them; PiRuntime.Run passes
 	// each one explicitly with -e.
 	SandboxPiExtensionsDir = "/usr/local/share/pi-extensions"
-	// SandboxCodexConfig is the codex config directory inside the sandbox.
-	// Exported as CODEX_HOME. Outside the cloned repo tree, like
-	// SandboxClaudeConfig and SandboxPiConfig, so repo contents cannot
-	// pre-seed it and workspace resets do not clear it. It is not a
-	// permission boundary: the agent process runs as the same user, so the
-	// runner-written files under it (config.toml, hooks, the auth helper)
-	// have to be checksum-guarded before every launch rather than trusted.
-	// codex refuses to start when CODEX_HOME does not exist; the sandbox
-	// image creates it (images/sandbox/Containerfile).
-	SandboxCodexConfig = "/sandbox/codex-config" //nolint:gosec // not a credential
 
 	// KeepAliveCommand is the sandbox's canonical main process, started by
 	// createOnce so the sandbox stays Ready between `sandbox exec` calls
