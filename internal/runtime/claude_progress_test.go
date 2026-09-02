@@ -955,7 +955,7 @@ func TestParseClaudeStreamTokensEventWithReasoningTokens(t *testing.T) {
 			tokens = append(tokens, te)
 		}
 	}
-	// Total = 4000 + 1000 + 500 + 200 = 5700, crosses 5k threshold
+	// Total = 4000 + 1000 + 300 + 500 + 200 = 6000, crosses 5k threshold
 	if len(tokens) != 1 {
 		t.Fatalf("expected 1 tokens event, got %d", len(tokens))
 	}
