@@ -92,8 +92,8 @@ type RepoEntry struct {
 	MintMode               string   `yaml:"mint_mode,omitempty"`
 	AllowedRemoteResources []string `yaml:"allowed_remote_resources,omitempty"`
 	// Runtime is the agent runtime written as the repo's `runtime:` at
-	// install time (claude, pi); empty inherits defaults.runtime, and an
-	// empty resolved value keeps the code default (claude).
+	// install time (claude, pi, codex); empty inherits defaults.runtime,
+	// and an empty resolved value keeps the code default (claude).
 	Runtime string `yaml:"runtime,omitempty"`
 }
 
@@ -101,7 +101,7 @@ type RepoEntry struct {
 // across all platforms.
 type DefaultsConfig struct {
 	AllowedRemoteResources []string `yaml:"allowed_remote_resources,omitempty"`
-	// Runtime is the default agent runtime for every repo (claude, pi).
+	// Runtime is the default agent runtime for every repo (claude, pi, codex).
 	Runtime string `yaml:"runtime,omitempty"`
 }
 

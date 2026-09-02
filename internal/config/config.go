@@ -305,10 +305,10 @@ func ValidProviders() []string {
 }
 
 // ValidRuntimes returns the set of recognized agent runtimes. "pi" is
-// opt-in per org/repo (#6464); "dummy" and "dummy-playback" are for
-// behaviour test orgs only.
+// opt-in per org/repo (#6464) and "codex" per org/repo/agent (#6920);
+// "dummy" and "dummy-playback" are for behaviour test orgs only.
 func ValidRuntimes() []string {
-	return []string{"claude", "pi", "dummy", "dummy-playback"}
+	return []string{"claude", "pi", "codex", "dummy", "dummy-playback"}
 }
 
 // validModelRef matches a provider-qualified model reference: one or more
