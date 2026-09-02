@@ -597,9 +597,7 @@ func TestNewReconcileStatusCmd_Jira(t *testing.T) {
 		gotNumber = number
 		return nil
 	}
-	reconcileNewJiraTrackerClient = func(baseURL, token, email string) (tracker.Client, error) {
-		assert.Equal(t, "https://acme.atlassian.net", baseURL)
-		assert.NotEmpty(t, token)
+	reconcileNewJiraTrackerClient = func() (tracker.Client, error) {
 		return tracker.NewForgeClient(gh.New("fake")), nil // stub; type doesn't matter for this test
 	}
 	t.Cleanup(func() {
@@ -686,7 +684,7 @@ func TestNewReconcileStatusCmd_Jira_ViaGitHubEventPath(t *testing.T) {
 		gotNumber = number
 		return nil
 	}
-	reconcileNewJiraTrackerClient = func(baseURL, token, email string) (tracker.Client, error) {
+	reconcileNewJiraTrackerClient = func() (tracker.Client, error) {
 		return tracker.NewForgeClient(gh.New("fake")), nil
 	}
 	t.Cleanup(func() {

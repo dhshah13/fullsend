@@ -37,7 +37,6 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
 	gl "github.com/fullsend-ai/fullsend/internal/forge/gitlab"
-	"github.com/fullsend-ai/fullsend/internal/forge/jira"
 	"github.com/fullsend-ai/fullsend/internal/gitfetch"
 	"github.com/fullsend-ai/fullsend/internal/harness"
 	"github.com/fullsend-ai/fullsend/internal/lock"
@@ -4566,36 +4565,14 @@ func setupStatusNotifierGitLab(notifyCfg config.StatusNotificationConfig, owner,
 	return n, nil
 }
 
-// setupStatusNotifierJira creates a status notifier for Jira. It reads
-// JIRA_BASE_URL and JIRA_TOKEN from the environment and constructs a
-// tracker.JiraClient. JIRA_USER_EMAIL is optional (when set, Basic auth
-// is used; otherwise Bearer auth). Unlike the GitHub/GitLab paths,
-// Jira has no commit SHA or CI run ID equivalents, so a synthetic run
-// ID is generated from the current time.
+// setupStatusNotifierJira creates a status notifier for Jira. Unlike the
+// GitHub/GitLab paths, Jira has no commit SHA or CI run ID equivalents, so a
+// synthetic run ID is generated from the current time when no CI run ID is
+// available.
 func setupStatusNotifierJira(notifyCfg config.StatusNotificationConfig, sOpts statusOpts, printer *ui.Printer) (*statuscomment.Notifier, error) {
-	baseURL := os.Getenv("JIRA_BASE_URL")
-	if baseURL == "" {
-		return nil, fmt.Errorf("JIRA_BASE_URL required for Jira status notifications")
-	}
-	token := os.Getenv("JIRA_TOKEN")
-	if token == "" {
-		return nil, fmt.Errorf("JIRA_TOKEN required for Jira status notifications")
-	}
-
-	var opts []jira.Option
-	opts = append(opts, jira.WithBaseURL(baseURL))
-	if email := os.Getenv("JIRA_USER_EMAIL"); email != "" {
-		opts = append(opts, jira.WithEmail(email))
-	}
-
-	jc, err := jira.New(token, opts...)
+	tc, err := newJiraTrackerClientFromEnv()
 	if err != nil {
-		return nil, fmt.Errorf("creating Jira client: %w", err)
-	}
-
-	tc, err := tracker.NewJiraClient(jc, baseURL)
-	if err != nil {
-		return nil, fmt.Errorf("creating Jira tracker client: %w", err)
+		return nil, err
 	}
 
 	// Prefer the CI run ID when available (e.g. GITHUB_RUN_ID) so the

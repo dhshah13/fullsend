@@ -4478,6 +4478,26 @@ func TestSetupStatusNotifier_Jira_NoToken(t *testing.T) {
 	assert.Contains(t, err.Error(), "JIRA_TOKEN required")
 }
 
+func TestSetupStatusNotifier_Jira_NoEmail(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "jira-test-token")
+	t.Setenv("JIRA_USER_EMAIL", "")
+
+	_, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JIRA_USER_EMAIL required")
+}
+
 func TestParseJiraKey(t *testing.T) {
 	tests := []struct {
 		key  string
@@ -4520,6 +4540,7 @@ func TestSetupStatusNotifier_Jira_UsesGitHubRunID(t *testing.T) {
 
 	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
 	t.Setenv("JIRA_TOKEN", "test-token")
+	t.Setenv("JIRA_USER_EMAIL", "bot@example.com")
 	t.Setenv("GITHUB_RUN_ID", "98765")
 
 	n, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
@@ -4540,6 +4561,7 @@ func TestSetupStatusNotifier_Jira_FallsBackToSyntheticRunID(t *testing.T) {
 
 	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
 	t.Setenv("JIRA_TOKEN", "jira-test-token")
+	t.Setenv("JIRA_USER_EMAIL", "bot@example.com")
 	t.Setenv("GITHUB_RUN_ID", "") // unset
 
 	n, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)

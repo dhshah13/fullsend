@@ -1974,3 +1974,23 @@ func TestJiraMarkerMatchesAcrossCreationAndReconciliation(t *testing.T) {
 	require.NotNil(t, statusComment)
 	assert.True(t, terminal)
 }
+
+func TestJiraCompletionDisabled_CleansUpStartComment(t *testing.T) {
+	jiraFake, err := tracker.NewFakeJiraClient("https://acme.atlassian.net")
+	require.NoError(t, err)
+
+	cfg := config.StatusNotificationConfig{
+		Comment: config.CommentNotificationConfig{Start: "enabled", Completion: "disabled"},
+	}
+	n := New(jiraFake, cfg, "PROJ", 42, "https://ci/run/42", "", "run-42")
+	n.now = fixedTime
+
+	ctx := context.Background()
+	require.NoError(t, n.PostStart(ctx, "Working"))
+	require.NotEmpty(t, n.startCommentID)
+
+	require.NoError(t, n.PostCompletion(ctx, "Working", "success"))
+	comments, err := jiraFake.ListComments(ctx, "PROJ", 42)
+	require.NoError(t, err)
+	assert.Empty(t, comments, "suppressed Jira completion should delete the start comment")
+}

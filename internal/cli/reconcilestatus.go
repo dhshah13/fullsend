@@ -11,7 +11,6 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
 	gl "github.com/fullsend-ai/fullsend/internal/forge/gitlab"
-	"github.com/fullsend-ai/fullsend/internal/forge/jira"
 	"github.com/fullsend-ai/fullsend/internal/mintclient"
 	"github.com/fullsend-ai/fullsend/internal/statuscomment"
 	"github.com/fullsend-ai/fullsend/internal/tracker"
@@ -31,18 +30,7 @@ var reconcileNewTrackerClient = func(fc forge.Client) tracker.Client {
 
 // reconcileNewJiraTrackerClient creates a tracker.Client backed by Jira.
 // Extracted as a package-level var so tests can replace it.
-var reconcileNewJiraTrackerClient = func(baseURL, token, email string) (tracker.Client, error) {
-	var opts []jira.Option
-	opts = append(opts, jira.WithBaseURL(baseURL))
-	if email != "" {
-		opts = append(opts, jira.WithEmail(email))
-	}
-	jc, err := jira.New(token, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return tracker.NewJiraClient(jc, baseURL)
-}
+var reconcileNewJiraTrackerClient = newJiraTrackerClientFromEnv
 
 func newReconcileStatusCmd() *cobra.Command {
 	var (
@@ -107,17 +95,8 @@ finalized, this is a no-op.`,
 			}
 
 			if trackerSource == "jira" {
-				baseURL := os.Getenv("JIRA_BASE_URL")
-				if baseURL == "" {
-					return fmt.Errorf("JIRA_BASE_URL required for Jira event-source routing")
-				}
-				token := os.Getenv("JIRA_TOKEN")
-				if token == "" {
-					return fmt.Errorf("JIRA_TOKEN required for Jira event-source routing")
-				}
-				email := os.Getenv("JIRA_USER_EMAIL")
 				var jErr error
-				tc, jErr = reconcileNewJiraTrackerClient(baseURL, token, email)
+				tc, jErr = reconcileNewJiraTrackerClient()
 				if jErr != nil {
 					return fmt.Errorf("creating Jira tracker client: %w", jErr)
 				}
