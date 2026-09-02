@@ -616,7 +616,6 @@ func TestNewReconcileStatusCmd_Jira(t *testing.T) {
 
 	cmd := newReconcileStatusCmd()
 	cmd.SetArgs([]string{
-		"--number", "1",
 		"--run-id", "run-1",
 		"--fullsend-dir", dir,
 	})
@@ -632,11 +631,10 @@ func TestNewReconcileStatusCmd_Jira_NoBaseURL(t *testing.T) {
 	writeJiraDispatchEvent(t, dir, "PROJ-123")
 
 	t.Setenv("JIRA_BASE_URL", "")
-	t.Setenv("JIRA_TOKEN", "jira-test-token")
+	t.Setenv("JIRA_TOKEN", "test-token")
 
 	cmd := newReconcileStatusCmd()
 	cmd.SetArgs([]string{
-		"--number", "1",
 		"--run-id", "run-1",
 		"--fullsend-dir", dir,
 	})

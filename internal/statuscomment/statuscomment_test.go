@@ -1926,3 +1926,39 @@ func TestNotifier_ReactionsSkippedForNonReactorTracker(t *testing.T) {
 	n.now = func() time.Time { return fixedTime().Add(5 * time.Minute) }
 	require.NoError(t, n.PostCompletion(context.Background(), "Code", "success"))
 }
+
+func TestJiraMarkerMatchesAcrossCreationAndReconciliation(t *testing.T) {
+	// Verify that a status comment created by a Jira-backed notifier
+	// can be found and finalized by ReconcileOrphaned using the same
+	// runID. This exercises the marker round-trip: the notifier embeds
+	// the runID in the HTML marker, and the reconciler searches for it.
+	jiraFake, err := tracker.NewFakeJiraClient("https://acme.atlassian.net")
+	require.NoError(t, err)
+
+	cfg := config.StatusNotificationConfig{
+		Comment: config.CommentNotificationConfig{Start: "enabled", Completion: "enabled"},
+	}
+
+	const runID = "gh-run-98765"
+	n := New(jiraFake, cfg, "PROJ", 42, "https://ci/run/98765", "", runID)
+	n.now = fixedTime
+
+	ctx := context.Background()
+	require.NoError(t, n.PostStart(ctx, "Triaging issue"))
+	require.NotEqual(t, "", n.startCommentID, "start comment should have been posted")
+
+	// Simulate the process being hard-killed before PostCompletion.
+	// ReconcileOrphaned should find and update the orphaned comment.
+	reconcileTime := fixedTime().Add(10 * time.Minute)
+	setNow(t, reconcileTime)
+
+	err = ReconcileOrphaned(ctx, jiraFake, "PROJ", 42, runID, "https://ci/run/98765", "", ReasonTerminated, "", "", false, "Triage")
+	require.NoError(t, err)
+
+	// The comment should have been updated to a terminated state.
+	comments, listErr := jiraFake.ListComments(ctx, "PROJ", 42)
+	require.NoError(t, listErr)
+	require.Len(t, comments, 1)
+	assert.Contains(t, string(comments[0].Body), "Terminated", "orphaned comment should be finalized")
+	assert.Contains(t, string(comments[0].Body), terminalTag, "comment should contain terminal tag")
+}

@@ -73,10 +73,6 @@ terminal tag (<!-- fullsend:status:terminal -->). If found, updates it
 to an "Interrupted" state and adds the terminal tag. If already
 finalized, this is a no-op.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if number <= 0 {
-				return fmt.Errorf("--number must be a positive integer, got %d", number)
-			}
-
 			var tc tracker.Client
 			var project string
 
@@ -85,25 +81,32 @@ finalized, this is a no-op.`,
 			// dispatch payload or GITHUB_EVENT_PATH—to determine the
 			// tracker destination. When the event originated from
 			// Jira, construct a Jira tracker client instead of
-			// wrapping a forge client.
+			// wrapping a forge client. This runs before --number
+			// validation so Jira callers can omit --number (the
+			// number is derived from entity.key).
 			var trackerSource string
 			eventMap := extractNormalizedEventFromDispatch(fullsendDir)
 			if eventMap != nil {
 				trackerSource = extractMapString(eventMap, "source", "system")
 				if trackerSource == "jira" {
-					if key := extractMapString(eventMap, "entity", "key"); key != "" {
-						if proj, num, ok := parseJiraKey(key); ok {
-							project = proj
-							number = num
-						}
+					key := extractMapString(eventMap, "entity", "key")
+					if key == "" {
+						return fmt.Errorf("Jira event detected but entity.key is missing in normalized event")
 					}
+					proj, num, ok := parseJiraKey(key)
+					if !ok {
+						return fmt.Errorf("Jira event has unparseable entity.key %q in normalized event", key)
+					}
+					project = proj
+					number = num
 				}
 			}
 
+			if number <= 0 {
+				return fmt.Errorf("--number must be a positive integer, got %d", number)
+			}
+
 			if trackerSource == "jira" {
-				if project == "" {
-					return fmt.Errorf("Jira event detected but could not derive project key from entity.key in normalized event")
-				}
 				baseURL := os.Getenv("JIRA_BASE_URL")
 				if baseURL == "" {
 					return fmt.Errorf("JIRA_BASE_URL required for Jira event-source routing")
@@ -184,7 +187,7 @@ finalized, this is a no-op.`,
 	}
 
 	cmd.Flags().StringVar(&repo, "repo", "", "repository in owner/repo format (required for GitHub/GitLab)")
-	cmd.Flags().IntVar(&number, "number", 0, "issue or pull request number (required)")
+	cmd.Flags().IntVar(&number, "number", 0, "issue or pull request number (required for GitHub/GitLab; derived from entity.key for Jira)")
 	cmd.Flags().StringVar(&runID, "run-id", "", "workflow run ID used in the status comment marker (required)")
 	cmd.Flags().StringVar(&runURL, "run-url", "", "URL to the workflow run (optional)")
 	cmd.Flags().StringVar(&sha, "sha", "", "commit SHA (optional, shown as short hash)")
@@ -195,7 +198,6 @@ finalized, this is a no-op.`,
 	cmd.Flags().StringVar(&fullsendDir, "fullsend-dir", "", "path to fullsend config directory (used to detect completion mode and read normalized event for tracker routing)")
 	cmd.Flags().StringVar(&jobStatus, "job-status", "", "job outcome from the CI runner (e.g. success, failure, cancelled)")
 	cmd.Flags().BoolVar(&wasSkipped, "was-skipped", false, "whether the pre-script decided to skip the run (forces synthesis under on_failure even when --job-status is success)")
-	_ = cmd.MarkFlagRequired("number")
 	_ = cmd.MarkFlagRequired("run-id")
 
 	return cmd

@@ -564,11 +564,16 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		// When the event originated from Jira, status notifications
 		// should be posted to Jira, not to the code-hosting forge.
 		sOpts.trackerSource = string(ev.Source.System)
-		if ev.Source.System == normevent.SystemJira && ev.Entity.Key != "" {
-			if proj, num, ok := parseJiraKey(ev.Entity.Key); ok {
-				sOpts.trackerProject = proj
-				sOpts.statusNum = num
+		if ev.Source.System == normevent.SystemJira {
+			if ev.Entity.Key == "" {
+				return fmt.Errorf("Jira event from --event-file is missing entity.key")
 			}
+			proj, num, ok := parseJiraKey(ev.Entity.Key)
+			if !ok {
+				return fmt.Errorf("Jira event from --event-file has unparseable entity.key %q", ev.Entity.Key)
+			}
+			sOpts.trackerProject = proj
+			sOpts.statusNum = num
 		}
 	}
 	// Fallback: extract _normalized_event from the dispatch event-payload
@@ -586,12 +591,16 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if sOpts.trackerSource == "" && eventMap != nil {
 		sOpts.trackerSource = extractMapString(eventMap, "source", "system")
 		if sOpts.trackerSource == "jira" {
-			if key := extractMapString(eventMap, "entity", "key"); key != "" {
-				if proj, num, ok := parseJiraKey(key); ok {
-					sOpts.trackerProject = proj
-					sOpts.statusNum = num
-				}
+			key := extractMapString(eventMap, "entity", "key")
+			if key == "" {
+				return fmt.Errorf("Jira event from dispatch payload is missing entity.key")
 			}
+			proj, num, ok := parseJiraKey(key)
+			if !ok {
+				return fmt.Errorf("Jira event from dispatch payload has unparseable entity.key %q", key)
+			}
+			sOpts.trackerProject = proj
+			sOpts.statusNum = num
 		}
 	}
 
@@ -4589,9 +4598,14 @@ func setupStatusNotifierJira(notifyCfg config.StatusNotificationConfig, sOpts st
 		return nil, fmt.Errorf("creating Jira tracker client: %w", err)
 	}
 
-	// Jira has no CI run ID. Generate a synthetic one so the HTML
-	// marker in the status comment is unique per run.
-	runID := fmt.Sprintf("%d", time.Now().UnixNano())
+	// Prefer the CI run ID when available (e.g. GITHUB_RUN_ID) so the
+	// status-comment marker matches the value passed to reconcile-status
+	// --run-id, enabling orphan reconciliation to find the comment.
+	// Fall back to a synthetic timestamp when no CI run ID is set.
+	runID := os.Getenv("GITHUB_RUN_ID")
+	if runID == "" {
+		runID = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
 
 	n := statuscomment.New(tc, notifyCfg, sOpts.trackerProject, sOpts.statusNum, sOpts.runURL, "", runID)
 	n.SetWarnFunc(func(format string, args ...any) {

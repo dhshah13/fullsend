@@ -4507,6 +4507,46 @@ func TestParseJiraKey(t *testing.T) {
 	}
 }
 
+func TestSetupStatusNotifier_Jira_UsesGitHubRunID(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "test-token")
+	t.Setenv("GITHUB_RUN_ID", "98765")
+
+	n, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.NoError(t, err)
+	assert.NotNil(t, n)
+}
+
+func TestSetupStatusNotifier_Jira_FallsBackToSyntheticRunID(t *testing.T) {
+	tmpDir := t.TempDir()
+	printer := ui.New(io.Discard)
+
+	sOpts := statusOpts{
+		statusRepo:     "org/repo",
+		statusNum:      123,
+		trackerSource:  "jira",
+		trackerProject: "PROJ",
+	}
+
+	t.Setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+	t.Setenv("JIRA_TOKEN", "jira-test-token")
+	t.Setenv("GITHUB_RUN_ID", "") // unset
+
+	n, err := setupStatusNotifier(tmpDir, "code", "", sOpts, printer)
+	require.NoError(t, err)
+	assert.NotNil(t, n)
+}
+
 func TestEmitDiagnostic_Warning(t *testing.T) {
 	var buf bytes.Buffer
 	printer := ui.New(&buf)
