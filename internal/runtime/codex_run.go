@@ -394,7 +394,12 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 	// runner passes HooksSettingsPath, Bootstrap writes hooks.json — but
 	// nothing asserted it, and a refactor that split them would silently drop
 	// the hooks.json digest from the guard while the adapter still loaded.
-	if hooksEnabled && len(hashes.HookScripts) == 0 {
+	// nil, not empty: a harness may enable security and disable every
+	// individual hook, which leaves HookFiles empty but the hooks path taken —
+	// legal on pi too, whose check distinguishes a nil groups array from an
+	// empty one for the same reason. A nil map means Bootstrap never ran the
+	// hooks path at all, which contradicts the runner's signal.
+	if hooksEnabled && hashes.HookScripts == nil {
 		return -1, fmt.Errorf(
 			"codex hook wiring is inconsistent: the runner expects hooks but Bootstrap recorded no hook-script digests; refusing to run rather than fall back to the weaker checks")
 	}

@@ -212,5 +212,10 @@ func codexIsRolloutFile(path string) error {
 		}
 		return nil
 	}
+	if err := scanner.Err(); err != nil {
+		// An oversized first line reads as "no lines" without this, and the
+		// file would be refused for the wrong reason.
+		return fmt.Errorf("cannot read the first line: %w", err)
+	}
 	return fmt.Errorf("file is empty")
 }

@@ -45,9 +45,10 @@ if [ "$2" = "download" ]; then
   mkdir -p "$5" 2>/dev/null
   # A real rollout envelope, unless the remote path says it is planted: the
   # extractor now refuses anything that is not one.
+  default_body='{"type":"session_meta","payload":{}}'
   case "$4" in
     *planted*) body='not a rollout' ;;
-    *) body='{"type":"session_meta","payload":{"id":"probe"}}' ;;
+    *) body="${FULLSEND_TEST_DOWNLOAD_BODY:-$default_body}" ;;
   esac
   if [ -d "$5" ]; then printf '%s\n' "$body" > "$5/$base"; else printf '%s\n' "$body" > "$5"; fi
   exit 0
@@ -61,6 +62,7 @@ if [ "$2" = "exec" ]; then
   case "$last" in
     "codex --version") echo "` + versionOutput + `"; exit 0 ;;
     "command -v python3") echo "/usr/bin/python3"; exit 0 ;;
+    *"sys.version_info"*) echo "${FULLSEND_TEST_PYVER:-3.12}"; exit 0 ;;
     cat\ *) f=$(printf '%s' "${last#cat }" | tr -d "'" | tr '/' '_'); cat '` + storeDir + `'/"$f"; exit $? ;;
     *"exec --json"*) ` + streamCase + ` ;;
     find\ *) ` + findCase + ` ;;
@@ -435,4 +437,62 @@ func TestCodexPreflightPython(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not found in the sandbox image")
 	})
+}
+
+func TestCodexPreflightPythonVersion(t *testing.T) {
+	t.Run("accepts the image's interpreter", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		require.NoError(t, codexPreflightPythonVersion("sb", "/usr/bin/python3"))
+	})
+
+	// The adapter appends the hooks directory behind the standard library and
+	// relies on -I keeping the script's own directory off sys.path; below the
+	// floor a planted hooks/json/ could shadow a stdlib import.
+	t.Run("refuses an interpreter below the floor", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		t.Setenv("FULLSEND_TEST_PYVER", "3.8")
+
+		err := codexPreflightPythonVersion("sb", "/usr/bin/python3")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "needs at least 3.11")
+	})
+
+	t.Run("refuses an unreadable version", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		t.Setenv("FULLSEND_TEST_PYVER", "python 2 maybe")
+
+		err := codexPreflightPythonVersion("sb", "/usr/bin/python3")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected 3.x")
+	})
+}
+
+// TestCodexBootstrap_RecordsHookScriptDigests pins the anchor: the name to
+// digest map has to reach the runner's memory, since Run cannot re-derive
+// which scripts the harness enabled.
+func TestCodexBootstrap_RecordsHookScriptDigests(t *testing.T) {
+	storeDir := t.TempDir()
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "codex-cli 0.152.1")
+	forgetCodexArtifactHashes("sb")
+	t.Cleanup(func() { forgetCodexArtifactHashes("sb") })
+
+	r := CodexRuntime{}
+	require.NoError(t, r.Bootstrap(codexHooksBootstrapInput{
+		bootstrapInput: bootstrapInput{
+			sandboxName: "sb",
+			agentPath:   writeAgentFile(t, codexTestAgentDef),
+			agentName:   "triage",
+		},
+		hooks: security.SandboxHookConfigFromHarness(&harness.Harness{}),
+	}))
+
+	got, ok := lookupCodexArtifactHashes("sb")
+	require.True(t, ok, "Bootstrap must record the digests for Run to guard against")
+	assert.NotEmpty(t, got.ConfigTOML)
+	assert.NotEmpty(t, got.HooksJSON)
+	want := security.HookFiles(security.SandboxHookConfigFromHarness(&harness.Harness{}))
+	require.Len(t, got.HookScripts, len(want))
+	for name, content := range want {
+		assert.Equal(t, codexAssetSHA256(content), got.HookScripts[name], "digest for %s", name)
+	}
 }

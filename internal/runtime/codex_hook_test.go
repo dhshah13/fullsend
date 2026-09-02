@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/fullsend-ai/fullsend/internal/harness"
+	"github.com/fullsend-ai/fullsend/internal/sandbox"
 	"github.com/fullsend-ai/fullsend/internal/security"
 )
 
@@ -426,4 +428,71 @@ sys.exit(1)`)
 	var exitErr *exec.ExitError
 	require.ErrorAs(t, runErr, &exitErr)
 	assert.Equal(t, 2, exitErr.ExitCode(), "the block must still be an exit 2, reason or no reason")
+}
+
+// TestCodexAdapter_LeavesTheHooksDirUntouched is the regression test for a
+// self-inflicted lockout. `-I` does not imply `-B`, and `-E` makes
+// PYTHONDONTWRITEBYTECODE inert, so without `-B` the first hook that imports a
+// sibling writes hooks/__pycache__/*.pyc. Nothing clears the hooks directory
+// between iterations and Run's guard requires it to hold exactly the files
+// fullsend installed, so iteration 2 of a validation-loop retry would refuse
+// to start and blame tampering. Reproduced before `-B` was added: four .pyc
+// files after one chain run.
+func TestCodexAdapter_LeavesTheHooksDirUntouched(t *testing.T) {
+	h := newCodexAdapterHarness(t)
+	scripts := security.HookFiles(security.SandboxHookConfigFromHarness(&harness.Harness{}))
+	for name, content := range scripts {
+		require.NoError(t, os.WriteFile(filepath.Join(h.hooksDir, name), content, 0o755))
+	}
+	before, err := os.ReadDir(h.hooksDir)
+	require.NoError(t, err)
+
+	// Several iterations' worth of both phases, including the chain that
+	// imports hook_io and every sanitizer stage.
+	for range 3 {
+		input := codexBashInput("ls")
+		input["tool_response"] = "hello"
+		post := h.run("PostToolUse", input, "posttool_chain.py")
+		require.Equal(t, 0, post.exitCode, post.stderr)
+		pre := h.run("PreToolUse", codexBashInput("ls"), "tirith_check.py")
+		require.Equal(t, 0, pre.exitCode, pre.stderr)
+	}
+
+	after, err := os.ReadDir(h.hooksDir)
+	require.NoError(t, err)
+	assert.Equal(t, len(before), len(after),
+		"running hooks must not add anything to the directory the guard enumerates")
+	for _, e := range after {
+		assert.False(t, e.IsDir(), "no directory may appear in the hooks dir, __pycache__ least of all")
+	}
+
+	// And the guard still passes afterwards, which is the property that
+	// actually matters for the next iteration.
+	digests := map[string]string{}
+	for name, content := range scripts {
+		digests[name] = codexAssetSHA256(content)
+	}
+	guard := strings.ReplaceAll(
+		codexHookScriptsGuard(CodexRuntime{}.codexHooksDir(), digests),
+		sandbox.SandboxCodexConfig, h.dir)
+	require.NoError(t, exec.Command("/bin/sh", "-c", guard).Run(),
+		"the hooks-dir guard must still pass after hooks have run")
+}
+
+// The isolation is asserted end to end rather than inferred from the flags:
+// a planted package next to the scripts must not be importable by them.
+func TestCodexAdapter_DoesNotImportPlantedModules(t *testing.T) {
+	h := newCodexAdapterHarness(t)
+	marker := filepath.Join(h.dir, "planted-ran")
+	require.NoError(t, os.MkdirAll(filepath.Join(h.hooksDir, "json"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(h.hooksDir, "json", "__init__.py"),
+		[]byte("open("+pyStr(marker)+", 'w').write('x')\n"), 0o644))
+	// A script that imports json, as every real hook script does.
+	h.script("importer.py", "sys.exit(0)")
+
+	got := h.run("PreToolUse", codexBashInput("ls"), "importer.py")
+	assert.Equal(t, 0, got.exitCode, got.stderr)
+	_, err := os.Stat(marker)
+	assert.True(t, os.IsNotExist(err),
+		"the standard library must win over anything planted beside the hook scripts")
 }

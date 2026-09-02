@@ -107,6 +107,8 @@ def _child_env() -> dict[str, str]:
     codex spawns the hook after the agent-writable .env has been sourced.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    # Inert under `-I`, which already ignores the user site directory. Kept as
+    # a second latch so dropping the flag does not silently re-enable it.
     env["PYTHONNOUSERSITE"] = "1"
     return env
 
@@ -130,10 +132,21 @@ def _child_env() -> dict[str, str]:
 # execute, appending did not, and the sibling imports work either way because
 # no hook module shadows a stdlib name.
 #
+# `-B` is not optional and `-I` does not imply it: the first hook that imports
+# a sibling writes `hooks/__pycache__/*.pyc`, and Run's guard requires the hooks
+# directory to hold exactly the files fullsend installed. Nothing clears that
+# directory between iterations, so without `-B` the first PostToolUse hook of
+# iteration 1 fails the guard closed on iteration 2 — a validation-loop retry
+# would refuse to start, blamed on tampering. `-E` also makes
+# PYTHONDONTWRITEBYTECODE inert, so the flag is the only lever; the child sets
+# `sys.dont_write_bytecode` as well, in case a future caller drops the flag.
+# Reproduced before this was added: four .pyc files after one chain run.
+#
 # runpy runs the script as __main__ so its `if __name__ == "__main__"` block
 # still fires.
 _CHILD_BOOTSTRAP = (
     "import runpy, sys; "
+    "sys.dont_write_bytecode = True; "
     "sys.path.append(sys.argv[1].rsplit('/', 1)[0]); "
     "runpy.run_path(sys.argv[1], run_name='__main__')"
 )
@@ -205,7 +218,7 @@ def run_script(script: str, payload: dict[str, Any]) -> dict[str, Any]:
         }
     try:
         completed = subprocess.run(  # noqa: S603 - runner-owned path, no shell
-            [sys.executable or "python3", "-I", "-s", "-c", _CHILD_BOOTSTRAP, path],
+            [sys.executable or "python3", "-I", "-s", "-B", "-c", _CHILD_BOOTSTRAP, path],
             input=json.dumps(payload),
             capture_output=True,
             text=True,

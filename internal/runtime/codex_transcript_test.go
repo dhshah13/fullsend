@@ -368,8 +368,8 @@ func TestCodexExtractTranscripts_DiscardsSpoofedFiles(t *testing.T) {
 	outDir := filepath.Join(t.TempDir(), "transcripts")
 	require.NoError(t, r.ExtractTranscripts("sb", "smoke", outDir))
 
-	// The fake writes "fixture\n" as the downloaded body, which is not a
-	// rollout envelope, so nothing is kept.
+	// The fake writes a non-rollout body for a path containing "planted", so
+	// nothing is kept.
 	entries, err := os.ReadDir(outDir)
 	require.NoError(t, err)
 	assert.Empty(t, entries, "a file that is not a codex rollout must not ship as the transcript")
@@ -522,15 +522,19 @@ func TestCodexExtractDebugLog_FailurePaths(t *testing.T) {
 		require.Error(t, err)
 	})
 
-	t.Run("the downloaded log is redacted", func(t *testing.T) {
+	// codex logs at error level by default and raises with RUST_LOG, so this
+	// file carries request bodies and command text — the same material
+	// output.jsonl does, and it is uploaded the same way.
+	t.Run("a credential-shaped line is masked", func(t *testing.T) {
 		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
 		local := filepath.Join(t.TempDir(), "codex-debug.log")
+		t.Setenv("FULLSEND_TEST_DOWNLOAD_BODY", "ERROR authorization: Bearer "+codexTestSecret)
 
 		require.NoError(t, r.ExtractDebugLog("sb", local, "1"))
 		got, err := os.ReadFile(local)
 		require.NoError(t, err)
-		// The fake writes a rollout envelope as the body; what matters is that
-		// the file went through the redactor rather than straight to disk.
-		assert.NotEmpty(t, got)
+		assert.NotContains(t, string(got), codexTestSecret)
+		assert.Contains(t, string(got), "ERROR", "only the credential is masked")
 	})
+
 }

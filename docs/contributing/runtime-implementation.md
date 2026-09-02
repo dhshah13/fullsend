@@ -113,7 +113,7 @@ How the shared PostToolUse chain reaches each runtime — the three sanitizer ro
 | Feature | Where it runs | Claude Code | OpenCode (stub) | Pi | Codex | Notes for future runtimes |
 |---------|---------------|-------------|-----------------|----|-------|---------------------------|
 | **Sandbox tool hooks wiring** | `SandboxHooksBootstrap` type assert in `Bootstrap` | ✓ scripts at `claude-config/hooks/`, wiring at `claude-config/hooks.json` via `--settings` (#6358) | ✗ — `Bootstrap` is a stub; must wire `security.HookPlan` via OpenCode plugin hooks | ✓ see [pi: hook adapter contract](#hook-adapter-contract) — scripts under `/sandbox/pi-config/hooks/`, `HookPlan` in `fullsend-manifest.json`, embedded `fullsend-hooks.js` loaded with `-e` under `--no-extensions`; fail-closed on a missing/altered adapter (exit 97) or a manifest without a hook plan (exit -1) | ✓ see [codex: hook adapter contract](#codex-hook-adapter-contract) — scripts under `/sandbox/codex-config/hooks/`, wiring in `$CODEX_HOME/hooks.json` rendered from `HookPlan`, embedded `fullsend-codex-hook.py` loaded with `--dangerously-bypass-hook-trust`; fail-closed on a missing or altered adapter, auth script or wiring (exit 97), on a tampered `config.toml` (exit 98) and on a manifest without a hook plan (exit -1) | Hook scripts and wiring plan are runtime-neutral (see [Sandbox hook contract](#sandbox-hook-contract)); a runtime that ignores `SandboxHooksBootstrap` installs **no** sandbox tool hooks — say so explicitly here |
-| **Transcript / debug artifacts** | `TranscriptHandler` (+ optional `DebugLogNamer`) | ✓ (stream-json, `claude-debug.log`) | No-op — see #1935 | ✓ session JSONL under `PI_CODING_AGENT_SESSION_DIR` (`ExtractTranscripts`), `pi-debug.log` (`DebugLogNamer`; pi's stderr when `--debug` is set), `ParseTranscriptFile` judges the tee'd `--mode json` stream and session files | ✓ rollout session JSONL under `$CODEX_HOME/sessions/` (`ExtractTranscripts`, `.jsonl` and `.jsonl.zst`), `codex-debug.log` (`DebugLogNamer`; codex has no debug flag, so Run exports `RUST_LOG` and captures stderr), `ParseTranscriptFile` judges the tee'd `exec --json` stream | Format-specific; not shared across runtimes. Debug-log filename defaults to `agent-debug.log` unless the runtime implements `DebugLogNamer` |
+| **Transcript / debug artifacts** | `TranscriptHandler` (+ optional `DebugLogNamer`) | ✓ (stream-json, `claude-debug.log`) | No-op — see #1935 | ✓ session JSONL under `PI_CODING_AGENT_SESSION_DIR` (`ExtractTranscripts`), `pi-debug.log` (`DebugLogNamer`; pi's stderr when `--debug` is set), `ParseTranscriptFile` judges the tee'd `--mode json` stream and session files | ✓ rollout session JSONL under `$CODEX_HOME/sessions/` (`ExtractTranscripts`; plain `.jsonl` only, each validated as a rollout envelope and redacted before it is kept), `codex-debug.log` (`DebugLogNamer`; codex has no debug flag, so Run exports `RUST_LOG` and captures stderr — redacted too), `ParseTranscriptFile` judges the tee'd `exec --json` stream | Format-specific; not shared across runtimes. Debug-log filename defaults to `agent-debug.log` unless the runtime implements `DebugLogNamer` |
 
 ### Fail modes
 
@@ -786,12 +786,19 @@ adapter. Bootstrap resolves the absolute path in its preflight and renders it wi
 ignores `PYTHONPATH` and the user site directory; `Run` unsets `PYTHONPATH`, `PYTHONHOME` and
 `PYTHONSTARTUP` after `.env` for good measure.
 
-The adapter then spawns each hook script the same way, which needs care: `-I` alone breaks the
-scripts, because they import their siblings (`hook_io`, the sanitizer stages). The verified hooks
-directory is put back on `sys.path` explicitly — and **appended, not prepended**. Prepending would
+The adapter then spawns each hook script the same way, which needs care in two directions. `-I`
+alone breaks the scripts, because they import their siblings (`hook_io`, the sanitizer stages), so
+the verified hooks directory is put back on `sys.path` explicitly — and **appended, not prepended**. Prepending would
 place it ahead of the standard library and re-open the hole `-I` closes, since `import json` in a
 hook script would find a planted `hooks/json/` first; verified both ways, and the sibling imports
-resolve either way because no hook module shadows a stdlib name.
+resolve either way because no hook module shadows a stdlib name. Bootstrap's preflight asserts the
+interpreter is at least Python 3.11 rather than assuming the `-I` behaviour that ordering rests on.
+
+The children also run with **`-B`**, which `-I` does not imply and `PYTHONDONTWRITEBYTECODE` cannot
+supply because `-E` makes it inert. Without it the first hook that imports a sibling writes
+`hooks/__pycache__/*.pyc`, nothing clears the hooks directory between iterations, and the exhaustive
+directory guard then refuses to start iteration 2 of a validation-loop retry — a self-inflicted
+fail-closed lockout, reproduced as four `.pyc` files after a single chain run.
 
 ### What the local smoke proved
 

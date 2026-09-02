@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -404,7 +405,51 @@ func codexPreflightPython(sandboxName string) (string, error) {
 	if !strings.HasPrefix(path, "/") {
 		return "", fmt.Errorf("resolving python3 for the hook adapter: %q is not an absolute path", sanitizeOutput(path))
 	}
+	// The adapter's isolation of its children rests on `-I` keeping the
+	// script's own directory off sys.path, so the verified hooks directory can
+	// be appended behind the standard library rather than ahead of it. That is
+	// true of every CPython that has had `-I`, but the floor is asserted here
+	// rather than assumed: below it, a planted `hooks/json/` would shadow a
+	// stdlib import inside a hook script.
+	if err := codexPreflightPythonVersion(sandboxName, path); err != nil {
+		return "", err
+	}
 	return path, nil
+}
+
+// codexMinPythonMinor is the 3.x minor the hook adapter requires. 3.11 is the
+// floor the repo already assumes elsewhere (tomllib in the config tests) and
+// is far below anything the sandbox image ships.
+const codexMinPythonMinor = 11
+
+func codexPreflightPythonVersion(sandboxName, python string) error {
+	cmd := shellQuote(python) + ` -c 'import sys; print("%d.%d" % sys.version_info[:2])'`
+	stdout, stderr, exitCode, err := sandbox.Exec(sandboxName, cmd, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("checking the hook interpreter version: %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("checking the hook interpreter version: exited %d: %s",
+			exitCode, strings.TrimSpace(sanitizeOutput(stderr)))
+	}
+	version := strings.TrimSpace(stdout)
+	if i := strings.LastIndexByte(version, '\n'); i >= 0 {
+		version = strings.TrimSpace(version[i+1:])
+	}
+	major, minor, ok := strings.Cut(version, ".")
+	if !ok || major != "3" {
+		return fmt.Errorf("hook interpreter %s reports version %q, expected 3.x", python, sanitizeOutput(version))
+	}
+	n, convErr := strconv.Atoi(minor)
+	if convErr != nil {
+		return fmt.Errorf("hook interpreter %s reports version %q, expected 3.x", python, sanitizeOutput(version))
+	}
+	if n < codexMinPythonMinor {
+		return fmt.Errorf(
+			"hook interpreter %s is Python %s; the sandbox hook adapter needs at least 3.%d",
+			python, sanitizeOutput(version), codexMinPythonMinor)
+	}
+	return nil
 }
 
 // codexManifestMaxBytes bounds the manifest read back through exec stdout; a
