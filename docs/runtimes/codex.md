@@ -1,8 +1,9 @@
 # Codex
 
-[Codex](https://github.com/openai/codex) is fullsend's third agent runtime, opt-in per repo, per
-agent, or as a `repos.yaml` default. It runs **OpenAI models only**, through the same sandbox, egress policy and secretless
-credential path pi uses for GPT — the runner holds the credential, the sandbox never sees it.
+[Codex](https://github.com/openai/codex) is fullsend's third agent runtime. It runs **OpenAI models
+only**, through the same sandbox, egress policy and secretless credential path pi uses for GPT — the
+runner holds the credential, the sandbox never sees it. Turn it on for one repo, for one agent, or
+as a `repos.yaml` default.
 
 ```bash
 fullsend run triage --runtime codex --model openai/gpt-5.6-luna
@@ -141,10 +142,9 @@ What a local codex run needs, beyond the guide:
 
 ## Behaviour differences worth knowing
 
-- **No permission system.** Codex's posture, like pi's, is "run in a container". The sandbox, its
-  egress policy and credential placeholders are the boundary
-  ([ADR 0027](../ADRs/0027-allowed-and-disallowed-tools-for-agents.md)); fullsend's hook adapter is
-  defense-in-depth on top.
+- **No permission prompts.** Codex, like pi, expects to run inside a container: the sandbox and its
+  egress policy are what contain the agent, not a tool-approval dialog
+  ([ADR 0027](../ADRs/0027-allowed-and-disallowed-tools-for-agents.md)).
 - **Reads `AGENTS.md` natively** — no `CLAUDE.md` bridge is injected.
 - **The repository's own `.codex/` is never loaded.** Codex reads a project config layer only for a
   directory it has been told to trust, and fullsend does not trust the cloned repo — so a target
@@ -158,56 +158,43 @@ What a local codex run needs, beyond the guide:
   (see docs/contributing/runtime-implementation.md)
   ```
 
-  Entries with no codex equivalent are dropped from the hook wiring with their own note — `WebFetch`,
-  for instance, because codex does that through the shell. The sandbox and its egress policy, not the
-  tool list, remain the boundary.
+  Entries with no codex equivalent are dropped, each with its own note — `WebFetch`, for instance,
+  because codex reaches the web through the shell.
 - **A blocked tool call reads as *declined*, not failed.** A PreToolUse block reaches the model as
   `Command blocked by PreToolUse hook: <reason>`, so the agent understands it was refused rather
   than that the command broke — in a smoke run it summarised the block as "blocked by a safety hook"
   and moved on.
-- **PostToolUse hooks block or warn; they never rewrite.** Codex accepts a block decision from a
-  post-tool hook but not replacement output for a built-in tool. So the two outcomes differ: a
-  canary hit **blocks**, and the model never sees that tool result at all; a redaction, unicode or
-  suppression hit **cannot** rewrite the output, and instead tells the model the result contained
-  something that would have been redacted. Separately, the run's artifacts (`output.jsonl`, the
-  extracted transcripts and `codex-debug.log`) get pattern redaction on the way to disk, so raw tool
-  output does not reach an uploaded artifact either.
-- **Skills** come from the runner-owned `CODEX_HOME/skills/`, and the repository's own
-  `.agents/skills` are discovered too (the same as Claude Code; leaving the project untrusted
-  suppresses `.codex/` config, not skills). Repo-supplied `SKILL.md` files are covered by the
-  host-side content scan and the in-sandbox `scan context` pass. Codex's own bundled skills
-  (`skill-installer`, `imagegen` and friends) are switched off, so an agent sees only the harness's
-  skills and the image's.
+- **The security hooks block a tool result or warn about it; they never edit it.** Codex does not
+  let a hook replace the output of a built-in tool, so where another runtime would hand the model a
+  redacted result, codex either withholds it entirely or passes it through with a note saying what
+  it contained. Your run artifacts are redacted either way — `output.jsonl`, the transcripts and
+  `codex-debug.log` are all scrubbed before they are written.
+- **Skills** work as they do on Claude Code: the harness's skills, plus your repository's own
+  `.agents/skills`, both scanned for injected content before the agent sees them. Codex's bundled
+  skills (`skill-installer`, `imagegen` and friends) are switched off, so an agent sees only yours.
 - **No cost in metrics** — see [At a glance](#at-a-glance).
 
 ## Not yet exercised
 
-`runtime: codex` is selectable, but there is **no fleet lifecycle run** on it yet, and no live run on
-the OpenAI Workload Identity path: that is gated on an OpenAI organization being mapped to the pool
-repositories, exactly as it is for pi. `e2e/behaviour/features/runtime/codex-openai.feature` stays
-gated on the `runtime-codex-openai` capability until then, so codex has no default behaviour-test
-coverage. Pilot on a disposable repo with `triage`/`prioritize` before `code`/`fix`.
+**Start on a disposable repo,** with `triage` or `prioritize` before `code` or `fix`. Codex has been
+run end to end by hand — the fleet's own `triage` and `review` harnesses, on `openai/gpt-5.6-luna`,
+on macOS — but not yet through a full fleet lifecycle, and not yet on the CI credential path: the
+Workload Identity route needs an OpenAI organization mapped to the repositories, which does not
+exist yet, so local runs use `OPENAI_API_KEY` on the runner. Until that mapping exists codex also
+has no default behaviour-test coverage; its scenario is gated. What was run, and on which versions,
+is recorded in [codex runtime
+internals](../contributing/runtime-implementation.md#codex-runtime-internals-6920).
 
-Sub-agent rosters are not wired. Codex does have a `spawn_agent` tool, but fullsend does not build
-a persona roster for it in v1, so `review` and `retro` — which depend on that roster and its
-per-persona models — are best kept on Claude Code. That is a recommendation, not a restriction:
-nothing stops a repo-wide `runtime: codex` from applying to them, and they will run, just in a
-single context. Pin them with `runtime: claude` on their `agents:` entries if you want the roster.
+**Keep `review` and `retro` on Claude Code.** Codex has a `spawn_agent` tool, but fullsend does not
+build a persona roster for it yet, so those two agents run in a single context instead of with their
+reviewer personas. Nothing prevents a repo-wide `runtime: codex` from applying to them — they will
+run — so pin them with `runtime: claude` on their `agents:` entries if you want the roster:
 
-**What has been run.** Locally on macOS (arm64, codex-cli 0.152.1 in the sandbox image), on
-`openai/gpt-5.6-luna` with a static `OPENAI_API_KEY` on the runner:
-
-- A hook-level smoke run — the credential stayed outside the sandbox, both hook phases fired, a
-  blocked command was reported as declined, and a PostToolUse block withheld the output. Detail in
-  [codex runtime internals](../contributing/runtime-implementation.md#codex-runtime-internals-6920).
-- The fleet's own `triage` and `review` harnesses, run unmodified except for the sandbox image, the
-  `openai` provider in place of Vertex, and dropping the Vertex-only host files. Both completed with
-  a schema-valid result and a passing validation loop; the run-scoped provider was created and
-  deleted, and `triage`'s post-script wrote its labels and comment. `review`'s agent completed the
-  same way.
-
-What that leaves untested is the WIF exchange itself — there is no OpenAI organization mapped yet —
-and any run driven by CI rather than by hand.
+```yaml
+agents:
+  - name: review
+    runtime: claude
+```
 
 ## Troubleshooting
 
