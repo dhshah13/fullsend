@@ -1247,6 +1247,12 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// runScopedProviders maps a harness provider name to the run-scoped
 	// instance created for it; sandbox creation attaches the latter.
 	runScopedProviders := map[string]string{}
+	// skippedProviders are harness-declared providers the selected runtime
+	// does not need (an openai entry on a Vertex run, see
+	// runtime.NeedsOpenAIProvider): nothing is created for them and their
+	// name must not reach `sandbox create`, or the gateway would attach a
+	// profile whose egress rules the run never uses.
+	skippedProviders := map[string]struct{}{}
 	var openAIHandles []openAIProviderHandle
 	allProviderNames := append([]string{}, h.Providers...)
 	if len(h.Providers) > 0 || len(result.Providers) > 0 || len(result.Profiles) > 0 {
@@ -1332,10 +1338,27 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			if err := rejectReservedProfileID(openAIProviderType, result.Profiles, dirProfileIDs); err != nil {
 				return err
 			}
+			// The OpenAI provider is materialized only for a run that will
+			// actually call OpenAI. A harness can then declare it next to
+			// the Vertex provider without making every run resolve an
+			// OpenAI credential (#6920); the profile is not imported and
+			// the instance is not created or attached.
+			if !agentruntime.NeedsOpenAIProvider(runtimeBackend.Runtime.Name(), h.Model) {
+				skippedProviders[pd.Name] = struct{}{}
+				// Counts as handled, so the "declared but no definition
+				// found" warning below does not also fire for it.
+				created[pd.Name] = struct{}{}
+				model := h.Model
+				if model == "" {
+					model = "(the runtime default)"
+				}
+				printer.StepWarn(fmt.Sprintf("Provider %q declared by the harness but not needed by runtime %s with model %s; skipped", pd.Name, runtimeBackend.Runtime.Name(), model))
+				continue
+			}
 			if err := ensureOpenAIProfile(ctx, pd.Type, printer); err != nil {
 				return err
 			}
-			handle, err := ensureOpenAIProvider(ctx, pd, sandboxName, openAIConfigIDs(runCfg), printer)
+			handle, err := ensureOpenAIProvider(ctx, pd, sandboxName, openAIConfigIDs(runCfg), runtimeBackend, printer)
 			if err != nil {
 				return err
 			}
@@ -1394,7 +1417,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			}
 		}
 
-		allProviderNames = applyRunScopedProviderNames(sandboxProviderNames(h.Providers, result.Providers), runScopedProviders)
+		allProviderNames = applyRunScopedProviderNames(dropSkippedProviders(sandboxProviderNames(h.Providers, result.Providers), skippedProviders), runScopedProviders)
 	}
 
 	workItemID := resolveWorkItemID()
@@ -1537,7 +1560,8 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			printer.StepFail("Sandbox policy cannot deliver the OpenAI credential")
 			return err
 		}
-		// From here a refresh must also re-seed the running pi.
+		// From here a refresh must also re-seed the running agent's
+		// credential file (when its runtime has one).
 		for _, h := range openAIHandles {
 			h.sandboxUp.Store(true)
 		}

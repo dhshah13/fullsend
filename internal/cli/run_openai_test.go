@@ -20,12 +20,24 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/harness"
 	"github.com/fullsend-ai/fullsend/internal/inference/openaiwif"
 	"github.com/fullsend-ai/fullsend/internal/resolve"
+	agentruntime "github.com/fullsend-ai/fullsend/internal/runtime"
+	"github.com/fullsend-ai/fullsend/internal/scaffold"
 	"github.com/fullsend-ai/fullsend/internal/security"
 	"github.com/fullsend-ai/fullsend/internal/ui"
+
+	"gopkg.in/yaml.v3"
 )
 
 func openAITestEnv(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
+}
+
+// piBackend is the selected-runtime argument for the provider tests: pi is
+// the runtime that implements runtime.OpenAICredentialSeeder today, so it is
+// what the production path passes for an OpenAI run.
+func piBackend() agentruntime.Backend {
+	r := agentruntime.PiRuntime{}
+	return agentruntime.Backend{Runtime: r, Transcripts: r}
 }
 
 func stubOpenAIExchange(t *testing.T, fn func(ctx context.Context, cfg openaiwif.Config) (*openaiwif.Token, error)) {
@@ -197,7 +209,7 @@ func TestEnsureOpenAIProvider_WIF(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "ambient-key-must-not-be-used")
 
 	pd := harness.ProviderDef{Name: "openai", Type: openAIProviderType, Credentials: map[string]string{"OPENAI_API_KEY": ""}}
-	h, err := ensureOpenAIProvider(context.Background(), pd, "fs-tri-0123456789abcdef", config.OpenAIWIFConfig{}, ui.New(io.Discard))
+	h, err := ensureOpenAIProvider(context.Background(), pd, "fs-tri-0123456789abcdef", config.OpenAIWIFConfig{}, piBackend(), ui.New(io.Discard))
 	require.NoError(t, err)
 	assert.Equal(t, "openai-0123456789ab", h.name)
 	assert.Equal(t, []string{"OPENAI_API_KEY"}, h.keys)
@@ -232,7 +244,7 @@ func TestEnsureOpenAIProvider_StaticGetsBoundedExpiry(t *testing.T) {
 
 	// No credential keys declared: the default key is used.
 	pd := harness.ProviderDef{Name: "openai", Type: openAIProviderType}
-	h, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, ui.New(io.Discard))
+	h, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, piBackend(), ui.New(io.Discard))
 	require.NoError(t, err)
 	assert.Equal(t, "openai-feedface", h.name)
 	assert.Equal(t, []string{"OPENAI_API_KEY"}, h.keys, "the default key when the definition declares none")
@@ -260,7 +272,7 @@ func TestEnsureOpenAIProvider_StoreFailureDeletesProvider(t *testing.T) {
 	t.Setenv("GITHUB_ACTIONS", "")
 
 	pd := harness.ProviderDef{Name: "openai", Type: openAIProviderType}
-	_, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, ui.New(io.Discard))
+	_, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, piBackend(), ui.New(io.Discard))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "storing credential")
 
@@ -280,7 +292,7 @@ func TestEnsureOpenAIProvider_StoreAndDeleteFailureBlanksCredential(t *testing.T
 	t.Setenv("OPENAI_API_KEY", "sk-local-static-key")
 	t.Setenv("GITHUB_ACTIONS", "")
 	var buf strings.Builder
-	_, err := ensureOpenAIProvider(context.Background(), harness.ProviderDef{Name: "openai", Type: openAIProviderType}, "fs-cod-feedface", config.OpenAIWIFConfig{}, ui.New(&buf))
+	_, err := ensureOpenAIProvider(context.Background(), harness.ProviderDef{Name: "openai", Type: openAIProviderType}, "fs-cod-feedface", config.OpenAIWIFConfig{}, piBackend(), ui.New(&buf))
 	require.Error(t, err)
 	lines := readArgLines(t, argsLog)
 	require.Len(t, lines, 4, "empty create, failed store, failed delete, blank: %q", lines)
@@ -294,7 +306,7 @@ func TestEnsureOpenAIProvider_NoCredentialFailsBeforeOpenshell(t *testing.T) {
 		t.Setenv(k, "")
 	}
 	pd := harness.ProviderDef{Name: "openai", Type: openAIProviderType}
-	_, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, ui.New(io.Discard))
+	_, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, piBackend(), ui.New(io.Discard))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `provider "openai"`)
 	assert.Contains(t, err.Error(), "no OpenAI credential")
@@ -342,23 +354,93 @@ func recordingProvidersStub(t *testing.T) string {
 // writeOpenAIFullsendDir lays out a fullsend dir whose code harness declares
 // the openai provider — by bare name, or by file path the way the
 // behaviour scenarios do — with the scaffold's provider and profile files.
+// The run selects pi on an openai model, which is what makes the provider
+// needed (runtime.NeedsOpenAIProvider); writeOpenAIFullsendDirFor covers the
+// combinations that do not need it.
 func writeOpenAIFullsendDir(t *testing.T, pathForm bool) string {
+	t.Helper()
+	return writeOpenAIFullsendDirFor(t, pathForm, "pi", "openai/gpt-5.6-luna")
+}
+
+// writeOpenAIFullsendDirFor is writeOpenAIFullsendDir with the runtime and
+// the harness model spelled out. An empty runtimeName leaves the config
+// without a runtime: key (the run then defaults to Claude Code); an empty
+// model leaves the harness without a model:.
+func writeOpenAIFullsendDirFor(t *testing.T, pathForm bool, runtimeName, model string) string {
 	t.Helper()
 	dir := t.TempDir()
 	for _, d := range []string{"harness", "agents", "providers", "profiles"} {
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, d), 0o755))
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "agents", "code.md"), []byte("You are a coding agent."), 0o644))
-	harnessYAML := "agent: agents/code.md\nrole: test\nproviders:\n  - openai\n"
+	modelLine := ""
+	if model != "" {
+		modelLine = "model: " + model + "\n"
+	}
+	harnessYAML := "agent: agents/code.md\nrole: test\n" + modelLine + "providers:\n  - openai\n"
 	if pathForm {
-		harnessYAML = "agent: agents/code.md\nrole: test\nprofiles:\n  - profiles/fullsend-openai.yaml\nproviders:\n  - providers/openai.yaml\n"
+		harnessYAML = "agent: agents/code.md\nrole: test\n" + modelLine + "profiles:\n  - profiles/fullsend-openai.yaml\nproviders:\n  - providers/openai.yaml\n"
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "harness", "code.yaml"), []byte(harnessYAML), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "providers", "openai.yaml"),
 		[]byte("name: openai\ntype: fullsend-openai\ncredentials:\n  OPENAI_API_KEY: \"\"\n"), 0o644))
 	_ = pathForm // the profile is never shipped by the workspace: the runner embeds it
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("agents:\n  - harness/code.yaml\n"), 0o644))
+	runtimeLine := ""
+	if runtimeName != "" {
+		runtimeLine = "runtime: " + runtimeName + "\n"
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("version: \"1\"\n"+runtimeLine+"agents:\n  - harness/code.yaml\n"), 0o644))
 	return dir
+}
+
+// TestRunAgent_OpenAIProviderSkippedWhenRuntimeDoesNotNeedIt covers the
+// materialization rule (#6920): a harness may declare the openai provider
+// for every runtime, and a run that will not call OpenAI must not resolve a
+// credential, import the profile, create an instance, or attach anything to
+// the sandbox. Before this, one `providers: [openai]` entry made every run
+// on that harness require an OpenAI credential whatever the runtime.
+func TestRunAgent_OpenAIProviderSkippedWhenRuntimeDoesNotNeedIt(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		runtimeName string
+		model       string
+	}{
+		{"claude on an alias", "", "opus"},
+		{"pi on a vertex model", "pi", "anthropic-vertex/claude-opus-4-6"},
+		{"pi with no model", "pi", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := recordingProvidersStub(t)
+			for _, k := range []string{"FULLSEND_OPENAI_AUDIENCE", "FULLSEND_OPENAI_IDENTITY_PROVIDER_ID", "FULLSEND_OPENAI_SERVICE_ACCOUNT_ID", "GITHUB_ACTIONS", "FULLSEND_PI_PROVIDER"} {
+				t.Setenv(k, "")
+			}
+			// No OPENAI_API_KEY at all: a run that skipped the provider must
+			// not have needed one. With the old always-create rule this
+			// alone failed the run with "no OpenAI credential".
+			t.Setenv("OPENAI_API_KEY", "")
+			dir := writeOpenAIFullsendDirFor(t, false, tc.runtimeName, tc.model)
+
+			var out strings.Builder
+			rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
+			err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "", rFlags, statusOpts{}, ui.New(&out), false, runOverrideFlags{})
+			// The stub cannot bootstrap an agent, so the run still fails
+			// later; what matters is that it got past the provider block.
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "no OpenAI credential")
+			assert.Contains(t, out.String(), "declared by the harness but not needed by runtime")
+
+			data, readErr := os.ReadFile(logPath)
+			require.NoError(t, readErr)
+			log := string(data)
+			assert.NotContains(t, log, "provider create --name openai-", "no run-scoped instance is created")
+			assert.NotContains(t, log, "fullsend-openai-", "the embedded profile is not imported")
+			for _, l := range strings.Split(strings.TrimSpace(log), "\n") {
+				if strings.HasPrefix(l, "sandbox create ") {
+					assert.NotContains(t, l, "--provider openai", "the skipped provider is not attached to the sandbox")
+				}
+			}
+		})
+	}
 }
 
 func TestRunAgent_OpenAIProviderIsRunScopedAndDeleted(t *testing.T) {
@@ -738,7 +820,7 @@ func TestEnsureOpenAIProvider_FallsBackWhenEmptyCreateIsRefused(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "sk-local-static-key")
 	t.Setenv("GITHUB_ACTIONS", "")
 	var buf strings.Builder
-	h, err := ensureOpenAIProvider(context.Background(), harness.ProviderDef{Name: "openai", Type: openAIProviderType}, "fs-cod-feedface", config.OpenAIWIFConfig{}, ui.New(&buf))
+	h, err := ensureOpenAIProvider(context.Background(), harness.ProviderDef{Name: "openai", Type: openAIProviderType}, "fs-cod-feedface", config.OpenAIWIFConfig{}, piBackend(), ui.New(&buf))
 	require.NoError(t, err)
 	assert.Equal(t, "openai-feedface", h.name)
 	lines := readArgLines(t, argsLog)
@@ -761,7 +843,7 @@ func TestEnsureOpenAIProvider_IgnoresExtraCredentialKeys(t *testing.T) {
 	t.Setenv("GITHUB_ACTIONS", "")
 	var buf strings.Builder
 	pd := harness.ProviderDef{Name: "openai", Type: openAIProviderType, Credentials: map[string]string{"OPENAI_API_KEY": "", "LD_PRELOAD": ""}}
-	h, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, ui.New(&buf))
+	h, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, piBackend(), ui.New(&buf))
 	require.NoError(t, err)
 	assert.Equal(t, []string{"OPENAI_API_KEY"}, h.keys, "the token is never copied under another key")
 	assert.Contains(t, buf.String(), "LD_PRELOAD")
@@ -808,7 +890,7 @@ func TestEnsureOpenAIProvider_RefusesUnredactableCredential(t *testing.T) {
 	}
 	t.Setenv("OPENAI_API_KEY", "short")
 	t.Setenv("GITHUB_ACTIONS", "")
-	_, err := ensureOpenAIProvider(context.Background(), harness.ProviderDef{Name: "openai", Type: openAIProviderType}, "fs-cod-feedface", config.OpenAIWIFConfig{}, ui.New(io.Discard))
+	_, err := ensureOpenAIProvider(context.Background(), harness.ProviderDef{Name: "openai", Type: openAIProviderType}, "fs-cod-feedface", config.OpenAIWIFConfig{}, piBackend(), ui.New(io.Discard))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "too short to redact")
 	_, statErr := os.Stat(argsLog)
@@ -1173,4 +1255,70 @@ func TestReseedOpenAIAuth_WaitsForSandboxLock(t *testing.T) {
 	data, err := os.ReadFile(log)
 	require.NoError(t, err)
 	assert.Equal(t, "polled\nseeded\n", string(data))
+}
+
+// TestEmbeddedOpenAIProfileBinaries pins the `binaries:` rules of the
+// profile the runner imports for every fullsend-openai provider. The rule
+// list is what the gateway will let open a connection to api.openai.com:
+// pi issues its requests from node, and codex's npm launcher spawns a
+// per-platform native binary that makes them itself (#6920), so both names
+// must be there or that runtime's first model call is refused by the proxy
+// with nothing in the agent's log to explain it.
+func TestEmbeddedOpenAIProfileBinaries(t *testing.T) {
+	data, err := scaffold.FullsendRepoFile("profiles/" + openAIProviderType + ".yaml")
+	require.NoError(t, err)
+
+	var profile struct {
+		Description string   `yaml:"description"`
+		Binaries    []string `yaml:"binaries"`
+	}
+	require.NoError(t, yaml.Unmarshal(data, &profile))
+	assert.ElementsMatch(t, []string{"**/node", "**/codex"}, profile.Binaries)
+	assert.Contains(t, profile.Description, "codex", "the description names both runtimes the profile serves")
+}
+
+// TestEnsureOpenAIProvider_SeedComesFromTheSelectedBackend pins the
+// runtime-neutral half of the credential path (#6920): the handle's re-seed
+// fragment and credential file come from the backend the run selected, not
+// from pi. A backend with no seeder (or a stubbed one) leaves both empty,
+// which is what makes sandboxReady() false so a refresh only updates the
+// provider instead of trying to write a file nothing reads.
+func TestEnsureOpenAIProvider_SeedComesFromTheSelectedBackend(t *testing.T) {
+	newBackend := func(name string) agentruntime.Backend {
+		b, err := agentruntime.Resolve(name)
+		require.NoError(t, err)
+		return b
+	}
+	for _, tc := range []struct {
+		name     string
+		backend  agentruntime.Backend
+		wantSeed bool
+		wantFile string
+	}{
+		{name: "pi seeds its auth.json", backend: newBackend("pi"), wantSeed: true,
+			wantFile: agentruntime.PiRuntime{}.ConfigDir() + "/auth.json"},
+		{name: "claude has no seeder", backend: newBackend("claude")},
+		{name: "codex's seeder is still a stub", backend: newBackend("codex")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeOpenshellRecorder(t)
+			for _, k := range []string{"FULLSEND_OPENAI_AUDIENCE", "FULLSEND_OPENAI_IDENTITY_PROVIDER_ID", "FULLSEND_OPENAI_SERVICE_ACCOUNT_ID", "GITHUB_ACTIONS"} {
+				t.Setenv(k, "")
+			}
+			t.Setenv("OPENAI_API_KEY", "sk-local-static-key")
+
+			pd := harness.ProviderDef{Name: "openai", Type: openAIProviderType}
+			h, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, tc.backend, ui.New(io.Discard))
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantFile, h.authFile)
+			if tc.wantSeed {
+				assert.Equal(t, agentruntime.PiRuntime{}.OpenAIAuthSeed(), h.authSeed)
+			} else {
+				assert.Empty(t, h.authSeed, "no seeder means no re-seed")
+			}
+			// sandboxReady gates the re-seed on a non-empty fragment.
+			h.sandboxUp.Store(true)
+			assert.Equal(t, tc.wantSeed, h.sandboxReady())
+		})
+	}
 }

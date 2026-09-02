@@ -76,6 +76,19 @@ func (CodexRuntime) ClearIterationArtifacts(_ string) error { return nil }
 // stderr trace output.
 func (CodexRuntime) DebugLogName() string { return codexDebugLogFile }
 
+// OpenAIAuthSeed and OpenAIAuthFile implement OpenAICredentialSeeder. They
+// are stubs until Run exists (#6920): codex reads its bearer token by
+// running an auth command that prints the placeholder from a runner-owned
+// token file under CODEX_HOME, and both the file and the fragment that
+// seeds it are written by Bootstrap. An empty seed is how the runner tells
+// a backend has no re-seed to perform, so until then a codex run's
+// run-scoped provider is created and refreshed but nothing is re-seeded
+// inside the sandbox.
+
+func (CodexRuntime) OpenAIAuthSeed() string { return "" }
+
+func (CodexRuntime) OpenAIAuthFile() string { return "" }
+
 // TranscriptHandler stub methods — return not-implemented errors for extract
 // methods (to avoid silent success claims in CI logs) and no-ops for parse
 // methods (which correctly indicate "nothing found"). See #6920.
@@ -103,4 +116,6 @@ var (
 	_ Runtime           = CodexRuntime{}
 	_ TranscriptHandler = CodexRuntime{}
 	_ DebugLogNamer     = CodexRuntime{}
+
+	_ OpenAICredentialSeeder = CodexRuntime{}
 )
