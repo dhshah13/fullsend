@@ -624,6 +624,14 @@ var optionalRolePermissions = map[string]map[string]bool{
 	"fix":   {"packages": true},
 }
 
+// IsOptionalRolePermission reports whether the given permission may be omitted
+// from the role's requested set — and therefore only warned about — while
+// installations catch up with an App permission update. Every other permission
+// the role requests is required.
+func IsOptionalRolePermission(role, permission string) bool {
+	return optionalRolePermissions[role][permission]
+}
+
 // ErrRequiredPermissionsMissing is returned by effectiveInstallationPermissions
 // when the installation lacks a non-optional permission for the role.
 var ErrRequiredPermissionsMissing = errors.New("required permissions missing")
@@ -633,7 +641,9 @@ var ErrRequiredPermissionsMissing = errors.New("required permissions missing")
 // Unknown or empty levels intentionally fail closed as not granted.
 var permRank = map[string]int{"read": 1, "write": 2, "admin": 3}
 
-func permissionLevelAtLeast(granted, requested string) bool {
+// PermissionLevelAtLeast reports whether a granted permission level satisfies
+// the requested level.
+func PermissionLevelAtLeast(granted, requested string) bool {
 	g, gok := permRank[granted]
 	r, rok := permRank[requested]
 	return gok && rok && g >= r
@@ -668,7 +678,7 @@ func effectiveInstallationPermissions(role string, requested, granted map[string
 	var dropped []string
 	var missingRequired []string
 	for perm, level := range requested {
-		if permissionLevelAtLeast(grantedPermissionLevel(granted, perm), level) {
+		if PermissionLevelAtLeast(grantedPermissionLevel(granted, perm), level) {
 			effective[perm] = level
 			continue
 		}
@@ -738,8 +748,8 @@ func createInstallationToken(ctx context.Context, githubBaseURL, jwt string, ins
 }
 
 // postInstallationAccessToken POSTs /app/installations/{id}/access_tokens and
-// returns the parsed success payload or the raw status/body for the caller to
-// decide on fallback. Network and marshal errors are returned via err.
+// returns the parsed success payload, or the raw status and body for the caller
+// to surface in an error. Network and marshal errors are returned via err.
 func postInstallationAccessToken(ctx context.Context, githubBaseURL, jwt string, installationID int64, perms map[string]string, repos []string) (token, expiresAt string, granted *GrantedScope, status int, body string, err error) {
 	tokenReqBody := map[string]interface{}{
 		"permissions": perms,

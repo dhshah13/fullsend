@@ -140,8 +140,8 @@ their installation.
 The implementation sequence is: update `canonicalRolePermissions`, the GCF
 embedded mint source, and `AgentAppConfig` together; have mint intersect the
 requested role map with the installation's granted `permissions`; and have CLI
-`checkPermissions` warn with the installing org's Accept URL instead of
-failing. Only permissions explicitly listed in `optionalRolePermissions`
+`checkPermissions` warn with the installing org's Accept URL instead of failing
+**for optional permissions only**. Only permissions explicitly listed in `optionalRolePermissions`
 (currently `packages` for `coder` and direct `fix`-role callers) may be omitted when ungranted — all
 other permissions remain required and fail before the token POST, preserving
 the pre-existing behavior where GitHub's `422` surfaced immediately. Dropped
@@ -174,8 +174,11 @@ Recommended operator order for adding **`packages:read`** to `coder` (code / fix
    `packages:read` until they Accept. The preflight avoids the two-POST retry
    volume that the old rollout path incurred.
 4. Release the CLI after the App registration and mint change. `fullsend github setup` reports
-   pending permissions as warnings with the installing org's Accept URL, so a
-   CLI release is not blocked on every installation accepting at once.
+   pending **optional** permissions — those listed in `optionalRolePermissions`,
+   currently `packages:read` — as warnings with the installing org's Accept URL
+   and does not block, so a CLI release is not blocked on every installation
+   accepting at once. Any other missing permission is still a setup error,
+   exactly as before the rollout mechanism existed.
 5. Tell installation owners to Accept the pending permission update (GitHub also
    emails org owners), and use the mint permission logs to find lagging installs.
 

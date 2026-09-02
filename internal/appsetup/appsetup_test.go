@@ -784,23 +784,6 @@ func TestManifestFlow_HTMLForm(t *testing.T) {
 	<-errCh
 }
 
-func TestPermLevelAtLeast(t *testing.T) {
-	tests := []struct {
-		granted, requested string
-		want               bool
-	}{
-		{"admin", "write", true},
-		{"admin", "read", true},
-		{"read", "write", false},
-		{"", "read", false},
-		{"bogus", "read", false},
-	}
-	for _, tc := range tests {
-		assert.Equal(t, tc.want, permLevelAtLeast(tc.granted, tc.requested),
-			"permLevelAtLeast(%q, %q)", tc.granted, tc.requested)
-	}
-}
-
 func TestGithubWebBaseURL(t *testing.T) {
 	t.Run("uses configured client base URL", func(t *testing.T) {
 		t.Setenv("GITHUB_SERVER_URL", "")
@@ -870,8 +853,12 @@ func TestSetup_StalePermissions_AllRolesChecked(t *testing.T) {
 	_, err = setup.Run(context.Background(), "myorg", "triage")
 	require.NoError(t, err)
 
-	// Pending permissions are rollout warnings, not setup-blocking errors.
-	assert.NoError(t, setup.PermissionErrors())
+	// None of the missing permissions are optional rollout permissions, so
+	// setup still fails the way it did before the rollout mechanism existed.
+	err = setup.PermissionErrors()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fullsend-fullsend")
+	assert.Contains(t, err.Error(), "fullsend-triage")
 	assert.Contains(t, output.String(), "fullsend-fullsend")
 	assert.Contains(t, output.String(), "fullsend-triage")
 }
@@ -904,7 +891,15 @@ func TestSetup_StalePermissions_IncludesInstallationURL(t *testing.T) {
 	_, err := setup.Run(context.Background(), "myorg", "fullsend")
 	require.NoError(t, err)
 
-	assert.NoError(t, setup.PermissionErrors())
+	permErr := setup.PermissionErrors()
+	require.Error(t, permErr)
+	assert.NotContains(t, permErr.Error(), "/settings/apps/fullsend-fullsend/permissions",
+		"error should not include a direct link to the App owner's settings page")
+	assert.Contains(t, permErr.Error(), "/settings/installations/12345",
+		"error should contain the installation approval URL")
+	assert.Contains(t, permErr.Error(), "organizations/myorg",
+		"installation URL should reference the correct org")
+
 	warning := output.String()
 	assert.NotContains(t, warning, "/settings/apps/fullsend-fullsend/permissions",
 		"warning should not include a direct link to the App owner's settings page")
@@ -935,12 +930,85 @@ func TestSetup_PendingCoderPackagesPermissionIsWarningOnly(t *testing.T) {
 		},
 	}
 
-	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&discardWriter{})).
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
 		WithSecretExists(func(_ string) (bool, error) { return true, nil })
 
 	_, err := setup.Run(context.Background(), "myorg", "coder")
 	require.NoError(t, err)
 	assert.NoError(t, setup.PermissionErrors())
+	assert.Contains(t, output.String(), "packages:read")
+	assert.Contains(t, output.String(), "/settings/installations/4242")
+}
+
+func TestSetup_MissingRequiredPermissionFailsSetup(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.coder",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 4242, AppID: 10, AppSlug: "fullsend-ai-coder",
+				Permissions: map[string]string{
+					"contents":      "write",
+					"packages":      "read",
+					"pull_requests": "write",
+					"checks":        "read",
+					// issues:write is missing and is not an optional rollout
+					// permission, so setup must fail.
+				},
+			},
+		},
+	}
+
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+
+	permErr := setup.PermissionErrors()
+	require.Error(t, permErr)
+	assert.Contains(t, permErr.Error(), "issues:write")
+	assert.Contains(t, permErr.Error(), "fullsend-ai-coder")
+	assert.NotContains(t, permErr.Error(), "packages",
+		"a granted optional permission must not appear in the error")
+}
+
+func TestSetup_MixedOptionalAndRequiredMissing(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.coder",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 4242, AppID: 10, AppSlug: "fullsend-ai-coder",
+				Permissions: map[string]string{
+					"contents":      "write",
+					"pull_requests": "write",
+					"checks":        "read",
+					// missing: packages:read (optional) and issues:write
+					// (required).
+				},
+			},
+		},
+	}
+
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+
+	permErr := setup.PermissionErrors()
+	require.Error(t, permErr)
+	assert.Contains(t, permErr.Error(), "issues:write")
+	assert.NotContains(t, permErr.Error(), "packages:read",
+		"an optional rollout permission must stay out of the setup error")
+	assert.Contains(t, output.String(), "packages:read",
+		"the optional permission is still surfaced as a warning")
 }
 
 func TestSetup_CorrectPermissions_NoError(t *testing.T) {
@@ -966,7 +1034,8 @@ func TestSetup_CorrectPermissions_NoError(t *testing.T) {
 			},
 		},
 	}
-	printer := ui.New(&discardWriter{})
+	var output bytes.Buffer
+	printer := ui.New(&output)
 
 	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
 		WithAppSet("fullsend").
@@ -976,6 +1045,7 @@ func TestSetup_CorrectPermissions_NoError(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NoError(t, setup.PermissionErrors())
+	assert.NotContains(t, output.String(), "missing")
 }
 
 func TestSetup_DefaultAppSet(t *testing.T) {

@@ -20,12 +20,14 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	ghTypes "github.com/fullsend-ai/fullsend/internal/forge/github"
+	"github.com/fullsend-ai/fullsend/internal/mintcore"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
@@ -649,11 +651,11 @@ func (s *Setup) handleExistingApp(ctx context.Context, inst *forge.Installation,
 	}, nil
 }
 
-// checkPermissions warns if the installed app is missing permissions that
-// the current manifest expects. Pending permissions are expected during an App
-// permission rollout and must not block setup or token minting.
-// PermissionErrors is retained for callers that previously checked for stale
-// permissions; permission drift is now reported only through StepWarn.
+// PermissionErrors returns the accumulated missing-permission errors from every
+// checkPermissions call on this Setup, or nil when no required permission was
+// missing. Only required permissions land here: permissions that mintcore marks
+// optional for the role (rollout permissions such as coder's packages:read) are
+// reported as warnings and do not fail setup.
 func (s *Setup) PermissionErrors() error {
 	if len(s.permErrors) == 0 {
 		return nil
@@ -661,17 +663,10 @@ func (s *Setup) PermissionErrors() error {
 	return fmt.Errorf("apps have stale permissions:\n  %s", strings.Join(s.permErrors, "\n  "))
 }
 
-// Keep this ranking in sync with mintcore.permissionLevelAtLeast. GitHub's
-// app-permissions schema defines read, write, and admin; unknown or empty
-// levels intentionally fail closed as not granted.
-var permRank = map[string]int{"read": 1, "write": 2, "admin": 3}
-
-func permLevelAtLeast(granted, requested string) bool {
-	g, gok := permRank[granted]
-	r, rok := permRank[requested]
-	return gok && rok && g >= r
-}
-
+// grantedPermissionLevel resolves the level an installation actually grants for
+// a permission. The App manifest never carries metadata, so the implicit grant
+// below is a no-op here; it is kept for parity with mint's granted-set
+// preflight.
 func grantedPermissionLevel(granted map[string]string, permission string) string {
 	level := granted[permission]
 	if permission == "metadata" && level == "" {
@@ -715,6 +710,12 @@ func (s *Setup) githubWebBaseURL() string {
 	return githubWebBaseURL()
 }
 
+// checkPermissions compares the installed app's granted permissions against the
+// ones the current manifest expects and reports the gap the same way mint does.
+// Permissions that mintcore marks optional for the role are pending-rollout
+// permissions: they are warned about but do not block setup. Every other
+// missing permission is required and is recorded in s.permErrors so
+// PermissionErrors fails the run.
 func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
 	if inst.Permissions == nil {
 		s.ui.StepWarn(fmt.Sprintf("app %s: permissions not available, skipping check", inst.AppSlug))
@@ -724,21 +725,38 @@ func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
 	data, _ := json.Marshal(expected)
 	var want map[string]string
 	_ = json.Unmarshal(data, &want)
-	var missing []string
+	var optional, required []string
 	for perm, level := range want {
 		if level == "" {
 			continue
 		}
-		if !permLevelAtLeast(grantedPermissionLevel(inst.Permissions, perm), level) {
-			missing = append(missing, fmt.Sprintf("%s:%s", perm, level))
+		if mintcore.PermissionLevelAtLeast(grantedPermissionLevel(inst.Permissions, perm), level) {
+			continue
 		}
+		entry := fmt.Sprintf("%s:%s", perm, level)
+		if mintcore.IsOptionalRolePermission(role, perm) {
+			optional = append(optional, entry)
+			continue
+		}
+		required = append(required, entry)
 	}
-	if len(missing) == 0 {
+	if len(optional) == 0 && len(required) == 0 {
 		return
 	}
+	sort.Strings(optional)
+	sort.Strings(required)
+
 	installURL := fmt.Sprintf("%s/organizations/%s/settings/installations/%d", s.githubWebBaseURL(), org, inst.ID)
-	s.ui.StepWarn(fmt.Sprintf("app %s missing permissions: %s — if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
-		inst.AppSlug, strings.Join(missing, ", "), installURL))
+	if len(optional) > 0 {
+		s.ui.StepWarn(fmt.Sprintf("app %s pending rollout permissions (setup continues): %s — if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
+			inst.AppSlug, strings.Join(optional, ", "), installURL))
+	}
+	if len(required) > 0 {
+		s.ui.StepWarn(fmt.Sprintf("app %s missing permissions: %s — if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
+			inst.AppSlug, strings.Join(required, ", "), installURL))
+		s.permErrors = append(s.permErrors, fmt.Sprintf("%s — missing required permissions: %s; if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
+			inst.AppSlug, strings.Join(required, ", "), installURL))
+	}
 }
 
 // manifestResponse is the JSON response from GitHub's app manifest conversion.

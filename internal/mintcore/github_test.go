@@ -401,8 +401,27 @@ func TestPermissionLevelAtLeast(t *testing.T) {
 		{"read", "bogus", false},
 	}
 	for _, tc := range tests {
-		assert.Equal(t, tc.want, permissionLevelAtLeast(tc.granted, tc.requested),
-			"permissionLevelAtLeast(%q, %q)", tc.granted, tc.requested)
+		assert.Equal(t, tc.want, PermissionLevelAtLeast(tc.granted, tc.requested),
+			"PermissionLevelAtLeast(%q, %q)", tc.granted, tc.requested)
+	}
+}
+
+func TestIsOptionalRolePermission(t *testing.T) {
+	tests := []struct {
+		role, permission string
+		want             bool
+	}{
+		{"coder", "packages", true},
+		{"coder", "contents", false},
+		{"fix", "packages", true},
+		{"fix", "contents", false},
+		{"triage", "packages", false},
+		{"nosuchrole", "packages", false},
+		{"", "", false},
+	}
+	for _, tc := range tests {
+		assert.Equal(t, tc.want, IsOptionalRolePermission(tc.role, tc.permission),
+			"IsOptionalRolePermission(%q, %q)", tc.role, tc.permission)
 	}
 }
 
