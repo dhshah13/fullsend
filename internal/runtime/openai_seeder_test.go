@@ -26,12 +26,18 @@ func TestPiRuntimeOpenAISeeder(t *testing.T) {
 // CodexRuntime's seeder is a stub until its Bootstrap writes the token file
 // (#6920). Empty is the contract for "no re-seed": the runner then leaves
 // both handle fields empty and a refresh only updates the provider.
-func TestCodexRuntimeOpenAISeederIsStubbed(t *testing.T) {
+func TestCodexRuntimeOpenAISeeder(t *testing.T) {
 	t.Parallel()
 
+	// PR D replaced the stub: codex reads its bearer token by running an auth
+	// command that prints the placeholder from this runner-owned file, so the
+	// runner has a real fragment to re-run after every credential refresh.
+	// The behaviour of both is covered in codex_run_test.go, which executes
+	// the fragment under /bin/sh.
 	r := CodexRuntime{}
-	assert.Empty(t, r.OpenAIAuthSeed())
-	assert.Empty(t, r.OpenAIAuthFile())
+	assert.Equal(t, r.ConfigDir()+"/openai-token", r.OpenAIAuthFile())
+	assert.Contains(t, r.OpenAIAuthSeed(), "OPENAI_API_KEY")
+	assert.Contains(t, r.OpenAIAuthSeed(), r.OpenAIAuthFile())
 }
 
 // Not parallel: the pi provider default is an environment variable

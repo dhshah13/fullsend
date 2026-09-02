@@ -2,13 +2,12 @@ package runtime
 
 import (
 	"bytes"
-	"context"
 	"testing"
-	"time"
 
-	"github.com/fullsend-ai/fullsend/internal/sandbox"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/fullsend-ai/fullsend/internal/sandbox"
 )
 
 func TestCodexRuntimeMetadata(t *testing.T) {
@@ -25,51 +24,29 @@ func TestCodexRuntimeMetadata(t *testing.T) {
 	assert.Equal(t, "codex-debug.log", rt.DebugLogName())
 }
 
-func TestCodexRuntimeRun_NotImplemented(t *testing.T) {
+// TestCodexRuntimeReadsAgentsMD pins the deliberate absence of ContextBridger:
+// codex reads AGENTS.md natively (cwd chain plus $CODEX_HOME/AGENTS.md), so
+// the runner must not inject the CLAUDE.md pointer it writes for Claude Code.
+func TestCodexRuntimeReadsAgentsMD(t *testing.T) {
 	t.Parallel()
 
-	rt := CodexRuntime{}
-	exit, err := rt.Run(context.Background(), RunParams{}, nil, time.Now(), nil)
-	assert.Equal(t, -1, exit)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not yet implemented")
-	assert.Contains(t, err.Error(), "#6920")
+	assert.False(t, WantsClaudeMDBridge(CodexRuntime{}))
 }
 
-func TestCodexRuntimeBootstrap_NotImplemented(t *testing.T) {
+func TestCodexRuntimeBootstrap_EmptyAgentPath(t *testing.T) {
 	t.Parallel()
 
-	rt := CodexRuntime{}
-	err := rt.Bootstrap(nil)
+	err := CodexRuntime{}.Bootstrap(bootstrapInput{sandboxName: "test"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not yet implemented")
-	assert.Contains(t, err.Error(), "#6920")
+	assert.Contains(t, err.Error(), "agent path is required")
 }
 
-func TestCodexRuntimeExtractStubs_NotImplemented(t *testing.T) {
+func TestCodexRuntimeEmitTranscriptErrors(t *testing.T) {
 	t.Parallel()
-
-	rt := CodexRuntime{}
-	err := rt.ExtractTranscripts("", "", "")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "#6920")
-
-	err = rt.ExtractDebugLog("", "", "")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "#6920")
-}
-
-func TestCodexRuntimeNoopMethods(t *testing.T) {
-	t.Parallel()
-
-	rt := CodexRuntime{}
-	assert.Nil(t, rt.ParseTranscriptErrors(""))
-	assert.NoError(t, rt.ClearIterationArtifacts(""))
-
-	te, ok := rt.ParseTranscriptFile("")
-	assert.False(t, ok)
-	assert.Equal(t, TranscriptError{}, te)
 
 	var buf bytes.Buffer
-	rt.EmitTranscriptErrors(&buf, nil)
+	CodexRuntime{}.EmitTranscriptErrors(&buf, []TranscriptError{{
+		Source: "output.jsonl", IsError: true, ErrorMessage: "turn failed",
+	}})
+	assert.Contains(t, buf.String(), "turn failed")
 }
