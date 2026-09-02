@@ -192,7 +192,7 @@ usage() {
 }
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  head -73 "$0" | tail -71 | sed 's/^# \?//'
+  head -72 "$0" | tail -70 | sed 's/^# \?//'
   exit 0
 fi
 
@@ -206,31 +206,9 @@ if ! [[ "${GL_TOKEN}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 1
 fi
 
-# Exactly one of PROJECT_ID or GROUP_ID must be set.
-if [ -n "${PROJECT_ID:-}" ] && [ -n "${GROUP_ID:-}" ]; then
-  echo "ERROR: PROJECT_ID and GROUP_ID are mutually exclusive — set one, not both" >&2
-  exit 1
-fi
-if [ -z "${PROJECT_ID:-}" ] && [ -z "${GROUP_ID:-}" ]; then
-  echo "ERROR: one of PROJECT_ID or GROUP_ID is required" >&2
+if ! validate_runner_scope; then
   usage >&2
   exit 1
-fi
-
-if [ -n "${PROJECT_ID:-}" ]; then
-  if ! [[ "${PROJECT_ID}" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: PROJECT_ID must be numeric (got: ${PROJECT_ID})" >&2
-    exit 1
-  fi
-  RUNNER_SCOPE="project"
-  SCOPE_ID="${PROJECT_ID}"
-else
-  if ! [[ "${GROUP_ID}" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: GROUP_ID must be numeric (got: ${GROUP_ID})" >&2
-    exit 1
-  fi
-  RUNNER_SCOPE="group"
-  SCOPE_ID="${GROUP_ID}"
 fi
 
 if [ -z "${GITLAB_URL}" ]; then
@@ -399,24 +377,9 @@ echo "  OK: packages installed"
 # ----------------------------------------------------------------------
 echo "==> Registering runner with ${GITLAB_URL} (${RUNNER_SCOPE} ${SCOPE_ID})"
 
-# Build scope-specific API parameters:
-#   project mode: runner_type=project_type, project_id, locked=true
-#   group mode:   runner_type=group_type,   group_id,   locked=false
-scope_args=()
-if [ "${RUNNER_SCOPE}" = "project" ]; then
-  scope_args=(
-    --data-urlencode "runner_type=project_type"
-    --data-urlencode "project_id=${PROJECT_ID}"
-    --data-urlencode "locked=true"
-  )
-else
-  scope_args=(
-    --data-urlencode "runner_type=group_type"
-    --data-urlencode "group_id=${GROUP_ID}"
-    --data-urlencode "locked=false"
-  )
-fi
+build_scope_args
 
+# shellcheck disable=SC2154  # scope_args set by build_scope_args
 runner_json=$(gl_curl -X POST \
   "${GITLAB_URL}/api/v4/user/runners" \
   "${scope_args[@]}" \
