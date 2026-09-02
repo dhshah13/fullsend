@@ -64,10 +64,22 @@ type codexThreadStartedEvent struct {
 
 // codexUsage is `Usage` on turn.completed. Every field is an i64 on the wire.
 //
-// IMPORTANT: the processor fills this from `usage_from_last_total()`, i.e. the
-// thread's *cumulative* token usage, not the delta for the turn that just
-// finished. Successive turn.completed values therefore replace each other;
-// summing them would double-count.
+// Two things about it differ from fullsend's normalized counters, and both
+// have to be undone before the values reach an AgentEvent:
+//
+//  1. It is *cumulative* for the thread, not the delta for the turn that just
+//     finished — the processor fills it from `usage_from_last_total()`. So
+//     successive turn.completed values replace each other; summing them would
+//     double-count.
+//  2. Its categories are **nested**, following the OpenAI Responses API:
+//     input_tokens is the whole input including the cached and cache-write
+//     parts, and output_tokens is the whole output including the reasoning
+//     part. Claude Code and pi report cache and reasoning as counters
+//     *disjoint* from input/output (Anthropic's convention), which is what
+//     RunMetrics means and what the renderer sums for its total. Passing
+//     codex's numbers through unchanged double-counted every cached and
+//     reasoning token — the live fixture's 41,615 real tokens rendered as
+//     ~83,000. codexUsage.counters() subtracts the subsets.
 type codexUsage struct {
 	InputTokens           int `json:"input_tokens"`
 	CachedInputTokens     int `json:"cached_input_tokens"`
@@ -78,6 +90,54 @@ type codexUsage struct {
 
 type codexTurnCompletedEvent struct {
 	Usage codexUsage `json:"usage"`
+}
+
+// codexCounters is a usage snapshot in fullsend's normalized shape: five
+// disjoint counters, as Claude Code and pi report them and as the renderer
+// and RunMetrics sum them.
+type codexCounters struct {
+	Input      int
+	Output     int
+	Reasoning  int
+	CacheRead  int
+	CacheWrite int
+}
+
+// counters converts a codex snapshot into the normalized shape by subtracting
+// the nested subsets. The subtractions are floored at zero: the fields come
+// from a model service, and a snapshot whose parts exceed its whole must not
+// produce a negative count.
+func (u codexUsage) counters() codexCounters {
+	return codexCounters{
+		Input:      nonNegative(u.InputTokens - u.CachedInputTokens - u.CacheWriteInputTokens),
+		Output:     nonNegative(u.OutputTokens - u.ReasoningOutputTokens),
+		Reasoning:  u.ReasoningOutputTokens,
+		CacheRead:  u.CachedInputTokens,
+		CacheWrite: u.CacheWriteInputTokens,
+	}
+}
+
+// highWater returns the per-field maximum of two snapshots. The cumulative
+// usage should only grow; when a snapshot reports less than the one before
+// it, keeping the larger value stops the baseline from dropping. Without
+// that, a 500 -> 300 -> 500 sequence emits deltas of 500, 0 and 200 — 700
+// tokens for a thread that used 500.
+func (c codexCounters) highWater(o codexCounters) codexCounters {
+	return codexCounters{
+		Input:      max(c.Input, o.Input),
+		Output:     max(c.Output, o.Output),
+		Reasoning:  max(c.Reasoning, o.Reasoning),
+		CacheRead:  max(c.CacheRead, o.CacheRead),
+		CacheWrite: max(c.CacheWrite, o.CacheWrite),
+	}
+}
+
+// nonNegative floors a value at zero.
+func nonNegative(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // codexErrorPayload is ThreadErrorEvent / ErrorItem / McpToolCallItemError —
@@ -313,11 +373,13 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 
 	var (
 		numTurns int
-		// usage is cumulative on the wire, so the newest turn.completed
-		// replaces the previous value; reported is what has already been
-		// announced as a TokensEvent, so each turn shows its own delta.
-		usage    codexUsage
-		reported codexUsage
+		// counters is the normalized high-water snapshot for the thread:
+		// cumulative on the wire, so a newer turn.completed replaces it
+		// rather than adding to it, and never lowers it. reported is what
+		// has already been announced as a TokensEvent, so each turn shows
+		// its own delta.
+		counters codexCounters
+		reported codexCounters
 		terminal codexTerminalKind
 		// terminalErrMsg is the message from the deciding turn.failed.
 		terminalErrMsg string
@@ -327,25 +389,18 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 		criticalErrMsg string
 	)
 
-	// nonNegative floors a delta at zero. The usage snapshot should only
-	// grow, but it is a value the model service reports and a non-monotonic
-	// one must not surface as a negative token count.
-	nonNegative := func(n int) int {
-		if n < 0 {
-			return 0
-		}
-		return n
-	}
-
+	// emitTokensDelta announces what the newest snapshot added. Because
+	// counters is a high-water mark, every field of the delta is already
+	// non-negative.
 	emitTokensDelta := func() {
 		delta := TokensEvent{
-			InputTokens:     nonNegative(usage.InputTokens - reported.InputTokens),
-			OutputTokens:    nonNegative(usage.OutputTokens - reported.OutputTokens),
-			ReasoningTokens: nonNegative(usage.ReasoningOutputTokens - reported.ReasoningOutputTokens),
-			CacheRead:       nonNegative(usage.CachedInputTokens - reported.CachedInputTokens),
-			CacheWrite:      nonNegative(usage.CacheWriteInputTokens - reported.CacheWriteInputTokens),
+			InputTokens:     counters.Input - reported.Input,
+			OutputTokens:    counters.Output - reported.Output,
+			ReasoningTokens: counters.Reasoning - reported.Reasoning,
+			CacheRead:       counters.CacheRead - reported.CacheRead,
+			CacheWrite:      counters.CacheWrite - reported.CacheWrite,
 		}
-		reported = usage
+		reported = counters
 		onEvent(delta)
 	}
 
@@ -458,11 +513,11 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 		result := ResultEvent{
 			NumTurns:                 numTurns,
 			TotalCostUSD:             0, // codex reports no cost
-			InputTokens:              usage.InputTokens,
-			OutputTokens:             usage.OutputTokens,
-			ReasoningTokens:          usage.ReasoningOutputTokens,
-			CacheCreationInputTokens: usage.CacheWriteInputTokens,
-			CacheReadInputTokens:     usage.CachedInputTokens,
+			InputTokens:              counters.Input,
+			OutputTokens:             counters.Output,
+			ReasoningTokens:          counters.Reasoning,
+			CacheCreationInputTokens: counters.CacheWrite,
+			CacheReadInputTokens:     counters.CacheRead,
 		}
 		switch terminal {
 		case codexTerminalCompleted:
@@ -534,7 +589,7 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 				continue
 			}
 			numTurns++
-			usage = evt.Usage
+			counters = counters.highWater(evt.Usage.counters())
 			emitTokensDelta()
 			terminal = codexTerminalCompleted
 			terminalErrMsg = ""

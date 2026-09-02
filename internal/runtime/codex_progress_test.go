@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,21 +94,30 @@ func TestParseCodexStream_BasicRun(t *testing.T) {
 	assert.Equal(t, "Write", tools[1].Name, "kind=add maps to Write")
 	assert.Equal(t, "/sandbox/workspace/repo/hello.txt", tools[1].Summary)
 
+	// codex nests its categories: input_tokens 41320 includes the 27386
+	// cached and 13925 cache-write tokens, and output_tokens 295 includes
+	// the 74 reasoning tokens. The normalized counters are disjoint, so the
+	// five sum to the 41615 tokens the thread actually used rather than to
+	// ~83000.
 	tokens := codexEventsOfType[TokensEvent](events)
 	require.Len(t, tokens, 1)
-	assert.Equal(t, 41320, tokens[0].InputTokens)
-	assert.Equal(t, 295, tokens[0].OutputTokens)
+	assert.Equal(t, 9, tokens[0].InputTokens, "41320 - 27386 - 13925")
+	assert.Equal(t, 221, tokens[0].OutputTokens, "295 - 74")
 	assert.Equal(t, 74, tokens[0].ReasoningTokens)
 	assert.Equal(t, 27386, tokens[0].CacheRead)
 	assert.Equal(t, 13925, tokens[0].CacheWrite)
+	assert.Equal(t, 41615,
+		tokens[0].InputTokens+tokens[0].OutputTokens+tokens[0].ReasoningTokens+
+			tokens[0].CacheRead+tokens[0].CacheWrite,
+		"the renderer sums all five, so they must not overlap")
 
 	result := codexOnlyResult(t, events)
 	assert.False(t, result.IsError)
 	assert.Empty(t, result.Subtype)
 	assert.Equal(t, 1, result.NumTurns)
 	assert.Zero(t, result.TotalCostUSD, "codex reports no cost")
-	assert.Equal(t, 41320, result.InputTokens)
-	assert.Equal(t, 295, result.OutputTokens)
+	assert.Equal(t, 9, result.InputTokens)
+	assert.Equal(t, 221, result.OutputTokens)
 	assert.Equal(t, 74, result.ReasoningTokens)
 	assert.Equal(t, 13925, result.CacheCreationInputTokens)
 	assert.Equal(t, 27386, result.CacheReadInputTokens)
@@ -337,16 +347,24 @@ func TestParseCodexStream_LastTerminalEventWins(t *testing.T) {
 	assert.Equal(t, 2, second.NumTurns)
 }
 
-func TestParseCodexStream_TokenDeltasNeverGoNegative(t *testing.T) {
+func TestParseCodexStream_SnapshotBaselineNeverDrops(t *testing.T) {
 	t.Parallel()
 
-	// The usage snapshot should only grow; a service that reports a smaller
-	// one must not produce negative token counts.
+	// A snapshot that reports less than the one before it must not lower the
+	// baseline: if it did, the next increase would be measured from the
+	// smaller value and counted twice. 500 -> 300 -> 500 is one thread that
+	// used 500, not 700.
+	snapshot := func(in int) string {
+		return fmt.Sprintf(
+			`{"type":"turn.completed","usage":{"input_tokens":%d,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}`, in)
+	}
 	stream := strings.Join([]string{
 		`{"type":"thread.started","thread_id":"t1"}`,
-		`{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":100,"cache_write_input_tokens":50,"output_tokens":80,"reasoning_output_tokens":9}}`,
+		snapshot(500),
 		`{"type":"turn.started"}`,
-		`{"type":"turn.completed","usage":{"input_tokens":300,"cached_input_tokens":40,"cache_write_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":1}}`,
+		snapshot(300),
+		`{"type":"turn.started"}`,
+		snapshot(500),
 	}, "\n")
 
 	var events []AgentEvent
@@ -356,12 +374,19 @@ func TestParseCodexStream_TokenDeltasNeverGoNegative(t *testing.T) {
 	require.NoError(t, err)
 
 	tokens := codexEventsOfType[TokensEvent](events)
-	require.Len(t, tokens, 2)
-	assert.Equal(t, TokensEvent{}, tokens[1], "a shrinking snapshot floors every delta at 0")
+	require.Len(t, tokens, 3)
+	assert.Equal(t, 500, tokens[0].InputTokens)
+	assert.Equal(t, 0, tokens[1].InputTokens, "a smaller snapshot adds nothing")
+	assert.Equal(t, 0, tokens[2].InputTokens, "and does not let the recovery be counted again")
 
-	// The result still reports the latest snapshot verbatim.
+	total := 0
+	for _, tk := range tokens {
+		total += tk.InputTokens
+	}
+	assert.Equal(t, 500, total, "the deltas sum to the thread's usage, not 700")
+
 	result := codexOnlyResult(t, events)
-	assert.Equal(t, 300, result.InputTokens)
+	assert.Equal(t, 500, result.InputTokens, "the high-water mark, not the last snapshot")
 }
 
 func TestParseCodexStream_FailedFileChangeWithoutPaths(t *testing.T) {
@@ -405,18 +430,21 @@ func TestParseCodexStream_UsageIsCumulativeNotSummed(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// Snapshots are nested as well as cumulative: turn 1 is
+	// 100 - 10 - 5 = 85 uncached input and 20 - 2 = 18 non-reasoning output;
+	// turn 2 is 250 - 40 - 5 = 205 and 70 - 9 = 61.
 	tokens := codexEventsOfType[TokensEvent](events)
 	require.Len(t, tokens, 2)
-	assert.Equal(t, 100, tokens[0].InputTokens)
-	assert.Equal(t, 150, tokens[1].InputTokens, "second turn reports its delta")
-	assert.Equal(t, 50, tokens[1].OutputTokens)
+	assert.Equal(t, 85, tokens[0].InputTokens)
+	assert.Equal(t, 120, tokens[1].InputTokens, "205 - 85: the second turn's delta")
+	assert.Equal(t, 43, tokens[1].OutputTokens, "61 - 18")
 	assert.Equal(t, 30, tokens[1].CacheRead)
 	assert.Equal(t, 0, tokens[1].CacheWrite)
 
 	result := codexOnlyResult(t, events)
 	assert.Equal(t, 2, result.NumTurns)
-	assert.Equal(t, 250, result.InputTokens, "cumulative, not 350")
-	assert.Equal(t, 70, result.OutputTokens)
+	assert.Equal(t, 205, result.InputTokens, "cumulative, not summed")
+	assert.Equal(t, 61, result.OutputTokens)
 	assert.Equal(t, 9, result.ReasoningTokens)
 	assert.Equal(t, 5, result.CacheCreationInputTokens)
 	assert.Equal(t, 40, result.CacheReadInputTokens)
@@ -481,8 +509,9 @@ func TestParseCodexStream_TurnStartedReopensTheVerdict(t *testing.T) {
 	assert.True(t, result.IsError)
 	assert.Equal(t, codexSubtypeIncomplete, result.Subtype)
 	assert.Equal(t, 1, result.NumTurns, "only the first turn completed")
-	// Usage from the completed turn is still reported.
-	assert.Equal(t, 800, result.InputTokens)
+	// Usage from the completed turn is still reported, normalized:
+	// 800 - 200 cached - 100 cache-write.
+	assert.Equal(t, 500, result.InputTokens)
 
 	// A failed turn followed by a new turn is reopened the same way.
 	stream := strings.Join([]string{
@@ -703,8 +732,8 @@ func TestApplyCodexMetrics(t *testing.T) {
 	}
 
 	assert.Equal(t, 1, metrics.NumTurns)
-	assert.Equal(t, 41320, metrics.InputTokens)
-	assert.Equal(t, 295, metrics.OutputTokens)
+	assert.Equal(t, 9, metrics.InputTokens)
+	assert.Equal(t, 221, metrics.OutputTokens)
 	assert.Equal(t, 74, metrics.ReasoningTokens)
 	assert.Equal(t, 13925, metrics.CacheCreationInputTokens)
 	assert.Equal(t, 27386, metrics.CacheReadInputTokens)

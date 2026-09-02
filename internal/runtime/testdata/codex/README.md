@@ -92,7 +92,18 @@ in `parseCodexStream`:
 - **`turn.completed.usage` is cumulative for the thread**, not the delta for the
   turn that just ended (`usage_from_last_total()` reads the last
   `ThreadTokenUsageUpdated` total). Successive values replace each other;
-  summing them double-counts.
+  summing them double-counts. The parser also keeps a per-field high-water
+  mark, so a snapshot that reports *less* than the one before it cannot lower
+  the baseline and let the recovery be counted twice.
+- **The usage categories are nested, not disjoint.** Following the OpenAI
+  Responses API, `input_tokens` is the whole input *including*
+  `cached_input_tokens` and `cache_write_input_tokens`, and `output_tokens` is
+  the whole output *including* `reasoning_output_tokens`. Anthropic's
+  convention — the one fullsend's `RunMetrics` and the renderer's total assume
+  — is the opposite: cache and reasoning are separate from input and output.
+  `codexUsage.counters()` subtracts the subsets so the five normalized
+  counters sum to the tokens actually used. In `basic_run.jsonl` that is
+  41,615; passed through unchanged it would render as ~83,000.
 - **An `error` item is not a failure.** The processor emits one for config
   warnings, generic warnings, deprecation notices and model reroutes, and keeps
   the status `Running`.
