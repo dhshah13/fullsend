@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Capture a live `codex exec --json` basic_run.jsonl for parseCodexStream tests.
+# Capture a live `codex exec --json` basic_run.ndjson for parseCodexStream tests.
 #
-# Only basic_run.jsonl is a live capture. The other fixtures stay hand-authored
+# Only basic_run.ndjson is a live capture. The other fixtures stay hand-authored
 # to the event structs in codex-rs/exec/src/exec_events.rs (see README.md), so
 # they can cover shapes a happy-path run never produces: turn.failed, a
 # top-level error, MCP calls, declined commands, malformed and truncated lines.
@@ -45,7 +45,7 @@ trap 'rm -rf "${WORKDIR}"' EXIT
 
 echo "regen.sh: capturing with ${PKG} in ${WORKDIR}" >&2
 
-RAW="${WORKDIR}/raw.jsonl"
+RAW="${WORKDIR}/raw.ndjson"
 # workspace-write + approval_policy=never keeps the capture non-interactive and
 # confined to WORKDIR. `codex exec` has no --ask-for-approval flag; the policy
 # is a -c override. model_reasoning_summary=detailed is what makes the run emit
@@ -71,12 +71,12 @@ WORKDIR="${WORKDIR}" python3 -c '
 import os, sys
 work = os.environ["WORKDIR"]
 sys.stdout.write(sys.stdin.read().replace(work, "/sandbox/workspace/repo"))
-' <"${RAW}" >"${DIR}/basic_run.jsonl"
+' <"${RAW}" >"${DIR}/basic_run.ndjson"
 
-if grep -qF "${WORKDIR}" "${DIR}/basic_run.jsonl"; then
+if grep -qF "${WORKDIR}" "${DIR}/basic_run.ndjson"; then
 	echo "regen.sh: refusing to keep a capture that still contains ${WORKDIR}" >&2
 	exit 1
 fi
 
-echo "wrote ${DIR}/basic_run.jsonl ($(wc -l <"${DIR}/basic_run.jsonl") lines) with ${PKG}"
+echo "wrote ${DIR}/basic_run.ndjson ($(wc -l <"${DIR}/basic_run.ndjson") lines) with ${PKG}"
 echo "update README.md with the model and version, and re-check the expected events in codex_progress_test.go" >&2

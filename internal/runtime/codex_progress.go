@@ -229,7 +229,7 @@ func codexOutputTail(s string) string {
 	}
 	if utf8.RuneCountInString(s) > codexOutputTailMax {
 		runes := []rune(s)
-		return "..." + string(runes[len(runes)-codexOutputTailMax:])
+		return "…" + string(runes[len(runes)-codexOutputTailMax:])
 	}
 	return s
 }
@@ -239,7 +239,7 @@ func codexOutputTail(s string) string {
 func codexCapPath(path string) string {
 	path = redactSummary(path)
 	if utf8.RuneCountInString(path) > maxPathDisplay {
-		return string([]rune(path)[:maxPathDisplay]) + "..."
+		return string([]rune(path)[:maxPathDisplay]) + "…"
 	}
 	return path
 }
@@ -259,9 +259,12 @@ func codexCommandSummary(item codexCommandExecutionItem) string {
 	case "declined":
 		suffix = "blocked"
 	case "failed":
+		// The status is the finding; the exit code only qualifies it. An
+		// earlier version replaced the label with "exit N", which rendered a
+		// failed item that reported exit 0 as if it had succeeded.
 		suffix = "failed"
 		if item.ExitCode != nil {
-			suffix = fmt.Sprintf("exit %d", *item.ExitCode)
+			suffix = fmt.Sprintf("failed (exit %d)", *item.ExitCode)
 		}
 	case "completed":
 		if item.ExitCode != nil && *item.ExitCode != 0 {
@@ -488,7 +491,7 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 			}
 			summary := redactSummary(item.Query)
 			if utf8.RuneCountInString(summary) > maxPatternDisplay {
-				summary = string([]rune(summary)[:maxPatternDisplay]) + "..."
+				summary = string([]rune(summary)[:maxPatternDisplay]) + "…"
 			}
 			onEvent(ToolUseEvent{Name: "WebSearch", Summary: summary})
 		case "error":

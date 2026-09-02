@@ -64,7 +64,7 @@ func codexOnlyResult(t *testing.T, events []AgentEvent) ResultEvent {
 func TestParseCodexStream_BasicRun(t *testing.T) {
 	t.Parallel()
 
-	events, threadID := collectCodexEvents(t, "basic_run.jsonl")
+	events, threadID := collectCodexEvents(t, "basic_run.ndjson")
 
 	// Asserted by shape, not value: regen.sh produces a new id every time
 	// and re-capturing the fixture must not require editing this test.
@@ -140,7 +140,7 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 	}{
 		{
 			name:        "turn.failed is a failed run",
-			fixture:     "turn_failed.jsonl",
+			fixture:     "turn_failed.ndjson",
 			threadID:    "01a06300-0000-7000-8000-000000000001",
 			wantErr:     true,
 			subtype:     codexSubtypeFailed,
@@ -150,7 +150,7 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 		},
 		{
 			name:      "warnings and a top-level error before a completed turn are not failures",
-			fixture:   "error_event.jsonl",
+			fixture:   "error_event.ndjson",
 			threadID:  "01a06300-0000-7000-8000-000000000002",
 			wantErr:   false,
 			numTurns:  1,
@@ -158,7 +158,7 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 		},
 		{
 			name:        "a top-level error with no terminal event is incomplete",
-			fixture:     "critical_error_only.jsonl",
+			fixture:     "critical_error_only.ndjson",
 			threadID:    "01a06300-0000-7000-8000-000000000003",
 			wantErr:     true,
 			subtype:     codexSubtypeIncomplete,
@@ -167,7 +167,7 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 		},
 		{
 			name:     "every tool item kind",
-			fixture:  "mcp_and_file_change.jsonl",
+			fixture:  "mcp_and_file_change.ndjson",
 			threadID: "01a06300-0000-7000-8000-000000000004",
 			numTurns: 1,
 			toolNames: []string{
@@ -183,14 +183,14 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 		},
 		{
 			name:      "malformed and empty lines are skipped",
-			fixture:   "malformed_line.jsonl",
+			fixture:   "malformed_line.ndjson",
 			threadID:  "01a06300-0000-7000-8000-000000000006",
 			numTurns:  1,
 			toolNames: []string{"Bash"},
 		},
 		{
 			name:      "a truncated stream yields what it has",
-			fixture:   "truncated.jsonl",
+			fixture:   "truncated.ndjson",
 			threadID:  "01a06300-0000-7000-8000-000000000007",
 			wantErr:   true,
 			subtype:   codexSubtypeIncomplete,
@@ -199,7 +199,7 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 		},
 		{
 			name:      "a second turn that never finishes is not the first turn's success",
-			fixture:   "second_turn_unfinished.jsonl",
+			fixture:   "second_turn_unfinished.ndjson",
 			threadID:  "01a06300-0000-7000-8000-000000000008",
 			wantErr:   true,
 			subtype:   codexSubtypeIncomplete,
@@ -208,7 +208,7 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 		},
 		{
 			name:      "unknown top-level and item types are skipped",
-			fixture:   "unknown_types.jsonl",
+			fixture:   "unknown_types.ndjson",
 			threadID:  "01a06300-0000-7000-8000-000000000005",
 			numTurns:  1,
 			toolNames: []string{"Bash"},
@@ -244,7 +244,7 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 func TestParseCodexStream_ToolSummaries(t *testing.T) {
 	t.Parallel()
 
-	events, _ := collectCodexEvents(t, "mcp_and_file_change.jsonl")
+	events, _ := collectCodexEvents(t, "mcp_and_file_change.ndjson")
 	tools := codexEventsOfType[ToolUseEvent](events)
 	require.Len(t, tools, 10)
 
@@ -274,7 +274,7 @@ func TestParseCodexStream_ToolSummaries(t *testing.T) {
 func TestParseCodexStream_FailedCommandShowsOutputTail(t *testing.T) {
 	t.Parallel()
 
-	events, _ := collectCodexEvents(t, "turn_failed.jsonl")
+	events, _ := collectCodexEvents(t, "turn_failed.ndjson")
 	tools := codexEventsOfType[ToolUseEvent](events)
 	require.Len(t, tools, 1)
 	assert.Equal(t, "Bash", tools[0].Name)
@@ -287,7 +287,7 @@ func TestParseCodexStream_FailedCommandShowsOutputTail(t *testing.T) {
 func TestParseCodexStream_ErrorItemsAreNotFatal(t *testing.T) {
 	t.Parallel()
 
-	events, _ := collectCodexEvents(t, "error_event.jsonl")
+	events, _ := collectCodexEvents(t, "error_event.ndjson")
 
 	// The renderer prints every ErrorEvent as a failure line, so a run that
 	// succeeded must emit none — neither the warning item nor the
@@ -300,7 +300,7 @@ func TestParseCodexStream_ErrorItemsAreNotFatal(t *testing.T) {
 	assert.Empty(t, result.ErrorMessage)
 
 	// A failed run does emit one, so a real failure is still visible.
-	failed, _ := collectCodexEvents(t, "turn_failed.jsonl")
+	failed, _ := collectCodexEvents(t, "turn_failed.ndjson")
 	errs := codexEventsOfType[ErrorEvent](failed)
 	require.Len(t, errs, 1)
 	assert.Equal(t, codexSubtypeFailed, errs[0].ErrorType)
@@ -503,7 +503,7 @@ func TestParseCodexStream_TurnStartedReopensTheVerdict(t *testing.T) {
 	// turn.completed decides the turn it ends, not the run: a turn that
 	// starts afterwards and never finishes must reopen the verdict, or a
 	// stream killed mid-second-turn reports the first turn's success.
-	events, _ := collectCodexEvents(t, "second_turn_unfinished.jsonl")
+	events, _ := collectCodexEvents(t, "second_turn_unfinished.ndjson")
 
 	result := codexOnlyResult(t, events)
 	assert.True(t, result.IsError)
@@ -608,7 +608,7 @@ func TestCodexOutputTail(t *testing.T) {
 
 	long := strings.Repeat("a", codexOutputTailMax) + "TAIL"
 	got := codexOutputTail(long)
-	assert.True(t, strings.HasPrefix(got, "..."), "the head is dropped, not the tail")
+	assert.True(t, strings.HasPrefix(got, "…"), "the head is dropped, not the tail")
 	assert.True(t, strings.HasSuffix(got, "TAIL"))
 
 	assert.Equal(t, "(output too large to summarize)",
@@ -641,6 +641,21 @@ func TestCodexCommandSummary_Branches(t *testing.T) {
 			want: "$ timeout 1 sleep 5 (failed: killed)",
 		},
 		{
+			name: "failed with an exit code keeps the failure visible",
+			item: codexCommandExecutionItem{
+				Command: "make build", AggregatedOutput: "boom\n", ExitCode: exit(1), Status: "failed",
+			},
+			want: "$ make build (failed (exit 1): boom)",
+		},
+		{
+			// A failed item that reports exit 0 must not read as a success.
+			name: "failed with exit 0 still says failed",
+			item: codexCommandExecutionItem{
+				Command: "flaky", AggregatedOutput: "", ExitCode: exit(0), Status: "failed",
+			},
+			want: "$ flaky (failed (exit 0))",
+		},
+		{
 			name: "an empty command still carries its outcome",
 			item: codexCommandExecutionItem{Command: "", ExitCode: nil, Status: "declined"},
 			want: "blocked",
@@ -669,8 +684,8 @@ func TestCodexSummaries_AreCapped(t *testing.T) {
 
 	longPath := "/sandbox/workspace/repo/" + strings.Repeat("d/", maxPathDisplay) + "f.go"
 	capped := codexCapPath(longPath)
-	assert.True(t, strings.HasSuffix(capped, "..."))
-	assert.Equal(t, maxPathDisplay+3, len([]rune(capped)))
+	assert.True(t, strings.HasSuffix(capped, "…"))
+	assert.Equal(t, maxPathDisplay+1, len([]rune(capped)), "one ellipsis rune, as claude and pi use")
 
 	longQuery := strings.Repeat("q", maxPatternDisplay+40)
 	stream := strings.Join([]string{
@@ -689,8 +704,8 @@ func TestCodexSummaries_AreCapped(t *testing.T) {
 	tools := codexEventsOfType[ToolUseEvent](events)
 	require.Len(t, tools, 2)
 	assert.Equal(t, "WebSearch", tools[0].Name)
-	assert.Equal(t, maxPatternDisplay+3, len([]rune(tools[0].Summary)))
-	assert.True(t, strings.HasSuffix(tools[0].Summary, "..."))
+	assert.Equal(t, maxPatternDisplay+1, len([]rune(tools[0].Summary)))
+	assert.True(t, strings.HasSuffix(tools[0].Summary, "…"))
 
 	// A failed MCP call with no error object still reports the failure.
 	assert.Equal(t, "mcp__jira__search", tools[1].Name)
@@ -724,7 +739,7 @@ func TestCodexFileChangeTool(t *testing.T) {
 func TestApplyCodexMetrics(t *testing.T) {
 	t.Parallel()
 
-	events, _ := collectCodexEvents(t, "basic_run.jsonl")
+	events, _ := collectCodexEvents(t, "basic_run.ndjson")
 
 	var metrics RunMetrics
 	for _, evt := range events {
@@ -749,7 +764,7 @@ func TestApplyCodexMetrics(t *testing.T) {
 func TestApplyCodexMetrics_CountsEveryFileChange(t *testing.T) {
 	t.Parallel()
 
-	events, _ := collectCodexEvents(t, "mcp_and_file_change.jsonl")
+	events, _ := collectCodexEvents(t, "mcp_and_file_change.ndjson")
 
 	var metrics RunMetrics
 	for _, evt := range events {
@@ -766,9 +781,9 @@ func TestIsCodexStreamCapture(t *testing.T) {
 	t.Parallel()
 
 	for _, name := range []string{
-		"basic_run.jsonl", "turn_failed.jsonl", "error_event.jsonl",
-		"critical_error_only.jsonl", "mcp_and_file_change.jsonl",
-		"malformed_line.jsonl", "truncated.jsonl", "unknown_types.jsonl",
+		"basic_run.ndjson", "turn_failed.ndjson", "error_event.ndjson",
+		"critical_error_only.ndjson", "mcp_and_file_change.ndjson",
+		"malformed_line.ndjson", "truncated.ndjson", "unknown_types.ndjson",
 	} {
 		assert.True(t, isCodexStreamCapture(readCodexFixture(t, name)), "fixture %s", name)
 	}
@@ -823,17 +838,17 @@ func TestCodexStreamVerdict(t *testing.T) {
 		subtype     string
 		errContains string
 	}{
-		{fixture: "basic_run.jsonl"},
-		{fixture: "error_event.jsonl"},
-		{fixture: "mcp_and_file_change.jsonl"},
-		{fixture: "malformed_line.jsonl"},
-		{fixture: "unknown_types.jsonl"},
-		{fixture: "turn_failed.jsonl", wantErr: true, subtype: codexSubtypeFailed, errContains: "429"},
+		{fixture: "basic_run.ndjson"},
+		{fixture: "error_event.ndjson"},
+		{fixture: "mcp_and_file_change.ndjson"},
+		{fixture: "malformed_line.ndjson"},
+		{fixture: "unknown_types.ndjson"},
+		{fixture: "turn_failed.ndjson", wantErr: true, subtype: codexSubtypeFailed, errContains: "429"},
 		{
-			fixture: "critical_error_only.jsonl", wantErr: true,
+			fixture: "critical_error_only.ndjson", wantErr: true,
 			subtype: codexSubtypeIncomplete, errContains: "401 Unauthorized",
 		},
-		{fixture: "truncated.jsonl", wantErr: true, subtype: codexSubtypeIncomplete},
+		{fixture: "truncated.ndjson", wantErr: true, subtype: codexSubtypeIncomplete},
 	}
 
 	for _, tt := range tests {
@@ -860,10 +875,10 @@ func TestCodexStreamVerdict(t *testing.T) {
 func TestCodexStreamVerdict_RejectsNonCaptures(t *testing.T) {
 	t.Parallel()
 
-	_, ok := codexStreamVerdict([]byte("not a capture\n"), "x.jsonl")
+	_, ok := codexStreamVerdict([]byte("not a capture\n"), "x.ndjson")
 	assert.False(t, ok)
 
-	_, ok = parseCodexTranscriptFile(filepath.Join("testdata", "codex", "does-not-exist.jsonl"))
+	_, ok = parseCodexTranscriptFile(filepath.Join("testdata", "codex", "does-not-exist.ndjson"))
 	assert.False(t, ok, "a missing file is not a verdict")
 }
 

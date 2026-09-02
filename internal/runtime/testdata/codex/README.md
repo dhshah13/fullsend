@@ -6,10 +6,10 @@ Inputs for `parseCodexStream` (`internal/runtime/codex_progress.go`) and its tes
 
 | Fixture | Origin |
 |---|---|
-| `basic_run.jsonl` | **Live capture**, 2026-09-02, `@openai/codex@0.152.1` (`npx`), model `gpt-5.6-luna`, host login (`~/.codex/auth.json`). Captured by `regen.sh`; the throwaway working directory was rewritten to `/sandbox/workspace/repo`, nothing else was edited. |
+| `basic_run.ndjson` | **Live capture**, 2026-09-02, `@openai/codex@0.152.1` (`npx`), model `gpt-5.6-luna`, host login (`~/.codex/auth.json`). Captured by `regen.sh`; the throwaway working directory was rewritten to `/sandbox/workspace/repo`, nothing else was edited. |
 | everything else | Hand-authored to the structs below. |
 
-`regen.sh` re-captures `basic_run.jsonl` only. It reads `ARG CODEX_VERSION` from
+`regen.sh` re-captures `basic_run.ndjson` only. It reads `ARG CODEX_VERSION` from
 `images/sandbox/Containerfile` (added by the image-pin PR of the codex runtime
 stack) and falls back to the `CODEX_VERSION` environment variable, so until that
 ARG exists run `CODEX_VERSION=0.152.1 ./regen.sh`.
@@ -18,14 +18,14 @@ ARG exists run `CODEX_VERSION=0.152.1 ./regen.sh`.
 
 | Fixture | Covers |
 |---|---|
-| `turn_failed.jsonl` | `turn.failed` after a failed command — the run is an error, with the bounded message. |
-| `error_event.jsonl` | An `error` **item** (a warning/model-reroute) and a **top-level** `error`, both followed by `turn.completed`: neither fails the run. |
-| `critical_error_only.jsonl` | A top-level `error` and then nothing: no terminal event, so the run is incomplete and the parked message is the reason. |
-| `mcp_and_file_change.jsonl` | `file_change` (add/update/delete, and a failed patch), `mcp_tool_call` (success and error), `web_search`, `collab_tool_call`, `todo_list`, a `declined` command, and a multi-line command. |
-| `malformed_line.jsonl` | Garbage, half-written and empty lines mid-stream: skipped, the run still completes. |
-| `truncated.jsonl` | Killed mid-write — the last line stops mid-token and there is no terminal event. (The repo's `end-of-file-fixer` hook keeps a trailing newline after it; the line is still unparseable, which is what the fixture tests.) |
-| `unknown_types.jsonl` | An unknown top-level event type and an unknown item type: skipped, the run still completes. |
-| `second_turn_unfinished.jsonl` | A completed turn followed by a second `turn.started` that never finishes: the run is incomplete, not the first turn's success. |
+| `turn_failed.ndjson` | `turn.failed` after a failed command — the run is an error, with the bounded message. |
+| `error_event.ndjson` | An `error` **item** (a warning/model-reroute) and a **top-level** `error`, both followed by `turn.completed`: neither fails the run. |
+| `critical_error_only.ndjson` | A top-level `error` and then nothing: no terminal event, so the run is incomplete and the parked message is the reason. |
+| `mcp_and_file_change.ndjson` | `file_change` (add/update/delete, and a failed patch), `mcp_tool_call` (success and error), `web_search`, `collab_tool_call`, `todo_list`, a `declined` command, and a multi-line command. |
+| `malformed_line.ndjson` | Garbage, half-written and empty lines mid-stream: skipped, the run still completes. |
+| `truncated.ndjson` | Killed mid-write — the last line stops mid-token and there is no terminal event. (The repo's `end-of-file-fixer` hook keeps a trailing newline after it; the line is still unparseable, which is what the fixture tests.) |
+| `unknown_types.ndjson` | An unknown top-level event type and an unknown item type: skipped, the run still completes. |
+| `second_turn_unfinished.ndjson` | A completed turn followed by a second `turn.started` that never finishes: the run is incomplete, not the first turn's success. |
 
 ## Event structs
 
@@ -102,7 +102,7 @@ in `parseCodexStream`:
   convention — the one fullsend's `RunMetrics` and the renderer's total assume
   — is the opposite: cache and reasoning are separate from input and output.
   `codexUsage.counters()` subtracts the subsets so the five normalized
-  counters sum to the tokens actually used. In `basic_run.jsonl` that is
+  counters sum to the tokens actually used. In `basic_run.ndjson` that is
   41,615; passed through unchanged it would render as ~83,000.
 - **An `error` item is not a failure.** The processor emits one for config
   warnings, generic warnings, deprecation notices and model reroutes, and keeps
