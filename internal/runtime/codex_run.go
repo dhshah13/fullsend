@@ -152,19 +152,40 @@ func codexAssetGuard(r CodexRuntime, hooksEnabled bool) string {
 			"test -f "+shellQuote(r.codexManifestPath()),
 			"test -f "+shellQuote(r.codexAdapterPath()),
 			codexSHACheck(r.codexAdapterPath(), codexAssetSHA256(codexHookAdapterPy)),
-			// The wiring itself is rendered per run, so it cannot be pinned by
-			// a compile-time hash; assert instead that every handler still
-			// invokes the adapter this guard just verified. The alternation is
-			// wrapped in a group on purpose: `&&` and `||` are left-associative
-			// in sh, so a bare trailing `|| check` would rescue every earlier
-			// failure in the chain and make the whole guard fail open.
-			"{ ! command -p grep -q '\"command\"' "+shellQuote(r.codexHooksPath())+
-				" || command -p grep -q "+shellQuote(r.codexAdapterPath())+" "+shellQuote(r.codexHooksPath())+"; }",
+			// The wiring is rendered per run, so it cannot be pinned by a
+			// compile-time hash. Instead every handler line must carry both the
+			// "command" key and this adapter's path, so the two counts are
+			// equal: replacing one handler's command with something else, or
+			// adding a handler of the agent's own, breaks the equality.
+			//
+			// What it does not catch is deletion — removing whole handlers
+			// keeps the counts equal and narrows the wiring. That residue is
+			// the same one Claude Code has with its own hooks.json, which is
+			// likewise written once at Bootstrap and agent-writable after.
+			codexHooksAdapterCheck(r.codexHooksPath(), r.codexAdapterPath()),
 		)
 	}
 	return fmt.Sprintf(
 		`{ %s || { echo 'fullsend: codex config, hook adapter or auth script missing or modified; refusing to run' >&2; exit %d; }; }`,
 		strings.Join(checks, " && "), codexHooksMissingExit)
+}
+
+// codexHooksAdapterCheck asserts that every command handler in hooks.json
+// still invokes adapter. The grouping braces are load-bearing: `&&` and `||`
+// are left-associative in sh, so an ungrouped alternation inside the guard's
+// chain would rescue every earlier failure and make the whole guard fail open.
+func codexHooksAdapterCheck(hooksPath, adapter string) string {
+	// `grep -o | wc -l` counts occurrences rather than matching lines: the
+	// runner writes one handler per line, but an agent rewriting the file is
+	// under no such obligation, and a compacted single-line hooks.json would
+	// make a line count collapse to 1 = 1 and pass.
+	count := func(pattern string) string {
+		return fmt.Sprintf(`$(command -p grep -o %s %s | command -p wc -l)`,
+			shellQuote(pattern), shellQuote(hooksPath))
+	}
+	// The key, with its colon: a bare `"command"` would also match the value
+	// in `"type": "command"` and double every handler's count.
+	return fmt.Sprintf(`[ "%s" = "%s" ]`, count(`"command":`), count(adapter))
 }
 
 func codexSHACheck(path, sum string) string {
@@ -249,13 +270,14 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		// `unset -f` is a special builtin, which a function .env defined
 		// cannot shadow, so it restores the real utilities before the second
 		// pass; `command -p` inside the guard defeats a PATH swap.
-		"&& unset -f test command grep cut sha256sum printf codex",
+		"&& unset -f test command grep cut wc sha256sum printf codex",
 		"&& "+codexAssetGuard(r, hooksEnabled),
 		"&& "+codexConfigGuard(r),
 	)
 	if params.Debug != "" {
-		// codex exec has no --debug flag; its tracing goes to stderr behind
-		// the RUST_LOG filter and is silent without one.
+		// codex exec has no --debug flag. Its tracing goes to stderr, at
+		// error level by default — a codex run is not silent there the way pi
+		// is — and RUST_LOG raises it.
 		parts = append(parts, `&& export RUST_LOG="${RUST_LOG:-info}"`)
 	}
 

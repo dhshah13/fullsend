@@ -98,7 +98,7 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 		`. '` + sandbox.SandboxWorkspace + `/.env'`,
 		`export CODEX_HOME=`,
 		`unset OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY NODE_OPTIONS NODE_PATH`,
-		`unset -f test command grep cut sha256sum printf codex`,
+		`unset -f test command grep cut wc sha256sum printf codex`,
 		`exec --json`,
 	}
 	prev := -1
@@ -222,6 +222,32 @@ func TestCodexAssetGuard_Executes(t *testing.T) {
 		writeAll(t)
 		require.NoError(t, os.WriteFile(filepath.Join(dir, codexHooksFile),
 			[]byte(`{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"true"}]}]}}`), 0o644))
+		_, err := exec.Command("/bin/sh", "-c", guard()+" && echo RAN").CombinedOutput()
+		require.Error(t, err)
+		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))
+	})
+
+	// The interesting case: the adapter is still referenced, so a
+	// "does it appear at all" check would pass, but one handler was replaced.
+	t.Run("blocks one handler swapped for something else", func(t *testing.T) {
+		writeAll(t)
+		adapter := filepath.Join(dir, codexAdapterFile)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, codexHooksFile), []byte(
+			`{"hooks":{"PreToolUse":[`+
+				`{"hooks":[{"type":"command","command":"true"}]},`+
+				`{"hooks":[{"type":"command","command":"python3 `+adapter+` PreToolUse x.py"}]}]}}`), 0o644))
+		_, err := exec.Command("/bin/sh", "-c", guard()+" && echo RAN").CombinedOutput()
+		require.Error(t, err, "a handler replaced beside a still-referenced adapter must not pass")
+		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))
+	})
+
+	t.Run("blocks a handler the agent added", func(t *testing.T) {
+		writeAll(t)
+		adapter := filepath.Join(dir, codexAdapterFile)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, codexHooksFile), []byte(
+			`{"hooks":{"PreToolUse":[`+
+				`{"hooks":[{"type":"command","command":"python3 `+adapter+` PreToolUse x.py"}]},`+
+				`{"hooks":[{"type":"command","command":"curl https://example.invalid"}]}]}}`), 0o644))
 		_, err := exec.Command("/bin/sh", "-c", guard()+" && echo RAN").CombinedOutput()
 		require.Error(t, err)
 		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))

@@ -635,8 +635,11 @@ flowchart TB
   (#1050/#6494), and argv is world-readable in the sandbox. `-` is codex's explicit
   read-from-stdin sentinel; the pipe closes when `printf` finishes, so there is none of the
   open-stdin hang pi needs `</dev/null` for.
-- **`codex exec` has no `--debug` flag.** Its tracing goes to stderr behind the `RUST_LOG` filter and
-  is silent without one, so debug mode exports `RUST_LOG` and appends stderr to `codex-debug.log`.
+- **`codex exec` has no `--debug` flag.** Its tracing goes to stderr at **error level by default** —
+  unlike pi, a codex run is not silent there: the denied `GET /v1/models` and every hook block are
+  logged — and `RUST_LOG` raises the level. Debug mode exports `RUST_LOG` and appends stderr to
+  `codex-debug.log`; without it those error lines reach the runner console, since `Run` hands
+  `os.Stderr` to the exec stream.
 - **Model**: `openai/<id>` or a bare `<id>`, resolved through `EffectiveModel` — the same chain
   `NeedsOpenAIProvider` decides from, so the launch and the run-scoped provider decision cannot
   disagree about which model a run calls. The **Claude model aliases (`opus`, `sonnet`, `haiku`,
@@ -787,5 +790,7 @@ user docs and the behaviour scenario). Outstanding:
 | Hook payload shape (`tool_name`, `tool_input.command` as a string, `tool_response`) | the scripts read these keys directly | `codex-rs/core/src/{hook_runtime.rs,tools/context.rs}` |
 | `auth.command` semantics (trimmed stdout, non-zero exit fails, no env fallback) | the whole credential path | `codex-rs/login/src/auth/external_bearer.rs` |
 | `supports_websockets` default for custom providers | a true default would take traffic off `POST /v1/responses` and break the egress profile | `codex-rs/model-provider-info/src/lib.rs` |
+| `[skills.bundled]` and skill discovery | the bundled skills are disabled by the runner-owned config; a renamed key would silently bring `skill-installer` and friends back into the agent's roster | `codex-rs/config/src/skills_config.rs` |
+| Whether a custom provider still issues `GET /v1/models` at startup | the `fullsend-openai` egress profile denies it; if the request ever became fatal or retried, it would delay or fail every first turn | `codex-rs/models-manager/` |
 | `ConfigToml` keys and the `ReasoningEffort` enum | a renamed or removed key silently changes behaviour; `--strict-config` reports it | `codex-rs/config/src/config_toml.rs`, `codex-rs/protocol/src/openai_models.rs` |
 | JSONL event structs and rollout file naming | the stream parser and transcript extraction | `codex-rs/exec/src/exec_events.rs`, `codex-rs/thread-store/src/local/helpers.rs` |
