@@ -22,6 +22,12 @@ func TestSandboxImageCodexDefaults(t *testing.T) {
 	for _, want := range []string{
 		`CODEX_HOME="` + SandboxCodexConfig + `"`,
 		`install -d -o sandbox -g sandbox -m 0755 ` + SandboxCodexConfig,
+		// codex has no env switches for these; the managed System config
+		// layer is where an ad-hoc invocation picks them up.
+		`/etc/codex/config.toml`,
+		`'check_for_update_on_startup = false'`,
+		`'[analytics]'`,
+		`'[feedback]'`,
 	} {
 		assert.Contains(t, containerfile, want)
 	}
@@ -43,7 +49,7 @@ func TestSandboxImageCodexPinWins(t *testing.T) {
 
 	require.Regexp(t, regexp.MustCompile(`(?m)^ARG CODEX_VERSION=\d+\.\d+\.\d+$`), containerfile,
 		"CODEX_VERSION must stay an explicit semver pin")
-	assert.Contains(t, containerfile, `npm install -g @openai/codex@${CODEX_VERSION}`)
+	assert.Contains(t, containerfile, `npm install -g --ignore-scripts @openai/codex@${CODEX_VERSION}`)
 
 	for _, want := range []string{
 		`NPM_CODEX="$(npm prefix -g)/bin/codex"`,
@@ -57,7 +63,7 @@ func TestSandboxImageCodexPinWins(t *testing.T) {
 	}
 
 	// The symlink + assertion must come after the npm install it points at.
-	install := regexp.MustCompile(`npm install -g @openai/codex@`).FindStringIndex(containerfile)
+	install := regexp.MustCompile(`npm install -g --ignore-scripts @openai/codex@`).FindStringIndex(containerfile)
 	link := regexp.MustCompile(`ln -s "\$\{NPM_CODEX\}" /usr/local/bin/codex`).FindStringIndex(containerfile)
 	require.NotNil(t, install)
 	require.NotNil(t, link)

@@ -110,7 +110,7 @@ How the shared PostToolUse chain reaches each runtime — the three sanitizer ro
 
 | Feature | Where it runs | Claude Code | OpenCode (stub) | Pi | Codex (stub) | Notes for future runtimes |
 |---------|---------------|-------------|-----------------|----|--------------|---------------------------|
-| **Sandbox tool hooks wiring** | `SandboxHooksBootstrap` type assert in `Bootstrap` | ✓ scripts at `claude-config/hooks/`, wiring at `claude-config/hooks.json` via `--settings` (#6358) | ✗ — `Bootstrap` is a stub; must wire `security.HookPlan` via OpenCode plugin hooks | ✓ see [pi: hook adapter contract](#hook-adapter-contract) — scripts under `/sandbox/pi-config/hooks/`, `HookPlan` in `fullsend-manifest.json`, embedded `fullsend-hooks.js` loaded with `-e` under `--no-extensions`; fail-closed on a missing/altered adapter (exit 97) or a manifest without a hook plan (exit -1) | N/A — stub | Hook scripts and wiring plan are runtime-neutral (see [Sandbox hook contract](#sandbox-hook-contract)); a runtime that ignores `SandboxHooksBootstrap` installs **no** sandbox tool hooks — say so explicitly here |
+| **Sandbox tool hooks wiring** | `SandboxHooksBootstrap` type assert in `Bootstrap` | ✓ scripts at `claude-config/hooks/`, wiring at `claude-config/hooks.json` via `--settings` (#6358) | ✗ — `Bootstrap` is a stub; must wire `security.HookPlan` via OpenCode plugin hooks | ✓ see [pi: hook adapter contract](#hook-adapter-contract) — scripts under `/sandbox/pi-config/hooks/`, `HookPlan` in `fullsend-manifest.json`, embedded `fullsend-hooks.js` loaded with `-e` under `--no-extensions`; fail-closed on a missing/altered adapter (exit 97) or a manifest without a hook plan (exit -1) | ✗ — `Bootstrap` is a stub; must wire `security.HookPlan` via codex `hooks.json` + an adapter (#6920) | Hook scripts and wiring plan are runtime-neutral (see [Sandbox hook contract](#sandbox-hook-contract)); a runtime that ignores `SandboxHooksBootstrap` installs **no** sandbox tool hooks — say so explicitly here |
 | **Transcript / debug artifacts** | `TranscriptHandler` (+ optional `DebugLogNamer`) | ✓ (stream-json, `claude-debug.log`) | No-op — see #1935 | ✓ session JSONL under `PI_CODING_AGENT_SESSION_DIR` (`ExtractTranscripts`), `pi-debug.log` (`DebugLogNamer`; pi's stderr when `--debug` is set), `ParseTranscriptFile` judges the tee'd `--mode json` stream and session files | N/A — stub | Format-specific; not shared across runtimes. Debug-log filename defaults to `agent-debug.log` unless the runtime implements `DebugLogNamer` |
 
 ### Fail modes
@@ -268,7 +268,7 @@ The image also creates each runtime's config directory when the binary refuses t
 
 ## Sandbox workspace layout
 
-The sandbox has two key directories that map to Claude Code's config levels (plus a runner-owned config directory per additional runtime, e.g. `pi-config/` for pi):
+The sandbox has two key directories that map to Claude Code's config levels (plus a runner-owned config directory per additional runtime, e.g. `pi-config/` for pi and `codex-config/` for codex):
 
 ```
 /sandbox/
@@ -280,6 +280,9 @@ The sandbox has two key directories that map to Claude Code's config levels (plu
 │   ├── fullsend-hooks.js               Hook adapter extension (loaded with -e; --no-extensions otherwise)
 │   ├── fullsend-manifest.json          Agent tools/allowlist, HookPlan, pi version — read by Run and the extension
 │   └── sessions/                       PI_CODING_AGENT_SESSION_DIR (session JSONL → transcripts)
+│
+├── codex-config/                    ← CODEX_HOME (codex runtime; written by CodexRuntime.Bootstrap, #6920)
+│                                       Created by the sandbox image (codex will not start without it)
 │
 ├── claude-config/                   ← CLAUDE_CONFIG_DIR (personal level)
 │   ├── agents/

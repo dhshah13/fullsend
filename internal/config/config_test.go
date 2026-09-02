@@ -429,13 +429,9 @@ func TestOrgConfigValidateRuntime(t *testing.T) {
 	cfg.Defaults.Runtime = "pi"
 	require.NoError(t, cfg.Validate(), "pi is user-selectable (#6464)")
 
-	// opencode and codex are resolvable via runtime.Resolve() but not in
-	// ValidRuntimes(), so config validation must reject them until those
-	// runtimes are implemented.
+	// opencode is resolvable via runtime.Resolve() but not in ValidRuntimes(),
+	// so config validation must reject it until the runtime is implemented.
 	cfg.Defaults.Runtime = "opencode"
-	require.Error(t, cfg.Validate())
-
-	cfg.Defaults.Runtime = "codex"
 	require.Error(t, cfg.Validate())
 
 	cfg.Defaults.Runtime = "invalid"

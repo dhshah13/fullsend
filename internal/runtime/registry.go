@@ -101,7 +101,7 @@ func ResolveForAgent(agents []config.AgentEntry, repoRuntime, agent string) (Bac
 // validateConfigRuntime checks that rt is in the set of user-facing
 // runtimes allowed in config files.  Stub runtimes (e.g. "opencode",
 // "codex") are intentionally excluded from [config.ValidRuntimes] so
-// they cannot be activated through org or per-repo config.
+// they cannot be activated through per-repo config or an agents: entry.
 func validateConfigRuntime(rt string) error {
 	valid := config.ValidRuntimes()
 	if !slices.Contains(valid, rt) {

@@ -40,5 +40,7 @@ func TestWantsClaudeMDBridge(t *testing.T) {
 	assert.True(t, WantsClaudeMDBridge(ClaudeRuntime{}))
 	assert.False(t, WantsClaudeMDBridge(OpenCodeRuntime{}))
 	assert.False(t, WantsClaudeMDBridge(PiRuntime{}))
+	// codex reads AGENTS.md natively, so it needs no CLAUDE.md bridge.
+	assert.False(t, WantsClaudeMDBridge(CodexRuntime{}))
 	assert.False(t, WantsClaudeMDBridge(DummyRuntime{}))
 }

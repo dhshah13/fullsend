@@ -25,8 +25,8 @@ const codexNotImplemented = "codex runtime is not yet implemented (#6920)"
 // in the sandbox image by CODEX_VERSION). All methods are no-ops or return
 // not-implemented errors; subsequent PRs fill in stream parsing, bootstrap,
 // run execution, and transcript extraction (#6920). It is registered in
-// Resolve() but deliberately absent from config.ValidRuntimes(), so no org
-// or per-repo config can select it until it works.
+// Resolve() but deliberately absent from config.ValidRuntimes(), so no
+// per-repo config (nor an agents: entry) can select it until it works.
 type CodexRuntime struct{}
 
 func (CodexRuntime) Name() string { return "codex" }
