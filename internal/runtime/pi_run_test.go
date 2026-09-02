@@ -695,9 +695,12 @@ func TestTranslatePiModel_WithConfigAlias(t *testing.T) {
 
 func TestMergedPiModelAliases(t *testing.T) {
 	t.Parallel()
-	// nil config aliases returns the fleet defaults unchanged.
+	// nil config aliases returns the fleet defaults unchanged — as a copy,
+	// so a caller cannot mutate the package-level table through it.
 	merged := mergedPiModelAliases(nil)
 	assert.Equal(t, piModelAliases, merged)
+	merged["opus"] = "mutated"
+	assert.NotEqual(t, "mutated", piModelAliases["opus"], "merged map must be a copy")
 
 	// Config alias overrides per key.
 	merged = mergedPiModelAliases(map[string]string{"sonnet": "claude-sonnet-5"})

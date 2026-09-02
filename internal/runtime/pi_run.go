@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"strings"
 	"time"
@@ -74,26 +75,18 @@ func validatePiModel(model string, configAliases map[string]string) error {
 	if piDocumentedAliases[model] {
 		aliases := mergedPiModelAliases(configAliases)
 		if _, ok := aliases[model]; !ok {
-			return fmt.Errorf("model alias %q is documented but has no pi mapping; add it to piModelAliases with a catalog id enabled in the fleet's Vertex project", model)
+			return fmt.Errorf("model alias %q is documented but has no pi mapping; add it to piModelAliases with a catalog id enabled in the fleet's Vertex project, or map it for this repo under models.aliases in .fullsend/config.yaml", model)
 		}
 	}
 	return nil
 }
 
-// mergedPiModelAliases returns piModelAliases with per-key overrides from
-// configAliases applied. A nil or empty configAliases returns the compiled-in
-// defaults unchanged.
+// mergedPiModelAliases returns a copy of piModelAliases with per-key
+// overrides from configAliases applied. Always a fresh map, so a caller
+// can never mutate the package-level table through it.
 func mergedPiModelAliases(configAliases map[string]string) map[string]string {
-	if len(configAliases) == 0 {
-		return piModelAliases
-	}
-	merged := make(map[string]string, len(piModelAliases))
-	for k, v := range piModelAliases {
-		merged[k] = v
-	}
-	for k, v := range configAliases {
-		merged[k] = v
-	}
+	merged := maps.Clone(piModelAliases)
+	maps.Copy(merged, configAliases)
 	return merged
 }
 
