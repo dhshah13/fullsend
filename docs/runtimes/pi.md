@@ -56,10 +56,8 @@ Harness `model:` and `agents:` entry `model:` values accept the `provider/id` fo
 
 ### Per-repo alias overrides
 
-The alias table above is a fullsend-owned constant, pinned on purpose: Vertex enables models per
-project, so "latest" is not necessarily accessible. To retarget an alias for one repo — say
-`claude-sonnet-5` is enabled in its project while the fleet still pins `claude-sonnet-4-6` — add
-`models.aliases` to `.fullsend/config.yaml`:
+fullsend pins what each alias means. Vertex enables models per project, so your project may be
+able to run a newer one than the pin — point the alias at it in `.fullsend/config.yaml`:
 
 ```yaml
 models:
@@ -67,19 +65,18 @@ models:
     sonnet: claude-sonnet-5
 ```
 
-Rules: merge is per key (a repo that sets only `sonnet` keeps the fleet default for `opus`, `haiku`
-and `fable`); keys are the alias vocabulary (`opus`, `sonnet`, `haiku`, `fable`); a value is a bare id
-or `provider/id` (`haiku: google-vertex/gemini-3.7-flash` works, and an `xai/…` value takes the same
-Grok normalisation as a direct spec) — never another alias, bare or as the id segment of a
-`provider/id` spec, since aliases resolve once.
+- Only the aliases you set change; the rest keep the fleet default.
+- Keys are `opus`, `sonnet`, `haiku`, `fable`. A value is a model id or `provider/id`
+  (`haiku: google-vertex/gemini-3.7-flash`); it cannot be another alias.
+- The same block applies on [Claude Code](claude.md#models).
 
-At run time the plan block shows `Model: sonnet (from …) → claude-sonnet-5 (from <config path>
-models.aliases)` and `metrics.json` `override_source` ends with `remapped by <config path>
-models.aliases`. The same block applies on Claude Code ([Claude Code](claude.md#models)).
+**What you see.** The plan block prints the remap — `Model: sonnet (from ...) → claude-sonnet-5
+(from <config path> models.aliases)` — and `metrics.json` records it in `override_source`.
 
-Troubleshooting: an unknown key or a bad value fails `fullsend run` before the sandbox is created,
-naming the key (`models.aliases: unknown alias key "grok"`). An id the project cannot serve is not
-caught here — it fails at the first model call, and there is no fallback on pi.
+**If it goes wrong.** A key or value the block does not accept stops `fullsend run` before the
+sandbox is created, naming the key (`models.aliases: unknown alias key "grok"`). A model your
+project cannot serve is not caught here: the run fails at the first model call, and pi has no
+fallback.
 
 ### Each provider has its own GCP project
 
