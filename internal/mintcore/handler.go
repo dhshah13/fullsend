@@ -507,6 +507,13 @@ func (h *Handler) mintToken(ctx context.Context, org, role string, repos []strin
 
 	token, expiresAt, granted, err := CreateInstallationToken(ctx, h.githubBaseURL, jwt, installationID, org, role, repos)
 	if err != nil {
+		if errors.Is(err, ErrRequiredPermissionsMissing) {
+			return "", "", nil, &mintError{
+				status:  http.StatusUnprocessableEntity,
+				msg:     err.Error(),
+				userMsg: err.Error(),
+			}
+		}
 		return "", "", nil, &mintError{status: http.StatusBadGateway, msg: err.Error()}
 	}
 

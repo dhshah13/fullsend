@@ -38,8 +38,9 @@ func githubUserAgent() string {
 
 // installationResponse is the response from GET /repos/{owner}/{repo}/installation.
 type installationResponse struct {
-	ID      int64 `json:"id"`
-	Account struct {
+	ID          int64             `json:"id"`
+	Permissions map[string]string `json:"permissions"`
+	Account     struct {
 		Login string `json:"login"`
 	} `json:"account"`
 }
@@ -325,10 +326,18 @@ var ErrInstallationNotFound = errors.New("installation not found")
 // The returned installation's account is verified against the expected org to
 // prevent cross-org token leakage.
 func FindInstallation(ctx context.Context, githubBaseURL, jwt, org, repo string) (int64, error) {
+	inst, err := findInstallationDetails(ctx, githubBaseURL, jwt, org, repo)
+	if err != nil {
+		return 0, err
+	}
+	return inst.ID, nil
+}
+
+func findInstallationDetails(ctx context.Context, githubBaseURL, jwt, org, repo string) (installationResponse, error) {
 	reqURL := fmt.Sprintf("%s/repos/%s/%s/installation", githubBaseURL, org, repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return 0, fmt.Errorf("creating installation request: %w", err)
+		return installationResponse{}, fmt.Errorf("creating installation request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -336,43 +345,51 @@ func FindInstallation(ctx context.Context, githubBaseURL, jwt, org, repo string)
 
 	resp, err := mintHTTP(req)
 	if err != nil {
-		return 0, fmt.Errorf("getting installation: %w", err)
+		return installationResponse{}, fmt.Errorf("getting installation: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		if resp.StatusCode == http.StatusNotFound {
-			return 0, fmt.Errorf("getting installation for %s/%s: %w", org, repo, ErrInstallationNotFound)
+			return installationResponse{}, fmt.Errorf("getting installation for %s/%s: %w", org, repo, ErrInstallationNotFound)
 		}
-		return 0, fmt.Errorf("getting installation for %s/%s returned status %d", org, repo, resp.StatusCode)
+		return installationResponse{}, fmt.Errorf("getting installation for %s/%s returned status %d", org, repo, resp.StatusCode)
 	}
 
 	var inst installationResponse
 	if err := json.NewDecoder(resp.Body).Decode(&inst); err != nil {
-		return 0, fmt.Errorf("decoding installation: %w", err)
+		return installationResponse{}, fmt.Errorf("decoding installation: %w", err)
 	}
 
 	if inst.ID == 0 {
-		return 0, fmt.Errorf("no installation found for %s/%s", org, repo)
+		return installationResponse{}, fmt.Errorf("no installation found for %s/%s", org, repo)
 	}
 
 	if !strings.EqualFold(inst.Account.Login, org) {
 		log.Printf("cross-org installation mismatch: %s/%s belongs to %s, not %s",
 			org, repo, inst.Account.Login, org)
-		return 0, fmt.Errorf("installation for %s/%s belongs to %s, not %s",
+		return installationResponse{}, fmt.Errorf("installation for %s/%s belongs to %s, not %s",
 			org, repo, inst.Account.Login, org)
 	}
 
-	return inst.ID, nil
+	return inst, nil
 }
 
 // FindOrgInstallation looks up a GitHub App's installation ID for an organization.
 func FindOrgInstallation(ctx context.Context, githubBaseURL, jwt, org string) (int64, error) {
+	inst, err := findOrgInstallationDetails(ctx, githubBaseURL, jwt, org)
+	if err != nil {
+		return 0, err
+	}
+	return inst.ID, nil
+}
+
+func findOrgInstallationDetails(ctx context.Context, githubBaseURL, jwt, org string) (installationResponse, error) {
 	reqURL := fmt.Sprintf("%s/orgs/%s/installation", githubBaseURL, org)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return 0, fmt.Errorf("creating org installation request: %w", err)
+		return installationResponse{}, fmt.Errorf("creating org installation request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -380,30 +397,30 @@ func FindOrgInstallation(ctx context.Context, githubBaseURL, jwt, org string) (i
 
 	resp, err := mintHTTP(req)
 	if err != nil {
-		return 0, fmt.Errorf("getting org installation: %w", err)
+		return installationResponse{}, fmt.Errorf("getting org installation: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return 0, fmt.Errorf("getting org installation for %s returned status %d", org, resp.StatusCode)
+		return installationResponse{}, fmt.Errorf("getting org installation for %s returned status %d", org, resp.StatusCode)
 	}
 
 	var inst installationResponse
 	if err := json.NewDecoder(resp.Body).Decode(&inst); err != nil {
-		return 0, fmt.Errorf("decoding org installation: %w", err)
+		return installationResponse{}, fmt.Errorf("decoding org installation: %w", err)
 	}
 
 	if inst.ID == 0 {
-		return 0, fmt.Errorf("no installation found for org %s", org)
+		return installationResponse{}, fmt.Errorf("no installation found for org %s", org)
 	}
 
 	if !strings.EqualFold(inst.Account.Login, org) {
-		return 0, fmt.Errorf("installation for org %s belongs to %s, not %s",
+		return installationResponse{}, fmt.Errorf("installation for org %s belongs to %s, not %s",
 			org, inst.Account.Login, org)
 	}
 
-	return inst.ID, nil
+	return inst, nil
 }
 
 // variableResponse is the JSON shape for GET /orgs/{org}/actions/variables/{name}
@@ -570,18 +587,6 @@ func ReadForeignAllowlistFromRepo(ctx context.Context, githubBaseURL, jwt string
 	return ParseForeignAllowlist(value), nil
 }
 
-// packagesPermissionKey is the GitHub App permission that may lag installation
-// approval during a packages:read rollout. When mint requests it before the
-// installation has accepted the App update, GitHub returns 422 for the entire
-// token request (no partial downscope).
-const packagesPermissionKey = "packages"
-
-// installationPermissionsNotGranted reports whether a GitHub 422 body indicates
-// the installation lacks a requested App permission (Ralph-verified message).
-func installationPermissionsNotGranted(body string) bool {
-	return strings.Contains(strings.ToLower(body), "permissions requested are not granted to this installation")
-}
-
 // isPublicGitHubAPI reports whether githubBaseURL refers to github.com's API
 // (or the empty default). Used only to choose Accept-URL wording.
 func isPublicGitHubAPI(githubBaseURL string) bool {
@@ -601,49 +606,113 @@ func isPublicGitHubAPI(githubBaseURL string) bool {
 // Accept the pending App permission update for the given installation.
 func installationAcceptHint(githubBaseURL, org string, installationID int64) string {
 	if isPublicGitHubAPI(githubBaseURL) {
-		return fmt.Sprintf("an installation admin should Accept the pending App permission update at https://github.com/organizations/%s/settings/installations/%d", org, installationID)
+		return fmt.Sprintf("if the App already requests these permissions, Accept the pending update at https://github.com/organizations/%s/settings/installations/%d; otherwise the App owner must add them first", org, installationID)
 	}
-	return fmt.Sprintf("an installation admin should Accept the pending App permission update for org=%q installation_id=%d on this GitHub host", org, installationID)
+	return fmt.Sprintf("if the App already requests these permissions, Accept the pending update for org=%q installation_id=%d; otherwise the App owner must add them first", org, installationID)
+}
+
+// optionalRolePermissions lists permissions that may be omitted during a
+// rollout while installations catch up with an App permission update. Only
+// permissions in this map are dropped when ungranted; everything else in the
+// role's set is required and fails hard if missing — preserving the pre-PR
+// behavior where GitHub's 422 surfaced immediately.
+var optionalRolePermissions = map[string]map[string]bool{
+	"coder": {"packages": true},
+	"fix":   {"packages": true},
+}
+
+// ErrRequiredPermissionsMissing is returned by effectiveInstallationPermissions
+// when the installation lacks a non-optional permission for the role.
+var ErrRequiredPermissionsMissing = errors.New("required permissions missing")
+
+var permRank = map[string]int{"read": 1, "write": 2, "admin": 3}
+
+func permissionLevelAtLeast(granted, requested string) bool {
+	g, gok := permRank[granted]
+	r, rok := permRank[requested]
+	return gok && rok && g >= r
+}
+
+// effectiveInstallationPermissions builds the permission map for a token POST.
+// Only permissions listed in optionalRolePermissions for the role may be
+// omitted when the installation has not yet granted them. All other permissions
+// are required: if any required permission is ungranted, the function returns
+// ErrRequiredPermissionsMissing. A nil granted map means the lookup response
+// did not provide permission information, so the full requested set is preserved.
+func effectiveInstallationPermissions(role string, requested, granted map[string]string) (map[string]string, []string, error) {
+	if granted == nil {
+		return copyPermissions(requested), nil, nil
+	}
+
+	optional := optionalRolePermissions[role]
+	effective := make(map[string]string, len(requested))
+	var dropped []string
+	var missingRequired []string
+	for perm, level := range requested {
+		if permissionLevelAtLeast(granted[perm], level) {
+			effective[perm] = level
+			continue
+		}
+		if optional[perm] {
+			dropped = append(dropped, fmt.Sprintf("%s:%s", perm, level))
+			continue
+		}
+		missingRequired = append(missingRequired, fmt.Sprintf("%s:%s", perm, level))
+	}
+
+	if len(missingRequired) > 0 {
+		sort.Strings(missingRequired)
+		return nil, nil, fmt.Errorf("%w for role %q: %s", ErrRequiredPermissionsMissing, role, strings.Join(missingRequired, ", "))
+	}
+
+	sort.Strings(dropped)
+	return effective, dropped, nil
+}
+
+func copyPermissions(perms map[string]string) map[string]string {
+	out := make(map[string]string, len(perms))
+	for k, v := range perms {
+		out[k] = v
+	}
+	return out
 }
 
 // CreateInstallationToken exchanges a JWT for an installation access token,
 // scoped to the given repos and role-specific permissions.
-//
-// If the role map includes packages and GitHub returns 422 because that
-// permission is not granted on the installation, it retries once without
-// packages so lagging installations keep authenticating during App-permission
-// rollouts. org is used only for fallback logging.
 func CreateInstallationToken(ctx context.Context, githubBaseURL, jwt string, installationID int64, org, role string, repos []string) (string, string, *GrantedScope, error) {
-	perms := RolePermissionsFor(role)
-	if perms == nil {
+	return createInstallationToken(ctx, githubBaseURL, jwt, installationID, org, role, repos, nil)
+}
+
+// CreateInstallationTokenWithGrantedPermissions mints a token after
+// downscoping requested role permissions to those currently granted to the
+// installation. This avoids a failed token POST while an App update is pending.
+func CreateInstallationTokenWithGrantedPermissions(ctx context.Context, githubBaseURL, jwt string, installationID int64, org, role string, repos []string, granted map[string]string) (string, string, *GrantedScope, error) {
+	return createInstallationToken(ctx, githubBaseURL, jwt, installationID, org, role, repos, granted)
+}
+
+func createInstallationToken(ctx context.Context, githubBaseURL, jwt string, installationID int64, org, role string, repos []string, granted map[string]string) (string, string, *GrantedScope, error) {
+	requested := RolePermissionsFor(role)
+	if requested == nil {
 		return "", "", nil, fmt.Errorf("no permissions defined for role %q", role)
 	}
 
-	token, expiresAt, granted, status, body, err := postInstallationAccessToken(ctx, githubBaseURL, jwt, installationID, perms, repos)
+	perms, dropped, err := effectiveInstallationPermissions(role, requested, granted)
 	if err != nil {
 		return "", "", nil, err
 	}
-	if status == http.StatusCreated {
-		return token, expiresAt, granted, nil
+	if len(dropped) > 0 {
+		log.Printf("installation permissions not granted: org=%q installation_id=%d role=%q dropped=%s; %s",
+			org, installationID, role, strings.Join(dropped, ", "), installationAcceptHint(githubBaseURL, org, installationID))
 	}
 
-	packagesLevel := perms[packagesPermissionKey]
-	if status == http.StatusUnprocessableEntity && packagesLevel != "" && installationPermissionsNotGranted(body) {
-		fallback := copyPermissionsWithout(perms, packagesPermissionKey)
-		log.Printf("installation token 422 for org=%q installation_id=%d role=%q; packages=%s not granted on this installation — retrying without packages; %s (response: %s)",
-			org, installationID, role, packagesLevel, installationAcceptHint(githubBaseURL, org, installationID), truncateForLog(body, 256))
-
-		token, expiresAt, granted, status, body, err = postInstallationAccessToken(ctx, githubBaseURL, jwt, installationID, fallback, repos)
-		if err != nil {
-			return "", "", nil, err
-		}
-		if status == http.StatusCreated {
-			return token, expiresAt, granted, nil
-		}
-		return "", "", nil, fmt.Errorf("creating installation token returned status %d after packages fallback: %s", status, truncateForLog(body, 256))
+	token, expiresAt, tokenGranted, status, body, err := postInstallationAccessToken(ctx, githubBaseURL, jwt, installationID, perms, repos)
+	if err != nil {
+		return "", "", nil, err
 	}
-
-	return "", "", nil, fmt.Errorf("creating installation token returned status %d: %s", status, truncateForLog(body, 256))
+	if status != http.StatusCreated {
+		return "", "", nil, fmt.Errorf("creating installation token returned status %d: %s", status, truncateForLog(body, 256))
+	}
+	return token, expiresAt, tokenGranted, nil
 }
 
 // postInstallationAccessToken POSTs /app/installations/{id}/access_tokens and
@@ -704,18 +773,6 @@ func postInstallationAccessToken(ctx context.Context, githubBaseURL, jwt string,
 		granted.Repos = append(granted.Repos, r.FullName)
 	}
 	return tokenResp.Token, tokenResp.ExpiresAt, granted, resp.StatusCode, "", nil
-}
-
-// copyPermissionsWithout returns a shallow copy of perms with the omit key removed.
-func copyPermissionsWithout(perms map[string]string, omit string) map[string]string {
-	out := make(map[string]string, len(perms))
-	for k, v := range perms {
-		if k == omit {
-			continue
-		}
-		out[k] = v
-	}
-	return out
 }
 
 // truncateForLog trims whitespace and truncates s to max runes, appending "…"

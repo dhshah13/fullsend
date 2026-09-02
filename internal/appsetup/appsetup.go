@@ -643,15 +643,23 @@ func (s *Setup) handleExistingApp(ctx context.Context, inst *forge.Installation,
 }
 
 // checkPermissions warns if the installed app is missing permissions that
-// the current manifest expects.
-// PermissionErrors returns a combined error if any apps have stale permissions,
-// or nil if all permissions are up to date. Call after all roles have been
-// processed so the user sees every mismatch at once.
+// the current manifest expects. Pending permissions are expected during an App
+// permission rollout and must not block setup or token minting.
+// PermissionErrors is retained for callers that previously checked for stale
+// permissions; permission drift is now reported only through StepWarn.
 func (s *Setup) PermissionErrors() error {
 	if len(s.permErrors) == 0 {
 		return nil
 	}
 	return fmt.Errorf("apps have stale permissions:\n  %s", strings.Join(s.permErrors, "\n  "))
+}
+
+var permRank = map[string]int{"read": 1, "write": 2, "admin": 3}
+
+func permLevelAtLeast(granted, requested string) bool {
+	g, gok := permRank[granted]
+	r, rok := permRank[requested]
+	return gok && rok && g >= r
 }
 
 func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
@@ -668,20 +676,16 @@ func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
 		if level == "" {
 			continue
 		}
-		if inst.Permissions[perm] != level {
+		if !permLevelAtLeast(inst.Permissions[perm], level) {
 			missing = append(missing, fmt.Sprintf("%s:%s", perm, level))
 		}
 	}
 	if len(missing) == 0 {
 		return
 	}
-	s.ui.StepWarn(fmt.Sprintf("app %s missing permissions: %s", inst.AppSlug, strings.Join(missing, ", ")))
-	permURL := fmt.Sprintf("https://github.com/organizations/%s/settings/apps/%s/permissions", org, inst.AppSlug)
 	installURL := fmt.Sprintf("https://github.com/organizations/%s/settings/installations/%d", org, inst.ID)
-	s.permErrors = append(s.permErrors, fmt.Sprintf(
-		"%s — update at %s then approve at %s",
-		inst.AppSlug, permURL, installURL,
-	))
+	s.ui.StepWarn(fmt.Sprintf("app %s missing permissions: %s — if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
+		inst.AppSlug, strings.Join(missing, ", "), installURL))
 }
 
 // manifestResponse is the JSON response from GitHub's app manifest conversion.

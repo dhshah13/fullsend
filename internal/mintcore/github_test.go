@@ -9,7 +9,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +136,24 @@ func TestFindInstallation(t *testing.T) {
 	assert.Equal(t, int64(42), id)
 }
 
+func TestFindInstallationDetails_DecodesPermissions(t *testing.T) {
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(installationResponse{
+			ID:          42,
+			Permissions: map[string]string{"contents": "write", "packages": "read"},
+			Account: struct {
+				Login string `json:"login"`
+			}{Login: "myorg"},
+		})
+	}))
+	defer mockGH.Close()
+
+	inst, err := findInstallationDetails(t.Context(), mockGH.URL, "fake-jwt", "myorg", "my-repo")
+	require.NoError(t, err)
+	assert.Equal(t, int64(42), inst.ID)
+	assert.Equal(t, map[string]string{"contents": "write", "packages": "read"}, inst.Permissions)
+}
+
 func TestFindInstallation_OrgMismatch(t *testing.T) {
 	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(installationResponse{
@@ -233,69 +250,81 @@ func TestCreateInstallationToken_UnknownRole(t *testing.T) {
 	assert.Contains(t, err.Error(), "no permissions defined")
 }
 
-func TestCreateInstallationToken_Packages422FallsBackWithoutPackages(t *testing.T) {
+func TestCreateInstallationTokenWithGrantedPermissions_DownscopesWithoutRetry(t *testing.T) {
 	var calls int
 	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		var body map[string]interface{}
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		perms := body["permissions"].(map[string]interface{})
-
-		switch calls {
-		case 1:
-			assert.Equal(t, "read", perms["packages"])
-			w.WriteHeader(http.StatusUnprocessableEntity)
-			_, _ = w.Write([]byte(`{"message":"The permissions requested are not granted to this installation."}`))
-		case 2:
-			_, hasPackages := perms["packages"]
-			assert.False(t, hasPackages, "retry must omit packages")
-			assert.Equal(t, "write", perms["contents"])
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(installationTokenResponse{
-				Token:     "ghs_fallback_token",
-				ExpiresAt: "2099-01-01T00:00:00Z",
-				Permissions: map[string]string{
-					"contents": "write",
-					"metadata": "read",
-				},
-			})
-		default:
-			t.Fatalf("unexpected call %d", calls)
-		}
+		_, hasPackages := perms["packages"]
+		assert.False(t, hasPackages, "ungranted packages permission must be omitted before POST")
+		assert.Equal(t, "write", perms["contents"])
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(installationTokenResponse{
+			Token:     "ghs_downscoped_token",
+			ExpiresAt: "2099-01-01T00:00:00Z",
+			Permissions: map[string]string{
+				"contents": "write",
+				"metadata": "read",
+			},
+		})
 	}))
 	defer mockGH.Close()
 
-	token, expiresAt, granted, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "coder", []string{"repo"})
+	token, expiresAt, granted, err := CreateInstallationTokenWithGrantedPermissions(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "coder", []string{"repo"}, map[string]string{
+		"contents":      "write",
+		"issues":        "write",
+		"pull_requests": "write",
+		"checks":        "read",
+		"metadata":      "read",
+	})
 	require.NoError(t, err)
-	assert.Equal(t, 2, calls)
-	assert.Equal(t, "ghs_fallback_token", token)
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, "ghs_downscoped_token", token)
 	assert.Equal(t, "2099-01-01T00:00:00Z", expiresAt)
 	require.NotNil(t, granted)
 	assert.Equal(t, "write", granted.Permissions["contents"])
 	assert.Empty(t, granted.Permissions["packages"])
 }
 
-func TestCreateInstallationToken_Packages422RetryStillFails(t *testing.T) {
+func TestCreateInstallationTokenWithGrantedPermissions_MissingRequiredFailsBeforePost(t *testing.T) {
 	var calls int
 	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		var body map[string]interface{}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		perms := body["permissions"].(map[string]interface{})
-		if calls == 2 {
-			_, hasPackages := perms["packages"]
-			assert.False(t, hasPackages, "retry must omit packages")
-		}
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		_, _ = w.Write([]byte(`{"message":"The permissions requested are not granted to this installation."}`))
+		t.Fatalf("token POST should not happen when required permissions are missing")
 	}))
 	defer mockGH.Close()
 
-	_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "fix", nil)
+	_, _, _, err := CreateInstallationTokenWithGrantedPermissions(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "coder", nil, map[string]string{
+		"packages": "read",
+	})
 	require.Error(t, err)
-	assert.Equal(t, 2, calls, "should retry once without packages")
-	assert.Contains(t, err.Error(), "after packages fallback")
-	assert.Contains(t, err.Error(), "422")
+	assert.Equal(t, 0, calls)
+	assert.ErrorIs(t, err, ErrRequiredPermissionsMissing)
+	assert.Contains(t, err.Error(), "contents:write")
+}
+
+func TestCreateInstallationTokenWithGrantedPermissions_NonOptionalPermissionFailsHard(t *testing.T) {
+	var calls int
+	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		t.Fatalf("token POST should not happen when a non-optional permission is missing")
+	}))
+	defer mockGH.Close()
+
+	_, _, _, err := CreateInstallationTokenWithGrantedPermissions(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "coder", nil, map[string]string{
+		"contents": "write",
+		"packages": "read",
+		"metadata": "read",
+		// missing: issues, pull_requests, checks — all non-optional
+	})
+	require.Error(t, err)
+	assert.Equal(t, 0, calls)
+	assert.ErrorIs(t, err, ErrRequiredPermissionsMissing)
+	assert.Contains(t, err.Error(), "issues:write")
+	assert.Contains(t, err.Error(), "pull_requests:write")
+	assert.Contains(t, err.Error(), "checks:read")
 }
 
 func TestCreateInstallationToken_422UnrelatedBodyDoesNotFallback(t *testing.T) {
@@ -330,9 +359,102 @@ func TestCreateInstallationToken_Non422DoesNotFallback(t *testing.T) {
 	assert.NotContains(t, err.Error(), "packages fallback")
 }
 
-func TestInstallationPermissionsNotGranted(t *testing.T) {
-	assert.True(t, installationPermissionsNotGranted(`{"message":"The permissions requested are not granted to this installation."}`))
-	assert.False(t, installationPermissionsNotGranted(`{"message":"Validation Failed"}`))
+func TestCreateInstallationToken_5xxDoesNotRetry(t *testing.T) {
+	for _, code := range []int{http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("status_%d", code), func(t *testing.T) {
+			var calls int
+			mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.WriteHeader(code)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"message":"server error %d"}`, code)))
+			}))
+			defer mockGH.Close()
+
+			_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "coder", nil)
+			require.Error(t, err)
+			assert.Equal(t, 1, calls, "%d must not trigger retry", code)
+			assert.Contains(t, err.Error(), fmt.Sprintf("status %d", code))
+		})
+	}
+}
+
+func TestPermissionLevelAtLeast(t *testing.T) {
+	tests := []struct {
+		granted, requested string
+		want               bool
+	}{
+		{"read", "read", true},
+		{"write", "read", true},
+		{"write", "write", true},
+		{"admin", "read", true},
+		{"admin", "write", true},
+		{"admin", "admin", true},
+		{"read", "write", false},
+		{"read", "admin", false},
+		{"write", "admin", false},
+		{"", "read", false},
+		{"", "write", false},
+		{"bogus", "read", false},
+		{"read", "", false},
+		{"read", "bogus", false},
+	}
+	for _, tc := range tests {
+		assert.Equal(t, tc.want, permissionLevelAtLeast(tc.granted, tc.requested),
+			"permissionLevelAtLeast(%q, %q)", tc.granted, tc.requested)
+	}
+}
+
+func TestEffectiveInstallationPermissions_AdminSatisfiesWrite(t *testing.T) {
+	effective, dropped, err := effectiveInstallationPermissions("prioritize",
+		map[string]string{"contents": "read", "issues": "write", "organization_projects": "write", "metadata": "read"},
+		map[string]string{"contents": "read", "issues": "write", "organization_projects": "admin", "metadata": "read"})
+	require.NoError(t, err)
+	assert.Empty(t, dropped)
+	assert.Equal(t, "write", effective["organization_projects"])
+}
+
+func TestEffectiveInstallationPermissions_NilGrantedPreservesRequested(t *testing.T) {
+	requested := map[string]string{"contents": "write", "packages": "read"}
+	effective, dropped, err := effectiveInstallationPermissions("coder", requested, nil)
+	require.NoError(t, err)
+	assert.Nil(t, dropped)
+	assert.Equal(t, requested, effective)
+}
+
+func TestEffectiveInstallationPermissions_OnlyOptionalDropped(t *testing.T) {
+	effective, dropped, err := effectiveInstallationPermissions("coder",
+		map[string]string{"contents": "write", "packages": "read", "issues": "write", "pull_requests": "write", "checks": "read", "metadata": "read"},
+		map[string]string{"contents": "write", "issues": "write", "pull_requests": "write", "checks": "read", "metadata": "read"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"packages:read"}, dropped)
+	assert.Equal(t, "write", effective["contents"])
+	_, hasPackages := effective["packages"]
+	assert.False(t, hasPackages)
+}
+
+func TestEffectiveInstallationPermissions_NonOptionalMissingFails(t *testing.T) {
+	_, _, err := effectiveInstallationPermissions("coder",
+		map[string]string{"contents": "write", "packages": "read", "issues": "write", "pull_requests": "write", "checks": "read", "metadata": "read"},
+		map[string]string{"contents": "write", "packages": "read", "metadata": "read"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrRequiredPermissionsMissing)
+	assert.Contains(t, err.Error(), "issues:write")
+	assert.Contains(t, err.Error(), "pull_requests:write")
+	assert.Contains(t, err.Error(), "checks:read")
+}
+
+func TestEffectiveInstallationPermissions_CustomRoleAllMissing(t *testing.T) {
+	t.Cleanup(func() { _ = RegisterCustomRolePermissions(nil) })
+	require.NoError(t, RegisterCustomRolePermissions(map[string]map[string]string{
+		"scanner": {"security_events": "write"},
+	}))
+
+	_, _, err := effectiveInstallationPermissions("scanner",
+		map[string]string{"security_events": "write"},
+		map[string]string{"contents": "read", "metadata": "read"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrRequiredPermissionsMissing)
+	assert.Contains(t, err.Error(), "security_events:write")
 }
 
 func TestInstallationAcceptHint(t *testing.T) {
@@ -342,6 +464,7 @@ func TestInstallationAcceptHint(t *testing.T) {
 	assert.False(t, isPublicGitHubAPI("https://github.example.com/api/v3"))
 	assert.False(t, isPublicGitHubAPI("https://evil.example/?x=api.github.com"))
 	assert.Contains(t, installationAcceptHint("https://api.github.com", "myorg", 42), "https://github.com/organizations/myorg/settings/installations/42")
+	assert.Contains(t, installationAcceptHint("https://api.github.com", "myorg", 42), "App owner must add them first")
 	assert.NotContains(t, installationAcceptHint("https://github.example.com/api/v3", "myorg", 42), "https://github.com/")
 	assert.Contains(t, installationAcceptHint("https://github.example.com/api/v3", "myorg", 42), "installation_id=42")
 	assert.Contains(t, installationAcceptHint("https://github.example.com/api/v3", "myorg", 42), `org="myorg"`)
@@ -376,7 +499,7 @@ func TestCreateInstallationToken_LargeSuccessBody(t *testing.T) {
 	assert.Len(t, granted.Repos, 200)
 }
 
-func TestCreateInstallationToken_422WithoutPackagesDoesNotRetry(t *testing.T) {
+func TestCreateInstallationToken_422ReturnsError(t *testing.T) {
 	var calls int
 	mockGH := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -385,32 +508,10 @@ func TestCreateInstallationToken_422WithoutPackagesDoesNotRetry(t *testing.T) {
 	}))
 	defer mockGH.Close()
 
-	// triage has no packages:read — a 422 must not retry/omit packages.
 	_, _, _, err := CreateInstallationToken(t.Context(), mockGH.URL, "fake-jwt", 99, "test-org", "triage", nil)
 	require.Error(t, err)
 	assert.Equal(t, 1, calls)
 	assert.Contains(t, err.Error(), "status 422")
-	assert.NotContains(t, err.Error(), "packages fallback")
-}
-
-func TestCreateInstallationToken_Packages422RetryHTTPError(t *testing.T) {
-	var calls int
-	SetMintHTTPForTest(t, func(req *http.Request) (*http.Response, error) {
-		calls++
-		if calls == 1 {
-			return &http.Response{
-				StatusCode: http.StatusUnprocessableEntity,
-				Body:       io.NopCloser(strings.NewReader(`{"message":"The permissions requested are not granted to this installation."}`)),
-				Header:     make(http.Header),
-			}, nil
-		}
-		return nil, errors.New("retry boom")
-	})
-
-	_, _, _, err := CreateInstallationToken(t.Context(), "http://example.invalid", "fake-jwt", 99, "test-org", "coder", nil)
-	require.Error(t, err)
-	assert.Equal(t, 2, calls)
-	assert.Contains(t, err.Error(), "retry boom")
 }
 
 func TestCreateInstallationToken_EmptyToken(t *testing.T) {
@@ -449,10 +550,11 @@ func TestCreateInstallationToken_HTTPError(t *testing.T) {
 	assert.Contains(t, err.Error(), "creating installation token")
 }
 
-func TestCopyPermissionsWithout(t *testing.T) {
+func TestCopyPermissions(t *testing.T) {
 	in := map[string]string{"contents": "write", "packages": "read", "metadata": "read"}
-	out := copyPermissionsWithout(in, "packages")
-	assert.Equal(t, map[string]string{"contents": "write", "metadata": "read"}, out)
+	out := copyPermissions(in)
+	assert.Equal(t, in, out)
+	out["packages"] = "write"
 	assert.Equal(t, "read", in["packages"], "input map must not be mutated")
 }
 

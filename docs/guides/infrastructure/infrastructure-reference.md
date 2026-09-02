@@ -122,29 +122,40 @@ New installations of an already-updated App receive the new permission at instal
 time. Self-managed App owners update their own App registration, then Accept on
 their installation.
 
-Recommended operator order for adding **`packages:read`** to `coder` / `fix`
-(today the mint only omits this permission on `422` fallback — other permission
-additions do not get the same retry):
+The mint reads the installation's currently granted `permissions` from the
+installation lookup it already performs. Before the token POST, it checks the
+role's requested permissions against that granted set. Only permissions
+explicitly listed in `optionalRolePermissions` (currently `packages` for
+`coder` and `fix`) may be omitted when ungranted — all other permissions are
+required and fail hard if missing, preserving the pre-existing behavior where
+GitHub's `422` surfaced immediately. Dropped optional permissions are logged
+with `org=` and `installation_id=`. This avoids a second token request during
+the rollout window without silently degrading permissions the agent needs.
+
+Recommended operator order for adding **`packages:read`** to `coder` / `fix`:
 
 1. Add **Packages: Read-only** on the GitHub App's **Permissions & events** page
    (hosted: `https://github.com/organizations/fullsend-ai/settings/apps/<app-slug>/permissions`).
    Optionally include a short note to users explaining why.
-2. Deploy mint code that requests `packages:read` **and** falls back on the
-   permissions-not-granted `422` by retrying once without `packages` (with a log
-   pointing admins at
-   `https://github.com/organizations/<org>/settings/installations/<installation-id>` on github.com).
-   Lagging installations keep authenticating; they simply lack packages access
-   until they Accept.
-3. Tell installation owners to Accept the pending permission update (GitHub also
-   emails org owners). Mint fallback logs include `org=` and `installation_id=`
-   when packages was omitted — use those to find lagging installs.
-4. Once fallbacks stop, the packages retry path can be removed in a follow-up if
-   desired.
+2. Update the e2e test App `fullsend-test-coder` as well, and have each
+   `halfsend-01` … `halfsend-12` installation owner Accept its pending update.
+   The test App and pool-org installations must not be left permanently on
+   permission-drop warnings.
+3. Deploy mint. Lagging installations keep authenticating; they simply omit
+   `packages:read` until they Accept. The preflight avoids the two-POST retry
+   volume that the old rollout path incurred.
+4. Release the CLI after the mint change. `fullsend github setup` reports
+   pending permissions as warnings with the installing org's Accept URL, so a
+   CLI release is not blocked on every installation accepting at once.
+5. Tell installation owners to Accept the pending permission update (GitHub also
+   emails org owners), and use the mint permission logs to find lagging installs.
 
-Do **not** block mint deploy on every installation reporting `packages:read` —
-inactive or unreachable installs would stall the platform. Treat setup /
-convergence permission-check URLs as outreach signals during rollout, not as a
-hard deploy gate.
+Do **not** block mint or CLI deploy on every installation reporting
+`packages:read` — inactive or unreachable installs would stall the platform.
+Permission-drop logs and setup warnings are outreach signals during rollout,
+not deploy gates. To add another optional permission in the future, add an
+entry to `optionalRolePermissions` alongside the `canonicalRolePermissions`
+change; remove it once all installations have accepted.
 
 ### Mint Security Controls
 

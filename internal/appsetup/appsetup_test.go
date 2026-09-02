@@ -1,6 +1,7 @@
 package appsetup
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -799,7 +800,8 @@ func TestSetup_StalePermissions_AllRolesChecked(t *testing.T) {
 			},
 		},
 	}
-	printer := ui.New(&discardWriter{})
+	var output bytes.Buffer
+	printer := ui.New(&output)
 
 	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
 		WithAppSet("fullsend").
@@ -811,11 +813,10 @@ func TestSetup_StalePermissions_AllRolesChecked(t *testing.T) {
 	_, err = setup.Run(context.Background(), "myorg", "triage")
 	require.NoError(t, err)
 
-	// PermissionErrors should report both apps.
-	permErr := setup.PermissionErrors()
-	require.Error(t, permErr)
-	assert.Contains(t, permErr.Error(), "fullsend-fullsend")
-	assert.Contains(t, permErr.Error(), "fullsend-triage")
+	// Pending permissions are rollout warnings, not setup-blocking errors.
+	assert.NoError(t, setup.PermissionErrors())
+	assert.Contains(t, output.String(), "fullsend-fullsend")
+	assert.Contains(t, output.String(), "fullsend-triage")
 }
 
 func TestSetup_StalePermissions_IncludesInstallationURL(t *testing.T) {
@@ -836,7 +837,8 @@ func TestSetup_StalePermissions_IncludesInstallationURL(t *testing.T) {
 			},
 		},
 	}
-	printer := ui.New(&discardWriter{})
+	var output bytes.Buffer
+	printer := ui.New(&output)
 
 	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), printer).
 		WithAppSet("fullsend").
@@ -845,15 +847,43 @@ func TestSetup_StalePermissions_IncludesInstallationURL(t *testing.T) {
 	_, err := setup.Run(context.Background(), "myorg", "fullsend")
 	require.NoError(t, err)
 
-	permErr := setup.PermissionErrors()
-	require.Error(t, permErr)
-	errMsg := permErr.Error()
-	assert.Contains(t, errMsg, "/settings/apps/fullsend-fullsend/permissions",
-		"error should contain app permissions URL")
-	assert.Contains(t, errMsg, "/settings/installations/12345",
-		"error should contain installation approval URL")
-	assert.Contains(t, errMsg, "organizations/myorg",
-		"both URLs should reference the correct org")
+	assert.NoError(t, setup.PermissionErrors())
+	warning := output.String()
+	assert.NotContains(t, warning, "/settings/apps/fullsend-fullsend/permissions",
+		"warning should not include a direct link to the App owner's settings page")
+	assert.Contains(t, warning, "/settings/installations/12345",
+		"warning should contain the installation approval URL")
+	assert.Contains(t, warning, "organizations/myorg",
+		"installation URL should reference the correct org")
+	assert.Contains(t, warning, "App owner must add them",
+		"warning should cover the case where the App registration has not been updated")
+}
+
+func TestSetup_PendingCoderPackagesPermissionIsWarningOnly(t *testing.T) {
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.coder",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 4242, AppID: 10, AppSlug: "fullsend-ai-coder",
+				Permissions: map[string]string{
+					"contents":      "write",
+					"issues":        "write",
+					"pull_requests": "write",
+					"checks":        "read",
+					// packages:read is pending installation approval.
+				},
+			},
+		},
+	}
+
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&discardWriter{})).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+	assert.NoError(t, setup.PermissionErrors())
 }
 
 func TestSetup_CorrectPermissions_NoError(t *testing.T) {
