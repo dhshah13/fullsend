@@ -56,7 +56,7 @@ func NewClient() *Client {
 	c := &Client{
 		httpClient: &http.Client{
 			Timeout:   30 * time.Second,
-			Transport: &http.Transport{},
+			Transport: http.DefaultTransport.(*http.Transport).Clone(),
 		},
 		retryDelayFn: defaultRetryDelay,
 	}
