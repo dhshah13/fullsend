@@ -90,7 +90,7 @@ flowchart LR
 | Setting | Flag | Env | Config (per-agent) | Config (repo-wide) |
 |---|---|---|---|---|
 | Runtime | `--runtime` | `FULLSEND_RUNTIME` | `runtime:` on the agent's `agents:` entry | `runtime:` in `.fullsend/config.yaml` (repo default) |
-| Model | `--model` | `FULLSEND_MODEL` (`FULLSEND_PI_MODEL` is a lower-precedence alias on pi) | `model:` on the agent's `agents:` entry | harness `model:`, then agent frontmatter `model:` |
+| Model | `--model` | `FULLSEND_MODEL` (`FULLSEND_PI_MODEL` on pi and `FULLSEND_CODEX_MODEL` on codex are lower-precedence aliases) | `model:` on the agent's `agents:` entry | harness `model:`, then agent frontmatter `model:` |
 | Effort | `--effort` | `FULLSEND_EFFORT` | `effort:` on the agent's `agents:` entry | harness `effort:` |
 
 In CI these are repository variables of the same name, plain or role-prefixed
@@ -175,8 +175,11 @@ On pi, a model is `provider/id` — aliases and bare ids still work, and the pro
 `FULLSEND_PI_PROVIDER` (default `anthropic-vertex`). pi reaches Claude, Gemini **and** Grok, each
 through its own provider; see [Pi › Models and providers](runtimes/pi.md#models-and-providers).
 
-On codex, a model is `openai/<id>` or a bare id — both reach codex's `--model`. Codex serves the
-OpenAI Responses API only, so any other provider prefix is an error; see
+On codex, a model is an OpenAI id — `openai/<id>` or the bare id. The Claude aliases above do
+**not** apply: codex serves the OpenAI Responses API only, so `opus` and friends are refused rather
+than remapped to a GPT model. Because the fleet harnesses say `model: opus`, a repo moving to codex
+names its model either once on the runner with `FULLSEND_CODEX_MODEL=openai/gpt-5.6-luna` or per
+agent with `model: openai/<id>` on the `agents:` entry — no harness needs editing either way. See
 [Codex › Models](runtimes/codex.md#models).
 
 Harness `model:` and `agents:` entry `model:` values accept provider-qualified `provider/id` syntax

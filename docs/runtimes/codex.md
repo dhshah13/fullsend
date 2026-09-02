@@ -13,11 +13,42 @@ This page is what changes once you are on it.
 
 ## Models
 
-Codex speaks the OpenAI Responses API and nothing else, so a model is either `openai/<id>` or a bare
-id — both reach `--model <id>`. Any other provider prefix is rejected before the run starts:
+**Codex takes an OpenAI model id** — `openai/<id>` or the bare id — and nothing else. It serves the
+OpenAI Responses API, so there is no Claude, Gemini or Grok on codex.
+
+**The Claude aliases do not apply.** `opus`, `sonnet`, `haiku` and `fable` name Anthropic models, so
+codex refuses them rather than picking a GPT model on your behalf:
 
 ```
-codex serves OpenAI models only; "anthropic-vertex/claude-opus-4-6" names another provider
+codex serves OpenAI models only; "opus" names a Claude model — use openai/<id>
+```
+
+<!-- TODO(D): replace the message above with the exact refusal text the runtime prints (the alias
+     case, which is the one a repo on fleet harnesses actually hits). Quote it; do not paraphrase. -->
+
+That matters because the fleet harnesses ship `model: opus`. You do not need to edit them — there
+are two places to name a model for a repo on codex.
+
+**A default for every agent in the repo,** set on the runner:
+
+```bash
+FULLSEND_CODEX_MODEL=openai/gpt-5.6-luna
+```
+
+It is read only when codex is the runtime actually selected, and it sits below `--model` and
+`FULLSEND_MODEL` in the [usual precedence](../runtimes.md#selecting-a-runtime-and-model) — so it is a
+default, not an override. When it decides the model, `metrics.json` records
+`override_source: FULLSEND_CODEX_MODEL` and the plan block names it, the same way
+`FULLSEND_PI_MODEL` does on pi.
+
+**A model for one agent,** on its `agents:` entry in `.fullsend/config.yaml`, which also outranks the
+harness:
+
+```yaml
+agents:
+  - name: triage
+    runtime: codex
+    model: openai/gpt-5.6-luna
 ```
 
 Effort maps onto codex's own reasoning levels:
@@ -40,6 +71,7 @@ warning, as it is on pi.
 | Credentials | A runner-exchanged OpenAI WIF token in CI, or your `OPENAI_API_KEY` on the runner locally — never in the sandbox. Codex reads a placeholder from a runner-owned token file and re-reads it when the credential is refreshed ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)) |
 | Unattended | Approvals off; codex's own sandbox off, because OpenShell is the boundary. A missing credential exits before the agent starts |
 | Artifacts | `output.jsonl` (the `codex exec --json` stream), `transcripts/<agent>-<rollout>.jsonl`, `last-message.txt`, `metrics.json` with `runtime: codex`, plus `codex-debug.log` with `--debug` |
+| Extra knobs | `FULLSEND_CODEX_MODEL` (the runner-side model default for codex runs; see [Models](#models)) |
 | Not supported | Sub-agents, `plugins:`, fallback chains, non-OpenAI providers |
 
 Cost is **not** in `metrics.json` on codex: the `codex exec --json` stream carries no cost field, so
