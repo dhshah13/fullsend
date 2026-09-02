@@ -129,7 +129,7 @@ unset, the accessor falls through to the base layer, then to code defaults.
 - **`version`**: Schema version string. Unset (`""`) falls through to parent.
   Code default is `"1"`.
 - **`runtime`**: Agent runtime identifier. Unset (`""`) falls through to
-  parent. Code default is `"claude"`. Valid values: `claude`, `pi`, `dummy`,
+  parent. Code default is `"claude"`. Valid values: `claude`, `pi`, `codex`, `dummy`,
   `dummy-playback`.
 - **`kill_switch`**: Pointer to bool (`*bool`). Using a pointer allows
   distinguishing between three states:
@@ -159,7 +159,7 @@ unset (`""`) falls through to parent, then to code default
 - **`inference.wif_provider`**: Full WIF provider resource name. Unset (`""`)
   falls through to parent (no code default — must be provided by the installer).
 - **`inference.openai.{audience,identity_provider_id,service_account_id}`**:
-  the OpenAI Workload Identity identifiers for GPT on pi (ADR 0092), written
+  the OpenAI Workload Identity identifiers for GPT on pi or codex (ADR 0092), written
   by `fullsend github setup --openai-*`. Each resolves independently through
   the layers; a run needs all three from one source. The `FULLSEND_OPENAI_*`
   runner variables, when any is set, replace the resolved block entirely.

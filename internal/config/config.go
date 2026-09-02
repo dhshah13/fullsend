@@ -304,9 +304,9 @@ func ValidProviders() []string {
 	return []string{"vertex"}
 }
 
-// ValidRuntimes returns the set of recognized agent runtimes. "pi" is
-// opt-in per org/repo (#6464) and "codex" per repo, per agent, or as a
-// repos.yaml default (#6920);
+// ValidRuntimes returns the set of recognized agent runtimes. "pi" (#6464)
+// and "codex" (#6920) are both opt-in per repo, per agent, or as a
+// repos.yaml default;
 // "dummy" and "dummy-playback" are for behaviour test orgs only.
 func ValidRuntimes() []string {
 	return []string{"claude", "pi", "codex", "dummy", "dummy-playback"}

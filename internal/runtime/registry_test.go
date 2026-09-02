@@ -85,6 +85,15 @@ func TestResolveFromPerRepoConfig(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "pi", piBackend.Runtime.Name())
 
+	// codex is user-selectable too (#6920), and resolves its own backend
+	// rather than falling back to the default.
+	codexCfg := config.NewPerRepoConfig(nil, "")
+	codexCfg.SetRuntime("codex")
+	codexBackend, err := ResolveFromPerRepoConfig(codexCfg)
+	require.NoError(t, err)
+	assert.Equal(t, "codex", codexBackend.Runtime.Name())
+	assert.IsType(t, CodexRuntime{}, codexBackend.Transcripts)
+
 	invalidCfg := config.NewPerRepoConfig(nil, "")
 	invalidCfg.SetRuntime("invalid")
 	_, err = ResolveFromPerRepoConfig(invalidCfg)

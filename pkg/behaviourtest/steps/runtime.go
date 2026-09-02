@@ -451,7 +451,11 @@ func assertCodexStreamHasToolCall(w *world.World) error {
 			return nil
 		}
 		streams++
-		if codexStreamHasCompletedCommand(data) {
+		hasCall, scanErr := codexStreamHasCompletedCommand(data)
+		if scanErr != nil {
+			return fmt.Errorf("reading %s: %w", path, scanErr)
+		}
+		if hasCall {
 			withToolCall++
 		}
 		return nil
@@ -483,7 +487,12 @@ type codexStreamEvent struct {
 // codex event. Parsing beats substring matching here for the same reason it
 // does in the production parser: a marker can appear inside another
 // envelope's payload or inside quoted tool output, where it means nothing.
-func codexStreamLines(data []byte) []codexStreamEvent {
+//
+// A scan error (a line past the buffer, an unreadable file) is returned
+// rather than swallowed: silently yielding the lines read so far would turn
+// a truncated read into "the agent ran no tools", which is a wrong assertion
+// failure rather than an honest one.
+func codexStreamLines(data []byte) ([]codexStreamEvent, error) {
 	var out []codexStreamEvent
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
@@ -498,22 +507,29 @@ func codexStreamLines(data []byte) []codexStreamEvent {
 		}
 		out = append(out, evt)
 	}
-	return out
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scanning codex stream: %w", err)
+	}
+	return out, nil
 }
 
 // codexStreamHasCompletedCommand requires a command_execution item that
 // actually reached item.completed with status "completed". An item.started
 // carries the same item type, and a declined or failed command is a tool call
 // the agent did not get to make — neither proves the agent ran a tool.
-func codexStreamHasCompletedCommand(data []byte) bool {
-	for _, evt := range codexStreamLines(data) {
+func codexStreamHasCompletedCommand(data []byte) (bool, error) {
+	events, err := codexStreamLines(data)
+	if err != nil {
+		return false, err
+	}
+	for _, evt := range events {
 		if evt.Type == "item.completed" &&
 			evt.Item.Type == "command_execution" &&
 			evt.Item.Status == "completed" {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // isCodexStreamFile reports whether the JSONL is a `codex exec --json`
@@ -522,7 +538,11 @@ func codexStreamHasCompletedCommand(data []byte) bool {
 // envelopes whose inner names are underscored (item_completed), so they
 // cannot match; nor can a codex event name nested inside another payload.
 func isCodexStreamFile(data []byte) bool {
-	for _, evt := range codexStreamLines(data) {
+	events, err := codexStreamLines(data)
+	if err != nil {
+		return false
+	}
+	for _, evt := range events {
 		switch evt.Type {
 		case "thread.started", "turn.started", "turn.completed", "turn.failed",
 			"item.started", "item.updated", "item.completed":

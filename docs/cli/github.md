@@ -57,7 +57,7 @@ that case). `--config` rewrites `config.base.yaml` and keeps the existing overla
 | `--inference-provider` | | Inference provider; resolved to `vertex` if unset |
 | `--inference-project` | | GCP project ID for Agent Platform |
 | `--inference-wif-provider` | | Full WIF provider resource name |
-| `--openai-audience` | | OpenAI Workload Identity audience for GPT on pi; with the two flags below, written to `inference.openai` in `config.yaml` (all three or none) |
+| `--openai-audience` | | OpenAI Workload Identity audience for GPT on pi or codex; with the two flags below, written to `inference.openai` in `config.yaml` (all three or none) |
 | `--openai-identity-provider-id` | | OpenAI Workload Identity provider ID |
 | `--openai-service-account-id` | | OpenAI service account ID the provider maps this repository to |
 | `--inference-region` | | GCP region for inference; resolved to `global` if unset |

@@ -18,7 +18,7 @@ fullsend run <agent-name> [flags]
 |------|-------------|
 | `--fullsend-dir` | Path to the `.fullsend` configuration directory |
 | `--runtime` | Override the agent runtime from `config.yaml` for this run (`claude`, `pi`, `codex`, `dummy` or `dummy-playback`); also `FULLSEND_RUNTIME` |
-| `--model` | Override the harness/agent model for this run (alias, model id, or `provider/id` on pi and codex); also `FULLSEND_MODEL` |
+| `--model` | Override the harness/agent model for this run (alias, model id, or `provider/id` on pi and codex — codex takes OpenAI ids only); also `FULLSEND_MODEL` |
 | `--effort` | Override the harness effort level for this run (`low`…`max`); also `FULLSEND_EFFORT` |
 | `--output-dir` | Base directory for run output (default: `/tmp/fullsend`) |
 | `--target-repo` | Path to the target repository |
@@ -66,13 +66,13 @@ Each run produces artifacts in the output directory:
 |------|-------------|
 | `metrics.json` | Behavioral metrics: tokens, cost, model, runtime, iterations |
 | `transcripts/` | Agent conversation transcripts |
-| `claude-debug.log` or `pi-debug.log` | Debug log (when `--debug` is set) |
+| `claude-debug.log`, `pi-debug.log` or `codex-debug.log` | Debug log (when `--debug` is set) |
 
 ### metrics.json fields
 
 | Field | Description |
 |-------|-------------|
-| `runtime` | Runtime that executed the run (e.g. `claude`, `pi`) |
+| `runtime` | Runtime that executed the run (e.g. `claude`, `pi`, `codex`) |
 | `model` | Model the provider reported using |
 | `requested_runtime` | Runtime selected for the run (config file, or a `--runtime`/`FULLSEND_RUNTIME` override) |
 | `requested_model` | Model the harness/agent requested |
@@ -82,9 +82,9 @@ Each run produces artifacts in the output directory:
 | `num_turns` | Number of conversation turns |
 | `iterations` | Number of retry iterations |
 
-## OpenAI credentials on pi
+## OpenAI credentials on pi and codex
 
-A `fullsend-openai` provider (`providers: [openai]` on the harness, `openai/<id>` models on pi)
+A `fullsend-openai` provider (`providers: [openai]` on the harness, `openai/<id>` models on pi or codex)
 gets its credential from the runner, never from the harness or the sandbox:
 
 | Runner environment | Effect |

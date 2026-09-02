@@ -96,7 +96,7 @@ fullsend agent set triage --fullsend-dir .fullsend --model xai-vertex/xai/grok-4
 |------|-------------|
 | `--fullsend-dir` | Path to the `.fullsend` configuration directory (required) |
 | `--runtime` | Agent runtime for this agent (`claude`, `pi` or `codex`) |
-| `--model` | Model for this agent — an alias, a model id, or `provider/id` on pi |
+| `--model` | Model for this agent — an alias, a model id, or `provider/id` on pi and codex (codex takes OpenAI ids only) |
 | `--effort` | Effort level for this agent (`low`, `medium`, `high`, `xhigh`, `max`) |
 
 See [Runtimes — per-agent settings](../runtimes.md#per-agent-runtime-model-and-effort) for precedence.
