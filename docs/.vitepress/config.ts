@@ -331,6 +331,7 @@ export default defineConfig({
             { text: "Private Repositories", link: "/guides/infrastructure/private-repositories" },
             { text: "Tracing Reference", link: "/guides/infrastructure/distributed-tracing" },
             { text: "Eval Measurements", link: "/guides/infrastructure/eval-measurements" },
+            { text: "Gate Binaries", link: "/guides/infrastructure/gate-binaries" },
             { text: "Advanced Setup", link: "/guides/infrastructure/advanced-setup" },
             { text: "OpenAI Workload Identity", link: "/guides/infrastructure/openai-workload-identity" },
             {
