@@ -57,7 +57,7 @@ sequenceDiagram
 | Models | Anthropic on Vertex | Claude, **Grok** and **Gemini** on Vertex; **GPT** via OpenAI WIF (opt-in, [not yet exercised live](runtimes/pi.md#models-and-providers)) | **GPT only**, via OpenAI WIF ([not yet exercised live](runtimes/codex.md#not-yet-exercised)) |
 | Sub-agents | Native (`Agent` tool) | Not wired — agents execute sub-agent definitions inline ([#6527](https://github.com/fullsend-ai/fullsend/issues/6527)) | Not available |
 | Fallback model chain | `FULLSEND_FALLBACK_MODELS`, tried in order | Ignored with a warning | Ignored with a warning |
-| Roles | All | `review`/`retro` stay on Claude Code — they rely on sub-agent rosters | Same — `review`/`retro` stay on Claude Code |
+| Roles | All | `review`/`retro` stay on Claude Code — they rely on sub-agent rosters | Same recommendation — no sub-agent roster on codex either |
 | Effort | `--effort low..max` | `--thinking`, same levels (`high` when unset) | `model_reasoning_effort`, same levels |
 | Tools | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | Shell + `apply_patch` only; `tools:` is recorded, not enforced (the allowlist hook is opt-in) |
 | Security controls | Full matrix | Full matrix; stricter on failed-call sanitizing | Full matrix; post-tool hooks detect and block but cannot rewrite output |

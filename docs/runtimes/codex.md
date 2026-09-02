@@ -190,7 +190,9 @@ coverage. Pilot on a disposable repo with `triage`/`prioritize` before `code`/`f
 
 Sub-agent rosters are not wired. Codex does have a `spawn_agent` tool, but fullsend does not build
 a persona roster for it in v1, so `review` and `retro` — which depend on that roster and its
-per-persona models — should stay on Claude Code.
+per-persona models — are best kept on Claude Code. That is a recommendation, not a restriction:
+nothing stops a repo-wide `runtime: codex` from applying to them, and they will run, just in a
+single context. Pin them with `runtime: claude` on their `agents:` entries if you want the roster.
 
 **What has been run.** Locally on macOS (arm64, codex-cli 0.152.1 in the sandbox image), on
 `openai/gpt-5.6-luna` with a static `OPENAI_API_KEY` on the runner:

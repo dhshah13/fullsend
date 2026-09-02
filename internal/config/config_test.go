@@ -429,8 +429,9 @@ func TestOrgConfigValidateRuntime(t *testing.T) {
 	cfg.Defaults.Runtime = "pi"
 	require.NoError(t, cfg.Validate(), "pi is user-selectable (#6464)")
 
-	cfg.Defaults.Runtime = "codex"
-	require.NoError(t, cfg.Validate(), "codex is user-selectable (#6920)")
+	// No codex case here: org mode is deprecated (ADR 0044), so codex's
+	// selectability is asserted on the per-repo and agents: paths instead
+	// (TestPerRepoConfigValidate_Runtime, TestResolveForAgent).
 
 	// opencode is resolvable via runtime.Resolve() but not in ValidRuntimes(),
 	// so config validation must reject it until the runtime is implemented.
