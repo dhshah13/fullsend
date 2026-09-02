@@ -784,32 +784,40 @@ func TestManifestFlow_HTMLForm(t *testing.T) {
 	<-errCh
 }
 
-func TestGithubWebBaseURL(t *testing.T) {
-	t.Run("uses configured client base URL", func(t *testing.T) {
-		t.Setenv("GITHUB_SERVER_URL", "")
-		t.Setenv("GITHUB_API_URL", "")
+func TestSetup_APIBaseURL(t *testing.T) {
+	t.Run("returns the configured client base URL", func(t *testing.T) {
 		client := gh.New("").WithBaseURL("https://github.example.com/api/v3")
 		setup := NewSetup(client, nil, nil, nil)
-		assert.Equal(t, "https://github.example.com", setup.githubWebBaseURL())
+		assert.Equal(t, "https://github.example.com/api/v3", setup.apiBaseURL())
 	})
 
-	t.Run("server URL takes precedence", func(t *testing.T) {
-		t.Setenv("GITHUB_SERVER_URL", "https://github.example.com/")
-		t.Setenv("GITHUB_API_URL", "https://ignored.example.com/api/v3")
-		assert.Equal(t, "https://github.example.com", githubWebBaseURL())
+	t.Run("empty when the client exposes no base URL", func(t *testing.T) {
+		setup := NewSetup(&forge.FakeClient{}, nil, nil, nil)
+		assert.Empty(t, setup.apiBaseURL())
 	})
+}
 
-	t.Run("derives enterprise web URL from API URL", func(t *testing.T) {
-		t.Setenv("GITHUB_SERVER_URL", "")
-		t.Setenv("GITHUB_API_URL", "https://github.example.com/api/v3/")
-		assert.Equal(t, "https://github.example.com", githubWebBaseURL())
-	})
+func TestSetup_StalePermissions_EnterpriseHostGuidance(t *testing.T) {
+	// On a GitHub Enterprise host mintcore omits the public github.com URL and
+	// identifies the installation by org and ID instead.
+	client := gh.New("").WithBaseURL("https://github.example.com/api/v3")
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithAppSet("fullsend")
 
-	t.Run("defaults to github.com", func(t *testing.T) {
-		t.Setenv("GITHUB_SERVER_URL", "")
-		t.Setenv("GITHUB_API_URL", "")
-		assert.Equal(t, "https://github.com", githubWebBaseURL())
-	})
+	setup.checkPermissions(&forge.Installation{
+		ID:          42,
+		AppID:       10,
+		AppSlug:     "fullsend-fullsend",
+		Permissions: map[string]string{"contents": "read"},
+	}, "myorg", "fullsend")
+
+	require.Error(t, setup.PermissionErrors())
+	warning := output.String()
+	assert.Contains(t, warning, "installation_id=42")
+	assert.Contains(t, warning, `org="myorg"`)
+	assert.NotContains(t, warning, "https://github.com/",
+		"enterprise guidance must not link to public github.com")
 }
 
 func TestSetup_StalePermissions_AllRolesChecked(t *testing.T) {

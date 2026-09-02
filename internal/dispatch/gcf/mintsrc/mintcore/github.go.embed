@@ -605,9 +605,9 @@ func isPublicGitHubAPI(githubBaseURL string) bool {
 	return host == "api.github.com" || host == "github.com"
 }
 
-// installationAcceptHint returns a human-readable message directing an admin to
+// InstallationAcceptHint returns a human-readable message directing an admin to
 // Accept the pending App permission update for the given installation.
-func installationAcceptHint(githubBaseURL, org string, installationID int64) string {
+func InstallationAcceptHint(githubBaseURL, org string, installationID int64) string {
 	if isPublicGitHubAPI(githubBaseURL) {
 		return fmt.Sprintf("if the App already requests these permissions, Accept the pending update at https://github.com/organizations/%s/settings/installations/%d; otherwise the App owner must add them first", org, installationID)
 	}
@@ -649,7 +649,10 @@ func PermissionLevelAtLeast(granted, requested string) bool {
 	return gok && rok && g >= r
 }
 
-func grantedPermissionLevel(granted map[string]string, permission string) string {
+// GrantedPermissionLevel resolves the level an installation actually grants for
+// a permission. GitHub implicitly grants metadata:read to every App
+// installation, so an absent "metadata" entry is treated as "read".
+func GrantedPermissionLevel(granted map[string]string, permission string) string {
 	level := granted[permission]
 	if permission == "metadata" && level == "" {
 		// GitHub implicitly grants metadata:read to every App installation.
@@ -680,7 +683,7 @@ func effectiveInstallationPermissions(role string, requested, granted map[string
 	var dropped []string
 	var missingRequired []string
 	for perm, level := range requested {
-		if PermissionLevelAtLeast(grantedPermissionLevel(granted, perm), level) {
+		if PermissionLevelAtLeast(GrantedPermissionLevel(granted, perm), level) {
 			effective[perm] = level
 			continue
 		}
@@ -732,11 +735,11 @@ func createInstallationToken(ctx context.Context, githubBaseURL, jwt string, ins
 
 	perms, dropped, err := effectiveInstallationPermissions(role, requested, granted)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("%w; %s", err, installationAcceptHint(githubBaseURL, org, installationID))
+		return "", "", nil, fmt.Errorf("%w; %s", err, InstallationAcceptHint(githubBaseURL, org, installationID))
 	}
 	if len(dropped) > 0 {
 		log.Printf("installation permissions not granted: org=%q installation_id=%d role=%q dropped=%s; %s",
-			org, installationID, role, strings.Join(dropped, ", "), installationAcceptHint(githubBaseURL, org, installationID))
+			org, installationID, role, strings.Join(dropped, ", "), InstallationAcceptHint(githubBaseURL, org, installationID))
 	}
 
 	token, expiresAt, tokenGranted, status, body, err := postInstallationAccessToken(ctx, githubBaseURL, jwt, installationID, perms, repos)

@@ -15,7 +15,6 @@ import (
 	"html"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -663,51 +662,14 @@ func (s *Setup) PermissionErrors() error {
 	return fmt.Errorf("apps have stale permissions:\n  %s", strings.Join(s.permErrors, "\n  "))
 }
 
-// grantedPermissionLevel resolves the level an installation actually grants for
-// a permission. The App manifest never carries metadata, so the implicit grant
-// below is a no-op here; it is kept for parity with mint's granted-set
-// preflight.
-func grantedPermissionLevel(granted map[string]string, permission string) string {
-	level := granted[permission]
-	if permission == "metadata" && level == "" {
-		// GitHub implicitly grants metadata:read to every App installation.
-		return "read"
-	}
-	return level
-}
-
-// githubWebBaseURL returns the browser-facing GitHub host for installation
-// approval links. GitHub Actions exposes GITHUB_SERVER_URL; when it is not
-// available, derive the web host from GITHUB_API_URL for GitHub Enterprise.
-func githubWebBaseURL() string {
-	if serverURL := strings.TrimRight(strings.TrimSpace(os.Getenv("GITHUB_SERVER_URL")), "/"); serverURL != "" {
-		return serverURL
-	}
-	return githubWebBaseURLFromAPI(os.Getenv("GITHUB_API_URL"))
-}
-
-func githubWebBaseURLFromAPI(rawAPIURL string) string {
-	apiURL := strings.TrimRight(strings.TrimSpace(rawAPIURL), "/")
-	if apiURL == "" || apiURL == "https://api.github.com" {
-		return "https://github.com"
-	}
-	parsed, err := url.Parse(apiURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "https://github.com"
-	}
-	parsed.Path = strings.TrimSuffix(strings.TrimRight(parsed.Path, "/"), "/api/v3")
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return strings.TrimRight(parsed.String(), "/")
-}
-
-func (s *Setup) githubWebBaseURL() string {
+// apiBaseURL returns the GitHub API base URL the configured client talks to,
+// or "" when the client does not expose one. mintcore treats "" as public
+// github.com when building installation guidance.
+func (s *Setup) apiBaseURL() string {
 	if provider, ok := s.client.(interface{ BaseURL() string }); ok {
-		if baseURL := strings.TrimSpace(provider.BaseURL()); baseURL != "" {
-			return githubWebBaseURLFromAPI(baseURL)
-		}
+		return strings.TrimSpace(provider.BaseURL())
 	}
-	return githubWebBaseURL()
+	return ""
 }
 
 // checkPermissions compares the installed app's granted permissions against the
@@ -732,7 +694,7 @@ func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
 		if level == "" {
 			continue
 		}
-		if mintcore.PermissionLevelAtLeast(grantedPermissionLevel(inst.Permissions, perm), level) {
+		if mintcore.PermissionLevelAtLeast(mintcore.GrantedPermissionLevel(inst.Permissions, perm), level) {
 			continue
 		}
 		entry := fmt.Sprintf("%s:%s", perm, level)
@@ -748,16 +710,16 @@ func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
 	sort.Strings(optional)
 	sort.Strings(required)
 
-	installURL := fmt.Sprintf("%s/organizations/%s/settings/installations/%d", s.githubWebBaseURL(), org, inst.ID)
+	hint := mintcore.InstallationAcceptHint(s.apiBaseURL(), org, int64(inst.ID))
 	if len(optional) > 0 {
-		s.ui.StepWarn(fmt.Sprintf("app %s pending rollout permissions (setup continues): %s — if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
-			inst.AppSlug, strings.Join(optional, ", "), installURL))
+		s.ui.StepWarn(fmt.Sprintf("app %s pending rollout permissions (setup continues): %s — %s",
+			inst.AppSlug, strings.Join(optional, ", "), hint))
 	}
 	if len(required) > 0 {
-		s.ui.StepWarn(fmt.Sprintf("app %s missing permissions: %s — if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
-			inst.AppSlug, strings.Join(required, ", "), installURL))
-		s.permErrors = append(s.permErrors, fmt.Sprintf("%s — missing required permissions: %s; if the App registration already requests them, an admin should Accept the pending update at %s; otherwise the App owner must add them on the App's Permissions & events page first",
-			inst.AppSlug, strings.Join(required, ", "), installURL))
+		s.ui.StepWarn(fmt.Sprintf("app %s missing permissions: %s — %s",
+			inst.AppSlug, strings.Join(required, ", "), hint))
+		s.permErrors = append(s.permErrors, fmt.Sprintf("%s — missing required permissions: %s; %s",
+			inst.AppSlug, strings.Join(required, ", "), hint))
 	}
 }
 
