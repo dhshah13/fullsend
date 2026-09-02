@@ -525,14 +525,8 @@ func (r PiRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printe
 		// tracked on #6527. Say so rather than silently dropping the list.
 		printer.StepWarn(fmt.Sprintf("fallback models %s are not supported on pi yet and are ignored", sanitizeOutput(strings.Join(params.FallbackModels, ","))))
 	}
-	{
-		model := params.Model
-		if model == "" {
-			model = m.Model
-		}
-		if err := validatePiModel(model); err != nil {
-			return -1, err
-		}
+	if err := validatePiModel(EffectiveModel(params.Model, m.Model)); err != nil {
+		return -1, err
 	}
 	cmd := buildPiRunCommand(params, m)
 
@@ -559,11 +553,7 @@ func (r PiRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printe
 		handler = renderer.Handle
 	}
 
-	model := params.Model
-	if model == "" {
-		model = m.Model
-	}
-	modelSpec := translatePiModel(model)
+	modelSpec := translatePiModel(EffectiveModel(params.Model, m.Model))
 	// Telemetry and the renderer get the bare model id, as they do for
 	// Claude Code, so runs group by model across runtimes; the provider is
 	// gen_ai.system's job and stays visible on the command line.

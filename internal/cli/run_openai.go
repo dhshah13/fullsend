@@ -132,8 +132,8 @@ var openAIPlaceholderPoll = 5 * time.Second
 const openAIPlaceholderExecTimeout = 30 * time.Second
 
 // openAIBaselineAttempts is how many times the placeholder the agent
-// currently holds is read before a rotation; without it the settle wait below could
-// not tell a new generation from the old one.
+// currently holds is read before a rotation; without it the settle wait
+// below could not tell a new generation from the old one.
 const openAIBaselineAttempts = 3
 
 // openAIDeleteBackoff is the wait between cleanup delete attempts while the
@@ -161,8 +161,8 @@ func sandboxOpenAIPlaceholder(ctx context.Context, sandboxName string) (string, 
 	return strings.TrimSpace(out), nil
 }
 
-// baselineOpenAIPlaceholder reads the placeholder the agent currently holds, with
-// bounded retries; it runs before the provider is rotated.
+// baselineOpenAIPlaceholder reads the placeholder the agent currently
+// holds, with bounded retries; it runs before the provider is rotated.
 func baselineOpenAIPlaceholder(ctx context.Context, sandboxName string) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt < openAIBaselineAttempts; attempt++ {
@@ -904,8 +904,8 @@ func refreshOpenAIProvider(ctx context.Context, h openAIProviderHandle, placehol
 func runOpenAIRefresh(ctx context.Context, h openAIProviderHandle, printer *ui.Printer) {
 	expiresAt := h.expiresAt
 	// placeholder is the generation the runtime's credential file currently
-	// names; learned
-	// from the sandbox before the first refresh, then tracked per re-seed.
+	// names; learned from the sandbox before the first refresh, then
+	// tracked per re-seed.
 	placeholder := ""
 	for {
 		jitter := time.Duration(0)
