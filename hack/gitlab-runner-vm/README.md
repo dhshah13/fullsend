@@ -132,9 +132,10 @@ GCP_PROJECT=my-gcp-project ./delete-gcp-vm.sh --list
   operator to have `roles/iap.tunnelResourceAccessor` and authenticates via
   GCP IAM — mirroring the OpenShift model where SSH is tunneled through the
   K8s API server. When `GCP_USE_IAP=false`, the VM gets an external IP and
-  SSH connects directly — host-key verification is disabled for ephemeral VMs,
-  so this mode should only be used for initial provisioning in trusted
-  networks. The script prints a command to remove the external IP afterward.
+  SSH connects directly with trust-on-first-use host-key verification
+  (`StrictHostKeyChecking=accept-new`) — the first connection accepts the key
+  and subsequent connections within the same run reject changes.
+  The script prints a command to remove the external IP afterward.
 - The CA trust bootstrap uses trust-on-first-use (TOFU). For higher assurance,
   provide the CA bundle out-of-band before running setup.sh.
 - The OCI CA-injection hook fires for all containers on the host. It only

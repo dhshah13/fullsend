@@ -104,22 +104,38 @@ if [[ "${GCP_USE_IAP}" != "true" && "${GCP_USE_IAP}" != "false" ]]; then
 fi
 
 if [ "${GCP_USE_IAP}" = "false" ]; then
-  echo "  WARN: GCP_USE_IAP=false — SSH will connect over the public internet" >&2
-  echo "        with host-key verification disabled (StrictHostKeyChecking=no)." >&2
+  echo "  WARN: GCP_USE_IAP=false — SSH will connect over the public internet." >&2
+  echo "        Host-key verification uses accept-new (TOFU within this session)." >&2
   echo "        Secrets (REGISTRATION_TOKEN) are transmitted over this session." >&2
 fi
 
 # Common flags for gcloud compute ssh. IAP tunneling is enabled by default
 # (no public IP); set GCP_USE_IAP=false to SSH directly via an external IP.
-# Host key prompts are suppressed for ephemeral VMs with no stable host key.
+#
+# Host-key handling differs by mode:
+#   IAP (default):  StrictHostKeyChecking=no + /dev/null — the IAP relay has no
+#                   stable host key, and the tunnel itself authenticates via IAM.
+#   Direct IP:      StrictHostKeyChecking=accept-new + temp known-hosts file —
+#                   the VM has a stable public IP, so we trust-on-first-use and
+#                   reject key changes for all subsequent connections in this run.
 GCE_SSH_FLAGS=(
-  --ssh-flag="-o StrictHostKeyChecking=no"
-  --ssh-flag="-o UserKnownHostsFile=/dev/null"
   --ssh-flag="-o ConnectTimeout=10"
   --ssh-flag="-o LogLevel=ERROR"
 )
 if [ "${GCP_USE_IAP}" = "true" ]; then
-  GCE_SSH_FLAGS=(--tunnel-through-iap "${GCE_SSH_FLAGS[@]}")
+  GCE_SSH_FLAGS=(
+    --tunnel-through-iap
+    --ssh-flag="-o StrictHostKeyChecking=no"
+    --ssh-flag="-o UserKnownHostsFile=/dev/null"
+    "${GCE_SSH_FLAGS[@]}"
+  )
+else
+  _known_hosts=$(mktemp)
+  GCE_SSH_FLAGS=(
+    --ssh-flag="-o StrictHostKeyChecking=accept-new"
+    --ssh-flag="-o UserKnownHostsFile=${_known_hosts}"
+    "${GCE_SSH_FLAGS[@]}"
+  )
 fi
 
 # shellcheck source=lib.sh
@@ -441,7 +457,7 @@ done
 # Transfer all files in a single SSH connection via tar to minimize IAP
 # tunnel usage. This replaces multiple scp calls that each open a separate
 # IAP tunnel, which triggers rate-limiting after long-running sessions.
-_copy_files_to_vm() {
+copy_files_to_vm() {
   tar -C "${_stage_dir}" -cf - . \
     | gcloud compute ssh "${vm_name}" \
         --project="${GCP_PROJECT}" \
@@ -449,7 +465,7 @@ _copy_files_to_vm() {
         "${GCE_SSH_FLAGS[@]}" \
         -- "tar -C ~/gitlab-runner-vm -xf -"
 }
-with_backoff _copy_files_to_vm
+with_backoff copy_files_to_vm
 
 rm -rf "${_stage_dir}"
 trap cleanup_runner ERR
@@ -462,7 +478,7 @@ with_backoff gce_ssh "chmod +x ~/gitlab-runner-vm/setup.sh ~/gitlab-runner-vm/cr
 # A dropped SSH channel can leave a truncated setup.sh that then executes an
 # arbitrary prefix of provisioning.
 echo "==> Verifying copied files"
-_verify_copied_files() {
+verify_copied_files() {
   {
     (cd "${SCRIPT_DIR}" && sha256sum setup.sh create-gcp-vm.sh gitlab-runner-version.sh \
       executor/job_id.sh executor/prepare.sh executor/run.sh executor/cleanup.sh)
@@ -471,7 +487,7 @@ _verify_copied_files() {
       | sed 's|  |  .github/scripts/|')
   } | gce_ssh "cd ~/gitlab-runner-vm && sha256sum -c --quiet -"
 }
-if ! with_backoff _verify_copied_files; then
+if ! verify_copied_files; then
   echo "ERROR: copied files failed checksum verification — transfer was truncated" >&2
   cleanup_runner
   exit 1
@@ -506,7 +522,7 @@ done
 # Note: each retry re-transmits REGISTRATION_TOKEN over a new SSH session.
 # The remote EXIT trap (`rm -f .env`) cleans up the token file on disconnect,
 # and umask 077 ensures it is never world-readable between attempts.
-_run_setup_on_vm() {
+run_setup_on_vm() {
   {
     printf "REGISTRATION_TOKEN='%s'\n" "${REGISTRATION_TOKEN}"
     printf "GITLAB_URL='%s'\n" "${GITLAB_URL}"
@@ -520,11 +536,12 @@ _run_setup_on_vm() {
     "${GCE_SSH_FLAGS[@]}" \
     -- "trap 'rm -f ~/gitlab-runner-vm/.env' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; umask 077 && cat > ~/gitlab-runner-vm/.env && set -a && . ~/gitlab-runner-vm/.env && set +a && bash ~/gitlab-runner-vm/setup.sh"
 }
-with_backoff _run_setup_on_vm
+with_backoff run_setup_on_vm
 
 # Setup succeeded — clear every rollback trap so a stray signal during the
 # final output cannot deregister a healthy runner.
 trap - ERR INT TERM
+rm -f "${_known_hosts:-}"
 
 echo ""
 echo "Done. Runner ${vm_name} (ID ${runner_id}) is ready."
