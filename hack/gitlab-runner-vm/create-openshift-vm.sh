@@ -95,7 +95,10 @@ usage() {
 }
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  head -52 "$0" | tail -50 | sed 's/^# \?//'
+  # Extract the comment block after the shebang until the first non-comment
+  # line, stripping the leading "# " prefix.  This is immune to header edits
+  # (no hardcoded line numbers).
+  awk 'NR==1{next} /^[^#]/{exit} {sub(/^# ?/, ""); print}' "$0"
   exit 0
 fi
 
