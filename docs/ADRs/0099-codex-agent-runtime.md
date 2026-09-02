@@ -84,5 +84,14 @@ config layer including the image's managed `/etc/codex/config.toml`.
 - Codex reports no cost, so `total_cost_usd` stays 0 for codex runs; token usage is reported.
 - `apply_patch` covers both Claude's `Write` and `Edit`, and reaches the hook scripts as `Edit`, so
   an agent allowlisted only for `Write` is blocked by the (opt-in) tool-allowlist hook.
+- With a custom provider, codex also issues a `GET /v1/models` catalog refresh at startup, which the
+  `fullsend-openai` egress profile denies; it is logged and non-fatal, but "only `POST /v1/responses`
+  is attempted" is not true of codex the way it is of pi.
+- The tee'd `output.jsonl` keeps each command's raw `aggregated_output`, so a hook block withholds
+  the output from the *model* but not from the run artifact — the hooks protect context, not
+  artifacts, which is also true of the other runtimes' streams.
+- Every guard is shell text, so each is executed under `/bin/sh` in tests rather than asserted as a
+  string: that is what caught the first draft's fail-open guard, where sh's left-associative `&&`
+  and `||` let a trailing check rescue every earlier failure.
 - The codex CLI pin now has to be re-checked on every bump against the hook payload shape,
   `auth.command` semantics and the JSONL event structs, since all three are load-bearing here.

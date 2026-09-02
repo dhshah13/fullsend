@@ -637,8 +637,14 @@ flowchart TB
   open-stdin hang pi needs `</dev/null` for.
 - **`codex exec` has no `--debug` flag.** Its tracing goes to stderr behind the `RUST_LOG` filter and
   is silent without one, so debug mode exports `RUST_LOG` and appends stderr to `codex-debug.log`.
-- **Model**: `openai/<id>` or a bare `<id>`; any other provider prefix is an error, because codex
-  would otherwise send the whole string as a model id and get a 404 with nothing to tune.
+- **Model**: `openai/<id>` or a bare `<id>`, resolved through `EffectiveModel` — the same chain
+  `NeedsOpenAIProvider` decides from, so the launch and the run-scoped provider decision cannot
+  disagree about which model a run calls. The **Claude model aliases (`opus`, `sonnet`, `haiku`,
+  `fable`) deliberately do not apply to codex**, and codex does not consult the per-repo
+  `models.aliases` overrides either, so a Claude alias can never resolve to a GPT model behind the
+  operator's back. A Claude alias, any non-`openai/` prefix, or no model at all is an error naming
+  both fixes (`FULLSEND_CODEX_MODEL=openai/<id>` for the repo, or `model: openai/<id>` on the
+  agent's `agents:` entry or the harness) rather than a 404 mid-run.
 - **Effort** maps 1:1 — every value `config.ValidEffortLevels()` accepts (`low`, `medium`, `high`,
   `xhigh`, `max`) is also a codex `ReasoningEffort`. An unset effort omits the override so the
   model's own default applies. `FallbackModels` is warned about and ignored; codex has no chain.
@@ -729,6 +735,33 @@ exits 97. It refuses to start at all (exit -1) when security is enabled but the 
 hook plan, and it decides whether hooks are expected from the runner's own signal rather than from
 the manifest. The manifest and the hook scripts themselves stay agent-writable between iterations —
 the same residue Claude Code has with `claude-config/hooks.json`.
+
+### What the local smoke proved
+
+A real `codex exec --json` run against `api.openai.com` inside the pinned sandbox image
+(`localhost/fullsend-sandbox:codex`, codex-cli 0.152.1, arm64), with the runner's own `config.toml`,
+`hooks.json` and adapter in place:
+
+| Question | Answer |
+|---|---|
+| Is `hooks.json` loaded with no `[hooks]` table in `config.toml`? | **Yes** — discovery reads the file independently, so no empty table is needed. Both phases fired. |
+| Is a hook block reported to the model as *declined* rather than *failed*? | **Yes.** codex surfaces `Command blocked by PreToolUse hook: <reason>. Command: <cmd>`, and the agent's own summary was "blocked by a safety hook that prevents dotfile overwrites". |
+| Does a PostToolUse block withhold the output? | **Yes** — a canary in a `cat` result never reached the model, which reported only that it had been blocked. |
+| Are a repo's `.agents/skills` discovered with the project untrusted? | **Yes** — Claude Code parity (repo `.claude/skills` load there too); those SKILL.md files are covered by the host-side runtime content scan and the in-sandbox `scan context` pass. |
+| Do codex's own bundled skills appear? | They did — `skill-installer`, `plugin-creator`, `imagegen`, `skill-creator`, `openai-docs` — until `[skills.bundled] enabled = false` was added, after which only the harness's skills and the image's own `github` skill remain. |
+| Is `POST /v1/responses` the only request? | **No.** With a custom provider codex also issues `GET /v1/models` at startup (`codex_models_manager`), which fails to decode OpenAI's public catalog shape and is logged as a non-fatal ERROR. The `fullsend-openai` egress profile denies it, so expect that denial in a run's logs; the model call itself is `POST /v1/responses`. |
+| Does `codex doctor` accept the rendered config? | Yes: `config.toml parse ok`, `default model provider fullsend-openai`, `OpenAI auth is not required for the active model provider`, and `Responses WebSocket is not enabled for the active provider` — the last confirming the HTTP/SSE path the egress profile requires. |
+
+Two artefacts of the run are worth knowing about:
+
+- The `command_execution` item in the stream keeps the command's raw `aggregated_output` even when a
+  PostToolUse hook blocked the result, so **the tee'd `output.jsonl` is not sanitized** — the hooks
+  protect the model's context, not the run artifact.
+- `--dangerously-bypass-hook-trust` emits its warning as an `error`-type *item*, which the stream
+  parser correctly treats as a warning rather than a run failure.
+- A model the account cannot serve on the Responses API fails as five `error` reconnect events and a
+  `turn.failed` carrying the 404, not as a startup error — which is why `Run` returns 1 from the
+  stream verdict rather than trusting the exit code.
 
 ### Not yet exercised
 
