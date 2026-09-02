@@ -15,7 +15,7 @@ import (
 // Codex `exec --json` wire format, taken from openai/codex tag rust-v0.152.1:
 // codex-rs/exec/src/exec_events.rs (the event/item structs) and
 // codex-rs/exec/src/event_processor_with_jsonl_output.rs (which events are
-// emitted, and when). Fixtures live under testdata/codex/; basic_run.jsonl is
+// emitted, and when). Fixtures live under testdata/codex/; basic_run.ndjson is
 // a live capture, the rest are hand-authored to the struct list below.
 // Regenerate the live one with testdata/codex/regen.sh and re-verify this file
 // whenever the pinned CODEX_VERSION moves.
