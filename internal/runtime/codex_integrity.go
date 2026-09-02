@@ -49,6 +49,14 @@ type codexRunnerHeldDigestSet struct {
 	// Ordered so the launch command is stable across iterations.
 	SecurityEnv []codexEnvPair
 
+	// AgentModel is the agent definition's frontmatter model, as Bootstrap
+	// parsed it from the file on the runner side. Run resolves the model from
+	// this rather than from the manifest's copy: the manifest is a file in the
+	// agent-writable config directory and is not digest-guarded, so an agent
+	// could otherwise change which model — and which cost tier — a validation
+	// retry runs on.
+	AgentModel string
+
 	// HookScripts maps each installed hook script's filename to its digest.
 	// Bootstrap knows exactly which the harness enabled; Run does not, which
 	// is why the expected names travel with the digests rather than being

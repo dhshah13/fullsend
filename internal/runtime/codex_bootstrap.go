@@ -152,7 +152,10 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	}
 	// A runner-held digest, not one recorded in the manifest: see
 	// codex_integrity.go for why nothing inside the sandbox can hold it.
-	digests := codexRunnerHeldDigestSet{ConfigTOML: codexAssetSHA256(configTOML)}
+	digests := codexRunnerHeldDigestSet{
+		ConfigTOML: codexAssetSHA256(configTOML),
+		AgentModel: def.Model,
+	}
 
 	// uploadBytes does not set a mode, and codex executes this one.
 	if err := uploadBytes(sandboxName, r.codexAuthScriptPath(), codexAuthScriptSH); err != nil {

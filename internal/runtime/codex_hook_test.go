@@ -311,6 +311,7 @@ sys.exit(0)`)
 
 func TestCodexAdapter_MisconfigurationFailsClosed(t *testing.T) {
 	h := newCodexAdapterHarness(t)
+	h.script("allow.py", "sys.exit(0)")
 
 	t.Run("no scripts", func(t *testing.T) {
 		cmd := exec.Command(h.python, h.adapter, "PreToolUse")
@@ -349,10 +350,27 @@ func TestCodexAdapter_MisconfigurationFailsClosed(t *testing.T) {
 		})
 	}
 
-	t.Run("empty stdin is not a tool call", func(t *testing.T) {
-		cmd := exec.Command(h.python, h.adapter, "PreToolUse", "x.py")
+	// The scripts read empty stdin as "no tool call" and allow, which is right
+	// for them — they also run standalone. The adapter was invoked *because* a
+	// tool call is about to happen, so an empty payload means the call cannot
+	// be scanned rather than that there is nothing to scan.
+	t.Run("empty stdin blocks on PreToolUse", func(t *testing.T) {
+		cmd := exec.Command(h.python, h.adapter, "PreToolUse", "allow.py")
+		cmd.Env = append(os.Environ(), codexHookDigestsEnv+"="+codexHookDigestsValue(h.digests))
 		cmd.Stdin = strings.NewReader("   ")
-		require.NoError(t, cmd.Run(), "every script treats empty stdin as no tool call and allows it")
+		out, err := cmd.CombinedOutput()
+		require.Error(t, err)
+		assert.Equal(t, 2, exitCodeOf(t, err))
+		assert.Contains(t, string(out), "cannot be scanned")
+	})
+
+	// On PostToolUse the call has already run and there is nothing left to
+	// prevent, so the no-op stands.
+	t.Run("empty stdin is a no-op on PostToolUse", func(t *testing.T) {
+		cmd := exec.Command(h.python, h.adapter, "PostToolUse", "allow.py")
+		cmd.Env = append(os.Environ(), codexHookDigestsEnv+"="+codexHookDigestsValue(h.digests))
+		cmd.Stdin = strings.NewReader("   ")
+		require.NoError(t, cmd.Run())
 	})
 }
 

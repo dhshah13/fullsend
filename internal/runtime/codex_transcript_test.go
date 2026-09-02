@@ -66,13 +66,16 @@ func TestCodexParseTranscriptErrors(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+	// Fixture names are .ndjson (the repo convention, PR B); the destinations
+	// keep the .jsonl names the runtime actually writes, which is what
+	// ParseTranscriptErrors scans for.
 	copyFixture := func(name, dest string) {
 		data, err := os.ReadFile(filepath.Join("testdata", "codex", name))
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filepath.Join(dir, dest), data, 0o644))
 	}
-	copyFixture("turn_failed.jsonl", "output.jsonl")
-	copyFixture("basic_run.jsonl", "ok.jsonl")
+	copyFixture("turn_failed.ndjson", "output.jsonl")
+	copyFixture("basic_run.ndjson", "ok.jsonl")
 	// A rollout session file is a different envelope; it must be skipped
 	// rather than misread as a failed run.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "rollout.jsonl"),
@@ -95,7 +98,7 @@ func TestCodexParseTranscriptErrors_MissingDir(t *testing.T) {
 func TestCodexParseTranscriptFile(t *testing.T) {
 	t.Parallel()
 
-	te, ok := CodexRuntime{}.ParseTranscriptFile(filepath.Join("testdata", "codex", "turn_failed.jsonl"))
+	te, ok := CodexRuntime{}.ParseTranscriptFile(filepath.Join("testdata", "codex", "turn_failed.ndjson"))
 	require.True(t, ok)
 	assert.True(t, te.IsError)
 
@@ -111,7 +114,7 @@ func TestCodexRun_StreamVerdictOverridesExitZero(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "turn_failed.jsonl"))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "turn_failed.ndjson"))
 
 	outPath := filepath.Join(t.TempDir(), "output.jsonl")
 	metrics := &RunMetrics{}
@@ -140,7 +143,7 @@ func TestCodexRun_SuccessfulRunReportsMetrics(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.ndjson"))
 
 	metrics := &RunMetrics{}
 	exit, err := r.Run(context.Background(), RunParams{
@@ -207,7 +210,7 @@ func TestCodexRun_AcceptsManifestHookPlan(t *testing.T) {
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r,
 		codexHooksManifestFor(r.codexHooksDir(), security.SandboxHookConfigFromHarness(&harness.Harness{})))
-	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.ndjson"))
 
 	exit, err := r.Run(context.Background(), RunParams{
 		SandboxName:       "sb",
@@ -227,7 +230,10 @@ func TestCodexRun_AcceptsManifestHookPlan(t *testing.T) {
 // would have kept in the runner-held digests for that sandbox.
 func seedCodexManifest(t *testing.T, storeDir string, r CodexRuntime, hooks *codexHooksManifest) {
 	t.Helper()
-	hashes := codexRunnerHeldDigestSet{ConfigTOML: "config0000000000000000000000000000000000000000000000000000000000"}
+	hashes := codexRunnerHeldDigestSet{
+		ConfigTOML: "config0000000000000000000000000000000000000000000000000000000000",
+		AgentModel: "openai/gpt-5.6-luna",
+	}
 	if hooks != nil {
 		hashes.HooksJSON = "hooks00000000000000000000000000000000000000000000000000000000000"
 		hashes.HookScripts = testCodexHookScripts()
@@ -235,8 +241,10 @@ func seedCodexManifest(t *testing.T, storeDir string, r CodexRuntime, hooks *cod
 	recordRunnerHeldDigests("sb", hashes)
 	t.Cleanup(func() { forgetRunnerHeldDigests("sb") })
 	data, err := json.MarshalIndent(codexManifest{
-		AgentName:    "triage",
-		Model:        "openai/gpt-5.6-luna",
+		AgentName: "triage",
+		// Deliberately different from the runner-held AgentModel: Run must
+		// never read the model from this agent-writable, undigested file.
+		Model:        "openai/gpt-9-tampered",
 		CodexVersion: "0.152.1",
 		Hooks:        hooks,
 	}, "", "  ")
@@ -265,10 +273,11 @@ func TestCodexRun_FallsBackToTheAgentDefinitionModel(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
-	// The manifest carries the agent definition's frontmatter model; the run
-	// params name none.
+	// The runner-held state carries the agent definition's frontmatter model;
+	// the run params name none. The manifest's own copy is deliberately not
+	// consulted, so it is left saying something else below.
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.ndjson"))
 
 	metrics := &RunMetrics{}
 	exit, err := r.Run(context.Background(), RunParams{
@@ -279,7 +288,7 @@ func TestCodexRun_FallsBackToTheAgentDefinitionModel(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 0, exit)
-	assert.Equal(t, "gpt-5.6-luna", metrics.Model, "the manifest's openai/ spec, prefix stripped")
+	assert.Equal(t, "gpt-5.6-luna", metrics.Model, "the runner-held openai/ spec, prefix stripped")
 	assert.Contains(t, readFileString(t, logPath), "--model 'gpt-5.6-luna'")
 }
 
@@ -288,21 +297,22 @@ func TestCodexRun_RequiresAModelWhenNothingNamesOne(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
-	// Drop the manifest's model so neither side names one.
-	data, err := os.ReadFile(filepath.Join(storeDir, sanitizeStorePath(r.codexManifestPath())))
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(storeDir, sanitizeStorePath(r.codexManifestPath())),
-		bytes.Replace(data, []byte(`"model": "openai/gpt-5.6-luna",`), nil, 1), 0o644))
+	// Clear the runner-held model so neither side names one. (Emptying the
+	// manifest's copy would prove nothing: Run does not read it.)
+	held, ok := lookupRunnerHeldDigests("sb")
+	require.True(t, ok)
+	held.AgentModel = ""
+	recordRunnerHeldDigests("sb", held)
 	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
 
-	_, err = r.Run(context.Background(), RunParams{
+	_, runErr := r.Run(t.Context(), RunParams{
 		SandboxName: "sb",
 		RepoDir:     "/sandbox/workspace/repo",
 		Timeout:     time.Minute,
 	}, ui.New(&bytes.Buffer{}), time.Now(), &RunMetrics{})
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no model was named")
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), "no model was named")
 	assert.NotContains(t, readFileString(t, logPath), "exec --json")
 }
 
@@ -537,4 +547,32 @@ func TestCodexExtractDebugLog_FailurePaths(t *testing.T) {
 		assert.Contains(t, string(got), "ERROR", "only the credential is masked")
 	})
 
+}
+
+// TestCodexRun_IgnoresATamperedManifestModel is the point of holding the model
+// on the runner side: the manifest lives in the agent-writable config
+// directory and carries no digest, so reading the model from it would let an
+// agent move a validation retry onto a different model — and a different cost
+// tier — than the run was authorised for.
+func TestCodexRun_IgnoresATamperedManifestModel(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	storeDir := t.TempDir()
+	r := CodexRuntime{}
+	seedCodexManifest(t, storeDir, r, nil) // manifest says gpt-9-tampered
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1",
+		filepath.Join("testdata", "codex", "basic_run.ndjson"))
+
+	metrics := &RunMetrics{}
+	exit, err := r.Run(t.Context(), RunParams{
+		SandboxName: "sb",
+		RepoDir:     "/sandbox/workspace/repo",
+		Timeout:     time.Minute,
+	}, ui.New(&bytes.Buffer{}), time.Now(), metrics)
+
+	require.NoError(t, err)
+	assert.Equal(t, 0, exit)
+	assert.Equal(t, "gpt-5.6-luna", metrics.Model, "the runner-held model, not the manifest's")
+	log := readFileString(t, logPath)
+	assert.Contains(t, log, "--model 'gpt-5.6-luna'")
+	assert.NotContains(t, log, "gpt-9-tampered")
 }

@@ -422,27 +422,6 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			r.codexManifestPath())
 	}
 
-	// The same fallback chain NeedsOpenAIProvider decides from, so the launch
-	// and the provider decision cannot disagree about which model this run
-	// calls — a disagreement would either strand a frontmatter-pinned OpenAI
-	// agent without a credential or attach one to a run that never uses it.
-	modelID, err := translateCodexModel(EffectiveModel(params.Model, m.Model))
-	if err != nil {
-		return -1, err
-	}
-	effort, ok := codexEffortFor(params.Effort)
-	if !ok {
-		printer.StepWarn(fmt.Sprintf(
-			"effort %q is not a codex reasoning effort; running at the model's default",
-			sanitizeOutput(params.Effort)))
-	}
-	if len(params.FallbackModels) > 0 {
-		// codex has no fallback chain. Say so rather than silently dropping it.
-		printer.StepWarn(fmt.Sprintf(
-			"fallback models %s are not supported on codex and are ignored",
-			sanitizeOutput(strings.Join(params.FallbackModels, ","))))
-	}
-
 	digests, ok := lookupRunnerHeldDigests(params.SandboxName)
 	if !ok {
 		// The digests are runner-held because the sandbox has no trustworthy
@@ -472,6 +451,33 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			map[bool]string{true: "expects", false: "does not expect"}[hooksEnabled],
 			map[bool]string{true: "recorded", false: "recorded no"}[digests.HooksJSON != ""])
 	}
+	// The same fallback chain NeedsOpenAIProvider decides from, so the launch
+	// and the provider decision cannot disagree about which model this run
+	// calls — a disagreement would either strand a frontmatter-pinned OpenAI
+	// agent without a credential or attach one to a run that never uses it.
+	//
+	// The fallback is the runner-held copy of the agent definition's model,
+	// not the manifest's: the manifest sits in the agent-writable config
+	// directory and carries no digest, so reading the model from there would
+	// let an agent move a validation retry onto a different model, and a
+	// different cost tier, than the one the run was authorised for.
+	modelID, err := translateCodexModel(EffectiveModel(params.Model, digests.AgentModel))
+	if err != nil {
+		return -1, err
+	}
+	effort, ok := codexEffortFor(params.Effort)
+	if !ok {
+		printer.StepWarn(fmt.Sprintf(
+			"effort %q is not a codex reasoning effort; running at the model's default",
+			sanitizeOutput(params.Effort)))
+	}
+	if len(params.FallbackModels) > 0 {
+		// codex has no fallback chain. Say so rather than silently dropping it.
+		printer.StepWarn(fmt.Sprintf(
+			"fallback models %s are not supported on codex and are ignored",
+			sanitizeOutput(strings.Join(params.FallbackModels, ","))))
+	}
+
 	cmd := buildCodexRunCommand(params, modelID, effort, hooksEnabled, digests)
 
 	stdout, execCmd, cancel, err := sandbox.ExecStreamReader(ctx, params.SandboxName, cmd, params.Timeout, os.Stderr)

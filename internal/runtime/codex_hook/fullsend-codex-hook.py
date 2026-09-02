@@ -469,16 +469,26 @@ def main() -> None:
     raw = sys.stdin.read()
     hook_input = parse_json(raw)
     if not isinstance(hook_input, dict):
-        # Every script treats empty stdin as "no tool call" and allows it; a
-        # payload we cannot read at all is a different matter on the blocking
-        # phase, where guessing would be fail-open.
-        if raw.strip() == "":
+        # A payload that arrived but cannot be read as an object is the shape a
+        # truncated or hostile message has, and passing it would let a tool
+        # call through unscanned.
+        #
+        # Empty stdin is treated the same way on PreToolUse. The scripts read
+        # it as "no tool call" and allow, which is right for them — they also
+        # run standalone — but the adapter was invoked *because* a tool call is
+        # about to happen, so an empty payload means the call cannot be
+        # scanned, not that there is nothing to scan. On PostToolUse the call
+        # has already run and there is nothing left to prevent, so the no-op
+        # stands there.
+        empty = raw.strip() == ""
+        if phase == PHASE_POST and empty:
             sys.exit(0)
-        # Only empty stdin is benign ("no tool call", which every script
-        # allows). A payload that arrived but cannot be read as an object is
-        # the shape a truncated or hostile message has, and passing it would
-        # let a tool call through unscanned on either phase.
-        message = "fullsend: codex hook payload was not a JSON object (fail closed)"
+        message = (
+            "fullsend: codex sent an empty PreToolUse payload, so the tool "
+            "call cannot be scanned (fail closed)"
+            if empty
+            else "fullsend: codex hook payload was not a JSON object (fail closed)"
+        )
         log_finding("codex_adapter_bad_payload", "critical", message, "block")
         block(message)
 

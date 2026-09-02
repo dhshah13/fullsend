@@ -643,7 +643,10 @@ flowchart TB
   `os.Stderr` to the exec stream.
 - **Model**: `openai/<id>` or a bare `<id>`, resolved through `EffectiveModel` — the same chain
   `NeedsOpenAIProvider` decides from, so the launch and the run-scoped provider decision cannot
-  disagree about which model a run calls. The **Claude model aliases (`opus`, `sonnet`, `haiku`,
+  disagree about which model a run calls. The fallback is the **runner-held** copy of the agent
+  definition's `model:`, not the manifest's: the manifest is agent-writable and carries no digest,
+  so reading it there would let an agent move a validation retry onto a different model, and a
+  different cost tier, than the run was authorised for. The **Claude model aliases (`opus`, `sonnet`, `haiku`,
   `fable`) deliberately do not apply to codex**, and codex does not consult the per-repo
   `models.aliases` overrides either, so a Claude alias can never resolve to a GPT model behind the
   operator's back. A Claude alias, any non-`openai/` prefix, or no model at all is an error naming
