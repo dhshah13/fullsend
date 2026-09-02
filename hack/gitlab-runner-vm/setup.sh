@@ -92,9 +92,25 @@ fix_fedora_repos() {
     [ -f "${repo_file}" ] || continue
     if grep -q '^metalink=' "${repo_file}"; then
       sudo sed -i -e 's/^metalink=/#metalink=/' -e 's/^#baseurl=/baseurl=/' "${repo_file}"
+      # Stock Fedora cloud images ship a placeholder baseurl pointing at
+      # download.example (not a real mirror). Replace it with the real
+      # Fedora mirror that is already in the TenantEgress allowlist.
+      if grep -q 'download\.example' "${repo_file}"; then
+        sudo sed -i 's|download\.example|dl.fedoraproject.org|g' "${repo_file}"
+      fi
       changed=1
     fi
   done
+
+  # The Cisco openh264 repo has broken mirrors on Fedora 43 cloud images
+  # and is not needed for runner operation. Disable it to prevent dnf
+  # metadata refresh failures.
+  local cisco_repo="/etc/yum.repos.d/fedora-cisco-openh264.repo"
+  if [ -f "${cisco_repo}" ]; then
+    sudo dnf config-manager setopt fedora-cisco-openh264.enabled=0 2>/dev/null \
+      || sudo sed -i 's/^enabled=1/enabled=0/' "${cisco_repo}"
+    ok "disabled fedora-cisco-openh264 repo"
+  fi
 
   if [ "${changed}" -eq 1 ]; then
     ok "switched Fedora repos from metalink to baseurl"
