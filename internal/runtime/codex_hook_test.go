@@ -401,3 +401,28 @@ sys.exit(0)`)
 	assert.Equal(t, 2, crashed.exitCode, "a crash must block, not fail open")
 	assert.NotEmpty(t, strings.TrimSpace(crashed.stderr))
 }
+
+// TestCodexAdapter_BlocksWithUnwritableStderr covers the last un-guarded line
+// on the fail-closed path: if stderr is already a broken pipe, an unsuppressed
+// write would take the interpreter down with exit 1 — which codex records as
+// Failed, and a failed hook does not block. A block without its reason still
+// beats a block that never happens.
+func TestCodexAdapter_BlocksWithUnwritableStderr(t *testing.T) {
+	h := newCodexAdapterHarness(t)
+	h.script("blocker.py", `print(json.dumps({"decision": "block", "reason": "nope"}))
+sys.exit(1)`)
+
+	payload, err := json.Marshal(codexBashInput("ls"))
+	require.NoError(t, err)
+
+	// Close stderr for the child: writing to fd 2 then fails.
+	cmd := exec.Command("/bin/sh", "-c",
+		shellQuote(h.python)+" "+shellQuote(h.adapter)+" PreToolUse blocker.py 2>&-")
+	cmd.Stdin = strings.NewReader(string(payload))
+	runErr := cmd.Run()
+
+	require.Error(t, runErr)
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, runErr, &exitErr)
+	assert.Equal(t, 2, exitErr.ExitCode(), "the block must still be an exit 2, reason or no reason")
+}

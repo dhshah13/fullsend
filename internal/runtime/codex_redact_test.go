@@ -158,7 +158,7 @@ func TestCodexRun_TeedOutputIsRedacted(t *testing.T) {
 			`{"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"cat .env",`+
 			`"aggregated_output":"GITHUB_TOKEN=`+codexTestSecret+`","exit_code":0,"status":"completed"}}`+"\n"+
 			`{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}`+"\n"), 0o644))
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1", fixture)
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", fixture)
 
 	outPath := filepath.Join(t.TempDir(), "output.jsonl")
 	metrics := &RunMetrics{}

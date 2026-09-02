@@ -144,7 +144,7 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 		"-c 'approval_policy=never'",
 		"-c 'sandbox_mode=danger-full-access'",
 		"-c 'model_reasoning_effort=high'",
-		"-o '" + sandbox.SandboxWorkspace + "/output/last-message.txt'",
+		"-o '" + sandbox.SandboxCodexConfig + "/last-message.txt'",
 	} {
 		assert.Contains(t, cmd, want)
 	}

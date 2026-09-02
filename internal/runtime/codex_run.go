@@ -176,9 +176,18 @@ func codexAssetGuard(r CodexRuntime, hooksEnabled bool) string {
 }
 
 // codexHooksAdapterCheck asserts that every command handler in hooks.json
-// still invokes adapter. The grouping braces are load-bearing: `&&` and `||`
-// are left-associative in sh, so an ungrouped alternation inside the guard's
-// chain would rescue every earlier failure and make the whole guard fail open.
+// still invokes adapter.
+//
+// This is **defense in depth, not the boundary**. On its own the count
+// comparison is bypassable — swap one handler's command and pad the adapter's
+// path into the free-form `description` field to restore parity. What actually
+// makes hooks.json tamper-evident is codexConfigGuard's whole-file digest,
+// anchored in the runner's memory; this check survives as a cheap, readable
+// assertion that fails first and names the wiring rather than the file.
+//
+// The grouping braces are load-bearing: `&&` and `||` are left-associative in
+// sh, so an ungrouped alternation inside the guard's chain would rescue every
+// earlier failure and make the whole guard fail open.
 func codexHooksAdapterCheck(hooksPath, adapter string) string {
 	// `grep -o | wc -l` counts occurrences rather than matching lines: the
 	// runner writes one handler per line, but an agent rewriting the file is
@@ -326,7 +335,7 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		parts = append(parts, "-c "+shellQuote("model_reasoning_effort="+effort))
 	}
 	parts = append(parts,
-		"-o "+shellQuote(sandbox.SandboxWorkspace+"/"+codexLastMessageFile),
+		"-o "+shellQuote(r.ConfigDir()+"/"+codexLastMessageFile),
 		"-",
 	)
 	if params.Debug != "" {
@@ -380,6 +389,16 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 		return -1, fmt.Errorf(
 			"no recorded config digests for sandbox %s: CodexRuntime.Run requires Bootstrap to have run in the same process (internal/cli/run.go does), because the expected hashes cannot be read back from the agent-writable config directory",
 			params.SandboxName)
+	}
+	// Both sides derive from the harness's SecurityEnabled() today — the
+	// runner passes HooksSettingsPath, Bootstrap writes hooks.json — but
+	// nothing asserted it, and a refactor that split them would silently drop
+	// the hooks.json digest from the guard while the adapter still loaded.
+	if hooksEnabled != (hashes.HooksJSON != "") {
+		return -1, fmt.Errorf(
+			"codex hook wiring is inconsistent: the runner %s hooks but Bootstrap %s a hooks.json digest; refusing to run rather than fall back to the weaker checks",
+			map[bool]string{true: "expects", false: "does not expect"}[hooksEnabled],
+			map[bool]string{true: "recorded", false: "recorded no"}[hashes.HooksJSON != ""])
 	}
 	cmd := buildCodexRunCommand(params, modelID, effort, hooksEnabled, hashes)
 
@@ -474,10 +493,11 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 // per-iteration.
 func (r CodexRuntime) ClearIterationArtifacts(sandboxName string) error {
 	clearStrayProcesses(sandbox.Exec, sandboxName, os.Stderr)
-	clearCmd := fmt.Sprintf("rm -rf %s/output/* %s/* %s",
+	clearCmd := fmt.Sprintf("rm -rf %s/output/* %s/* %s %s",
 		shellQuote(r.WorkspaceDir()),
 		shellQuote(r.codexSessionsDir()),
-		shellQuote(r.WorkspaceDir()+"/"+codexDebugLogFile))
+		shellQuote(r.WorkspaceDir()+"/"+codexDebugLogFile),
+		shellQuote(r.ConfigDir()+"/"+codexLastMessageFile))
 	_, _, _, err := sandbox.Exec(sandboxName, clearCmd, 10*time.Second)
 	return err
 }

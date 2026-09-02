@@ -120,9 +120,16 @@ def block(reason: str) -> None:
     """Exit 2 with a non-empty reason on stderr — codex's blocking contract.
 
     An empty stderr on exit 2 is reported as `Failed`, which does not block,
-    so a missing reason is replaced rather than passed through."""
+    so a missing reason is replaced rather than passed through.
+
+    The write is suppressed rather than allowed to raise: a stderr that is
+    already a broken pipe would otherwise take the interpreter down with exit
+    1, which codex records as `Failed` — and a failed hook does not block. A
+    block without its reason still beats a block that never happens."""
     text = (reason or "").strip() or "fullsend hook blocked this tool call"
-    sys.stderr.write(text[:MAX_TEXT])
+    with contextlib.suppress(BaseException):
+        sys.stderr.write(text[:MAX_TEXT])
+        sys.stderr.flush()
     sys.exit(2)
 
 

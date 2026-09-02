@@ -17,10 +17,11 @@ import (
 
 // fakeOpenshellCodex installs a fake "openshell" that records every argv line
 // to logPath, stores each upload payload under storeDir keyed by the remote
-// path, answers `codex --version` and `cat <remote>` execs from that store,
+// path, answers `codex --version` with versionOutput verbatim and `cat <remote>`
+// execs from that store,
 // and streams streamFixture (when non-empty) for the codex run command.
 // Everything else succeeds silently.
-func fakeOpenshellCodex(t *testing.T, logPath, storeDir, version string, streamFixture ...string) {
+func fakeOpenshellCodex(t *testing.T, logPath, storeDir, versionOutput string, streamFixture ...string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(storeDir, 0o755))
 	streamCase := "exit 0"
@@ -52,7 +53,7 @@ fi
 if [ "$2" = "exec" ]; then
   for last; do :; done
   case "$last" in
-    "codex --version") echo "codex-cli ` + version + `"; exit 0 ;;
+    "codex --version") echo "` + versionOutput + `"; exit 0 ;;
     "command -v python3") echo "/usr/bin/python3"; exit 0 ;;
     cat\ *) f=$(printf '%s' "${last#cat }" | tr -d "'" | tr '/' '_'); cat '` + storeDir + `'/"$f"; exit $? ;;
     *"exec --json"*) ` + streamCase + ` ;;
@@ -85,7 +86,7 @@ You are the triage agent. Use gh.
 func TestCodexRuntimeBootstrap_WritesConfigAndManifest(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
 	storeDir := t.TempDir()
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1")
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
 
 	r := CodexRuntime{}
 	err := r.Bootstrap(bootstrapInput{
@@ -112,7 +113,7 @@ func TestCodexRuntimeBootstrap_WritesConfigAndManifest(t *testing.T) {
 	require.NoError(t, json.Unmarshal(storedUpload(t, storeDir, r.codexManifestPath()), &m))
 	assert.Equal(t, "triage", m.AgentName)
 	assert.Equal(t, "openai/gpt-5.6-luna", m.Model)
-	assert.Equal(t, "codex-cli 0.152.1", m.CodexVersion)
+	assert.Equal(t, "0.152.1", m.CodexVersion, "the bare number: the renderer prefixes \"v\"")
 	// Tools stay in Claude vocabulary: codex has no native allowlist, so this
 	// is what FULLSEND_TOOL_ALLOWLIST and the allowlist hook match on (#608).
 	assert.Equal(t, []string{"Bash", "Read", "Skill"}, m.Tools)
@@ -126,7 +127,7 @@ func TestCodexRuntimeBootstrap_WritesConfigAndManifest(t *testing.T) {
 }
 
 func TestCodexRuntimeBootstrap_RejectsAgentNameMismatch(t *testing.T) {
-	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
 
 	err := CodexRuntime{}.Bootstrap(bootstrapInput{
 		sandboxName: "sb",
@@ -140,7 +141,7 @@ func TestCodexRuntimeBootstrap_RejectsAgentNameMismatch(t *testing.T) {
 func TestCodexRuntimeBootstrap_InstallsHooksWiringAndAdapter(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
 	storeDir := t.TempDir()
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1")
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
 
 	r := CodexRuntime{}
 	err := r.Bootstrap(codexHooksBootstrapInput{
@@ -191,7 +192,7 @@ func TestCodexRuntimeBootstrap_InstallsHooksWiringAndAdapter(t *testing.T) {
 
 func TestCodexRuntimeBootstrap_UploadsSkillsAndWarnsOnPlugins(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
-	fakeOpenshellCodex(t, logPath, t.TempDir(), "0.152.1")
+	fakeOpenshellCodex(t, logPath, t.TempDir(), "codex-cli 0.152.1")
 
 	skillDir := filepath.Join(t.TempDir(), "code-review")
 	require.NoError(t, os.MkdirAll(skillDir, 0o755))
@@ -265,7 +266,7 @@ func TestCodexDeveloperInstructions(t *testing.T) {
 func TestReadCodexManifest_RejectsGarbage(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
 	storeDir := t.TempDir()
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1")
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
 
 	r := CodexRuntime{}
 	path := r.codexManifestPath()
@@ -279,7 +280,7 @@ func TestReadCodexManifest_RejectsGarbage(t *testing.T) {
 
 func TestCodexClearIterationArtifacts_SweepsSessionsAndLogs(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
-	fakeOpenshellCodex(t, logPath, t.TempDir(), "0.152.1")
+	fakeOpenshellCodex(t, logPath, t.TempDir(), "codex-cli 0.152.1")
 
 	r := CodexRuntime{}
 	require.NoError(t, r.ClearIterationArtifacts("sb"))
@@ -318,7 +319,7 @@ func TestCodexRuntimeBootstrap_ReportsInfrastructureFailures(t *testing.T) {
 		"manifest":    {codexManifestFile, "writing " + codexManifestFile},
 	} {
 		t.Run(name, func(t *testing.T) {
-			fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+			fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
 			t.Setenv("FULLSEND_TEST_FAIL_MATCH", tc.match)
 
 			err := r.Bootstrap(bootstrapInput{
@@ -333,7 +334,7 @@ func TestCodexRuntimeBootstrap_ReportsInfrastructureFailures(t *testing.T) {
 }
 
 func TestCodexRuntimeBootstrap_HookInstallFailureIsReported(t *testing.T) {
-	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
 	t.Setenv("FULLSEND_TEST_FAIL_MATCH", codexAdapterFile)
 
 	err := CodexRuntime{}.Bootstrap(codexHooksBootstrapInput{
@@ -353,7 +354,7 @@ func TestCodexRuntimeBootstrap_HookInstallFailureIsReported(t *testing.T) {
 // header the prompt can refer to.
 func TestCodexRuntimeBootstrap_DerivesAgentNameFromTheFile(t *testing.T) {
 	storeDir := t.TempDir()
-	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "0.152.1")
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "codex-cli 0.152.1")
 
 	r := CodexRuntime{}
 	require.NoError(t, r.Bootstrap(bootstrapInput{
@@ -370,19 +371,28 @@ func TestCodexRuntimeBootstrap_DerivesAgentNameFromTheFile(t *testing.T) {
 	assert.Contains(t, string(storedUpload(t, storeDir, r.codexConfigPath())), "# Agent: triage")
 }
 
+func TestCodexPreflightVersion_RejectsAnUnexpectedShape(t *testing.T) {
+	// Fail closed rather than let the run log render "(vsomething odd)".
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+
+	_, err := codexPreflightVersion("sb")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected")
+}
+
 func TestCodexPreflightVersion_UsesTheLastLine(t *testing.T) {
 	storeDir := t.TempDir()
-	// The fake echoes one line; a real codex may print a warning first, and the
-	// version is the last line either way.
+	// A real codex may print a warning first — the sandbox image logs one
+	// about PATH aliases — and the version is the last line either way.
 	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "warning: something\ncodex-cli 0.152.1")
 
 	got, err := codexPreflightVersion("sb")
 	require.NoError(t, err)
-	assert.Equal(t, "codex-cli 0.152.1", got)
+	assert.Equal(t, "0.152.1", got)
 }
 
 func TestReadCodexManifest_ReportsAMissingFile(t *testing.T) {
-	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
 
 	_, err := readCodexManifest("sb", CodexRuntime{}.codexManifestPath())
 	require.Error(t, err)
@@ -393,7 +403,7 @@ func TestReadCodexManifest_ReportsAMissingFile(t *testing.T) {
 // agent has not touched, so hooks.json can name an absolute interpreter.
 func TestCodexPreflightPython(t *testing.T) {
 	t.Run("returns the absolute path", func(t *testing.T) {
-		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
 		got, err := codexPreflightPython("sb")
 		require.NoError(t, err)
 		assert.Equal(t, "/usr/bin/python3", got)

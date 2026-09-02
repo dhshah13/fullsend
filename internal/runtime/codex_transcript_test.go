@@ -22,7 +22,7 @@ func TestCodexExtractTranscripts_DownloadsRollouts(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	rollout := r.codexSessionsDir() + "/2026/09/02/rollout-2026-09-02T10-00-00-abc123.jsonl"
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1", "", rollout)
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", "", rollout)
 
 	outDir := filepath.Join(t.TempDir(), "transcripts")
 	require.NoError(t, r.ExtractTranscripts("sb", "triage", outDir))
@@ -40,7 +40,7 @@ func TestCodexExtractTranscripts_DownloadsRollouts(t *testing.T) {
 
 func TestCodexExtractTranscripts_NoSessionsIsNotAnError(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
-	fakeOpenshellCodex(t, logPath, t.TempDir(), "0.152.1")
+	fakeOpenshellCodex(t, logPath, t.TempDir(), "codex-cli 0.152.1")
 
 	outDir := filepath.Join(t.TempDir(), "transcripts")
 	require.NoError(t, CodexRuntime{}.ExtractTranscripts("sb", "triage", outDir))
@@ -49,7 +49,7 @@ func TestCodexExtractTranscripts_NoSessionsIsNotAnError(t *testing.T) {
 
 func TestCodexExtractDebugLog_OnlyWhenDebugIsOn(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
-	fakeOpenshellCodex(t, logPath, t.TempDir(), "0.152.1")
+	fakeOpenshellCodex(t, logPath, t.TempDir(), "codex-cli 0.152.1")
 	local := filepath.Join(t.TempDir(), "codex-debug.log")
 
 	require.NoError(t, CodexRuntime{}.ExtractDebugLog("sb", local, ""))
@@ -108,7 +108,7 @@ func TestCodexRun_StreamVerdictOverridesExitZero(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1", filepath.Join("testdata", "codex", "turn_failed.jsonl"))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "turn_failed.jsonl"))
 
 	outPath := filepath.Join(t.TempDir(), "output.jsonl")
 	metrics := &RunMetrics{}
@@ -137,7 +137,7 @@ func TestCodexRun_SuccessfulRunReportsMetrics(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
 
 	metrics := &RunMetrics{}
 	exit, err := r.Run(context.Background(), RunParams{
@@ -160,7 +160,7 @@ func TestCodexRun_RejectsForeignModelBeforeSpending(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1")
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
 
 	exit, err := r.Run(context.Background(), RunParams{
 		SandboxName: "sb",
@@ -183,7 +183,7 @@ func TestCodexRun_RefusesHooklessRunWhenSecurityIsOn(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1")
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
 
 	_, err := r.Run(context.Background(), RunParams{
 		SandboxName:       "sb",
@@ -204,7 +204,7 @@ func TestCodexRun_AcceptsManifestHookPlan(t *testing.T) {
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r,
 		codexHooksManifestFor(r.codexHooksDir(), security.SandboxHookConfigFromHarness(&harness.Harness{})))
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
 
 	exit, err := r.Run(context.Background(), RunParams{
 		SandboxName:       "sb",
@@ -220,13 +220,20 @@ func TestCodexRun_AcceptsManifestHookPlan(t *testing.T) {
 }
 
 // seedCodexManifest puts a manifest into the fake openshell's store so
-// readCodexManifest finds one.
+// readCodexManifest finds one, and records the artifact digests Bootstrap
+// would have kept in the runner's memory for that sandbox.
 func seedCodexManifest(t *testing.T, storeDir string, r CodexRuntime, hooks *codexHooksManifest) {
 	t.Helper()
+	hashes := codexUploadedHashes{ConfigTOML: "config0000000000000000000000000000000000000000000000000000000000"}
+	if hooks != nil {
+		hashes.HooksJSON = "hooks00000000000000000000000000000000000000000000000000000000000"
+	}
+	recordCodexArtifactHashes("sb", hashes)
+	t.Cleanup(func() { forgetCodexArtifactHashes("sb") })
 	data, err := json.MarshalIndent(codexManifest{
 		AgentName:    "triage",
 		Model:        "openai/gpt-5.6-luna",
-		CodexVersion: "codex-cli 0.152.1",
+		CodexVersion: "0.152.1",
 		Hooks:        hooks,
 	}, "", "  ")
 	require.NoError(t, err)
@@ -257,7 +264,7 @@ func TestCodexRun_FallsBackToTheAgentDefinitionModel(t *testing.T) {
 	// The manifest carries the agent definition's frontmatter model; the run
 	// params name none.
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.jsonl"))
 
 	metrics := &RunMetrics{}
 	exit, err := r.Run(context.Background(), RunParams{
@@ -282,7 +289,7 @@ func TestCodexRun_RequiresAModelWhenNothingNamesOne(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(storeDir, sanitizeStorePath(r.codexManifestPath())),
 		bytes.Replace(data, []byte(`"model": "openai/gpt-5.6-luna",`), nil, 1), 0o644))
-	fakeOpenshellCodex(t, logPath, storeDir, "0.152.1")
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
 
 	_, err = r.Run(context.Background(), RunParams{
 		SandboxName: "sb",
@@ -293,4 +300,54 @@ func TestCodexRun_RequiresAModelWhenNothingNamesOne(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no model was named")
 	assert.NotContains(t, readFileString(t, logPath), "exec --json")
+}
+
+// TestCodexRun_RefusesInconsistentHookWiring pins the invariant between the
+// runner's own signal and what Bootstrap recorded. Both derive from the
+// harness's SecurityEnabled() today; a refactor that split them would drop the
+// hooks.json digest from the guard while the adapter still loaded, and nothing
+// would fail.
+func TestCodexRun_RefusesInconsistentHookWiring(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	storeDir := t.TempDir()
+	r := CodexRuntime{}
+	seedCodexManifest(t, storeDir, r,
+		codexHooksManifestFor(r.codexHooksDir(), security.SandboxHookConfigFromHarness(&harness.Harness{})))
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1")
+
+	// Bootstrap recorded no hooks.json digest, but the runner says hooks are on.
+	recordCodexArtifactHashes("sb", codexUploadedHashes{ConfigTOML: "deadbeef"})
+	t.Cleanup(func() { forgetCodexArtifactHashes("sb") })
+
+	_, err := r.Run(t.Context(), RunParams{
+		SandboxName:       "sb",
+		RepoDir:           "/sandbox/workspace/repo",
+		Model:             "gpt-5-mini",
+		HooksSettingsPath: r.codexHooksPath(),
+		Timeout:           time.Minute,
+	}, ui.New(&bytes.Buffer{}), time.Now(), &RunMetrics{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hook wiring is inconsistent")
+	assert.NotContains(t, readFileString(t, logPath), "exec --json")
+}
+
+// Run cannot fall back to the manifest for the digests, so a sandbox this
+// process never bootstrapped is refused rather than run unguarded.
+func TestCodexRun_RefusesWithoutRecordedDigests(t *testing.T) {
+	storeDir := t.TempDir()
+	r := CodexRuntime{}
+	seedCodexManifest(t, storeDir, r, nil)
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "codex-cli 0.152.1")
+	forgetCodexArtifactHashes("sb-never-bootstrapped")
+
+	_, err := r.Run(t.Context(), RunParams{
+		SandboxName: "sb-never-bootstrapped",
+		RepoDir:     "/sandbox/workspace/repo",
+		Model:       "gpt-5-mini",
+		Timeout:     time.Minute,
+	}, ui.New(&bytes.Buffer{}), time.Now(), &RunMetrics{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no recorded config digests")
 }

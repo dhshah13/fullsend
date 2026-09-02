@@ -84,9 +84,16 @@ func (r CodexRuntime) codexAuthScriptPath() string {
 }
 
 // codexLastMessageFile is where --output-last-message writes the agent's final
-// message. It lives in the workspace output directory so
-// ClearIterationArtifacts sweeps it with the rest of the iteration.
-const codexLastMessageFile = "output/last-message.txt"
+// message, under the runner-owned config dir.
+//
+// Deliberately not the workspace output directory: that is the agent's own
+// result location (FULLSEND_OUTPUT_DIR), the runner extracts everything there
+// as the run's output files, and nothing creates it up front — codex reported
+// `Failed to write last message file ... No such file or directory` in the
+// first end-to-end smoke. The final message is in the stream as an
+// agent_message either way; this file is a convenience for an operator
+// inspecting a kept sandbox, and ClearIterationArtifacts removes it.
+const codexLastMessageFile = "last-message.txt"
 
 // Bootstrap prepares the runner-owned codex config directory for one agent
 // run: the agent body as developer_instructions in config.toml, the auth
@@ -349,8 +356,27 @@ func codexPreflightVersion(sandboxName string) (string, error) {
 	if i := strings.LastIndexByte(version, '\n'); i >= 0 {
 		version = strings.TrimSpace(version[i+1:])
 	}
-	return sanitizeOutput(version), nil
+	// `codex --version` prints "codex-cli X.Y.Z", where pi prints a bare
+	// "0.84.4". The renderer writes "(v" + this + ")", so the product name has
+	// to come off or the run log reads "(vcodex-cli 0.152.1)".
+	number, ok := strings.CutPrefix(version, codexVersionPrefix)
+	if !ok {
+		return "", fmt.Errorf(
+			"codex preflight: `codex --version` printed %q, expected %q followed by the version",
+			sanitizeOutput(version), codexVersionPrefix)
+	}
+	number = strings.TrimSpace(number)
+	if number == "" {
+		return "", fmt.Errorf("codex preflight: `codex --version` printed no version after %q", codexVersionPrefix)
+	}
+	return sanitizeOutput(number), nil
 }
+
+// codexVersionPrefix is what `codex --version` puts before the number.
+// Asserted at image build time too (images/sandbox/Containerfile compares the
+// whole "codex-cli <pin>" string), so a change here shows up as a build
+// failure before it reaches a run.
+const codexVersionPrefix = "codex-cli "
 
 // codexPreflightPython resolves the absolute interpreter the hook handlers
 // will name. It is resolved here, on a shell the agent has not touched, rather

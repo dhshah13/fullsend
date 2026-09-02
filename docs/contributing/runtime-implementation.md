@@ -790,6 +790,28 @@ A real `codex exec --json` run against `api.openai.com` inside the pinned sandbo
 | Is `POST /v1/responses` the only request? | **No.** With a custom provider codex also issues `GET /v1/models` at startup (`codex_models_manager`), which fails to decode OpenAI's public catalog shape and is logged as a non-fatal ERROR. The `fullsend-openai` egress profile denies it, so expect that denial in a run's logs; the model call itself is `POST /v1/responses`. |
 | Does `codex doctor` accept the rendered config? | Yes: `config.toml parse ok`, `default model provider fullsend-openai`, `OpenAI auth is not required for the active model provider`, and `Responses WebSocket is not enabled for the active provider` — the last confirming the HTTP/SSE path the egress profile requires. |
 
+A full `fullsend run` through OpenShell then confirmed the credential path end to end
+(`--runtime codex --model openai/gpt-5-mini --forge github`, arm64, 2026-09-02):
+
+- **Egress, from the sandbox OCSF log.** `POST /v1/responses` **ALLOWED** ×3 under the run-scoped
+  provider's policy; `GET /v1/models` **DENIED** ×2 by the L7 engine, 3 ms apart — one attempt and
+  its immediate retry, not a loop, and the first allowed `POST` followed 100 ms later, so it delays
+  nothing. codex also probes `chatgpt.com:443` and `api.github.com:443`, both **DENIED** at L4.
+- **Hooks.** The agent's `ls -la` ran; its `~/.bashrc` overwrite was blocked by the PreToolUse chain
+  (`Command blocked by PreToolUse hook: Tirith [HIGH] dotfile_overwrite …`) and the agent reported it
+  as blocked rather than failed.
+- **Artifacts.** `metrics.json` carried `"runtime": "codex"`, `"model": "gpt-5-mini"`,
+  `"tool_calls": 1`, token usage, and `"total_cost_usd": 0`; the rollout transcript was extracted.
+- **Credential rotation on a kept sandbox.** `openshell provider update` produced a new placeholder
+  generation in the sandbox environment while the token file still held the old one; running
+  `OpenAIAuthSeed()` through `sandbox exec` — what the runner's refresher does — rewrote the file to
+  the new generation, and a further `codex exec` completed a turn on it. That is the whole reason
+  the credential goes through a file rather than the environment.
+- **Cleanup.** A run that fails at model resolution still tears down the sandbox and deletes the
+  run-scoped provider: the cleanup is deferred from provider creation, well before `Run`. With
+  `--keep-sandbox` the provider is expired in place instead and the run prints the
+  `openshell provider delete` command — that is by design, not a leak.
+
 Two artefacts of the run are worth knowing about:
 
 - The `command_execution` item in the stream keeps the command's raw `aggregated_output` even when a
