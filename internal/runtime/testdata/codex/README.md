@@ -25,6 +25,7 @@ ARG exists run `CODEX_VERSION=0.152.1 ./regen.sh`.
 | `malformed_line.jsonl` | Garbage, half-written and empty lines mid-stream: skipped, the run still completes. |
 | `truncated.jsonl` | Killed mid-write — the last line stops mid-token and there is no terminal event. (The repo's `end-of-file-fixer` hook keeps a trailing newline after it; the line is still unparseable, which is what the fixture tests.) |
 | `unknown_types.jsonl` | An unknown top-level event type and an unknown item type: skipped, the run still completes. |
+| `second_turn_unfinished.jsonl` | A completed turn followed by a second `turn.started` that never finishes: the run is incomplete, not the first turn's success. |
 
 ## Event structs
 

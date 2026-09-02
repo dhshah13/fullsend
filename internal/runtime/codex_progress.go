@@ -242,6 +242,9 @@ func codexFileChangeTool(kind string) string {
 // missing half is dropped rather than left as an empty segment, so a malformed
 // item still reads as a name instead of "mcp____".
 func codexMcpToolName(server, tool string) string {
+	// Server and tool names come off the wire and land in CI annotations
+	// via the renderer, so they are redacted like every other summary.
+	server, tool = redactSummary(server), redactSummary(tool)
 	parts := []string{"mcp"}
 	if server != "" {
 		parts = append(parts, server)
@@ -324,13 +327,23 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 		criticalErrMsg string
 	)
 
+	// nonNegative floors a delta at zero. The usage snapshot should only
+	// grow, but it is a value the model service reports and a non-monotonic
+	// one must not surface as a negative token count.
+	nonNegative := func(n int) int {
+		if n < 0 {
+			return 0
+		}
+		return n
+	}
+
 	emitTokensDelta := func() {
 		delta := TokensEvent{
-			InputTokens:     usage.InputTokens - reported.InputTokens,
-			OutputTokens:    usage.OutputTokens - reported.OutputTokens,
-			ReasoningTokens: usage.ReasoningOutputTokens - reported.ReasoningOutputTokens,
-			CacheRead:       usage.CachedInputTokens - reported.CachedInputTokens,
-			CacheWrite:      usage.CacheWriteInputTokens - reported.CacheWriteInputTokens,
+			InputTokens:     nonNegative(usage.InputTokens - reported.InputTokens),
+			OutputTokens:    nonNegative(usage.OutputTokens - reported.OutputTokens),
+			ReasoningTokens: nonNegative(usage.ReasoningOutputTokens - reported.ReasoningOutputTokens),
+			CacheRead:       nonNegative(usage.CachedInputTokens - reported.CachedInputTokens),
+			CacheWrite:      nonNegative(usage.CacheWriteInputTokens - reported.CacheWriteInputTokens),
 		}
 		reported = usage
 		onEvent(delta)
@@ -346,6 +359,8 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 		}
 		switch head.Type {
 		case "agent_message":
+			// Assistant text is passed through unredacted, as it is on pi
+			// and Claude Code; the renderer sanitizes it for display.
 			var item codexTextItem
 			if json.Unmarshal(raw, &item) == nil && item.Text != "" {
 				onEvent(TextEvent{Text: item.Text})
@@ -367,6 +382,14 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 		case "file_change":
 			var item codexFileChangeItem
 			if json.Unmarshal(raw, &item) != nil {
+				return
+			}
+			if len(item.Changes) == 0 {
+				// A patch that failed before it could name a file still
+				// happened; reporting nothing would hide it.
+				if item.Status == "failed" {
+					onEvent(ToolUseEvent{Name: "Edit", Summary: "(failed)"})
+				}
 				return
 			}
 			for _, change := range item.Changes {
@@ -414,13 +437,15 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 			}
 			onEvent(ToolUseEvent{Name: "WebSearch", Summary: summary})
 		case "error":
-			// Non-fatal: warnings, deprecation notices and model reroutes all
-			// arrive as completed error items. Shown, never fatal.
-			var item codexErrorPayload
-			if json.Unmarshal(raw, &item) != nil {
-				return
-			}
-			onEvent(ErrorEvent{ErrorType: "warning", Message: piSummarize(item.Message)})
+			// Non-fatal: warnings, deprecation notices and model reroutes
+			// all arrive as completed error items, and the run carries on.
+			// No AgentEvent is emitted for them. AgentEvent has no
+			// informational kind — the renderer prints every ErrorEvent
+			// with StepFail — so emitting one here would paint a
+			// successful run with red failure lines. RetryEvent is not a
+			// fit either: it promises an attempt/limit/delay that these
+			// do not have. They stay in output.jsonl, which is kept as a
+			// run artifact.
 		case "todo_list":
 			// The agent's running plan: useful in a TUI, noise here.
 		default:
@@ -495,7 +520,13 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 			}
 
 		case "turn.started":
-			// Lifecycle only.
+			// A new turn reopens the outcome: the previous turn's
+			// terminal event described that turn, not this one. Without
+			// this reset a stream of turn.completed -> turn.started -> EOF
+			// would inherit the first turn's success and report a run that
+			// died mid-turn as a clean finish.
+			terminal = codexTerminalNone
+			terminalErrMsg = ""
 
 		case "turn.completed":
 			var evt codexTurnCompletedEvent
@@ -520,6 +551,11 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 			} else {
 				msg = piSummarize(msg)
 			}
+			// A failed turn is still a turn: it consumed a prompt and
+			// produced work. turn.failed carries no usage on the wire
+			// (only turn.completed does), so the counters keep whatever
+			// the last completed turn reported.
+			numTurns++
 			terminal = codexTerminalFailed
 			terminalErrMsg = msg
 			onEvent(ErrorEvent{ErrorType: codexSubtypeFailed, Message: msg})
@@ -529,8 +565,13 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 			if json.Unmarshal(line, &evt) != nil {
 				continue
 			}
+			// Parked, not rendered: the processor keeps running after this
+			// and a turn may still complete, so surfacing it as an
+			// ErrorEvent would fail-flag a successful run (see the error
+			// item above). It becomes the reported reason only if the
+			// stream then ends without a terminal event, or if a
+			// turn.failed arrives carrying no message of its own.
 			criticalErrMsg = piSummarize(evt.Message)
-			onEvent(ErrorEvent{ErrorType: "error", Message: criticalErrMsg})
 
 		case "item.completed":
 			var evt codexItemEvent
@@ -561,6 +602,11 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 // Two fields are deliberately not set here because the stream does not carry
 // them: TotalCostUSD (codex reports no cost; it stays 0) and Model (the runner
 // knows the resolved model from the run parameters).
+//
+// ToolCalls counts one per ToolUseEvent, and parseCodexStream emits one per
+// *changed path* in a file_change item. That is intended: a single apply_patch
+// touching N files is N edits, which is exactly what Claude Code's per-file
+// Edit/Write calls would count, so the metric stays comparable across runtimes.
 func applyCodexMetrics(metrics *RunMetrics, evt AgentEvent) {
 	if metrics == nil {
 		return
@@ -578,24 +624,46 @@ func applyCodexMetrics(metrics *RunMetrics, evt AgentEvent) {
 	}
 }
 
+// codexThreadEventTypes is the ThreadEvent tag set from exec_events.rs. A
+// line whose *top-level* type is one of these can only have come from
+// `codex exec --json`.
+var codexThreadEventTypes = map[string]bool{
+	"thread.started": true,
+	"turn.started":   true,
+	"turn.completed": true,
+	"turn.failed":    true,
+	"item.started":   true,
+	"item.updated":   true,
+	"item.completed": true,
+	"error":          true,
+}
+
 // isCodexStreamCapture reports whether the JSONL is a tee'd `codex exec --json`
-// stream. The dotted event names are unique to it: codex's own rollout session
-// files under $CODEX_HOME/sessions/ use `session_meta`/`response_item`/
-// `event_msg` envelopes whose inner names are underscored (`item_completed`),
-// so the two file kinds never collide. As with isPiStreamCapture, a whole-file
-// substring check is safe against tool output quoting these markers: inside a
-// JSON string the quotes are escaped, so the raw byte sequence can only occur
-// as a top-level event key.
+// stream. Detection is structural — a line is unmarshalled and its *top-level*
+// `type` checked — rather than a substring scan, because a substring match
+// cannot tell a top-level event from a `type` nested inside another envelope:
+// a wrapper such as {"payload":{"type":"turn.completed"}} would false-positive
+// on the raw bytes. (isPiStreamCapture scans for markers the same way; its
+// event names are underscored and far less likely to appear as a nested key,
+// but the gap is the same shape. Left alone here — changing pi's detection
+// belongs in a pi change, not this one.)
+//
+// "error" is in the set but never decides on its own: it is a plausible
+// top-level key in unrelated JSONL, so a file is a codex capture only once a
+// line carries one of the codex-specific event names.
 func isCodexStreamCapture(data []byte) bool {
-	// codex writes compact JSON; the spaced variants cost nothing and cover a
-	// hand-reformatted capture.
-	for _, marker := range [][]byte{
-		[]byte(`"type":"thread.started"`), []byte(`"type":"turn.completed"`),
-		[]byte(`"type":"turn.failed"`), []byte(`"type":"item.completed"`),
-		[]byte(`"type": "thread.started"`), []byte(`"type": "turn.completed"`),
-		[]byte(`"type": "turn.failed"`), []byte(`"type": "item.completed"`),
-	} {
-		if bytes.Contains(data, marker) {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 0, 64*1024), streamBufSize)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var env codexEnvelope
+		if json.Unmarshal(line, &env) != nil {
+			continue
+		}
+		if env.Type != "error" && codexThreadEventTypes[env.Type] {
 			return true
 		}
 	}

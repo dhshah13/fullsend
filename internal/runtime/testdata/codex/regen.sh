@@ -50,7 +50,7 @@ RAW="${WORKDIR}/raw.jsonl"
 # confined to WORKDIR. `codex exec` has no --ask-for-approval flag; the policy
 # is a -c override. model_reasoning_summary=detailed is what makes the run emit
 # `reasoning` items, which the fixture needs to cover.
-npx -y "${PKG}" exec --json \
+npx -y --ignore-scripts "${PKG}" exec --json \
 	--skip-git-repo-check \
 	--sandbox workspace-write \
 	-c approval_policy=never \
@@ -62,10 +62,18 @@ npx -y "${PKG}" exec --json \
 
 # Redact the throwaway working directory so the fixture reads like a sandbox
 # run and carries nothing machine-specific. Thread ids are kept: they are
-# random per run and are what the parser is asserted on.
-sed "s#${WORKDIR}#/sandbox/workspace/repo#g" "${RAW}" >"${DIR}/basic_run.jsonl"
+# random per run, and the test asserts their shape rather than their value.
+#
+# mktemp -d can hand back a path holding regex metacharacters (a "+" in a
+# macOS TMPDIR, for instance), so the replacement is done literally with
+# python rather than as a sed pattern, and the verification grep is -F.
+WORKDIR="${WORKDIR}" python3 -c '
+import os, sys
+work = os.environ["WORKDIR"]
+sys.stdout.write(sys.stdin.read().replace(work, "/sandbox/workspace/repo"))
+' <"${RAW}" >"${DIR}/basic_run.jsonl"
 
-if grep -q "${WORKDIR}" "${DIR}/basic_run.jsonl"; then
+if grep -qF "${WORKDIR}" "${DIR}/basic_run.jsonl"; then
 	echo "regen.sh: refusing to keep a capture that still contains ${WORKDIR}" >&2
 	exit 1
 fi

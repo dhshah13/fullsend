@@ -65,7 +65,10 @@ func TestParseCodexStream_BasicRun(t *testing.T) {
 
 	events, threadID := collectCodexEvents(t, "basic_run.jsonl")
 
-	assert.Equal(t, "01a062d8-3c06-78f1-95f2-0fe3e261d47f", threadID)
+	// Asserted by shape, not value: regen.sh produces a new id every time
+	// and re-capturing the fixture must not require editing this test.
+	assert.Regexp(t, `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
+		threadID, "thread.started carries a UUID/ULID-shaped thread id")
 
 	// No InitEvent: the stream carries neither a model nor a CLI version.
 	assert.Empty(t, codexEventsOfType[InitEvent](events),
@@ -132,7 +135,7 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 			wantErr:     true,
 			subtype:     codexSubtypeFailed,
 			errContains: "exceeded retry limit",
-			numTurns:    0,
+			numTurns:    1,
 			toolNames:   []string{"Bash"},
 		},
 		{
@@ -182,6 +185,15 @@ func TestParseCodexStream_Fixtures(t *testing.T) {
 			wantErr:   true,
 			subtype:   codexSubtypeIncomplete,
 			numTurns:  0,
+			toolNames: []string{"Bash"},
+		},
+		{
+			name:      "a second turn that never finishes is not the first turn's success",
+			fixture:   "second_turn_unfinished.jsonl",
+			threadID:  "01a06300-0000-7000-8000-000000000008",
+			wantErr:   true,
+			subtype:   codexSubtypeIncomplete,
+			numTurns:  1,
 			toolNames: []string{"Bash"},
 		},
 		{
@@ -267,16 +279,112 @@ func TestParseCodexStream_ErrorItemsAreNotFatal(t *testing.T) {
 
 	events, _ := collectCodexEvents(t, "error_event.jsonl")
 
-	errs := codexEventsOfType[ErrorEvent](events)
-	require.Len(t, errs, 2, "both the error item and the top-level error are shown")
-	assert.Equal(t, "warning", errs[0].ErrorType)
-	assert.Contains(t, errs[0].Message, "model rerouted")
-	assert.Equal(t, "error", errs[1].ErrorType)
-	assert.Contains(t, errs[1].Message, "stream disconnected")
+	// The renderer prints every ErrorEvent as a failure line, so a run that
+	// succeeded must emit none — neither the warning item nor the
+	// non-terminal top-level error may paint it red.
+	assert.Empty(t, codexEventsOfType[ErrorEvent](events),
+		"a successful run emits no ErrorEvent")
 
 	result := codexOnlyResult(t, events)
 	assert.False(t, result.IsError, "turn.completed decides the verdict, not the errors before it")
 	assert.Empty(t, result.ErrorMessage)
+
+	// A failed run does emit one, so a real failure is still visible.
+	failed, _ := collectCodexEvents(t, "turn_failed.jsonl")
+	errs := codexEventsOfType[ErrorEvent](failed)
+	require.Len(t, errs, 1)
+	assert.Equal(t, codexSubtypeFailed, errs[0].ErrorType)
+	assert.Contains(t, errs[0].Message, "exceeded retry limit")
+}
+
+func TestParseCodexStream_LastTerminalEventWins(t *testing.T) {
+	t.Parallel()
+
+	// Both directions of the documented rule: whichever terminal event
+	// arrives last decides, because each describes its own turn.
+	completedThenFailed := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"t1"}`,
+		`{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}`,
+		`{"type":"turn.started"}`,
+		`{"type":"turn.failed","error":{"message":"second turn failed"}}`,
+	}, "\n")
+	failedThenCompleted := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"t1"}`,
+		`{"type":"turn.failed","error":{"message":"first turn failed"}}`,
+		`{"type":"turn.started"}`,
+		`{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}`,
+	}, "\n")
+
+	collect := func(stream string) ResultEvent {
+		var events []AgentEvent
+		_, err := parseCodexStream(strings.NewReader(stream), func(evt AgentEvent) {
+			events = append(events, evt)
+		})
+		require.NoError(t, err)
+		return codexOnlyResult(t, events)
+	}
+
+	first := collect(completedThenFailed)
+	assert.True(t, first.IsError)
+	assert.Equal(t, codexSubtypeFailed, first.Subtype)
+	assert.Contains(t, first.ErrorMessage, "second turn failed")
+	assert.Equal(t, 2, first.NumTurns, "a failed turn counts as a turn")
+
+	second := collect(failedThenCompleted)
+	assert.False(t, second.IsError, "the later completed turn stands")
+	assert.Empty(t, second.Subtype)
+	assert.Empty(t, second.ErrorMessage)
+	assert.Equal(t, 2, second.NumTurns)
+}
+
+func TestParseCodexStream_TokenDeltasNeverGoNegative(t *testing.T) {
+	t.Parallel()
+
+	// The usage snapshot should only grow; a service that reports a smaller
+	// one must not produce negative token counts.
+	stream := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"t1"}`,
+		`{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":100,"cache_write_input_tokens":50,"output_tokens":80,"reasoning_output_tokens":9}}`,
+		`{"type":"turn.started"}`,
+		`{"type":"turn.completed","usage":{"input_tokens":300,"cached_input_tokens":40,"cache_write_input_tokens":10,"output_tokens":20,"reasoning_output_tokens":1}}`,
+	}, "\n")
+
+	var events []AgentEvent
+	_, err := parseCodexStream(strings.NewReader(stream), func(evt AgentEvent) {
+		events = append(events, evt)
+	})
+	require.NoError(t, err)
+
+	tokens := codexEventsOfType[TokensEvent](events)
+	require.Len(t, tokens, 2)
+	assert.Equal(t, TokensEvent{}, tokens[1], "a shrinking snapshot floors every delta at 0")
+
+	// The result still reports the latest snapshot verbatim.
+	result := codexOnlyResult(t, events)
+	assert.Equal(t, 300, result.InputTokens)
+}
+
+func TestParseCodexStream_FailedFileChangeWithoutPaths(t *testing.T) {
+	t.Parallel()
+
+	// A patch that failed before it could name a file still happened.
+	stream := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"t1"}`,
+		`{"type":"item.completed","item":{"id":"i0","type":"file_change","changes":[],"status":"failed"}}`,
+		`{"type":"item.completed","item":{"id":"i1","type":"file_change","changes":[],"status":"completed"}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`,
+	}, "\n")
+
+	var events []AgentEvent
+	_, err := parseCodexStream(strings.NewReader(stream), func(evt AgentEvent) {
+		events = append(events, evt)
+	})
+	require.NoError(t, err)
+
+	tools := codexEventsOfType[ToolUseEvent](events)
+	require.Len(t, tools, 1, "only the failed one is reported; an empty successful patch is nothing")
+	assert.Equal(t, "Edit", tools[0].Name)
+	assert.Equal(t, "(failed)", tools[0].Summary)
 }
 
 func TestParseCodexStream_UsageIsCumulativeNotSummed(t *testing.T) {
@@ -359,6 +467,39 @@ func TestParseCodexStream_NoTerminalEventIsIncomplete(t *testing.T) {
 	assert.True(t, result.IsError)
 	assert.Equal(t, codexSubtypeIncomplete, result.Subtype)
 	assert.Empty(t, result.ErrorMessage, "nothing explained the truncation")
+}
+
+func TestParseCodexStream_TurnStartedReopensTheVerdict(t *testing.T) {
+	t.Parallel()
+
+	// turn.completed decides the turn it ends, not the run: a turn that
+	// starts afterwards and never finishes must reopen the verdict, or a
+	// stream killed mid-second-turn reports the first turn's success.
+	events, _ := collectCodexEvents(t, "second_turn_unfinished.jsonl")
+
+	result := codexOnlyResult(t, events)
+	assert.True(t, result.IsError)
+	assert.Equal(t, codexSubtypeIncomplete, result.Subtype)
+	assert.Equal(t, 1, result.NumTurns, "only the first turn completed")
+	// Usage from the completed turn is still reported.
+	assert.Equal(t, 800, result.InputTokens)
+
+	// A failed turn followed by a new turn is reopened the same way.
+	stream := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"t1"}`,
+		`{"type":"turn.failed","error":{"message":"first turn blew up"}}`,
+		`{"type":"turn.started"}`,
+	}, "\n")
+	var reopened []AgentEvent
+	_, err := parseCodexStream(strings.NewReader(stream), func(evt AgentEvent) {
+		reopened = append(reopened, evt)
+	})
+	require.NoError(t, err)
+	got := codexOnlyResult(t, reopened)
+	assert.True(t, got.IsError)
+	assert.Equal(t, codexSubtypeIncomplete, got.Subtype,
+		"the second turn never finished, so the run is incomplete rather than turn_failed")
+	assert.Empty(t, got.ErrorMessage, "the first turn's message described that turn")
 }
 
 func TestParseCodexStream_ReadErrorStillEmitsResult(t *testing.T) {
@@ -446,6 +587,87 @@ func TestCodexOutputTail(t *testing.T) {
 		"an unbounded output is dropped rather than cut before redaction")
 }
 
+func TestCodexCommandSummary_Branches(t *testing.T) {
+	t.Parallel()
+
+	exit := func(n int) *int { return &n }
+
+	tests := []struct {
+		name string
+		item codexCommandExecutionItem
+		want string
+	}{
+		{
+			name: "completed with a non-zero exit still reports it",
+			item: codexCommandExecutionItem{
+				Command: "grep -q needle file", AggregatedOutput: "", ExitCode: exit(1), Status: "completed",
+			},
+			want: "$ grep -q needle file (exit 1)",
+		},
+		{
+			name: "failed without an exit code says so",
+			item: codexCommandExecutionItem{
+				Command: "timeout 1 sleep 5", AggregatedOutput: "killed\n", ExitCode: nil, Status: "failed",
+			},
+			want: "$ timeout 1 sleep 5 (failed: killed)",
+		},
+		{
+			name: "an empty command still carries its outcome",
+			item: codexCommandExecutionItem{Command: "", ExitCode: nil, Status: "declined"},
+			want: "blocked",
+		},
+		{
+			name: "an unrecognized status is passed through",
+			item: codexCommandExecutionItem{Command: "ls", Status: "abandoned"},
+			want: "$ ls (abandoned)",
+		},
+		{
+			name: "a still-running item reports the command alone",
+			item: codexCommandExecutionItem{Command: "ls", Status: "in_progress"},
+			want: "$ ls",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, codexCommandSummary(tt.item))
+		})
+	}
+}
+
+func TestCodexSummaries_AreCapped(t *testing.T) {
+	t.Parallel()
+
+	longPath := "/sandbox/workspace/repo/" + strings.Repeat("d/", maxPathDisplay) + "f.go"
+	capped := codexCapPath(longPath)
+	assert.True(t, strings.HasSuffix(capped, "..."))
+	assert.Equal(t, maxPathDisplay+3, len([]rune(capped)))
+
+	longQuery := strings.Repeat("q", maxPatternDisplay+40)
+	stream := strings.Join([]string{
+		`{"type":"thread.started","thread_id":"t1"}`,
+		`{"type":"item.completed","item":{"id":"i0","type":"web_search","query":"` + longQuery + `","action":{"type":"search"}}}`,
+		`{"type":"item.completed","item":{"id":"i1","type":"mcp_tool_call","server":"jira","tool":"search","arguments":{},"result":null,"error":null,"status":"failed"}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`,
+	}, "\n")
+
+	var events []AgentEvent
+	_, err := parseCodexStream(strings.NewReader(stream), func(evt AgentEvent) {
+		events = append(events, evt)
+	})
+	require.NoError(t, err)
+
+	tools := codexEventsOfType[ToolUseEvent](events)
+	require.Len(t, tools, 2)
+	assert.Equal(t, "WebSearch", tools[0].Name)
+	assert.Equal(t, maxPatternDisplay+3, len([]rune(tools[0].Summary)))
+	assert.True(t, strings.HasSuffix(tools[0].Summary, "..."))
+
+	// A failed MCP call with no error object still reports the failure.
+	assert.Equal(t, "mcp__jira__search", tools[1].Name)
+	assert.Equal(t, "failed", tools[1].Summary)
+}
+
 func TestCodexMcpToolName(t *testing.T) {
 	t.Parallel()
 
@@ -453,6 +675,10 @@ func TestCodexMcpToolName(t *testing.T) {
 	assert.Equal(t, "mcp__github", codexMcpToolName("github", ""))
 	assert.Equal(t, "mcp__search", codexMcpToolName("", "search"))
 	assert.Equal(t, "mcp", codexMcpToolName("", ""))
+
+	// Names come off the wire and reach CI annotations; they are redacted.
+	token := "ghp_" + strings.Repeat("b", 36)
+	assert.NotContains(t, codexMcpToolName(token, "search"), token)
 }
 
 func TestCodexFileChangeTool(t *testing.T) {
@@ -529,10 +755,31 @@ func TestIsCodexStreamCapture(t *testing.T) {
 	assert.False(t, isCodexStreamCapture([]byte(rollout)),
 		"rollout transcripts must not be mistaken for a --json capture")
 
-	// Tool output quoting a marker cannot match: the quotes are escaped inside
-	// a JSON string.
+	// A real item.updated line is a codex capture even when its text quotes
+	// another event name — the top-level type is what decides.
 	quoted := `{"type":"item.updated","item":{"id":"i0","type":"agent_message","text":"the type is \"turn.completed\""}}`
-	assert.False(t, isCodexStreamCapture([]byte(quoted)))
+	assert.True(t, isCodexStreamCapture([]byte(quoted)))
+
+	// The same quoted text in a line that is not a codex event does not match,
+	// which the old substring scan could not distinguish.
+	assert.False(t, isCodexStreamCapture(
+		[]byte(`{"type":"log","message":"the type is \"turn.completed\""}`)))
+
+	// Detection is structural, so a codex event name nested under another
+	// envelope's key is not a codex capture either.
+	assert.False(t, isCodexStreamCapture([]byte(`{"payload":{"type":"turn.completed"},"type":"event_msg"}`)),
+		"a nested type must not be mistaken for a top-level event")
+	assert.False(t, isCodexStreamCapture([]byte(`{"type":"wrapper","inner":{"type":"thread.started"}}`)))
+
+	// A top-level "error" alone is too generic to identify a codex stream.
+	assert.False(t, isCodexStreamCapture([]byte(`{"type":"error","message":"something else entirely"}`)),
+		"error is a plausible type in unrelated JSONL")
+	assert.True(t, isCodexStreamCapture([]byte(
+		`{"type":"error","message":"x"}`+"\n"+`{"type":"turn.failed","error":{"message":"y"}}`)),
+		"an error line alongside a codex event still identifies the stream")
+
+	// A leading malformed line does not hide the stream.
+	assert.True(t, isCodexStreamCapture([]byte("garbage\n"+`{"type":"thread.started","thread_id":"t1"}`)))
 
 	// A hand-reformatted capture with spaces after the colon still matches.
 	assert.True(t, isCodexStreamCapture([]byte(`{"type": "turn.completed", "usage": {}}`)))
