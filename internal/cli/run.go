@@ -1382,6 +1382,10 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	securityTraceID := security.GenerateTraceID()
 	rootSpan.SetAttributes(stringAttr("fullsend.security_trace_id", securityTraceID))
 
+	if attrs := harnessIdentityAttrs(harnessPath, composeOpts.SourceURL); len(attrs) > 0 {
+		rootSpan.SetAttributes(attrs...)
+	}
+
 	// validationPassed is declared before both defer closures that guard on
 	// it: the telemetry defer keys the root span's status on it (validation,
 	// not the last agent exit code, is the run's success gate), and the
@@ -3214,6 +3218,24 @@ func resolveWorkItemID() string {
 		return v
 	}
 	return evalmeasure.UnknownSentinel
+}
+
+// harnessIdentityAttrs returns root-span attributes identifying the harness
+// that produced the run: source URL, local path, and SHA-256 of the file on
+// disk. Empty fields are omitted (absent, not empty string). Content SHA is
+// best-effort: if the file cannot be read the attribute is absent (#6842, #2368).
+func harnessIdentityAttrs(harnessPath, sourceURL string) []attribute.KeyValue {
+	var attrs []attribute.KeyValue
+	if sourceURL != "" {
+		attrs = append(attrs, boundedStringAttr("fullsend.harness.url", sourceURL))
+	}
+	if harnessPath != "" {
+		attrs = append(attrs, boundedStringAttr("fullsend.harness.path", harnessPath))
+		if harnessData, hashErr := os.ReadFile(harnessPath); hashErr == nil {
+			attrs = append(attrs, stringAttr("fullsend.harness.content_sha", fetch.ComputeSHA256(harnessData)))
+		}
+	}
+	return attrs
 }
 
 // telemetryExitCode maps the run's final state to the exit code recorded on
