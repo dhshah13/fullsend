@@ -368,11 +368,23 @@ func writeOpenAIFullsendDir(t *testing.T, pathForm bool) string {
 // model leaves the harness without a model:.
 func writeOpenAIFullsendDirFor(t *testing.T, pathForm bool, runtimeName, model string) string {
 	t.Helper()
+	return writeOpenAIFullsendDirWithAgentModel(t, pathForm, runtimeName, model, "")
+}
+
+// writeOpenAIFullsendDirWithAgentModel additionally pins a `model:` in the
+// agent definition's frontmatter — pi's fallback when nothing else names
+// one, and therefore an input to the provider decision.
+func writeOpenAIFullsendDirWithAgentModel(t *testing.T, pathForm bool, runtimeName, model, agentModel string) string {
+	t.Helper()
 	dir := t.TempDir()
 	for _, d := range []string{"harness", "agents", "providers", "profiles"} {
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, d), 0o755))
 	}
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "agents", "code.md"), []byte("You are a coding agent."), 0o644))
+	agentDef := "You are a coding agent."
+	if agentModel != "" {
+		agentDef = "---\nname: code\nmodel: " + agentModel + "\n---\n" + agentDef
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "agents", "code.md"), []byte(agentDef), 0o644))
 	modelLine := ""
 	if model != "" {
 		modelLine = "model: " + model + "\n"
@@ -404,10 +416,14 @@ func TestRunAgent_OpenAIProviderSkippedWhenRuntimeDoesNotNeedIt(t *testing.T) {
 		name        string
 		runtimeName string
 		model       string
+		pathForm    bool
 	}{
-		{"claude on an alias", "", "opus"},
-		{"pi on a vertex model", "pi", "anthropic-vertex/claude-opus-4-6"},
-		{"pi with no model", "pi", ""},
+		{name: "claude on an alias", model: "opus"},
+		{name: "pi on a vertex model", runtimeName: "pi", model: "anthropic-vertex/claude-opus-4-6"},
+		{name: "pi with no model", runtimeName: "pi"},
+		// The provider can also be declared by file path, the way the
+		// behaviour scenarios do; the skip must drop that name too.
+		{name: "pi on a vertex model, path-form declaration", runtimeName: "pi", model: "anthropic-vertex/claude-opus-4-6", pathForm: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logPath := recordingProvidersStub(t)
@@ -418,7 +434,7 @@ func TestRunAgent_OpenAIProviderSkippedWhenRuntimeDoesNotNeedIt(t *testing.T) {
 			// not have needed one. With the old always-create rule this
 			// alone failed the run with "no OpenAI credential".
 			t.Setenv("OPENAI_API_KEY", "")
-			dir := writeOpenAIFullsendDirFor(t, false, tc.runtimeName, tc.model)
+			dir := writeOpenAIFullsendDirFor(t, tc.pathForm, tc.runtimeName, tc.model)
 
 			var out strings.Builder
 			rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
@@ -1321,4 +1337,60 @@ func TestEnsureOpenAIProvider_SeedComesFromTheSelectedBackend(t *testing.T) {
 			assert.Equal(t, tc.wantSeed, h.sandboxReady())
 		})
 	}
+}
+
+// TestRunAgent_OpenAIProviderFollowsTheAgentDefinitionModel covers the
+// second half of the fallback chain: with no --model, no env and no harness
+// model:, pi launches on the agent definition's frontmatter model: — so the
+// provider decision has to read it too. Deciding from the harness value
+// alone would skip the provider here and leave the agent to fail inside the
+// sandbox with no credential, and would create one for the inverse case
+// (a Vertex-pinned agent under FULLSEND_PI_PROVIDER=openai).
+func TestRunAgent_OpenAIProviderFollowsTheAgentDefinitionModel(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		agentModel  string
+		piProvider  string
+		wantCreated bool
+	}{
+		{name: "frontmatter openai model, no override", agentModel: "openai/gpt-5.6-luna", wantCreated: true},
+		{name: "frontmatter vertex model under FULLSEND_PI_PROVIDER=openai", agentModel: "anthropic-vertex/claude-opus-4-6", piProvider: "openai"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := recordingProvidersStub(t)
+			for _, k := range []string{"FULLSEND_OPENAI_AUDIENCE", "FULLSEND_OPENAI_IDENTITY_PROVIDER_ID", "FULLSEND_OPENAI_SERVICE_ACCOUNT_ID", "GITHUB_ACTIONS"} {
+				t.Setenv(k, "")
+			}
+			t.Setenv("FULLSEND_PI_PROVIDER", tc.piProvider)
+			t.Setenv("OPENAI_API_KEY", "sk-local-static-key")
+			dir := writeOpenAIFullsendDirWithAgentModel(t, false, "pi", "", tc.agentModel)
+
+			var out strings.Builder
+			rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
+			err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "", rFlags, statusOpts{}, ui.New(&out), false, runOverrideFlags{})
+			require.Error(t, err, "the stub cannot bootstrap an agent; the provider block is what matters")
+
+			data, readErr := os.ReadFile(logPath)
+			require.NoError(t, readErr)
+			log := string(data)
+			if tc.wantCreated {
+				assert.Contains(t, log, "provider create --name openai-", "the frontmatter model needs the provider")
+				assert.NotContains(t, out.String(), "not needed by runtime")
+			} else {
+				assert.NotContains(t, log, "provider create --name openai-", "nothing on this run calls OpenAI")
+				assert.Contains(t, out.String(), "not needed by runtime")
+			}
+		})
+	}
+}
+
+func TestDropSkippedProviders(t *testing.T) {
+	names := []string{"vertex-ai", "openai", "github-ro"}
+	assert.Equal(t, names, dropSkippedProviders(names, nil), "no skips: the list is returned as is")
+	assert.Equal(t, []string{"vertex-ai", "github-ro"},
+		dropSkippedProviders(names, map[string]struct{}{"openai": {}}))
+	assert.Empty(t, dropSkippedProviders(names, map[string]struct{}{
+		"vertex-ai": {}, "openai": {}, "github-ro": {},
+	}))
+	assert.Equal(t, names, dropSkippedProviders(names, map[string]struct{}{"not-declared": {}}))
 }

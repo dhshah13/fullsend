@@ -226,10 +226,10 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 	hooksEnabled := params.HooksSettingsPath != ""
 	hooksExt := r.ConfigDir() + "/" + piHooksExtensionFile
 
-	model := params.Model
-	if model == "" {
-		model = m.Model
-	}
+	// The agent definition's model is the fallback when the runner resolved
+	// none; EffectiveModel is shared with NeedsOpenAIProvider so the launch
+	// and the provider decision cannot disagree (#6920).
+	model := EffectiveModel(params.Model, m.Model)
 	modelSpec := translatePiModel(model)
 	provider := piModelProvider(model)
 	vertex := provider == piDefaultProvider

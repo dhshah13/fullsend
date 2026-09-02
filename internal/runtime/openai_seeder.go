@@ -36,14 +36,17 @@ type OpenAICredentialSeeder interface {
 // Every other backend — Claude Code on Vertex, the test runtimes — needs
 // none.
 //
-// model is the effective model the plan block prints (flag > env > agents:
-// entry > harness), already resolved by the caller.
-func NeedsOpenAIProvider(backend, model string) bool {
+// runModel is what the runner resolved (flag > env > agents: entry >
+// harness `model:`) and agentModel the agent definition's frontmatter
+// `model:`; both are passed rather than one pre-resolved value so a caller
+// cannot resolve them differently from the runtime's own launch path — see
+// EffectiveModel.
+func NeedsOpenAIProvider(backend, runModel, agentModel string) bool {
 	switch backend {
 	case "codex":
 		return true
 	case "pi":
-		return piModelProvider(model) == piOpenAIProvider
+		return piModelProvider(EffectiveModel(runModel, agentModel)) == piOpenAIProvider
 	default:
 		return false
 	}

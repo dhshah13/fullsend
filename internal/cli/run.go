@@ -1247,6 +1247,11 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// runScopedProviders maps a harness provider name to the run-scoped
 	// instance created for it; sandbox creation attaches the latter.
 	runScopedProviders := map[string]string{}
+	// The agent definition's frontmatter `model:` is the runtime's fallback
+	// when nothing else names a model (pi launches on it), so the decision
+	// below has to see it too — reading it here keeps it to one read for
+	// every provider entry.
+	agentDefModel := agentruntime.AgentDefinitionModel(h.Agent)
 	// skippedProviders are harness-declared providers the selected runtime
 	// does not need (an openai entry on a Vertex run, see
 	// runtime.NeedsOpenAIProvider): nothing is created for them and their
@@ -1334,7 +1339,10 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			// The profile is the security policy for the exchanged token and
 			// only the copy embedded in this binary is trusted: a repository
 			// or URL-resolved profile with the same id would be imported
-			// earlier in this function and could stand in for it.
+			// earlier in this function and could stand in for it. This runs
+			// before the skip decision below on purpose — skipping first
+			// would leave a repo-controlled profile with the reserved id
+			// live on the gateway for the next run to pick up.
 			if err := rejectReservedProfileID(openAIProviderType, result.Profiles, dirProfileIDs); err != nil {
 				return err
 			}
@@ -1343,16 +1351,20 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			// the Vertex provider without making every run resolve an
 			// OpenAI credential (#6920); the profile is not imported and
 			// the instance is not created or attached.
-			if !agentruntime.NeedsOpenAIProvider(runtimeBackend.Runtime.Name(), h.Model) {
+			if !agentruntime.NeedsOpenAIProvider(runtimeBackend.Runtime.Name(), h.Model, agentDefModel) {
 				skippedProviders[pd.Name] = struct{}{}
 				// Counts as handled, so the "declared but no definition
 				// found" warning below does not also fire for it.
 				created[pd.Name] = struct{}{}
-				model := h.Model
+				model := agentruntime.EffectiveModel(h.Model, agentDefModel)
 				if model == "" {
 					model = "(the runtime default)"
 				}
-				printer.StepWarn(fmt.Sprintf("Provider %q declared by the harness but not needed by runtime %s with model %s; skipped", pd.Name, runtimeBackend.Runtime.Name(), model))
+				// Informational, not a warning: declaring the provider on a
+				// harness that several runtimes share is the documented way
+				// to write a portable harness, so this line is a happy path
+				// and must not bury the real warnings around it.
+				printer.StepInfo(fmt.Sprintf("Provider %q declared by the harness but not needed by runtime %s with model %s; skipped", pd.Name, runtimeBackend.Runtime.Name(), model))
 				continue
 			}
 			if err := ensureOpenAIProfile(ctx, pd.Type, printer); err != nil {

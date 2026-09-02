@@ -38,11 +38,12 @@ func TestCodexRuntimeOpenAISeederIsStubbed(t *testing.T) {
 // (FULLSEND_PI_PROVIDER), which t.Setenv refuses to set in a parallel test.
 func TestNeedsOpenAIProvider(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		backend  string
-		model    string
-		provider string // FULLSEND_PI_PROVIDER, when set
-		want     bool
+		name       string
+		backend    string
+		model      string
+		agentModel string // the agent definition's frontmatter model:
+		provider   string // FULLSEND_PI_PROVIDER, when set
+		want       bool
 	}{
 		{name: "claude with an alias", backend: "claude", model: "opus"},
 		{name: "claude with an openai spec", backend: "claude", model: "openai/gpt-5.6-luna",
@@ -55,14 +56,28 @@ func TestNeedsOpenAIProvider(t *testing.T) {
 		{name: "pi on xai-vertex", backend: "pi", model: "xai/grok-4.6"},
 		{name: "pi with a bare id under FULLSEND_PI_PROVIDER=openai", backend: "pi",
 			model: "gpt-5.6-luna", provider: "openai", want: true},
+		{name: "pi with a bare id under a mixed-case FULLSEND_PI_PROVIDER", backend: "pi",
+			model: "gpt-5.6-luna", provider: "OpenAI", want: true},
 		{name: "codex with any model", backend: "codex", model: "openai/gpt-5.6-luna", want: true},
 		{name: "codex with no model", backend: "codex", model: "", want: true},
+		// The agent definition's model: is pi's fallback when the runner
+		// resolved none, so it decides here too. Reading only the runner's
+		// value would strand this agent without a credential...
+		{name: "pi with an openai model only in the agent frontmatter", backend: "pi",
+			model: "", agentModel: "openai/gpt-5.6-luna", want: true},
+		// ...and would attach a live OpenAI credential to this one, whose
+		// frontmatter pins a Vertex model the provider default never reaches.
+		{name: "pi with a vertex frontmatter model under FULLSEND_PI_PROVIDER=openai", backend: "pi",
+			model: "", agentModel: "anthropic-vertex/claude-opus-4-6", provider: "openai"},
+		{name: "an override still wins over the frontmatter", backend: "pi",
+			model: "anthropic-vertex/claude-opus-4-6", agentModel: "openai/gpt-5.6-luna"},
+		{name: "codex ignores both", backend: "codex", model: "", agentModel: "anthropic-vertex/claude-opus-4-6", want: true},
 		{name: "dummy", backend: "dummy", model: "openai/gpt-5.6-luna"},
 		{name: "unknown backend", backend: "opencode", model: "openai/gpt-5.6-luna"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(piProviderEnv, tc.provider)
-			assert.Equal(t, tc.want, NeedsOpenAIProvider(tc.backend, tc.model))
+			assert.Equal(t, tc.want, NeedsOpenAIProvider(tc.backend, tc.model, tc.agentModel))
 		})
 	}
 }
