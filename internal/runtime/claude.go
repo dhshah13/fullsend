@@ -145,7 +145,16 @@ func (ClaudeRuntime) Run(ctx context.Context, params RunParams, printer *ui.Prin
 			if metrics.Model == "" {
 				metrics.Model = e.Model
 			}
+		case TokensEvent:
+			// Capture cumulative token usage from the stream so cancelled
+			// runs (no ResultEvent) retain non-zero telemetry (#6905).
+			metrics.InputTokens = e.InputTokens
+			metrics.OutputTokens = e.OutputTokens
+			metrics.CacheReadInputTokens = e.CacheRead
+			metrics.CacheCreationInputTokens = e.CacheWrite
 		case ResultEvent:
+			// Authoritative totals from the terminal result event overwrite
+			// the incremental snapshot.
 			metrics.NumTurns = e.NumTurns
 			metrics.TotalCostUSD = e.TotalCostUSD
 			metrics.InputTokens = e.InputTokens
