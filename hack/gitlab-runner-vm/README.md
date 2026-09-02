@@ -31,7 +31,7 @@ See also:
 
 ```bash
 # 1. Create and provision a VM (auto-numbers):
-GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
+GL_TOKEN=glpat-xxx GROUP_ID=12345 \
   GITLAB_URL=https://gitlab.example.com \
   NAMESPACE=my-namespace \
   RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 \
@@ -59,7 +59,7 @@ NAMESPACE=my-namespace ./delete-openshift-vm.sh --list
 
 ```bash
 # 1. Create and provision a VM (auto-numbers):
-GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
+GL_TOKEN=glpat-xxx GROUP_ID=12345 \
   GITLAB_URL=https://gitlab.example.com \
   GCP_PROJECT=my-gcp-project \
   RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 \
@@ -81,12 +81,12 @@ GCP_PROJECT=my-gcp-project ./delete-gcp-vm.sh --list
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `GL_TOKEN` | yes | — | GitLab PAT (Owner role, scopes: `create_runner` + `manage_runner` + `api`) |
-| `PROJECT_ID` | yes (create) | — | GitLab project ID |
+| `GL_TOKEN` | yes | — | GitLab PAT (Owner role on the group, scopes: `create_runner` + `manage_runner` + `api`) |
+| `GROUP_ID` | yes (create) | — | GitLab group ID |
 | `GITLAB_URL` | yes | — | GitLab instance URL |
 | `RUNNER_IMAGE` | yes (create) | — | Image pre-pulled as a warm cache; jobs must still set `image:` in `.gitlab-ci.yml` |
 | `RUNNER_TAG` | no | `fullsend-gitlab-runner` | Runner tag for job matching |
-| `RUNNER_ACCESS_LEVEL` | no | `not_protected` | `ref_protected` restricts the runner to protected branches and tags, so merge-request pipelines on unprotected source refs never match and sit `pending`. Note the trade-off: with `not_protected`, any job on any branch of the project runs on this VM and can read the mounted gateway credentials (see Security below) — set `ref_protected` if the runner only needs to serve protected refs |
+| `RUNNER_ACCESS_LEVEL` | no | `not_protected` | `ref_protected` restricts the runner to protected branches and tags, so merge-request pipelines on unprotected source refs never match and sit `pending`. Note the trade-off: with `not_protected`, any tag-matched job on any branch of any project invited into the group tree runs on this VM and can read the mounted gateway credentials (see Security below) — set `ref_protected` if the runner only needs to serve protected refs |
 | `OPENSHELL_VERSION` | no | from `.github/scripts/openshell-version.sh` | OpenShell version (Renovate-tracked) |
 | `GITLAB_RUNNER_VERSION` | no | `19.2.1` | gitlab-runner version |
 | `REGISTRATION_TOKEN` | setup only | — | GitLab runner registration token |
@@ -147,8 +147,10 @@ GCP_PROJECT=my-gcp-project ./delete-gcp-vm.sh --list
 - Job containers receive read-only access to the runner's gateway mTLS
   credentials (`~/.config/openshell`). This is required for the fullsend
   agent inside job containers to authenticate to the gateway. The runner is
-  scoped to one project by `runner_type=project_type` and `locked=true`, so
-  only jobs from that project can access these credentials; `run_untagged=false`
-  narrows this further to tag-matched jobs. If job-scoped credential minting
-  is added to the gateway, this mount should be replaced with short-lived
-  per-job tokens.
+  scoped to the group by `runner_type=group_type`, so any project invited
+  into the group tree can run tag-matched jobs on this VM and access the
+  mounted gateway credentials. Access is narrowed by `run_untagged=false`
+  (only jobs tagged with the runner's tag are matched) and optionally by
+  `ref_protected` (restricting to protected branches/tags). If job-scoped
+  credential minting is added to the gateway, this mount should be replaced
+  with short-lived per-job tokens.

@@ -13,9 +13,9 @@
 # When done, the runner is online and accepting jobs tagged with RUNNER_TAG.
 #
 # Required environment variables:
-#   GL_TOKEN     — GitLab personal access token (Owner role on PROJECT_ID,
+#   GL_TOKEN     — GitLab personal access token (Owner role on GROUP_ID,
 #                  scopes: create_runner + manage_runner + api)
-#   PROJECT_ID   — GitLab project ID to register the runner against
+#   GROUP_ID     — GitLab group ID to register the runner against
 #   GITLAB_URL   — GitLab instance URL (e.g. https://gitlab.example.com)
 #   NAMESPACE    — OpenShift namespace for the VM
 #   RUNNER_IMAGE — image pre-pulled as warm cache (e.g. ghcr.io/org/runner:v1.2.3)
@@ -34,12 +34,12 @@
 #
 # Examples:
 #   # Auto-numbers the VM:
-#   GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
+#   GL_TOKEN=glpat-xxx GROUP_ID=12345 \
 #     GITLAB_URL=https://gitlab.example.com NAMESPACE=my-namespace \
 #     RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 ./create-openshift-vm.sh
 #
 #   # Explicit runner number:
-#   GL_TOKEN=glpat-xxx PROJECT_ID=12345 \
+#   GL_TOKEN=glpat-xxx GROUP_ID=12345 \
 #     GITLAB_URL=https://gitlab.example.com NAMESPACE=my-namespace \
 #     RUNNER_IMAGE=ghcr.io/org/runner:v1.2.3 ./create-openshift-vm.sh 01
 #
@@ -54,7 +54,7 @@ RUNNER_IMAGE="${RUNNER_IMAGE:-}"
 VM_USER="${VM_USER:-fedora}"
 # ref_protected restricts the runner to jobs on protected branches and tags.
 # Merge-request pipelines run on the (unprotected) source ref, so the default
-# is not_protected; scoping comes from runner_type=project_type + locked=true.
+# is not_protected; scoping comes from runner_type=group_type + run_untagged=false.
 RUNNER_ACCESS_LEVEL="${RUNNER_ACCESS_LEVEL:-not_protected}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Source the central gitlab-runner version pin (shared with setup.sh).
@@ -81,7 +81,7 @@ source "${SCRIPT_DIR}/lib.sh"
 # Validate inputs
 # ----------------------------------------------------------------------
 usage() {
-  echo "Usage: GL_TOKEN=glpat-xxx PROJECT_ID=<id> $0 [NUMBER]"
+  echo "Usage: GL_TOKEN=glpat-xxx GROUP_ID=<id> $0 [NUMBER]"
   echo ""
   echo "Run '$0' with --help for details."
 }
@@ -101,13 +101,13 @@ if ! [[ "${GL_TOKEN}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 1
 fi
 
-if [ -z "${PROJECT_ID:-}" ]; then
-  echo "ERROR: PROJECT_ID is required (GitLab project ID)" >&2
+if [ -z "${GROUP_ID:-}" ]; then
+  echo "ERROR: GROUP_ID is required (GitLab group ID)" >&2
   usage >&2
   exit 1
 fi
-if ! [[ "${PROJECT_ID}" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: PROJECT_ID must be numeric (got: ${PROJECT_ID})" >&2
+if ! [[ "${GROUP_ID}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: GROUP_ID must be numeric (got: ${GROUP_ID})" >&2
   exit 1
 fi
 
@@ -283,17 +283,17 @@ echo "  OK: cloud-init complete"
 # ----------------------------------------------------------------------
 # 4. Register a runner via the GitLab API
 # ----------------------------------------------------------------------
-echo "==> Registering runner with ${GITLAB_URL} (project ${PROJECT_ID})"
+echo "==> Registering runner with ${GITLAB_URL} (group ${GROUP_ID})"
 
 runner_json=$(gl_curl -X POST \
   "${GITLAB_URL}/api/v4/user/runners" \
-  --data-urlencode "runner_type=project_type" \
-  --data-urlencode "project_id=${PROJECT_ID}" \
+  --data-urlencode "runner_type=group_type" \
+  --data-urlencode "group_id=${GROUP_ID}" \
   --data-urlencode "tag_list=${RUNNER_TAG}" \
   --data-urlencode "description=${NAMESPACE}/${vm_name}" \
   --data-urlencode "run_untagged=false" \
   --data-urlencode "access_level=${RUNNER_ACCESS_LEVEL}" \
-  --data-urlencode "locked=true" 2>&1) || {
+  --data-urlencode "locked=false" 2>&1) || {
   echo "ERROR: GitLab runner registration failed. Response: ${runner_json}" >&2
   cleanup_vm
   exit 1
@@ -311,7 +311,7 @@ runner_id=""
 cleanup_runner() {
   if [ -z "${runner_id}" ]; then
     echo "ERROR: provisioning failed — runner may have been created but ID is unknown" >&2
-    echo "  Check ${GITLAB_URL} for orphaned runners in project ${PROJECT_ID}" >&2
+    echo "  Check ${GITLAB_URL} for orphaned runners in group ${GROUP_ID}" >&2
   else
     echo "ERROR: provisioning failed — deregistering runner ${runner_id}" >&2
     if gl_curl -X DELETE "${GITLAB_URL}/api/v4/runners/${runner_id}" >/dev/null 2>&1; then
