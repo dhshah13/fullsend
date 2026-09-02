@@ -625,7 +625,7 @@ start_gateway() {
 
   # Register the gateway with the CLI so openshell commands can find it.
   # Check for an active gateway (line starting with *).
-  if ! openshell gateway list 2>/dev/null | grep -Eq '^[[:space:]]*\*'; then
+  if ! openshell gateway list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -Eq '^[[:space:]]*\*'; then
     # `gateway add` is not idempotent — it refuses when metadata for the
     # canonical "openshell" loopback name already exists — so fall back to
     # selecting that name. Both failing must fail setup: every job's agent
@@ -635,7 +635,7 @@ start_gateway() {
       && ! openshell gateway select openshell >/dev/null 2>&1; then
       fail "could not register or select the OpenShell gateway: ${add_err}"
     fi
-    if ! openshell gateway list 2>/dev/null | grep -Eq '^[[:space:]]*\*'; then
+    if ! openshell gateway list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -Eq '^[[:space:]]*\*'; then
       fail "no active OpenShell gateway after add/select"
     fi
     ok "gateway registered and selected"
@@ -770,7 +770,7 @@ verify() {
 
   # The unit being active says nothing about CLI registration, which is what
   # the agent inside job containers actually resolves the gateway through.
-  if openshell gateway list 2>/dev/null | grep -Eq '^[[:space:]]*\*'; then
+  if openshell gateway list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -Eq '^[[:space:]]*\*'; then
     ok "gateway registered with the CLI"
   else
     echo "  WARN: no active gateway in 'openshell gateway list'"; errors=$((errors + 1))
