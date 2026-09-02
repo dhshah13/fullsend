@@ -3231,9 +3231,9 @@ func harnessIdentityAttrs(harnessPath, sourceURL string) []attribute.KeyValue {
 	}
 	if harnessPath != "" {
 		attrs = append(attrs, boundedStringAttr("fullsend.harness.path", harnessPath))
-	}
-	if harnessData, hashErr := os.ReadFile(harnessPath); hashErr == nil {
-		attrs = append(attrs, stringAttr("fullsend.harness.content_sha", fetch.ComputeSHA256(harnessData)))
+		if harnessData, hashErr := os.ReadFile(harnessPath); hashErr == nil {
+			attrs = append(attrs, stringAttr("fullsend.harness.content_sha", fetch.ComputeSHA256(harnessData)))
+		}
 	}
 	return attrs
 }
