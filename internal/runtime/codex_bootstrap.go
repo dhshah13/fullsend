@@ -131,8 +131,8 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	// sessions directory is where its rollout transcripts land.
 	mkdirCmd := fmt.Sprintf("mkdir -p %s %s %s",
 		shellQuote(cfg+"/skills"), shellQuote(r.codexSessionsDir()), shellQuote(r.codexHooksDir()))
-	if _, _, _, err := sandbox.Exec(sandboxName, mkdirCmd, 10*time.Second); err != nil {
-		return fmt.Errorf("creating codex config dirs: %w", err)
+	if err := codexExecOK(sandboxName, mkdirCmd, "creating codex config dirs"); err != nil {
+		return err
 	}
 
 	configTOML, err := renderCodexConfig(cfg, codexDeveloperInstructions(agentName, def))
@@ -147,9 +147,12 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	if err := uploadBytes(sandboxName, r.codexAuthScriptPath(), codexAuthScriptSH); err != nil {
 		return fmt.Errorf("writing %s: %w", codexAuthScriptFile, err)
 	}
+	// The exit code matters here, not just the transport error: codex runs
+	// this script, and a chmod that quietly failed would surface much later as
+	// an opaque "provider auth command failed to start" in the middle of a run.
 	chmodCmd := "chmod 755 " + shellQuote(r.codexAuthScriptPath())
-	if _, _, _, err := sandbox.Exec(sandboxName, chmodCmd, 10*time.Second); err != nil {
-		return fmt.Errorf("chmod %s: %w", codexAuthScriptFile, err)
+	if err := codexExecOK(sandboxName, chmodCmd, "chmod "+codexAuthScriptFile); err != nil {
+		return err
 	}
 
 	if err := duplicateDestinationNameError("skill", input.SkillDirs()); err != nil {
@@ -226,6 +229,21 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	}
 	if err := uploadBytes(sandboxName, r.codexManifestPath(), manifestJSON); err != nil {
 		return fmt.Errorf("writing %s: %w", codexManifestFile, err)
+	}
+	return nil
+}
+
+// codexExecOK runs one sandbox command and fails on a non-zero exit as well as
+// a transport error. sandbox.Exec reports the two separately, and Bootstrap's
+// setup commands have no later step that would surface a silent failure with a
+// clearer message.
+func codexExecOK(sandboxName, cmd, what string) error {
+	_, stderr, exitCode, err := sandbox.Exec(sandboxName, cmd, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("%s: exited %d: %s", what, exitCode, strings.TrimSpace(sanitizeOutput(stderr)))
 	}
 	return nil
 }

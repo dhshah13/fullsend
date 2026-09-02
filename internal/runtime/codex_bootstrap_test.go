@@ -34,6 +34,11 @@ func fakeOpenshellCodex(t *testing.T, logPath, storeDir, version string, streamF
 	binDir := t.TempDir()
 	script := `#!/bin/sh
 echo "$@" >> '` + logPath + `'
+if [ -n "${FULLSEND_TEST_FAIL_MATCH:-}" ]; then
+  case "$*" in
+    *"$FULLSEND_TEST_FAIL_MATCH"*) echo "fake openshell: refusing $FULLSEND_TEST_FAIL_MATCH" >&2; exit 1 ;;
+  esac
+fi
 if [ "$2" = "download" ]; then
   base=$(basename "$4")
   mkdir -p "$5" 2>/dev/null
@@ -297,4 +302,88 @@ func readFileString(t *testing.T, path string) string {
 	}
 	require.NoError(t, err)
 	return string(data)
+}
+
+// The remaining Bootstrap branches are infrastructure failures — an upload or
+// exec that does not succeed. The fake openshell fails on demand for one path
+// so each is reported with its own message rather than a bare wrapped error.
+func TestCodexRuntimeBootstrap_ReportsInfrastructureFailures(t *testing.T) {
+	r := CodexRuntime{}
+	for name, tc := range map[string]struct{ match, want string }{
+		"config dirs": {"mkdir -p", "creating codex config dirs"},
+		"config.toml": {codexConfigFile, "writing " + codexConfigFile},
+		"auth script": {codexAuthScriptFile, "writing " + codexAuthScriptFile},
+		"version":     {"codex --version", "codex preflight"},
+		"manifest":    {codexManifestFile, "writing " + codexManifestFile},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+			t.Setenv("FULLSEND_TEST_FAIL_MATCH", tc.match)
+
+			err := r.Bootstrap(bootstrapInput{
+				sandboxName: "sb",
+				agentPath:   writeAgentFile(t, codexTestAgentDef),
+				agentName:   "triage",
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestCodexRuntimeBootstrap_HookInstallFailureIsReported(t *testing.T) {
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+	t.Setenv("FULLSEND_TEST_FAIL_MATCH", codexAdapterFile)
+
+	err := CodexRuntime{}.Bootstrap(codexHooksBootstrapInput{
+		bootstrapInput: bootstrapInput{
+			sandboxName: "sb",
+			agentPath:   writeAgentFile(t, codexTestAgentDef),
+			agentName:   "triage",
+		},
+		hooks: security.SandboxHookConfigFromHarness(&harness.Harness{}),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "installing hook adapter")
+}
+
+// An agent definition with no frontmatter name and no harness-supplied name
+// falls back to the file's basename, so developer_instructions still carries a
+// header the prompt can refer to.
+func TestCodexRuntimeBootstrap_DerivesAgentNameFromTheFile(t *testing.T) {
+	storeDir := t.TempDir()
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "0.152.1")
+
+	r := CodexRuntime{}
+	require.NoError(t, r.Bootstrap(bootstrapInput{
+		sandboxName: "sb",
+		agentPath:   writeAgentFile(t, "Just a body, no frontmatter."+"\n"),
+		// Deliberately no agentName, and an empty skill entry, which is
+		// skipped rather than uploaded as "".
+		skillDirs: []string{""},
+	}))
+
+	var m codexManifest
+	require.NoError(t, json.Unmarshal(storedUpload(t, storeDir, r.codexManifestPath()), &m))
+	assert.Equal(t, "triage", m.AgentName, "the basename of the agent file")
+	assert.Contains(t, string(storedUpload(t, storeDir, r.codexConfigPath())), "# Agent: triage")
+}
+
+func TestCodexPreflightVersion_UsesTheLastLine(t *testing.T) {
+	storeDir := t.TempDir()
+	// The fake echoes one line; a real codex may print a warning first, and the
+	// version is the last line either way.
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "warning: something\ncodex-cli 0.152.1")
+
+	got, err := codexPreflightVersion("sb")
+	require.NoError(t, err)
+	assert.Equal(t, "codex-cli 0.152.1", got)
+}
+
+func TestReadCodexManifest_ReportsAMissingFile(t *testing.T) {
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+
+	_, err := readCodexManifest("sb", CodexRuntime{}.codexManifestPath())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "was Bootstrap run?")
 }
