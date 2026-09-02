@@ -1,6 +1,7 @@
 # OpenAI Workload Identity
 
-Run GPT models on the [pi runtime](../../runtimes/pi.md) without storing an OpenAI API key
+Run GPT models on the [pi](../../runtimes/pi.md) or [codex](../../runtimes/codex.md) runtime
+without storing an OpenAI API key
 anywhere. Your GitHub Actions job proves who it is with its OIDC token, OpenAI hands back a
 short-lived token (minutes — it never outlives the GitHub token it came from, and an hour at most),
 fullsend renews it for as long as the run lasts, and the agent sandbox never sees any of it — it only
@@ -363,7 +364,7 @@ The key still goes through the gateway placeholder, so the sandbox does not see 
 provider it lands in expires an hour after the run ends at the latest. A committed `inference.openai`
 block (step 4) is not used on your machine while `OPENAI_API_KEY` is set — there is no GitHub OIDC
 endpoint to exchange with — so the same checkout works in CI and locally. See
-[Running agents locally](../user/running-agents-locally.md#get-an-openai-key-gpt-on-pi-only).
+[Running agents locally](../user/running-agents-locally.md#get-an-openai-key-gpt-on-pi-or-codex).
 
 The fleet's agents already declare a sandbox policy. If you run a **custom harness**, give it one
 too — `policy: policies/base.yaml`, the fleet's base policy from the agents repository (it sets
