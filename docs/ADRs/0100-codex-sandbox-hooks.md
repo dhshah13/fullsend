@@ -3,7 +3,7 @@ title: "100. Sandbox tool hooks on Codex — a translating adapter with per-invo
 status: Accepted
 relates_to:
   - security-threat-model
-  - agent-architecture
+  - tool-call-risk-assessment
 topics:
   - runtime
   - sandbox
@@ -25,9 +25,9 @@ SSRF, canary, the sanitizer chain — runtime-neutral, so each runtime wires the
 `security.HookPlan` through its own mechanism rather than dropping the controls. Codex has a hook
 system of its own, and this ADR records how the two are joined. The hooks are defense in depth
 inside the sandbox boundary, not the boundary itself
-([security-threat-model.md](../problems/security-threat-model.md),
-[agent-architecture.md](../problems/agent-architecture.md)); the credential half of the codex
-runtime is [ADR 0099](0099-codex-agent-runtime.md).
+([security-threat-model.md](../problems/security-threat-model.md)) — the pattern-matching layer
+whose reach and limits [tool-call-risk-assessment.md](../problems/tool-call-risk-assessment.md)
+examines. The credential half of the codex runtime is [ADR 0099](0099-codex-agent-runtime.md).
 
 Codex's protocol differs from the scripts' in ways that **fail open** if bridged naively, which is
 what makes an adapter mandatory rather than a convenience. Verified against `rust-v0.152.1`:
