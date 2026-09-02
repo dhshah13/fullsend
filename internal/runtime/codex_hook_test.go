@@ -316,14 +316,27 @@ func TestCodexAdapter_MisconfigurationFailsClosed(t *testing.T) {
 		assert.Contains(t, got.stderr, "unknown codex hook phase")
 	})
 
-	t.Run("unreadable payload blocks on the phase that can block", func(t *testing.T) {
-		cmd := exec.Command(h.python, h.adapter, "PreToolUse", "x.py")
-		cmd.Stdin = strings.NewReader("not json")
-		out, err := cmd.CombinedOutput()
-		require.Error(t, err)
-		assert.Equal(t, 2, exitCodeOf(t, err))
-		assert.Contains(t, string(out), "fail closed")
-	})
+	// Only empty stdin is benign; a payload that arrived but cannot be read
+	// blocks on both phases, since passing it would let a tool call through
+	// unscanned.
+	for _, phase := range []string{"PreToolUse", "PostToolUse"} {
+		t.Run("unreadable payload blocks on "+phase, func(t *testing.T) {
+			cmd := exec.Command(h.python, h.adapter, phase, "x.py")
+			cmd.Stdin = strings.NewReader("not json")
+			out, err := cmd.CombinedOutput()
+			require.Error(t, err)
+			assert.Equal(t, 2, exitCodeOf(t, err))
+			assert.Contains(t, string(out), "fail closed")
+		})
+
+		t.Run("a JSON array is not an object either on "+phase, func(t *testing.T) {
+			cmd := exec.Command(h.python, h.adapter, phase, "x.py")
+			cmd.Stdin = strings.NewReader(`["tool_name","Bash"]`)
+			_, err := cmd.CombinedOutput()
+			require.Error(t, err)
+			assert.Equal(t, 2, exitCodeOf(t, err))
+		})
+	}
 
 	t.Run("empty stdin is not a tool call", func(t *testing.T) {
 		cmd := exec.Command(h.python, h.adapter, "PreToolUse", "x.py")
@@ -362,4 +375,29 @@ func sortStrings(s []string) {
 // pyStr renders a Go string as a Python string literal for the fake scripts.
 func pyStr(s string) string {
 	return `"` + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`) + `"`
+}
+
+// TestCodexAdapter_CrashBlocks covers the last fail-open path: an unexpected
+// exception would exit 1, and codex records any exit other than 0 and 2 as
+// Failed — which does not block. The top-level handler routes it to a block.
+func TestCodexAdapter_CrashBlocks(t *testing.T) {
+	h := newCodexAdapterHarness(t)
+	// A script whose stdout is valid JSON of the wrong shape: the adapter
+	// reaches into it and must not fall over silently.
+	h.script("weird.py", `print(json.dumps({"hookSpecificOutput": "not-an-object"}))
+sys.exit(0)`)
+
+	input := codexBashInput("ls")
+	input["tool_response"] = "out"
+	got := h.run("PostToolUse", input, "weird.py")
+	assert.Contains(t, []int{0, 2}, got.exitCode,
+		"whatever the adapter decides, it must never exit a code codex reads as Failed")
+
+	// And a genuine crash: the hooks directory replaced by a file makes the
+	// script lookup raise rather than return.
+	require.NoError(t, os.RemoveAll(h.hooksDir))
+	require.NoError(t, os.WriteFile(h.hooksDir, []byte("not a directory"), 0o644))
+	crashed := h.run("PreToolUse", codexBashInput("ls"), "tirith_check.py")
+	assert.Equal(t, 2, crashed.exitCode, "a crash must block, not fail open")
+	assert.NotEmpty(t, strings.TrimSpace(crashed.stderr))
 }

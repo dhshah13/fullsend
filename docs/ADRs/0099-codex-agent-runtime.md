@@ -66,34 +66,30 @@ anything but 0 or 2 is recorded as `Failed` and does not block, so the scripts' 
 exit 2 with the reason on stderr; and only a synchronous handler can apply control effects, so the
 wiring never carries an `async` key. Hooks are loaded with `--dangerously-bypass-hook-trust`,
 justified by fullsend's own SHA-256 guard over the adapter and the auth script, which is a stronger
-check than the trust hash it replaces. The project is left **untrusted**, and approval policy,
-sandbox mode and the model provider are additionally passed as `-c` overrides, which outrank every
-config layer including the image's managed `/etc/codex/config.toml`.
+check than the trust hash it replaces. The project is left **untrusted** — enforced by a whole-file digest of the runner's
+`config.toml`, because a single `projects."<repo>".trust_level = "trusted"` line there would load
+the target repo's own `.codex/` layer and there is no `-c` override for trust. Approval policy,
+sandbox mode, the model provider, the provider's `base_url` and its `auth.command` are additionally
+passed as `-c` overrides, which outrank every config layer including the image's managed
+`/etc/codex/config.toml`.
 
 ## Consequences
 
 - Codex has no Vertex path, so it gets **no default behaviour-CI coverage** until an OpenAI
   organization is mapped to the pool repositories; until then the evidence is unit tests, recorded
   stream fixtures and local smoke runs.
-- Codex cannot rewrite a built-in tool's output — its PostToolUse accepts only `additionalContext`
-  and `updatedMCPToolOutput` — so the sanitizer chain **detects and blocks** but does not redact,
-  and the adapter warns the model that the output it is reading would have been redacted.
-- Codex has **no hook-driven session halt**: `continue: false` is unsupported on PreToolUse and
-  inert on PostToolUse. A canary hit therefore blocks, which on codex withholds the tool output
-  entirely — stronger than Claude Code, where a block only appends a reason — but the run continues.
-- Codex reports no cost, so `total_cost_usd` stays 0 for codex runs; token usage is reported.
-- `apply_patch` covers both Claude's `Write` and `Edit`, and reaches the hook scripts as `Edit`, so
-  an agent allowlisted only for `Write` is blocked by the (opt-in) tool-allowlist hook.
-- With a custom provider, codex also issues a `GET /v1/models` catalog refresh at startup, which the
-  `fullsend-openai` egress profile denies; it is logged and non-fatal, but "only `POST /v1/responses`
-  is attempted" is not true of codex the way it is of pi.
-- Codex's own artifacts keep raw tool output — the stream's `aggregated_output` and the rollout
-  session file both survive a hook block, unlike Claude Code's stream, which carries the post-hook
-  result — so both are filtered through the shared secret-pattern redactor on the way to disk. That
-  closes the credential path; it is not the hook chain, so a canary is masked in the artifact rather
-  than withheld, and nothing is condensed or normalized there.
-- Every guard is shell text, so each is executed under `/bin/sh` in tests rather than asserted as a
-  string: that is what caught the first draft's fail-open guard, where sh's left-associative `&&`
-  and `||` let a trailing check rescue every earlier failure.
-- The codex CLI pin now has to be re-checked on every bump against the hook payload shape,
-  `auth.command` semantics and the JSONL event structs, since all three are load-bearing here.
+- The sanitizer chain **detects and blocks but cannot redact** for the model, because codex allows no
+  output rewrite for built-in tools; and codex has **no hook-driven session halt**, so a canary hit
+  blocks the tool result — which on codex withholds it entirely, unlike Claude Code — but the run
+  continues.
+- Codex's own artifacts keep raw tool output where Claude Code's stream carries the post-hook
+  result, so `output.jsonl` and the extracted rollout are filtered through the shared secret-pattern
+  redactor: a credential is masked there, a canary is not withheld.
+- The runner-owned files under `CODEX_HOME` are only as trustworthy as their digests' anchor, which
+  is this binary for the embedded assets and the runner's own memory for the per-run files — so
+  `Run` now requires `Bootstrap` to have run in the same process, and fails closed otherwise.
+- Codex reports no cost (`total_cost_usd` stays 0), `apply_patch` reaches the hook scripts as `Edit`
+  so an agent allowlisted only for `Write` is blocked by the opt-in allowlist hook, and the CLI pin
+  must be re-checked on every bump against the hook payload shape, `auth.command` semantics and the
+  JSONL event structs — the re-check table is in
+  [runtime-implementation.md](../contributing/runtime-implementation.md#codex-runtime-internals-6920).

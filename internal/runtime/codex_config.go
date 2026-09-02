@@ -334,13 +334,21 @@ func codexMatcherFor(tools []string) (matcher string, dropped []string, ok bool)
 // group's scripts, so the scripts still run in plan order inside one process
 // — the ordering the PostToolUse chain depends on.
 //
+// python is the absolute interpreter path Bootstrap resolved, rendered with
+// `-I`: codex spawns a hook through the shell it inherits, *after* the
+// agent-writable .env has been sourced, so a bare `python3` would be resolved
+// through a PATH the agent controls and a poisoned interpreter would run under
+// the hash-pinned adapter. `-I` additionally ignores PYTHONPATH and the user
+// site directory, which are the two ways to inject a module into an otherwise
+// genuine interpreter.
+//
 // HookPhasePostToolUseFailure renders nothing: codex has no such event
 // (codex-rs/config/src/hook_config.rs HookEventsToml), and it does not need
 // one, because its PostToolUse fires for a command that exited non-zero as
 // well — a shell tool result is `success` regardless of exit code
 // (codex-rs/core/src/tools/context.rs ExecCommandToolOutput). pi maps the
 // phase onto nothing for the same reason.
-func codexHooksJSON(configDir string, hooks security.SandboxHookConfig) ([]byte, []string, error) {
+func codexHooksJSON(configDir, python string, hooks security.SandboxHookConfig) ([]byte, []string, error) {
 	cfg := codexHooksConfig{
 		Description: "fullsend sandbox tool hooks (generated; see docs/contributing/runtime-implementation.md)",
 		Hooks:       map[string][]codexHookMatcherSet{},
@@ -372,7 +380,7 @@ func codexHooksJSON(configDir string, hooks security.SandboxHookConfig) ([]byte,
 			Hooks: []codexHookEntry{{
 				Type: "command",
 				Command: strings.Join(append(
-					[]string{"python3", adapter, string(g.Phase)}, g.Scripts...), " "),
+					[]string{python, "-I", adapter, string(g.Phase)}, g.Scripts...), " "),
 				Timeout: security.HookTimeoutSeconds,
 			}},
 		})

@@ -16,6 +16,9 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/security"
 )
 
+// testCodexPython is what Bootstrap's preflight resolves in the sandbox image.
+const testCodexPython = "/usr/bin/python3"
+
 func TestCodexTOMLString(t *testing.T) {
 	tests := []struct {
 		name string
@@ -183,7 +186,7 @@ func TestCodexMatcherFor_ExactAlternationForm(t *testing.T) {
 
 func TestCodexHooksJSON_DefaultPlan(t *testing.T) {
 	cfg := security.SandboxHookConfigFromHarness(&harness.Harness{})
-	data, notes, err := codexHooksJSON(sandbox.SandboxCodexConfig, cfg)
+	data, notes, err := codexHooksJSON(sandbox.SandboxCodexConfig, testCodexPython, cfg)
 	require.NoError(t, err)
 
 	var parsed codexHooksConfig
@@ -204,9 +207,13 @@ func TestCodexHooksJSON_DefaultPlan(t *testing.T) {
 			assert.Equal(t, "command", entry.Type)
 			assert.Equal(t, security.HookTimeoutSeconds, entry.Timeout,
 				"codex reads `timeout` in seconds, like Claude Code")
-			assert.True(t, strings.HasPrefix(entry.Command, "python3 "+adapter+" "+phase+" "),
-				"every handler invokes the SHA-guarded adapter with its phase: %q", entry.Command)
-			assert.NotEmpty(t, strings.Fields(entry.Command)[3:], "at least one script must follow the phase")
+			// Absolute interpreter, isolated: codex spawns hooks after the
+			// agent-writable .env is sourced, so a bare `python3` would be
+			// resolved through a PATH the agent controls, and -I keeps
+			// PYTHONPATH and the user site directory out of a genuine one.
+			assert.True(t, strings.HasPrefix(entry.Command, testCodexPython+" -I "+adapter+" "+phase+" "),
+				"every handler invokes the SHA-guarded adapter with a pinned interpreter: %q", entry.Command)
+			assert.NotEmpty(t, strings.Fields(entry.Command)[4:], "at least one script must follow the phase")
 		}
 	}
 
@@ -233,7 +240,7 @@ func TestCodexHooksJSON_DefaultPlan(t *testing.T) {
 // with no signal that they had.
 func TestCodexHooksJSON_NeverAsync(t *testing.T) {
 	cfg := security.SandboxHookConfigFromHarness(&harness.Harness{})
-	data, _, err := codexHooksJSON(sandbox.SandboxCodexConfig, cfg)
+	data, _, err := codexHooksJSON(sandbox.SandboxCodexConfig, testCodexPython, cfg)
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "async")
 
@@ -257,7 +264,7 @@ func TestCodexHooksJSON_NeverAsync(t *testing.T) {
 // hooks at all.
 func TestCodexHooksJSON_ParsesAsCodexHooksFile(t *testing.T) {
 	cfg := security.SandboxHookConfigFromHarness(&harness.Harness{})
-	data, _, err := codexHooksJSON(sandbox.SandboxCodexConfig, cfg)
+	data, _, err := codexHooksJSON(sandbox.SandboxCodexConfig, testCodexPython, cfg)
 	require.NoError(t, err)
 
 	var raw map[string]any
@@ -292,7 +299,7 @@ func TestCodexHooksJSON_SecurityDisabledPlanRendersNothing(t *testing.T) {
 			},
 		},
 	})
-	data, _, err := codexHooksJSON(sandbox.SandboxCodexConfig, cfg)
+	data, _, err := codexHooksJSON(sandbox.SandboxCodexConfig, testCodexPython, cfg)
 	require.NoError(t, err)
 
 	var parsed codexHooksConfig

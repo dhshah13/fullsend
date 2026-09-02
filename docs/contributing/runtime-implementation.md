@@ -730,14 +730,49 @@ Consequences of those, recorded in the matrix and [ADR 0099](../ADRs/0099-codex-
 - **A PreToolUse block reaches the model as a decline**, quoting the reason and the command, rather
   than as a tool failure.
 
-`Run` checks — before the agent-writable `.env` is sourced, with `command -p sha256sum` / `cut` so
-nothing in the environment can stand in for them — that the adapter and the auth script are
-byte-identical to the copies embedded in the fullsend binary, that `config.toml`, `hooks.json` and
-the manifest exist, and that every handler in `hooks.json` still invokes that adapter; otherwise it
-exits 97. It refuses to start at all (exit -1) when security is enabled but the manifest carries no
-hook plan, and it decides whether hooks are expected from the runner's own signal rather than from
-the manifest. The manifest and the hook scripts themselves stay agent-writable between iterations —
-the same residue Claude Code has with `claude-config/hooks.json`.
+### Where the guards' expected values come from
+
+Everything under `CODEX_HOME` is agent-writable between iterations, so a guard is worth only as much
+as the place its expected value comes from. There are two trustworthy places, and the manifest is
+not one of them:
+
+| File | Anchor | Guard |
+|---|---|---|
+| hook adapter, auth script | **compile-time** — `go:embed`ed, so the digest is a literal in the run command | SHA-256, exit 97 |
+| the shared hook scripts | **compile-time** — every script this binary can install is embedded, so each file in `hooks/` must match one of those digests without the guard knowing which the harness enabled | SHA-256 set, exit 97 |
+| `config.toml`, `hooks.json` | **the runner's own memory** — rendered per run, so Bootstrap records what it uploaded in the host process and Run reads it back (`codex_integrity.go`) | whole-file SHA-256, exit 98 |
+| `fullsend-manifest.json` | none — it is a file in the same directory | information only; never authority |
+
+The hook-script digests make codex **stricter than Claude Code and pi**, where the scripts stay
+agent-writable between iterations with no integrity check. An agent that rewrites `tirith_check.py`
+to exit 0, or drops a script of its own beside them, fails the run; deleting one narrows the wiring
+rather than redirecting it, and the `hooks.json` digest catches that.
+
+**Why not record the config digest in the manifest.** It would be a hash in the same agent-writable
+directory as the file it describes, so an agent could rewrite both and the guard would pass. That is
+not theoretical: `projects."<repo>".trust_level = "trusted"` in `config.toml` makes codex load the
+target repo's own `.codex/config.toml`, which then supplies `developer_instructions`, `model`, and —
+under `--dangerously-bypass-hook-trust` — repo-authored hooks. Verified against 0.152.1: with the
+line the repo layer applied, without it it did not. An earlier grep-based guard here looked for a
+`[projects` header and missed the dotted-key spelling entirely, which is why the check is a
+whole-file digest and not a pattern.
+
+**What `-c` can and cannot pin.** A `-c` override beats the file for
+`model_providers.<id>.base_url` and `.auth.command` (verified: a config naming an unreachable host
+still reached `api.openai.com`), so both are passed as SessionFlags as well as covered by the digest.
+There is **no such pin for project trust** — `-c projects={}` and a scalar
+`-c projects."<repo>".trust_level="untrusted"` were both tried and neither overrides the file.
+
+`Run` also refuses to start (exit -1) when security is enabled but the manifest carries no hook
+plan, and decides whether hooks are expected from the runner's own signal rather than from the
+manifest.
+
+**The hook interpreter is pinned too.** codex spawns a hook through the shell it inherits, *after*
+the agent-writable `.env` has been sourced, so a bare `python3` in `hooks.json` would be resolved
+through a PATH the agent controls — a poisoned interpreter running under the hash-pinned adapter.
+Bootstrap resolves the absolute path in its preflight and renders it with `-I`, which also ignores
+`PYTHONPATH` and the user site directory; `Run` unsets `PYTHONPATH`, `PYTHONHOME` and
+`PYTHONSTARTUP` after `.env` for good measure.
 
 ### What the local smoke proved
 

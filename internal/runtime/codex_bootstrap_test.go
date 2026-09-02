@@ -53,6 +53,7 @@ if [ "$2" = "exec" ]; then
   for last; do :; done
   case "$last" in
     "codex --version") echo "codex-cli ` + version + `"; exit 0 ;;
+    "command -v python3") echo "/usr/bin/python3"; exit 0 ;;
     cat\ *) f=$(printf '%s' "${last#cat }" | tr -d "'" | tr '/' '_'); cat '` + storeDir + `'/"$f"; exit $? ;;
     *"exec --json"*) ` + streamCase + ` ;;
     find\ *) ` + findCase + ` ;;
@@ -386,4 +387,36 @@ func TestReadCodexManifest_ReportsAMissingFile(t *testing.T) {
 	_, err := readCodexManifest("sb", CodexRuntime{}.codexManifestPath())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "was Bootstrap run?")
+}
+
+// TestCodexPreflightPython covers the resolution Bootstrap does on a shell the
+// agent has not touched, so hooks.json can name an absolute interpreter.
+func TestCodexPreflightPython(t *testing.T) {
+	t.Run("returns the absolute path", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "0.152.1")
+		got, err := codexPreflightPython("sb")
+		require.NoError(t, err)
+		assert.Equal(t, "/usr/bin/python3", got)
+	})
+
+	t.Run("refuses a relative answer", func(t *testing.T) {
+		binDir := t.TempDir()
+		script := "#!/bin/sh\nif [ \"$2\" = \"exec\" ]; then echo 'python3'; fi\nexit 0\n"
+		require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte(script), 0o755))
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		_, err := codexPreflightPython("sb")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not an absolute path")
+	})
+
+	t.Run("refuses a missing interpreter", func(t *testing.T) {
+		binDir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte("#!/bin/sh\nexit 0\n"), 0o755))
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		_, err := codexPreflightPython("sb")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not found in the sandbox image")
+	})
 }

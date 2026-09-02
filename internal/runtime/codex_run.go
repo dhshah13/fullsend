@@ -163,6 +163,11 @@ func codexAssetGuard(r CodexRuntime, hooksEnabled bool) string {
 			// the same one Claude Code has with its own hooks.json, which is
 			// likewise written once at Bootstrap and agent-writable after.
 			codexHooksAdapterCheck(r.codexHooksPath(), r.codexAdapterPath()),
+			// Every script in the hooks directory must be one this binary
+			// installed: the scripts are agent-writable between iterations,
+			// and a tirith_check.py rewritten to exit 0 would disable a
+			// control while every other check still passed.
+			codexHookScriptsGuard(r.codexHooksDir()),
 		)
 	}
 	return fmt.Sprintf(
@@ -193,40 +198,31 @@ func codexSHACheck(path, sum string) string {
 		shellQuote(path), shellQuote(sum))
 }
 
-// codexConfigGuard is the POSIX sh fragment that fails closed when config.toml
-// no longer describes the run-scoped provider the runner set up.
+// codexConfigGuard is the POSIX sh fragment that fails closed when a
+// runner-owned, per-run file under CODEX_HOME is no longer byte-for-byte what
+// Bootstrap uploaded. The expected digests come from the runner's own memory
+// (codex_integrity.go), so nothing in the agent-writable config directory
+// contributes to the answer.
 //
-// The keys that decide *which* model provider is used are also passed as `-c`
-// SessionFlag overrides, which outrank every config layer, so they need no
-// guard. What a rewritten config.toml could still do is move the endpoint or
-// the credential, which is the placeholder-leak path ADR 0025 describes:
-//
-//   - a different `base_url` under the provider table, or a second provider
-//     table carrying one — so exactly one base_url line is allowed and it must
-//     be the pinned endpoint;
-//   - `openai_base_url`, which redirects codex's built-in provider, or
-//     `env_key`, which would make codex read a credential straight from the
-//     environment instead of the sha-guarded auth script;
-//   - a different `auth.command`, which would bypass the auth script's own
-//     SHA-256 check — so exactly one command line is allowed and it must be
-//     the script the asset guard just verified;
-//   - a `[projects]` trust entry, which would load the target repo's own
-//     `.codex/` layer, including repo-owned hooks.
-//
-// Run emits it twice: before the agent-writable .env is sourced (nothing can
-// shadow the builtins yet) and after it, behind `unset -f`, which is a special
-// builtin a sourced function cannot stand in for. It applies whether or not
-// hooks are enabled, because the risk here is credential leak, not tool misuse.
-func codexConfigGuard(r CodexRuntime) string {
-	cfg := shellQuote(r.codexConfigPath())
-	baseURL := shellQuote(`base_url = "` + codexBaseURL + `"`)
-	authCmd := shellQuote(`command = ` + codexTOMLString(r.codexAuthScriptPath()))
+// An earlier version checked config.toml with grep line patterns instead —
+// that base_url is the pinned one, that no `[projects` header appears — and it
+// was wrong in a way worth recording: TOML's dotted-key form,
+// `projects."<repo>".trust_level = "trusted"`, sets the same value with no
+// bracket header and slipped straight past it. That line makes codex load the
+// target repo's own `.codex/config.toml`, which then supplies
+// `developer_instructions`, `model` and, under
+// `--dangerously-bypass-hook-trust`, repo-authored hooks. Verified against
+// codex 0.152.1: with the line the repo layer applied, without it it did not,
+// and `-c projects={}` and a `-c` scalar `trust_level="untrusted"` both failed
+// to override it. A whole-file digest has no such blind spot.
+func codexConfigGuard(r CodexRuntime, hashes codexUploadedHashes) string {
+	checks := []string{codexSHACheck(r.codexConfigPath(), hashes.ConfigTOML)}
+	if hashes.HooksJSON != "" {
+		checks = append(checks, codexSHACheck(r.codexHooksPath(), hashes.HooksJSON))
+	}
 	return fmt.Sprintf(
-		`{ command -p grep -qxF %s %s && [ "$(command -p grep -c '^base_url ' %s)" = 1 ] `+
-			`&& command -p grep -qxF %s %s && [ "$(command -p grep -c '^command ' %s)" = 1 ] `+
-			`&& ! command -p grep -qE '^[[:space:]]*(openai_base_url|env_key)[[:space:]]*=|^[[:space:]]*\[projects' %s `+
-			`|| { echo 'fullsend: codex config.toml no longer pins the run-scoped provider endpoint, its auth command, or leaves the project untrusted; refusing to run (credential-leak risk)' >&2; exit %d; }; }`,
-		baseURL, cfg, cfg, authCmd, cfg, cfg, cfg, codexConfigTamperedExit)
+		`{ %s || { echo 'fullsend: codex config.toml or hooks.json is not the file fullsend wrote; refusing to run (a rewritten config can trust the target repo, which loads its .codex/ layer and its hooks)' >&2; exit %d; }; }`,
+		strings.Join(checks, " && "), codexConfigTamperedExit)
 }
 
 // buildCodexRunCommand renders the in-sandbox command line.
@@ -250,7 +246,7 @@ func codexConfigGuard(r CodexRuntime) string {
 //   - whether the hook adapter is required is decided from the runner's own
 //     signal (params.HooksSettingsPath, the same one ClaudeRuntime uses for
 //     --settings), never from the agent-writable manifest.
-func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled bool) string {
+func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled bool, hashes codexUploadedHashes) string {
 	r := CodexRuntime{}
 	envFile := sandbox.SandboxWorkspace + "/.env"
 
@@ -258,7 +254,7 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 	parts = append(parts,
 		"&& "+codexBinaryPin(),
 		"&& "+codexAssetGuard(r, hooksEnabled),
-		"&& "+codexConfigGuard(r),
+		"&& "+codexConfigGuard(r, hashes),
 		"&& "+r.OpenAIAuthSeed(),
 		"&& . "+shellQuote(envFile),
 		// .env is agent-writable; re-pin the runner-owned config location
@@ -266,13 +262,17 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		// under the guards.
 		"&& "+strings.Join(r.EnvExports(), " && "),
 		"&& export "+codexRuntimeEnv+"=codex",
-		"&& unset OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY NODE_OPTIONS NODE_PATH",
+		// NODE_* would load code into npm's codex launcher; PYTHON* would do
+		// the same to the hook adapter's interpreter, which `-I` in hooks.json
+		// already isolates — belt and braces, since the adapter is the one
+		// process that decides whether a tool call is allowed.
+		"&& unset OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY NODE_OPTIONS NODE_PATH PYTHONPATH PYTHONHOME PYTHONSTARTUP",
 		// `unset -f` is a special builtin, which a function .env defined
 		// cannot shadow, so it restores the real utilities before the second
 		// pass; `command -p` inside the guard defeats a PATH swap.
 		"&& unset -f test command grep cut wc sha256sum printf codex",
 		"&& "+codexAssetGuard(r, hooksEnabled),
-		"&& "+codexConfigGuard(r),
+		"&& "+codexConfigGuard(r, hashes),
 	)
 	if params.Debug != "" {
 		// codex exec has no --debug flag. Its tracing goes to stderr, at
@@ -311,6 +311,16 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		"-c "+shellQuote("model_provider="+codexProviderID),
 		"-c "+shellQuote("approval_policy=never"),
 		"-c "+shellQuote("sandbox_mode=danger-full-access"),
+		// The endpoint and the credential command as SessionFlags too, so
+		// even an edit that somehow satisfied the digest guard could not move
+		// them. Verified against codex 0.152.1: a `-c` override of these two
+		// beats the value in config.toml (a file naming an unreachable host
+		// still reached api.openai.com). There is no such pin for project
+		// trust — `-c projects={}` and a scalar `trust_level="untrusted"` were
+		// both tried and neither overrides the file — which is why config.toml
+		// integrity is enforced by digest rather than by overrides alone.
+		"-c "+shellQuote(fmt.Sprintf("model_providers.%s.base_url=%q", codexProviderID, codexBaseURL)),
+		"-c "+shellQuote(fmt.Sprintf("model_providers.%s.auth.command=%q", codexProviderID, r.codexAuthScriptPath())),
 	)
 	if effort != "" {
 		parts = append(parts, "-c "+shellQuote("model_reasoning_effort="+effort))
@@ -361,7 +371,17 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			sanitizeOutput(strings.Join(params.FallbackModels, ","))))
 	}
 
-	cmd := buildCodexRunCommand(params, modelID, effort, hooksEnabled)
+	hashes, ok := lookupCodexArtifactHashes(params.SandboxName)
+	if !ok {
+		// The digests live in this process because the sandbox has no
+		// trustworthy place to keep them; the runner calls Bootstrap and Run
+		// in one invocation, so a miss means the config was never written by
+		// this process and the guards would have nothing to compare against.
+		return -1, fmt.Errorf(
+			"no recorded config digests for sandbox %s: CodexRuntime.Run requires Bootstrap to have run in the same process (internal/cli/run.go does), because the expected hashes cannot be read back from the agent-writable config directory",
+			params.SandboxName)
+	}
+	cmd := buildCodexRunCommand(params, modelID, effort, hooksEnabled, hashes)
 
 	stdout, execCmd, cancel, err := sandbox.ExecStreamReader(ctx, params.SandboxName, cmd, params.Timeout, os.Stderr)
 	if err != nil {

@@ -18,12 +18,13 @@ const codexDebugLogFile = "codex-debug.log"
 // executes `codex exec --json` against a run-scoped OpenAI provider whose
 // bearer token comes from a runner-seeded file, and normalizes the stream via
 // parseCodexStream (codex_progress.go); transcripts are codex's rollout
-// session JSONL files (codex_transcript.go). Selected per org/repo with
-// `runtime: codex` (#6920, ADR 0099).
+// session JSONL files (codex_transcript.go). Selectable with `runtime: codex`
+// once PR E adds it to config.ValidRuntimes() — per-repo config or an
+// `agents:` entry (#6920, ADR 0099).
 //
 // It is registered in Resolve() but deliberately absent from
-// config.ValidRuntimes() until PR E enables it, so no per-repo config (nor an
-// agents: entry) can select it before the docs and the behaviour scenario land.
+// config.ValidRuntimes() until then, so nothing can select it before the user
+// docs and the behaviour scenario land.
 type CodexRuntime struct{}
 
 func (CodexRuntime) Name() string { return "codex" }

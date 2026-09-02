@@ -56,6 +56,7 @@ cases (tirith).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -306,11 +307,13 @@ def main() -> None:
         # phase, where guessing would be fail-open.
         if raw.strip() == "":
             sys.exit(0)
+        # Only empty stdin is benign ("no tool call", which every script
+        # allows). A payload that arrived but cannot be read as an object is
+        # the shape a truncated or hostile message has, and passing it would
+        # let a tool call through unscanned on either phase.
         message = "fullsend: codex hook payload was not a JSON object (fail closed)"
         log_finding("codex_adapter_bad_payload", "critical", message, "block")
-        if phase == PHASE_PRE:
-            block(message)
-        sys.exit(0)
+        block(message)
 
     codex_tool = hook_input.get("tool_name")
     codex_tool = codex_tool if isinstance(codex_tool, str) else ""
@@ -327,4 +330,24 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        # block() and the allow paths exit deliberately; let those through.
+        raise
+    except BaseException as err:  # noqa: BLE001 - an unexpected failure must not fail open
+        # Without this the interpreter would exit 1, and codex records any
+        # exit other than 0 and 2 as `Failed` — which does not block. An
+        # adapter that crashed would therefore let the tool call through.
+        with contextlib.suppress(BaseException):
+            # Logging must never mask the block.
+            log_finding(
+                "codex_adapter_crashed",
+                "critical",
+                f"{type(err).__name__}: {err}",
+                "block",
+            )
+        block(
+            f"fullsend: the codex hook adapter failed ({type(err).__name__}); "
+            "refusing the tool call"
+        )

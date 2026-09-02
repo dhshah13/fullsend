@@ -142,6 +142,9 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	if err := uploadBytes(sandboxName, r.codexConfigPath(), configTOML); err != nil {
 		return fmt.Errorf("writing %s: %w", codexConfigFile, err)
 	}
+	// Recorded in the runner's own memory, not in the manifest: see
+	// codex_integrity.go for why the sandbox has no trustworthy anchor.
+	hashes := codexUploadedHashes{ConfigTOML: codexAssetSHA256(configTOML)}
 
 	// uploadBytes does not set a mode, and codex executes this one.
 	if err := uploadBytes(sandboxName, r.codexAuthScriptPath(), codexAuthScriptSH); err != nil {
@@ -204,7 +207,11 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		if err := uploadBytes(sandboxName, r.codexAdapterPath(), codexHookAdapterPy); err != nil {
 			return fmt.Errorf("installing hook adapter: %w", err)
 		}
-		hooksJSON, notes, err := codexHooksJSON(cfg, hooks)
+		python, err := codexPreflightPython(sandboxName)
+		if err != nil {
+			return err
+		}
+		hooksJSON, notes, err := codexHooksJSON(cfg, python, hooks)
 		if err != nil {
 			return err
 		}
@@ -214,6 +221,7 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		if err := uploadBytes(sandboxName, r.codexHooksPath(), hooksJSON); err != nil {
 			return fmt.Errorf("writing %s: %w", codexHooksFile, err)
 		}
+		hashes.HooksJSON = codexAssetSHA256(hooksJSON)
 		manifest.Hooks = codexHooksManifestFor(r.codexHooksDir(), hooks)
 	}
 
@@ -230,6 +238,7 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	if err := uploadBytes(sandboxName, r.codexManifestPath(), manifestJSON); err != nil {
 		return fmt.Errorf("writing %s: %w", codexManifestFile, err)
 	}
+	recordCodexArtifactHashes(sandboxName, hashes)
 	return nil
 }
 
@@ -341,6 +350,29 @@ func codexPreflightVersion(sandboxName string) (string, error) {
 		version = strings.TrimSpace(version[i+1:])
 	}
 	return sanitizeOutput(version), nil
+}
+
+// codexPreflightPython resolves the absolute interpreter the hook handlers
+// will name. It is resolved here, on a shell the agent has not touched, rather
+// than left as a bare `python3` in hooks.json: codex spawns hooks after the
+// agent-writable .env is sourced, so PATH resolution at that point is the
+// agent's to influence.
+func codexPreflightPython(sandboxName string) (string, error) {
+	stdout, _, exitCode, err := sandbox.Exec(sandboxName, "command -v python3", 10*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("resolving python3 for the hook adapter: %w", err)
+	}
+	path := strings.TrimSpace(stdout)
+	if exitCode != 0 || path == "" {
+		return "", fmt.Errorf("resolving python3 for the hook adapter: not found in the sandbox image (exit %d)", exitCode)
+	}
+	if i := strings.LastIndexByte(path, '\n'); i >= 0 {
+		path = strings.TrimSpace(path[i+1:])
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "", fmt.Errorf("resolving python3 for the hook adapter: %q is not an absolute path", sanitizeOutput(path))
+	}
+	return path, nil
 }
 
 // codexManifestMaxBytes bounds the manifest read back through exec stdout; a
