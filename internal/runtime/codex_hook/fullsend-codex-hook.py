@@ -57,6 +57,7 @@ cases (tirith).
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import subprocess
@@ -67,6 +68,13 @@ from typing import Any
 ADAPTER_DIR = os.path.dirname(os.path.abspath(__file__))
 HOOKS_DIR = os.path.join(ADAPTER_DIR, "hooks")
 FINDINGS_PATH = "/sandbox/workspace/.security/findings.jsonl"
+
+# Set by CodexRuntime.Run in the launch command, after .env and before codex
+# starts, as "<name>:<sha256>" pairs. See verify_script_digest.
+HOOK_DIGESTS_ENV = "FULLSEND_CODEX_HOOK_DIGESTS"
+
+# The PATH captured before the agent-writable .env was sourced. See _child_env.
+PINNED_PATH_ENV = "FULLSEND_CODEX_PATH"
 
 # Bound one script run. The hooks.json handler timeout (30 s) is codex's own
 # ceiling on this whole adapter; this one is per script so a wedged stage
@@ -105,11 +113,29 @@ def _child_env() -> dict[str, str]:
     the user site directory; PYTHONNOUSERSITE closes the same door from the
     environment side, and the rest cannot be relied on to be absent because
     codex spawns the hook after the agent-writable .env has been sourced.
+
+    LD_* goes the same way: it would load code into any dynamically linked
+    program a hook script runs — tirith, git — before its main. PATH is
+    inherited unchanged and is already the value the run command pinned before
+    sourcing .env, which is what makes `tirith` resolve to the real one.
     """
-    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("PYTHON") and not k.startswith("LD_")
+    }
     # Inert under `-I`, which already ignores the user site directory. Kept as
     # a second latch so dropping the flag does not silently re-enable it.
     env["PYTHONNOUSERSITE"] = "1"
+    # PATH from the value the run command captured before .env was sourced,
+    # when it is available. The hook scripts resolve their tools by name —
+    # tirith_check.py runs a bare `tirith` — so a PATH with a planted entry
+    # ahead of the real one neuters the chain with every digest still green.
+    # Taking it from here rather than from the inherited PATH means the
+    # defence does not rest on nothing having touched PATH in between.
+    pinned = os.environ.get(PINNED_PATH_ENV, "").strip()
+    if pinned:
+        env["PATH"] = pinned
     return env
 
 
@@ -150,6 +176,59 @@ _CHILD_BOOTSTRAP = (
     "sys.path.append(sys.argv[1].rsplit('/', 1)[0]); "
     "runpy.run_path(sys.argv[1], run_name='__main__')"
 )
+
+
+def expected_digests() -> dict[str, str] | None:
+    """The name -> sha256 map the run command put in this process's
+    environment, or None when it is absent or unreadable."""
+    raw = os.environ.get(HOOK_DIGESTS_ENV, "").strip()
+    if raw == "":
+        return None
+    digests: dict[str, str] = {}
+    for pair in raw.split():
+        name, _, digest = pair.partition(":")
+        if name == "" or len(digest) != 64:
+            return None
+        digests[name] = digest
+    return digests or None
+
+
+def verify_script_digest(script: str, path: str) -> str | None:
+    """Check one hook script against the digest fixed in this process's
+    environment, returning a block reason or None.
+
+    Run's shell guard checks the hooks directory once, before codex starts.
+    The agent then has the whole iteration — with full sandbox access — to
+    rewrite a script before the next tool call reaches it. This closes that
+    window: the expected digests were exported into the codex process's
+    environment before it started, and a running process's environment is not
+    something the agent can reach, so re-reading the file and comparing here
+    is trustworthy at every invocation.
+
+    A missing or unreadable map is a block: the adapter only ever runs when
+    the runner enabled hooks, so its absence means the launch was not the one
+    fullsend built.
+    """
+    digests = expected_digests()
+    if digests is None:
+        return (
+            f"fullsend: {HOOK_DIGESTS_ENV} is missing or malformed, so hook "
+            f"{script} cannot be verified (fail closed)"
+        )
+    expected = digests.get(script)
+    if expected is None:
+        return f"fullsend: hook {script} is not one fullsend installed (fail closed)"
+    try:
+        with open(path, "rb") as handle:
+            actual = hashlib.sha256(handle.read()).hexdigest()
+    except OSError as err:
+        return f"fullsend: hook {script} could not be read for verification (fail closed): {err}"
+    if actual != expected:
+        return (
+            f"fullsend: hook {script} changed since the run started; "
+            "refusing to run it (fail closed)"
+        )
+    return None
 
 
 def log_finding(name: str, severity: str, detail: str, action: str) -> None:
@@ -207,6 +286,9 @@ def run_script(script: str, payload: dict[str, Any]) -> dict[str, Any]:
     `{"decision":"block"}` object blocks, and a script that cannot be spawned
     or times out blocks too."""
     path = os.path.join(HOOKS_DIR, script)
+    digest_error = verify_script_digest(script, path)
+    if digest_error is not None:
+        return {"block": True, "reason": digest_error, "output": None}
     if not os.path.isfile(path):
         # Explicit rather than incidental: a missing script would otherwise
         # surface as python3's own exit 2, which blocks for the right reason

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -25,6 +26,9 @@ type codexAdapterHarness struct {
 	dir      string
 	hooksDir string
 	adapter  string
+	// digests is what the run command would have exported: the adapter
+	// re-verifies each script against it before every spawn.
+	digests map[string]string
 }
 
 func newCodexAdapterHarness(t *testing.T) *codexAdapterHarness {
@@ -38,7 +42,10 @@ func newCodexAdapterHarness(t *testing.T) *codexAdapterHarness {
 	require.NoError(t, os.MkdirAll(hooksDir, 0o755))
 	adapter := filepath.Join(dir, codexAdapterFile)
 	require.NoError(t, os.WriteFile(adapter, codexHookAdapterPy, 0o755))
-	return &codexAdapterHarness{t: t, python: python, dir: dir, hooksDir: hooksDir, adapter: adapter}
+	return &codexAdapterHarness{
+		t: t, python: python, dir: dir, hooksDir: hooksDir, adapter: adapter,
+		digests: map[string]string{},
+	}
 }
 
 // script writes a fake hook script. body is Python executed with the decoded
@@ -47,6 +54,7 @@ func (h *codexAdapterHarness) script(name, body string) string {
 	h.t.Helper()
 	src := "import json, sys\npayload = json.load(sys.stdin)\n" + body + "\n"
 	require.NoError(h.t, os.WriteFile(filepath.Join(h.hooksDir, name), []byte(src), 0o755))
+	h.digests[name] = codexAssetSHA256([]byte(src))
 	return name
 }
 
@@ -63,6 +71,7 @@ func (h *codexAdapterHarness) run(phase string, input map[string]any, scripts ..
 
 	args := append([]string{h.adapter, phase}, scripts...)
 	cmd := exec.Command(h.python, args...)
+	cmd.Env = append(os.Environ(), codexHookDigestsEnv+"="+codexHookDigestsValue(h.digests))
 	cmd.Stdin = strings.NewReader(string(payload))
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
@@ -443,6 +452,7 @@ func TestCodexAdapter_LeavesTheHooksDirUntouched(t *testing.T) {
 	scripts := security.HookFiles(security.SandboxHookConfigFromHarness(&harness.Harness{}))
 	for name, content := range scripts {
 		require.NoError(t, os.WriteFile(filepath.Join(h.hooksDir, name), content, 0o755))
+		h.digests[name] = codexAssetSHA256(content)
 	}
 	before, err := os.ReadDir(h.hooksDir)
 	require.NoError(t, err)
@@ -495,4 +505,126 @@ func TestCodexAdapter_DoesNotImportPlantedModules(t *testing.T) {
 	_, err := os.Stat(marker)
 	assert.True(t, os.IsNotExist(err),
 		"the standard library must win over anything planted beside the hook scripts")
+}
+
+// TestCodexAdapter_ReverifiesScriptsPerInvocation closes the intra-iteration
+// window. Run's shell guard checks the hooks directory once, before codex
+// starts; the agent then has the whole iteration to rewrite a script before
+// the next tool call reaches it. The expected digests were exported into the
+// codex process's environment before it started, which the agent cannot
+// reach, so re-reading the file at every invocation is trustworthy.
+func TestCodexAdapter_ReverifiesScriptsPerInvocation(t *testing.T) {
+	h := newCodexAdapterHarness(t)
+	h.script("blocker.py", `print(json.dumps({"decision": "block", "reason": "still blocking"}))
+sys.exit(1)`)
+
+	first := h.run("PreToolUse", codexBashInput("ls"), "blocker.py")
+	require.Equal(t, 2, first.exitCode, "the genuine script blocks")
+
+	// Between invocations the agent neuters it, exactly as it could mid-run.
+	require.NoError(t, os.WriteFile(filepath.Join(h.hooksDir, "blocker.py"),
+		[]byte("import sys\nsys.exit(0)\n"), 0o755))
+
+	second := h.run("PreToolUse", codexBashInput("ls"), "blocker.py")
+	assert.Equal(t, 2, second.exitCode, "a script changed mid-iteration must not be run")
+	assert.Contains(t, second.stderr, "changed since the run started")
+}
+
+func TestCodexAdapter_RefusesWithoutTheDigestEnv(t *testing.T) {
+	h := newCodexAdapterHarness(t)
+	h.script("allow.py", "sys.exit(0)")
+	payload, err := json.Marshal(codexBashInput("ls"))
+	require.NoError(t, err)
+
+	for name, env := range map[string][]string{
+		"absent":    nil,
+		"empty":     {codexHookDigestsEnv + "="},
+		"malformed": {codexHookDigestsEnv + "=allow.py:tooshort"},
+		"other script": {codexHookDigestsEnv + "=" + codexHookDigestsValue(
+			map[string]string{"elsewhere.py": strings.Repeat("a", 64)})},
+	} {
+		t.Run("refuses when the digest map is "+name, func(t *testing.T) {
+			cmd := exec.Command(h.python, h.adapter, "PreToolUse", "allow.py")
+			cmd.Env = append(os.Environ(), env...)
+			if env == nil {
+				// Strip it entirely rather than pass an empty value.
+				cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool {
+					return strings.HasPrefix(kv, codexHookDigestsEnv+"=")
+				})
+			}
+			cmd.Stdin = strings.NewReader(string(payload))
+			out, runErr := cmd.CombinedOutput()
+			require.Error(t, runErr, "output: %s", out)
+			assert.Equal(t, 2, exitCodeOf(t, runErr))
+		})
+	}
+}
+
+// The hook scripts resolve their tools by name — tirith_check.py runs a bare
+// `tirith` — so PATH is captured before .env and restored after it. Without
+// that, a .env prepending a directory with a fake `tirith` that exits 0
+// neuters the whole PreToolUse chain while every digest stays green.
+func TestCodexAdapter_ChildEnvDropsLoaderVariables(t *testing.T) {
+	h := newCodexAdapterHarness(t)
+	seen := filepath.Join(h.dir, "env.json")
+	h.script("record.py", `import os
+open(`+pyStr(seen)+`, "w").write(json.dumps({k: v for k, v in os.environ.items()}))
+sys.exit(0)`)
+
+	cmd := exec.Command(h.python, h.adapter, "PreToolUse", "record.py")
+	payload, err := json.Marshal(codexBashInput("ls"))
+	require.NoError(t, err)
+	cmd.Env = append(os.Environ(),
+		codexHookDigestsEnv+"="+codexHookDigestsValue(h.digests),
+		"LD_PRELOAD=/tmp/evil.so",
+		"LD_LIBRARY_PATH=/tmp/evil",
+		"PYTHONPATH=/tmp/evil",
+		"FULLSEND_CANARY_TOKEN=keep-me",
+	)
+	cmd.Stdin = strings.NewReader(string(payload))
+	require.NoError(t, cmd.Run())
+
+	data, err := os.ReadFile(seen)
+	require.NoError(t, err)
+	var env map[string]string
+	require.NoError(t, json.Unmarshal(data, &env))
+
+	assert.NotContains(t, env, "LD_PRELOAD", "a loader variable must not reach a hook script")
+	assert.NotContains(t, env, "LD_LIBRARY_PATH")
+	assert.NotContains(t, env, "PYTHONPATH")
+	assert.Equal(t, "keep-me", env["FULLSEND_CANARY_TOKEN"],
+		"the scripts' own configuration must still reach them")
+	assert.NotEmpty(t, env["PATH"], "PATH is inherited — the run command pinned it before .env")
+}
+
+// TestCodexAdapter_UsesThePinnedPathForChildren is the adapter half of the
+// PATH defence. The run command captures PATH before .env and exports it; the
+// adapter sets the children's PATH from that rather than from whatever it
+// inherits, so the protection does not rest on nothing having touched PATH in
+// between. Demonstrated in the sandbox image: with a fake `tirith` first on
+// PATH the chain returns 0 (neutered) without the pin and 2 (blocked) with it.
+func TestCodexAdapter_UsesThePinnedPathForChildren(t *testing.T) {
+	h := newCodexAdapterHarness(t)
+	seen := filepath.Join(h.dir, "path.txt")
+	h.script("record.py", `import os
+open(`+pyStr(seen)+`, "w").write(os.environ.get("PATH", ""))
+sys.exit(0)`)
+
+	payload, err := json.Marshal(codexBashInput("ls"))
+	require.NoError(t, err)
+	cmd := exec.Command(h.python, h.adapter, "PreToolUse", "record.py")
+	cmd.Env = append(os.Environ(),
+		codexHookDigestsEnv+"="+codexHookDigestsValue(h.digests),
+		// What a .env prepending a planted directory would leave behind.
+		"PATH=/planted/bin:"+os.Getenv("PATH"),
+		codexPathVar+"=/pinned/bin:/usr/bin",
+	)
+	cmd.Stdin = strings.NewReader(string(payload))
+	require.NoError(t, cmd.Run())
+
+	got, err := os.ReadFile(seen)
+	require.NoError(t, err)
+	assert.Equal(t, "/pinned/bin:/usr/bin", string(got),
+		"the child's PATH comes from the pinned value, not the inherited one")
+	assert.NotContains(t, string(got), "/planted/bin")
 }

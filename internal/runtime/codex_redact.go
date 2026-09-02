@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // Artifact-side redaction for codex runs.
@@ -136,7 +137,7 @@ func codexRedactValue(v any) any {
 // same raw tool output the stream does. A file it cannot rewrite is dropped by
 // the caller rather than shipped.
 func codexRedactFile(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := codexReadBounded(path)
 	if err != nil {
 		return err
 	}
@@ -163,7 +164,7 @@ func codexRedactFile(path string) error {
 // codexRedactTextFile rewrites a plain-text artifact in place with the shared
 // secret patterns applied. Used on the debug log, which is not JSONL.
 func codexRedactTextFile(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := codexReadBounded(path)
 	if err != nil {
 		return err
 	}
@@ -175,6 +176,20 @@ func codexRedactTextFile(path string) error {
 	return os.WriteFile(path, []byte(redactSummary(string(data))), mode)
 }
 
+// codexReadBounded reads a file the sandbox produced, refusing one larger than
+// codexMaxArtifactBytes rather than pulling it into the runner's memory.
+func codexReadBounded(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > codexMaxArtifactBytes {
+		return nil, fmt.Errorf("%s is %d bytes, past the %d-byte artifact limit",
+			filepath.Base(path), info.Size(), codexMaxArtifactBytes)
+	}
+	return os.ReadFile(path)
+}
+
 // codexRolloutEnvelopes are the top-level `type` values a codex rollout line
 // carries (codex-rs/thread-store). They are underscored, where the tee'd
 // `exec --json` stream uses dotted names, so the two never collide.
@@ -183,10 +198,17 @@ var codexRolloutEnvelopes = map[string]bool{
 	"turn_context": true, "compacted": true,
 }
 
-// codexIsRolloutFile reports whether path looks like a codex rollout, by
-// parsing its first non-empty line. The sessions directory is agent-writable,
-// so a `.jsonl` there is a claim, not a fact: without this a planted file
-// would be downloaded, kept, and presented as the run's transcript.
+// codexMaxArtifactBytes bounds what the artifact filters will read. A codex
+// rollout for a long run is megabytes; the sessions directory is
+// agent-writable, so without a bound a planted multi-gigabyte file would be
+// read into the runner's memory to be "redacted".
+const codexMaxArtifactBytes = 256 << 20
+
+// codexIsRolloutFile reports whether path is a codex rollout, by parsing
+// *every* line. The sessions directory is agent-writable, so a `.jsonl` there
+// is a claim, not a fact — and checking only the first line would let a file
+// open with one genuine envelope and carry anything after it into the run's
+// artifacts.
 func codexIsRolloutFile(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -194,8 +216,13 @@ func codexIsRolloutFile(path string) error {
 	}
 	defer f.Close()
 
+	if info, err := f.Stat(); err == nil && info.Size() > codexMaxArtifactBytes {
+		return fmt.Errorf("is %d bytes, past the %d-byte artifact limit", info.Size(), codexMaxArtifactBytes)
+	}
+
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxTranscriptLineSize)
+	seen := 0
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -205,10 +232,17 @@ func codexIsRolloutFile(path string) error {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(line, &envelope); err != nil {
-			return fmt.Errorf("first line is not JSON")
+			return fmt.Errorf("line %d is not JSON", seen+1)
 		}
 		if !codexRolloutEnvelopes[envelope.Type] {
-			return fmt.Errorf("first line is %q, not a codex rollout envelope", sanitizeOutput(envelope.Type))
+			return fmt.Errorf("line %d is %q, not a codex rollout envelope",
+				seen+1, sanitizeOutput(envelope.Type))
+		}
+		seen++
+	}
+	if seen > 0 {
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("cannot read the whole file: %w", err)
 		}
 		return nil
 	}

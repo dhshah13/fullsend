@@ -264,3 +264,51 @@ func TestCodexIsRolloutFile_ReportsAMissingFile(t *testing.T) {
 
 	assert.Error(t, codexIsRolloutFile(filepath.Join(t.TempDir(), "absent.jsonl")))
 }
+
+// A rollout is validated line by line, not just at its first: a planted file
+// could otherwise open with one genuine envelope and carry anything after it
+// into the run's artifacts.
+func TestCodexIsRolloutFile_ValidatesEveryLine(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, []byte(body), 0o644))
+		return p
+	}
+
+	require.NoError(t, codexIsRolloutFile(write("all-good.jsonl",
+		`{"type":"session_meta","payload":{}}`+"\n"+
+			`{"type":"response_item","payload":{}}`+"\n"+
+			`{"type":"event_msg","payload":{}}`+"\n")))
+
+	err := codexIsRolloutFile(write("smuggled.jsonl",
+		`{"type":"session_meta","payload":{}}`+"\n"+
+			`{"type":"thread.started","thread_id":"t1"}`+"\n"))
+	require.Error(t, err, "a genuine first line must not vouch for the rest")
+	assert.Contains(t, err.Error(), "line 2")
+
+	err = codexIsRolloutFile(write("junk-tail.jsonl",
+		`{"type":"session_meta","payload":{}}`+"\n"+"not json\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "line 2")
+}
+
+func TestCodexReadBounded_RefusesAnOversizedArtifact(t *testing.T) {
+	t.Parallel()
+
+	// Sparse: the size is what matters, not the bytes.
+	path := filepath.Join(t.TempDir(), "huge.jsonl")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(codexMaxArtifactBytes+1))
+	require.NoError(t, f.Close())
+
+	_, err = codexReadBounded(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "artifact limit")
+
+	require.Error(t, codexRedactFile(path))
+	require.Error(t, codexIsRolloutFile(path))
+}

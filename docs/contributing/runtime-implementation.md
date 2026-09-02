@@ -760,6 +760,23 @@ agent-writable between iterations with no integrity check at all. Each digest is
 All five were reproduced under `/bin/sh` before the guard was rewritten, and each has a case in
 `TestCodexHookScriptsGuard_Executes`.
 
+That guard runs once, before codex starts. The agent then has the whole iteration — with full
+sandbox access — to rewrite a script before the next tool call reaches it, a window Claude Code and
+pi leave open too. On codex it is cheap to close: the run command exports the name → digest map into
+the codex process's environment after `.env` and before launch, and a running process's environment
+is not something the agent can reach, so **the adapter re-reads and re-verifies each script
+immediately before spawning it** and blocks on a mismatch. A missing or malformed map is itself a
+block, since the adapter only ever runs when the runner enabled hooks.
+
+**PATH is pinned across `.env` for the same reason the interpreter is.** The hook scripts resolve
+their tools by name — `tirith_check.py` runs a bare `tirith` — so a `.env` that prepends a directory
+holding a fake `tirith` that exits 0 neuters the entire PreToolUse chain while every digest stays
+green. Reproduced before the pin existed. `Run` captures `PATH` into a readonly variable before
+sourcing `.env` and restores it afterwards, and unsets `LD_PRELOAD`, `LD_LIBRARY_PATH` and
+`LD_AUDIT`, which would otherwise load code into any dynamically linked program the run starts —
+codex's own binary, `tirith`, `git` — before its `main`. The adapter strips `LD_*` and `PYTHON*`
+from the children's environment too, while passing the scripts' own configuration through.
+
 **Why not record the config digest in the manifest.** It would be a hash in the same agent-writable
 directory as the file it describes, so an agent could rewrite both and the guard would pass. That is
 not theoretical: `projects."<repo>".trust_level = "trusted"` in `config.toml` makes codex load the
@@ -848,9 +865,12 @@ Two artefacts of the run are worth knowing about:
 - The sessions directory is agent-writable, so a file being there and ending in `.jsonl` is a claim
   rather than a fact. `ExtractTranscripts` collects regular `.jsonl` files only — never
   `.jsonl.zst`, since codex writes the running session uncompressed and a plaintext file merely
-  *named* that shipped as an artifact the redactor then declined to rewrite — and every candidate's
-  first line must parse as a rollout envelope (`session_meta`, `response_item`, `event_msg`, …)
-  before it is kept. Anything else is discarded with a note, as is anything that cannot be redacted.
+  *named* that shipped as an artifact the redactor then declined to rewrite — and **every line** of
+  a candidate must parse as a rollout envelope (`session_meta`, `response_item`, `event_msg`, …),
+  since checking only the first would let a file open with one genuine envelope and carry anything
+  after it. Each is downloaded to a staging name, validated, redacted and only then renamed into
+  place, so a crash cannot leave raw tool output at the path the artifact collector reads; reads are
+  bounded, so a planted multi-gigabyte file is refused rather than pulled into the runner's memory.
 - `--dangerously-bypass-hook-trust` emits its warning as an `error`-type *item*, which the stream
   parser correctly treats as a warning rather than a run failure.
 - A model the account cannot serve on the Responses API fails as five `error` reconnect events and a

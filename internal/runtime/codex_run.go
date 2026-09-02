@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -33,6 +34,38 @@ const codexBinaryVar = "FULLSEND_CODEX_BIN"
 // codexRuntimeEnv tells skills running inside the sandbox which runtime they
 // are on, so a skill can take a runtime-specific path deliberately.
 const codexRuntimeEnv = "FULLSEND_RUNTIME"
+
+// codexPathVar holds the PATH captured before the agent-writable .env is
+// sourced, so it can be restored before codex — and therefore every hook — is
+// launched.
+const codexPathVar = "FULLSEND_CODEX_PATH"
+
+// codexHookDigestsEnv carries the hook scripts' expected digests to the
+// adapter as "<name>:<sha256>" pairs, space separated.
+//
+// The run command exports it after .env and immediately before codex starts,
+// so its value is fixed in the codex process's environment for the whole
+// iteration: the agent can rewrite a hook script mid-run, but it cannot reach
+// into an already-running process's environment to move the digest it will be
+// checked against. That is what lets the adapter re-verify each script at
+// every invocation rather than trusting the once-per-launch shell guard —
+// closing the intra-iteration window that Claude Code and pi leave open.
+const codexHookDigestsEnv = "FULLSEND_CODEX_HOOK_DIGESTS"
+
+// codexHookDigestsValue renders the map for the environment. Sorted so the
+// launch command is stable across iterations.
+func codexHookDigestsValue(scripts map[string]string) string {
+	names := make([]string, 0, len(scripts))
+	for name := range scripts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	pairs := make([]string, 0, len(names))
+	for _, name := range names {
+		pairs = append(pairs, name+":"+scripts[name])
+	}
+	return strings.Join(pairs, " ")
+}
 
 // codexOpenAIProvider is the only model provider prefix codex accepts in a
 // fullsend model spec. codex speaks the OpenAI Responses API and has no
@@ -262,6 +295,14 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 	parts := []string{"cd " + shellQuote(params.RepoDir)}
 	parts = append(parts,
 		"&& "+codexBinaryPin(),
+		// PATH is captured before .env and restored after it. The hook scripts
+		// resolve their tools by name — tirith_check.py runs a bare `tirith` —
+		// so a .env that prepends a directory holding a fake `tirith` that
+		// exits 0 neuters the whole PreToolUse chain while every digest stays
+		// green. Reproduced before this was added. `readonly` means a .env
+		// that assigns the same name aborts the sourcing shell under a POSIX
+		// sh rather than winning.
+		"&& readonly "+codexPathVar+`="$PATH"`,
 		"&& "+codexAssetGuard(r, hooksEnabled, hashes),
 		"&& "+codexConfigGuard(r, hashes),
 		"&& "+r.OpenAIAuthSeed(),
@@ -270,12 +311,19 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		// after it so a rewritten .env cannot move codex's home out from
 		// under the guards.
 		"&& "+strings.Join(r.EnvExports(), " && "),
+		// Restored for codex itself, and exported so the hook adapter can set
+		// it for its children from a value that never passed through .env —
+		// rather than trusting whatever PATH it happens to inherit.
+		"&& export PATH=\"$"+codexPathVar+"\" && export "+codexPathVar,
 		"&& export "+codexRuntimeEnv+"=codex",
 		// NODE_* would load code into npm's codex launcher; PYTHON* would do
 		// the same to the hook adapter's interpreter, which `-I` in hooks.json
 		// already isolates — belt and braces, since the adapter is the one
 		// process that decides whether a tool call is allowed.
-		"&& unset OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY NODE_OPTIONS NODE_PATH PYTHONPATH PYTHONHOME PYTHONSTARTUP",
+		// LD_* would load code into any dynamically linked binary the run
+		// starts — codex's own native binary, tirith, git — before its main
+		// runs, which no digest of ours would see.
+		"&& unset OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY NODE_OPTIONS NODE_PATH PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT",
 		// `unset -f` is a special builtin, which a function .env defined
 		// cannot shadow, so it restores the real utilities before the second
 		// pass; `command -p` inside the guard defeats a PATH swap.
@@ -299,6 +347,12 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 	// #1050/#6494) and argv is world-readable in the sandbox. `-` is codex's
 	// explicit read-the-prompt-from-stdin sentinel; the pipe closes as soon as
 	// printf is done, so the read cannot hang the way pi's does.
+	if hooksEnabled {
+		// Exported after .env so nothing the agent wrote there can move it,
+		// and read by the adapter before every hook script it spawns.
+		parts = append(parts, "&& export "+codexHookDigestsEnv+"="+
+			shellQuote(codexHookDigestsValue(hashes.HookScripts)))
+	}
 	parts = append(parts,
 		"&& printf '%s' "+shellQuote(prompt)+` | "$`+codexBinaryVar+`"`,
 		"exec",

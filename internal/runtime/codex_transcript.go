@@ -77,26 +77,38 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 		f.Close()
 		localPath := filepath.Join(outputDir, localName)
 		os.Remove(localPath)
-		if dlErr := sandbox.DownloadFile(sandboxName, remotePath, localPath); dlErr != nil {
+
+		// Downloaded, validated and redacted at a staging name, then renamed
+		// into place: a crash between the download and the rewrite would
+		// otherwise leave raw tool output sitting at the path the artifact
+		// collector picks up.
+		stagePath := localPath + ".fullsend-staging"
+		os.Remove(stagePath)
+		if dlErr := sandbox.DownloadFile(sandboxName, remotePath, stagePath); dlErr != nil {
 			fmt.Fprintf(os.Stderr, "  [%s] Failed to copy transcript: %v\n", agentLabel, dlErr)
+			os.Remove(stagePath)
 			continue
 		}
 		// The sessions directory is agent-writable, so a file being there and
 		// ending in .jsonl proves nothing: anything that is not a codex
 		// rollout is dropped rather than shipped as this run's transcript.
-		if err := codexIsRolloutFile(localPath); err != nil {
+		if err := codexIsRolloutFile(stagePath); err != nil {
 			fmt.Fprintf(os.Stderr, "  [%s] Discarded %s: %v\n", agentLabel, localName, err)
-			os.Remove(localPath)
+			os.Remove(stagePath)
 			continue
 		}
 		// The rollout carries the same raw tool output the stream does, and it
 		// is uploaded as a run artifact, so it gets the same pattern redaction
-		// (codex_redact.go). A rewrite that fails drops the file rather than
-		// shipping it unredacted.
-		if redErr := codexRedactFile(localPath); redErr != nil {
+		// (codex_redact.go).
+		if redErr := codexRedactFile(stagePath); redErr != nil {
 			fmt.Fprintf(os.Stderr, "  [%s] Discarded %s: could not redact it: %v\n",
 				agentLabel, localName, redErr)
-			os.Remove(localPath)
+			os.Remove(stagePath)
+			continue
+		}
+		if mvErr := os.Rename(stagePath, localPath); mvErr != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] Discarded %s: %v\n", agentLabel, localName, mvErr)
+			os.Remove(stagePath)
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "  [%s] Saved transcript: %s\n", agentLabel, localName)

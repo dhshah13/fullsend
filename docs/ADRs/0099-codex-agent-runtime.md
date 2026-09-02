@@ -89,8 +89,11 @@ passed as `-c` overrides, which outrank every config layer including the image's
   is this binary for the embedded assets and the runner's own memory for the per-run files — so
   `Run` now requires `Bootstrap` to have run in the same process, and fails closed otherwise. The
   guard covers `config.toml`, `hooks.json` and **every hook script by name**, not just the adapter
-  and the auth script, and the hooks directory must hold exactly those files — which makes codex
-  stricter about hook integrity than Claude Code and pi, where the scripts stay unchecked.
+  and the auth script, and the hooks directory must hold exactly those files. The adapter then
+  **re-verifies each script against the digests fixed in the codex process's environment before
+  every invocation**, closing the intra-iteration window a once-per-launch check leaves open — so
+  codex is stricter about hook integrity than Claude Code and pi, where the scripts are never
+  checked at all.
 - Codex reports no cost (`total_cost_usd` stays 0), `apply_patch` reaches the hook scripts as `Edit`
   so an agent allowlisted only for `Write` is blocked by the opt-in allowlist hook, and the CLI pin
   must be re-checked on every bump against the hook payload shape, `auth.command` semantics and the

@@ -163,6 +163,32 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 	// The prompt goes in on stdin behind codex's explicit `-` sentinel, never
 	// on argv: on a retry iteration it carries the previous failure's text.
 	assert.Contains(t, cmd, "printf '%s' '"+DefaultAgentPrompt+"' | \"$FULLSEND_CODEX_BIN\"")
+
+	// PATH is captured before .env and restored after it: the hook scripts
+	// resolve their tools by name (tirith_check.py runs a bare `tirith`), so a
+	// .env that prepends a fake one would neuter the chain with every digest
+	// green. Reproduced before the pin was added.
+	pinAt := strings.Index(cmd, `readonly FULLSEND_CODEX_PATH="$PATH"`)
+	envAt := strings.Index(cmd, `. '`+sandbox.SandboxWorkspace+`/.env'`)
+	restoreAt := strings.Index(cmd, `export PATH="$FULLSEND_CODEX_PATH"`)
+	require.Positive(t, pinAt)
+	require.Positive(t, restoreAt)
+	assert.Less(t, pinAt, envAt, "PATH is captured before .env")
+	assert.Greater(t, restoreAt, envAt, "and restored after it")
+
+	// Loader variables would inject code into any dynamically linked program
+	// the run starts, before its main.
+	assert.Contains(t, cmd, "LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT")
+
+	// The digests reach the codex process's environment before it starts, so
+	// the adapter can re-verify each script at every invocation.
+	digestAt := strings.Index(cmd, "export "+codexHookDigestsEnv+"=")
+	require.Positive(t, digestAt)
+	assert.Greater(t, digestAt, envAt, "exported after .env so nothing there can move it")
+	assert.Less(t, digestAt, strings.Index(cmd, "exec --json"))
+	for name, digest := range testCodexHashes.HookScripts {
+		assert.Contains(t, cmd, name+":"+digest)
+	}
 	assert.True(t, strings.HasSuffix(strings.TrimSpace(cmd), "-"), "the command must end with the stdin sentinel")
 	assert.NotContains(t, cmd, "RUST_LOG", "debug tracing is off unless the runner asks for it")
 }
