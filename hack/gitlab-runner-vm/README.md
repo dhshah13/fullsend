@@ -171,6 +171,10 @@ GCP_PROJECT=my-gcp-project ./delete-gcp-vm.sh --list
   - **Group mode** (`GROUP_ID`): the runner is scoped to the group by
     `runner_type=group_type`, so any project invited into the group tree can
     run tag-matched jobs on this VM and access the mounted gateway credentials.
+    **This is a wider trust boundary than project mode** — credential access
+    extends from a single project to every project in the group tree. For
+    group-scoped runners, consider setting `RUNNER_ACCESS_LEVEL=ref_protected`
+    as a compensating control to restrict jobs to protected branches and tags.
   In both modes, access is narrowed by `run_untagged=false` (only jobs tagged
   with the runner's tag are matched) and optionally by `ref_protected`
   (restricting to protected branches/tags). If job-scoped credential minting
