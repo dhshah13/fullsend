@@ -442,6 +442,16 @@ func TestEffectiveInstallationPermissions_NilGrantedPreservesRequested(t *testin
 	assert.Equal(t, requested, effective)
 }
 
+func TestEffectiveInstallationPermissions_EmptyGrantedPreservesRequested(t *testing.T) {
+	// GitHub always grants at least metadata:read, so a non-nil but empty
+	// permissions object carries no grant data — it must not be intersected.
+	requested := map[string]string{"contents": "write", "packages": "read"}
+	effective, dropped, err := effectiveInstallationPermissions("coder", requested, map[string]string{})
+	require.NoError(t, err)
+	assert.Nil(t, dropped)
+	assert.Equal(t, requested, effective)
+}
+
 func TestEffectiveInstallationPermissions_OnlyOptionalDropped(t *testing.T) {
 	effective, dropped, err := effectiveInstallationPermissions("coder",
 		map[string]string{"contents": "write", "packages": "read", "issues": "write", "pull_requests": "write", "checks": "read", "metadata": "read"},

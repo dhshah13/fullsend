@@ -717,7 +717,9 @@ func (s *Setup) githubWebBaseURL() string {
 // missing permission is required and is recorded in s.permErrors so
 // PermissionErrors fails the run.
 func (s *Setup) checkPermissions(inst *forge.Installation, org, role string) {
-	if inst.Permissions == nil {
+	// GitHub always grants at least metadata:read, so an empty (non-nil) map
+	// carries no permission data either — treat it the same as nil.
+	if len(inst.Permissions) == 0 {
 		s.ui.StepWarn(fmt.Sprintf("app %s: permissions not available, skipping check", inst.AppSlug))
 		return
 	}

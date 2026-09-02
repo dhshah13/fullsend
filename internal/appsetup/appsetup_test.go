@@ -941,6 +941,32 @@ func TestSetup_PendingCoderPackagesPermissionIsWarningOnly(t *testing.T) {
 	assert.Contains(t, output.String(), "/settings/installations/4242")
 }
 
+func TestSetup_EmptyPermissionsMapSkipsCheck(t *testing.T) {
+	// A non-nil but empty permissions object carries no grant data (GitHub
+	// always grants at least metadata:read), so the check must be skipped
+	// rather than reporting every permission as missing.
+	client := &forge.FakeClient{
+		AppClientIDs: map[string]string{
+			"fullsend-ai-coder": "Iv1.coder",
+		},
+		Installations: []forge.Installation{
+			{
+				ID: 4242, AppID: 10, AppSlug: "fullsend-ai-coder",
+				Permissions: map[string]string{},
+			},
+		},
+	}
+
+	var output bytes.Buffer
+	setup := NewSetup(client, &fakePrompter{}, newFakeBrowser(), ui.New(&output)).
+		WithSecretExists(func(_ string) (bool, error) { return true, nil })
+
+	_, err := setup.Run(context.Background(), "myorg", "coder")
+	require.NoError(t, err)
+	assert.NoError(t, setup.PermissionErrors())
+	assert.Contains(t, output.String(), "permissions not available")
+}
+
 func TestSetup_MissingRequiredPermissionFailsSetup(t *testing.T) {
 	client := &forge.FakeClient{
 		AppClientIDs: map[string]string{

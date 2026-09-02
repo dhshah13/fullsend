@@ -662,10 +662,12 @@ func grantedPermissionLevel(granted map[string]string, permission string) string
 // Only permissions listed in optionalRolePermissions for the role may be
 // omitted when the installation has not yet granted them. All other permissions
 // are required: if any required permission is ungranted, the function returns
-// ErrRequiredPermissionsMissing. A nil granted map means the lookup response
-// did not provide permission information, so the full requested set is preserved.
+// ErrRequiredPermissionsMissing. A nil or empty granted map means the lookup
+// response did not provide permission information, so the full requested set is
+// preserved: GitHub always grants at least metadata:read to an installation, so
+// an empty map cannot be a real grant set.
 func effectiveInstallationPermissions(role string, requested, granted map[string]string) (map[string]string, []string, error) {
-	if granted == nil {
+	if len(granted) == 0 {
 		effective := copyPermissions(requested)
 		if len(effective) == 0 {
 			return nil, nil, fmt.Errorf("%w for role %q: no permissions remain", ErrRequiredPermissionsMissing, role)
