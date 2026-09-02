@@ -52,6 +52,9 @@ NAMESPACE=my-namespace ./delete-openshift-vm.sh --list
 > **Requires:** `gcloud` CLI (authenticated), `python3`, `curl`.
 > VMs have no public IP — SSH access is tunneled via [IAP](https://cloud.google.com/iap/docs/using-tcp-forwarding)
 > (Cloud IAP API must be enabled; operator needs `roles/iap.tunnelResourceAccessor`).
+> The VPC subnet must have [Cloud NAT](https://cloud.google.com/nat/docs/overview)
+> configured — without it, VMs created with `--no-address` cannot reach
+> package mirrors or container registries and `dnf install` will fail.
 
 ```bash
 # 1. Create and provision a VM (auto-numbers):
