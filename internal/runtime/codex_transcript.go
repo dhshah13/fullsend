@@ -16,14 +16,18 @@ import (
 // outputDir as <agentLabel>-<basename>, with the same path containment as the
 // Claude and pi handlers.
 //
-// Both `.jsonl` and `.jsonl.zst` are collected: codex compresses older
-// rollouts in place (codex-rs/thread-store/src/local/helpers.rs), and while a
-// single iteration's own file is written uncompressed, a kept sandbox running
-// several iterations can carry either.
+// Only `.jsonl` is collected. codex writes the running session's rollout
+// uncompressed and compresses older ones in place
+// (codex-rs/thread-store/src/local/helpers.rs), so a `.jsonl.zst` is never the
+// current iteration's transcript — and the sessions directory is
+// agent-writable, so trusting that suffix meant a plaintext file *named*
+// `x.jsonl.zst` shipped as an artifact that codexRedactFile declined to
+// rewrite. Extension is not evidence of content: the suffix is excluded and
+// every candidate's first line must parse as a codex rollout envelope before
+// it is kept.
 //
 // ClearIterationArtifacts empties the sessions directory between iterations,
-// so in practice this finds the current run's rollout; taking everything
-// present is deliberate, because a file left behind is evidence, not noise.
+// so in practice this finds the current run's rollout.
 func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir string) error {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return fmt.Errorf("creating output dir: %w", err)
@@ -35,7 +39,7 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 	defer root.Close()
 
 	stdout, _, _, err := sandbox.Exec(sandboxName,
-		fmt.Sprintf("find %s \\( -name '*.jsonl' -o -name '*.jsonl.zst' \\) 2>/dev/null || true",
+		fmt.Sprintf("find %s -type f -name '*.jsonl' 2>/dev/null || true",
 			shellQuote(r.codexSessionsDir())),
 		10*time.Second,
 	)
@@ -65,13 +69,23 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 			fmt.Fprintf(os.Stderr, "  [%s] Failed to copy transcript: %v\n", agentLabel, dlErr)
 			continue
 		}
+		// The sessions directory is agent-writable, so a file being there and
+		// ending in .jsonl proves nothing: anything that is not a codex
+		// rollout is dropped rather than shipped as this run's transcript.
+		if err := codexIsRolloutFile(localPath); err != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] Discarded %s: %v\n", agentLabel, localName, err)
+			os.Remove(localPath)
+			continue
+		}
 		// The rollout carries the same raw tool output the stream does, and it
 		// is uploaded as a run artifact, so it gets the same pattern redaction
-		// (codex_redact.go). A rewrite that fails leaves the file in place and
-		// says so rather than dropping the transcript.
+		// (codex_redact.go). A rewrite that fails drops the file rather than
+		// shipping it unredacted.
 		if redErr := codexRedactFile(localPath); redErr != nil {
-			fmt.Fprintf(os.Stderr, "  [%s] WARNING: transcript %s was not redacted: %v\n",
+			fmt.Fprintf(os.Stderr, "  [%s] Discarded %s: could not redact it: %v\n",
 				agentLabel, localName, redErr)
+			os.Remove(localPath)
+			continue
 		}
 		fmt.Fprintf(os.Stderr, "  [%s] Saved transcript: %s\n", agentLabel, localName)
 	}

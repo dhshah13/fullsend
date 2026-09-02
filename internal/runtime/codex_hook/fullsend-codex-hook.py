@@ -95,6 +95,34 @@ def claude_tool_name(codex_name: str) -> str:
     return CLAUDE_TOOL_FOR_CODEX.get(codex_name, codex_name)
 
 
+# How a hook script is executed. `-I` alone is not enough and a bare script
+# path is not safe:
+#
+#   * plain `python3 <script>` prepends the script's own directory to
+#     sys.path, so a file planted next to the hooks — `hooks/json/__init__.py`
+#     — is imported when a script does `import json`. `-I` removes that
+#     implicit entry (along with PYTHONPATH and the user site directory).
+#   * but the hook scripts legitimately import their siblings (`hook_io`, the
+#     sanitizer stages the PostToolUse chain loads), so the directory has to
+#     come back explicitly — and only this one, after Run's guard has checked
+#     that it holds exactly the files fullsend installed and nothing else.
+#
+# It is **appended**, not inserted at position 0: prepending would put the
+# hooks directory ahead of the standard library and re-open the very hole `-I`
+# closes, since `import json` in a hook script would find a planted
+# `hooks/json/` first. Verified both ways — prepending let the planted package
+# execute, appending did not, and the sibling imports work either way because
+# no hook module shadows a stdlib name.
+#
+# runpy runs the script as __main__ so its `if __name__ == "__main__"` block
+# still fires.
+_CHILD_BOOTSTRAP = (
+    "import runpy, sys; "
+    "sys.path.append(sys.argv[1].rsplit('/', 1)[0]); "
+    "runpy.run_path(sys.argv[1], run_name='__main__')"
+)
+
+
 def log_finding(name: str, severity: str, detail: str, action: str) -> None:
     """Append to the shared findings log. The adapter's own decisions belong
     there rather than on stderr: on an exit-2 run stderr *is* the block reason
@@ -161,7 +189,7 @@ def run_script(script: str, payload: dict[str, Any]) -> dict[str, Any]:
         }
     try:
         completed = subprocess.run(  # noqa: S603 - runner-owned path, no shell
-            [sys.executable or "python3", path],
+            [sys.executable or "python3", "-I", "-c", _CHILD_BOOTSTRAP, path],
             input=json.dumps(payload),
             capture_output=True,
             text=True,

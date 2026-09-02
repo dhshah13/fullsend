@@ -132,16 +132,10 @@ func TestCodexRedactFile_RewritesRolloutInPlace(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "the file's mode is preserved")
 }
 
-func TestCodexRedactFile_RefusesCompressedRollouts(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "rollout-old.jsonl.zst")
-	require.NoError(t, os.WriteFile(path, []byte("not really zstd"), 0o644))
-
-	err := codexRedactFile(path)
-	require.Error(t, err, "a compressed rollout must be reported, not silently left unredacted")
-	assert.Contains(t, err.Error(), "compressed")
-}
+// Compressed rollouts are no longer a redaction concern: ExtractTranscripts
+// does not collect `.jsonl.zst` at all, because a plaintext file simply named
+// that shipped as an artifact codexRedactFile then declined to rewrite.
+// TestCodexExtractTranscripts_DownloadsRollouts asserts the exclusion.
 
 // TestCodexRun_TeedOutputIsRedacted is the end-to-end half: the parser sees the
 // original stream and the artifact on disk does not carry the secret.

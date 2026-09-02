@@ -5,9 +5,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-
-	"github.com/fullsend-ai/fullsend/internal/harness"
-	"github.com/fullsend-ai/fullsend/internal/security"
 )
 
 // Integrity anchors for the runner-owned files under CODEX_HOME.
@@ -41,11 +38,23 @@ import (
 type codexUploadedHashes struct {
 	ConfigTOML string
 	HooksJSON  string
+	// HookScripts maps each installed hook script's filename to its digest.
+	// Bootstrap knows exactly which the harness enabled; Run does not, which
+	// is why the expected names travel with the digests rather than being
+	// re-derived from the binary's full set.
+	HookScripts map[string]string
 }
 
 // codexArtifactHashes maps a sandbox name to the digests Bootstrap recorded.
 // Process-local on purpose (see above); a sync.Map because the runner may
 // bootstrap and run more than one sandbox concurrently.
+//
+// Entries are keyed by sandbox name rather than kept in a single value, so
+// this does not assume one run per process, and they are never evicted: a
+// sandbox name is unique per run, the map holds two short strings and a small
+// map per entry, and a runner process is a one-shot CLI invocation. If
+// fullsend ever grows a long-lived server that runs many sandboxes, this wants
+// an explicit drop when a run finishes.
 var codexArtifactHashes sync.Map
 
 func recordCodexArtifactHashes(sandboxName string, h codexUploadedHashes) {
@@ -70,50 +79,51 @@ func forgetCodexArtifactHashes(sandboxName string) {
 	codexArtifactHashes.Delete(sandboxName)
 }
 
-// codexHookScriptDigests returns the SHA-256 of every hook script this binary
-// can install, sorted for a stable guard string.
+// codexHookScriptsGuard is the POSIX sh fragment that refuses to run unless the
+// hooks directory is *exactly* what Bootstrap installed: every expected name
+// present as a regular file with its own digest, and nothing else there at all.
 //
-// The set that is actually installed depends on the harness, but each script's
-// *bytes* are embedded here, so the guard can require that every script present
-// in the hooks directory matches one of these without knowing which the harness
-// enabled. An edited or agent-added script fails; deleting one narrows the
-// wiring, which the hooks.json digest then catches.
-func codexHookScriptDigests() []string {
-	// The zero config yields the default-enabled set; the one opt-in script
-	// (tool_allowlist_pretool.py) is asked for explicitly so the list covers
-	// every script this binary can install, whatever the harness enabled.
-	on := true
-	files := security.HookFiles(security.SandboxHookConfigFromHarness(&harness.Harness{
-		Security: &harness.SecurityConfig{SandboxHooks: &harness.SandboxHooks{
-			ToolAllowlistPreTool: &harness.ToolAllowlistConfig{Enabled: &on},
-		}},
-	}))
-	seen := map[string]bool{}
-	var digests []string
-	for _, content := range files {
-		sum := codexAssetSHA256(content)
-		if !seen[sum] {
-			seen[sum] = true
-			digests = append(digests, sum)
-		}
+// Binding each digest to its filename is the point. An earlier version checked
+// each file against the *set* of allowed digests, which let an agent overwrite
+// tirith_check.py with the bytes of hook_io.py — a pure library module with no
+// __main__, so it exits 0 with empty stdout, which the adapter reads as
+// "allow". Tirith was silently neutered with every guard green. Reproduced
+// under /bin/sh before this was rewritten.
+//
+// The exhaustive part closes a second hole: the old glob was `*.py`, so an
+// agent could plant a package directory the guard never saw — `hooks/json/`
+// with an `__init__.py` — and normal Python, which prepends a script's own
+// directory to sys.path, would import it when a hook script did `import json`.
+// The adapter now also runs its children isolated (see the adapter's own
+// comment), but the directory must be clean regardless.
+//
+// Checks, in order: each expected file is a regular file with the right
+// digest; the directory holds exactly that many entries; and none of them is
+// anything but a regular file. `find` does not follow symlinks, so a symlink
+// to an allowed file — which `test -f` and sha256sum would both accept — is
+// caught by the type check. Expected names come from the runner's memory
+// (recorded by Bootstrap), never from the sandbox.
+func codexHookScriptsGuard(hooksDir string, scripts map[string]string) string {
+	names := make([]string, 0, len(scripts))
+	for name := range scripts {
+		names = append(names, name)
 	}
-	sort.Strings(digests)
-	return digests
-}
+	sort.Strings(names)
 
-// codexHookScriptsGuard is the POSIX sh fragment that refuses to run when any
-// file in the hooks directory is not one of this binary's own hook scripts.
-//
-// It closes the "the hook scripts are agent-writable between iterations" gap
-// for codex: an agent that rewrites tirith_check.py to exit 0, or drops in a
-// script of its own for the adapter to run, fails the run instead of quietly
-// disabling a control. The comparison values are compile-time constants, so
-// nothing in the sandbox contributes to the answer.
-func codexHookScriptsGuard(hooksDir string) string {
-	digests := codexHookScriptDigests()
+	checks := make([]string, 0, len(names)+2)
+	for _, name := range names {
+		path := hooksDir + "/" + name
+		checks = append(checks, "test -f "+shellQuote(path), codexSHACheck(path, scripts[name]))
+	}
+	// Nothing beyond the expected entries, and nothing that is not a plain
+	// file — a directory or a symlink is refused on sight.
+	checks = append(checks,
+		fmt.Sprintf(`[ "$(command -p find %s -mindepth 1 | command -p wc -l)" -eq %d ]`,
+			shellQuote(hooksDir), len(names)),
+		fmt.Sprintf(`[ -z "$(command -p find %s -mindepth 1 ! -type f -print)" ]`, shellQuote(hooksDir)),
+	)
+
 	return fmt.Sprintf(
-		`{ for f in %s/*.py; do test -e "$f" || continue; `+
-			`h=$(command -p sha256sum "$f" | command -p cut -d' ' -f1); `+
-			`case "$h" in %s) ;; *) echo "fullsend: sandbox hook script $f is not the copy fullsend installed; refusing to run" >&2; exit %d ;; esac; done; }`,
-		shellQuote(hooksDir), strings.Join(digests, "|"), codexHooksMissingExit)
+		`{ %s || { echo 'fullsend: the sandbox hook scripts are not the set fullsend installed (a file was changed, replaced with another allowed file, or something was added); refusing to run' >&2; exit %d; }; }`,
+		strings.Join(checks, " && "), codexHooksMissingExit)
 }

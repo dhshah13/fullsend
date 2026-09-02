@@ -28,9 +28,11 @@ func TestCodexExtractTranscripts_DownloadsRollouts(t *testing.T) {
 	require.NoError(t, r.ExtractTranscripts("sb", "triage", outDir))
 
 	log := readFileString(t, logPath)
-	// Both suffixes are collected: codex compresses older rollouts in place.
-	assert.Contains(t, log, "*.jsonl")
-	assert.Contains(t, log, "*.jsonl.zst")
+	// Only plain .jsonl, and only regular files: the sessions directory is
+	// agent-writable, and a plaintext file named x.jsonl.zst used to ship as
+	// an artifact codexRedactFile then declined to rewrite.
+	assert.Contains(t, log, "-type f -name '*.jsonl'")
+	assert.NotContains(t, log, "*.jsonl.zst")
 	assert.Contains(t, log, "download")
 	// The local name is prefixed with the agent label, as for pi and Claude,
 	// so several agents' transcripts can share one directory.
@@ -227,6 +229,7 @@ func seedCodexManifest(t *testing.T, storeDir string, r CodexRuntime, hooks *cod
 	hashes := codexUploadedHashes{ConfigTOML: "config0000000000000000000000000000000000000000000000000000000000"}
 	if hooks != nil {
 		hashes.HooksJSON = "hooks00000000000000000000000000000000000000000000000000000000000"
+		hashes.HookScripts = testCodexHookScripts()
 	}
 	recordCodexArtifactHashes("sb", hashes)
 	t.Cleanup(func() { forgetCodexArtifactHashes("sb") })
@@ -350,4 +353,51 @@ func TestCodexRun_RefusesWithoutRecordedDigests(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no recorded config digests")
+}
+
+// TestCodexExtractTranscripts_DiscardsSpoofedFiles covers the agent-writable
+// sessions directory: a `.jsonl` there is a claim, not a fact.
+func TestCodexExtractTranscripts_DiscardsSpoofedFiles(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	storeDir := t.TempDir()
+	r := CodexRuntime{}
+	spoof := r.codexSessionsDir() + "/rollout-planted.jsonl"
+	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", "", spoof)
+
+	outDir := filepath.Join(t.TempDir(), "transcripts")
+	require.NoError(t, r.ExtractTranscripts("sb", "smoke", outDir))
+
+	// The fake writes "fixture\n" as the downloaded body, which is not a
+	// rollout envelope, so nothing is kept.
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "a file that is not a codex rollout must not ship as the transcript")
+}
+
+func TestCodexIsRolloutFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, []byte(body), 0o644))
+		return p
+	}
+
+	require.NoError(t, codexIsRolloutFile(write("ok.jsonl",
+		`{"type":"session_meta","payload":{"id":"abc"}}`+"\n")))
+	// A leading blank line is tolerated.
+	require.NoError(t, codexIsRolloutFile(write("blank.jsonl",
+		"\n"+`{"type":"response_item","payload":{}}`+"\n")))
+
+	for name, body := range map[string]string{
+		// The tee'd stream uses dotted names and is a different artifact.
+		"stream.jsonl": `{"type":"thread.started","thread_id":"t1"}` + "\n",
+		"plain.jsonl":  "not json at all\n",
+		"empty.jsonl":  "",
+		"other.jsonl":  `{"type":"something_else"}` + "\n",
+	} {
+		err := codexIsRolloutFile(write(name, body))
+		assert.Error(t, err, "%s must be refused", name)
+	}
 }

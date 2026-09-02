@@ -208,6 +208,12 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		if err := installHookScripts(sandboxName, r.codexHooksDir(), hooks); err != nil {
 			return err
 		}
+		// Exactly what was installed, by name: Run cannot re-derive the set
+		// because it does not see the harness's hook config.
+		hashes.HookScripts = map[string]string{}
+		for name, content := range security.HookFiles(hooks) {
+			hashes.HookScripts[name] = codexAssetSHA256(content)
+		}
 		if err := appendHookEnv(sandboxName, hooks); err != nil {
 			return err
 		}

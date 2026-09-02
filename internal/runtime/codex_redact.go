@@ -1,13 +1,12 @@
 package runtime
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"strings"
 )
 
 // Artifact-side redaction for codex runs.
@@ -134,17 +133,9 @@ func codexRedactValue(v any) any {
 
 // codexRedactFile rewrites a downloaded JSONL artifact in place with every
 // string value redacted. Used on the rollout session files, which carry the
-// same raw tool output the stream does.
-//
-// A compressed rollout (`.jsonl.zst`) is left alone and reported: codex
-// compresses older sessions in place, and decompressing one here to redact it
-// would mean shipping a zstd decoder for an artifact the current iteration did
-// not write. ClearIterationArtifacts empties the sessions directory between
-// iterations, so a compressed file is not the run's own transcript.
+// same raw tool output the stream does. A file it cannot rewrite is dropped by
+// the caller rather than shipped.
 func codexRedactFile(path string) error {
-	if strings.HasSuffix(path, ".zst") {
-		return fmt.Errorf("cannot redact compressed transcript %s", filepath.Base(path))
-	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -167,4 +158,44 @@ func codexRedactFile(path string) error {
 		mode = info.Mode().Perm()
 	}
 	return os.WriteFile(path, out.Bytes(), mode)
+}
+
+// codexRolloutEnvelopes are the top-level `type` values a codex rollout line
+// carries (codex-rs/thread-store). They are underscored, where the tee'd
+// `exec --json` stream uses dotted names, so the two never collide.
+var codexRolloutEnvelopes = map[string]bool{
+	"session_meta": true, "response_item": true, "event_msg": true,
+	"turn_context": true, "compacted": true,
+}
+
+// codexIsRolloutFile reports whether path looks like a codex rollout, by
+// parsing its first non-empty line. The sessions directory is agent-writable,
+// so a `.jsonl` there is a claim, not a fact: without this a planted file
+// would be downloaded, kept, and presented as the run's transcript.
+func codexIsRolloutFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxTranscriptLineSize)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(line, &envelope); err != nil {
+			return fmt.Errorf("first line is not JSON")
+		}
+		if !codexRolloutEnvelopes[envelope.Type] {
+			return fmt.Errorf("first line is %q, not a codex rollout envelope", sanitizeOutput(envelope.Type))
+		}
+		return nil
+	}
+	return fmt.Errorf("file is empty")
 }

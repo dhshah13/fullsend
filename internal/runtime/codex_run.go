@@ -140,7 +140,7 @@ func codexBinaryPin() string {
 // `command -p` bypasses shell functions and uses the system default PATH, so
 // nothing left in the environment can stand in for sha256sum or cut; test, [
 // and echo are builtins.
-func codexAssetGuard(r CodexRuntime, hooksEnabled bool) string {
+func codexAssetGuard(r CodexRuntime, hooksEnabled bool, hashes codexUploadedHashes) string {
 	checks := []string{
 		"test -f " + shellQuote(r.codexConfigPath()),
 		"test -f " + shellQuote(r.codexAuthScriptPath()),
@@ -167,7 +167,7 @@ func codexAssetGuard(r CodexRuntime, hooksEnabled bool) string {
 			// installed: the scripts are agent-writable between iterations,
 			// and a tirith_check.py rewritten to exit 0 would disable a
 			// control while every other check still passed.
-			codexHookScriptsGuard(r.codexHooksDir()),
+			codexHookScriptsGuard(r.codexHooksDir(), hashes.HookScripts),
 		)
 	}
 	return fmt.Sprintf(
@@ -262,7 +262,7 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 	parts := []string{"cd " + shellQuote(params.RepoDir)}
 	parts = append(parts,
 		"&& "+codexBinaryPin(),
-		"&& "+codexAssetGuard(r, hooksEnabled),
+		"&& "+codexAssetGuard(r, hooksEnabled, hashes),
 		"&& "+codexConfigGuard(r, hashes),
 		"&& "+r.OpenAIAuthSeed(),
 		"&& . "+shellQuote(envFile),
@@ -280,7 +280,7 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		// cannot shadow, so it restores the real utilities before the second
 		// pass; `command -p` inside the guard defeats a PATH swap.
 		"&& unset -f test command grep cut wc sha256sum printf codex",
-		"&& "+codexAssetGuard(r, hooksEnabled),
+		"&& "+codexAssetGuard(r, hooksEnabled, hashes),
 		"&& "+codexConfigGuard(r, hashes),
 	)
 	if params.Debug != "" {
@@ -394,6 +394,10 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 	// runner passes HooksSettingsPath, Bootstrap writes hooks.json — but
 	// nothing asserted it, and a refactor that split them would silently drop
 	// the hooks.json digest from the guard while the adapter still loaded.
+	if hooksEnabled && len(hashes.HookScripts) == 0 {
+		return -1, fmt.Errorf(
+			"codex hook wiring is inconsistent: the runner expects hooks but Bootstrap recorded no hook-script digests; refusing to run rather than fall back to the weaker checks")
+	}
 	if hooksEnabled != (hashes.HooksJSON != "") {
 		return -1, fmt.Errorf(
 			"codex hook wiring is inconsistent: the runner %s hooks but Bootstrap %s a hooks.json digest; refusing to run rather than fall back to the weaker checks",

@@ -739,14 +739,26 @@ not one of them:
 | File | Anchor | Guard |
 |---|---|---|
 | hook adapter, auth script | **compile-time** — `go:embed`ed, so the digest is a literal in the run command | SHA-256, exit 97 |
-| the shared hook scripts | **compile-time** — every script this binary can install is embedded, so each file in `hooks/` must match one of those digests without the guard knowing which the harness enabled | SHA-256 set, exit 97 |
+| the shared hook scripts | **compile-time** for the bytes, **the runner's memory** for which names — Bootstrap records the name → digest map for the set the harness enabled | SHA-256 per filename, plus an exhaustive directory check, exit 97 |
 | `config.toml`, `hooks.json` | **the runner's own memory** — rendered per run, so Bootstrap records what it uploaded in the host process and Run reads it back (`codex_integrity.go`) | whole-file SHA-256, exit 98 |
 | `fullsend-manifest.json` | none — it is a file in the same directory | information only; never authority |
 
-The hook-script digests make codex **stricter than Claude Code and pi**, where the scripts stay
-agent-writable between iterations with no integrity check. An agent that rewrites `tirith_check.py`
-to exit 0, or drops a script of its own beside them, fails the run; deleting one narrows the wiring
-rather than redirecting it, and the `hooks.json` digest catches that.
+The hook-script check makes codex **stricter than Claude Code and pi**, where the scripts stay
+agent-writable between iterations with no integrity check at all. Each digest is bound to its
+*filename*, and the directory must hold exactly those entries and nothing else:
+
+- rewriting `tirith_check.py` to exit 0 fails — the obvious case;
+- **overwriting `tirith_check.py` with `hook_io.py`'s bytes** also fails. It would otherwise pass a
+  set-of-digests check while silently neutering Tirith, because `hook_io.py` is a library module
+  with no `__main__`: it exits 0 with empty stdout, which the adapter reads as "allow";
+- **a planted package directory** — `hooks/json/__init__.py` — fails. A `*.py` glob never saw it,
+  and normal Python prepends a script's own directory to `sys.path`, so it would be imported when a
+  hook script did `import json`;
+- **a symlink to an allowed file** fails: `test -f` and `sha256sum` both follow one, `find` does not;
+- deleting a script fails too, since the expected name is checked by name.
+
+All five were reproduced under `/bin/sh` before the guard was rewritten, and each has a case in
+`TestCodexHookScriptsGuard_Executes`.
 
 **Why not record the config digest in the manifest.** It would be a hash in the same agent-writable
 directory as the file it describes, so an agent could rewrite both and the guard would pass. That is
@@ -767,12 +779,19 @@ There is **no such pin for project trust** — `-c projects={}` and a scalar
 plan, and decides whether hooks are expected from the runner's own signal rather than from the
 manifest.
 
-**The hook interpreter is pinned too.** codex spawns a hook through the shell it inherits, *after*
-the agent-writable `.env` has been sourced, so a bare `python3` in `hooks.json` would be resolved
-through a PATH the agent controls — a poisoned interpreter running under the hash-pinned adapter.
-Bootstrap resolves the absolute path in its preflight and renders it with `-I`, which also ignores
-`PYTHONPATH` and the user site directory; `Run` unsets `PYTHONPATH`, `PYTHONHOME` and
+**The hook interpreter is pinned twice.** codex spawns a hook through the shell it inherits,
+*after* the agent-writable `.env` has been sourced, so a bare `python3` in `hooks.json` would be
+resolved through a PATH the agent controls — a poisoned interpreter running under the hash-pinned
+adapter. Bootstrap resolves the absolute path in its preflight and renders it with `-I`, which also
+ignores `PYTHONPATH` and the user site directory; `Run` unsets `PYTHONPATH`, `PYTHONHOME` and
 `PYTHONSTARTUP` after `.env` for good measure.
+
+The adapter then spawns each hook script the same way, which needs care: `-I` alone breaks the
+scripts, because they import their siblings (`hook_io`, the sanitizer stages). The verified hooks
+directory is put back on `sys.path` explicitly — and **appended, not prepended**. Prepending would
+place it ahead of the standard library and re-open the hole `-I` closes, since `import json` in a
+hook script would find a planted `hooks/json/` first; verified both ways, and the sibling imports
+resolve either way because no hook module shadows a stdlib name.
 
 ### What the local smoke proved
 
@@ -818,8 +837,13 @@ Two artefacts of the run are worth knowing about:
   PostToolUse hook blocked the result, and the rollout session file keeps the same output. Both are
   uploaded as run artifacts, so `Run` and `ExtractTranscripts` filter them through the shared
   `security.SecretRedactor` (`codex_redact.go`): the stream is redacted on the tee branch, so the
-  parser still sees exactly what codex emitted and only the file on disk is masked. A compressed
-  rollout (`.jsonl.zst`) is reported as unredacted rather than silently shipped.
+  parser still sees exactly what codex emitted and only the file on disk is masked.
+- The sessions directory is agent-writable, so a file being there and ending in `.jsonl` is a claim
+  rather than a fact. `ExtractTranscripts` collects regular `.jsonl` files only — never
+  `.jsonl.zst`, since codex writes the running session uncompressed and a plaintext file merely
+  *named* that shipped as an artifact the redactor then declined to rewrite — and every candidate's
+  first line must parse as a rollout envelope (`session_meta`, `response_item`, `event_msg`, …)
+  before it is kept. Anything else is discarded with a note, as is anything that cannot be redacted.
 - `--dangerously-bypass-hook-trust` emits its warning as an `error`-type *item*, which the stream
   parser correctly treats as a warning rather than a run failure.
 - A model the account cannot serve on the Responses API fails as five `error` reconnect events and a

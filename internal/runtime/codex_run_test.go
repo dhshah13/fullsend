@@ -19,8 +19,19 @@ import (
 // testCodexHashes stands in for what Bootstrap recorded in the runner's
 // memory for a sandbox.
 var testCodexHashes = codexUploadedHashes{
-	ConfigTOML: "aaaa000000000000000000000000000000000000000000000000000000000000",
-	HooksJSON:  "bbbb000000000000000000000000000000000000000000000000000000000000",
+	ConfigTOML:  "aaaa000000000000000000000000000000000000000000000000000000000000",
+	HooksJSON:   "bbbb000000000000000000000000000000000000000000000000000000000000",
+	HookScripts: testCodexHookScripts(),
+}
+
+// testCodexHookScripts is the name→digest map Bootstrap records for the
+// default hook set.
+func testCodexHookScripts() map[string]string {
+	out := map[string]string{}
+	for name, content := range security.HookFiles(security.SandboxHookConfigFromHarness(&harness.Harness{})) {
+		out[name] = codexAssetSHA256(content)
+	}
+	return out
 }
 
 func TestTranslateCodexModel(t *testing.T) {
@@ -199,10 +210,18 @@ func TestCodexAssetGuard_Executes(t *testing.T) {
 
 	// The guard names absolute sandbox paths, so run it against a fake root.
 	guard := func() string {
-		return strings.ReplaceAll(codexAssetGuard(r, true), sandbox.SandboxCodexConfig, dir)
+		return strings.ReplaceAll(codexAssetGuard(r, true, testCodexHashes), sandbox.SandboxCodexConfig, dir)
 	}
 	writeAll := func(t *testing.T) {
 		t.Helper()
+		// The asset guard now also covers the hook scripts, so a passing case
+		// has to install the real ones.
+		hooksDir := filepath.Join(dir, "hooks")
+		require.NoError(t, os.RemoveAll(hooksDir))
+		require.NoError(t, os.MkdirAll(hooksDir, 0o755))
+		for name, content := range security.HookFiles(security.SandboxHookConfigFromHarness(&harness.Harness{})) {
+			require.NoError(t, os.WriteFile(filepath.Join(hooksDir, name), content, 0o755))
+		}
 		require.NoError(t, os.WriteFile(filepath.Join(dir, codexConfigFile), []byte("cfg"), 0o644))
 		require.NoError(t, os.WriteFile(filepath.Join(dir, codexAuthScriptFile), codexAuthScriptSH, 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(dir, codexAdapterFile), codexHookAdapterPy, 0o644))
@@ -387,22 +406,30 @@ func TestCodexConfigGuard_Executes(t *testing.T) {
 }
 
 // TestCodexHookScriptsGuard_Executes covers the other agent-writable half: the
-// shared hook scripts themselves. Their bytes are embedded in this binary, so
-// the guard needs no anchor in the sandbox at all.
+// shared hook scripts themselves. Their bytes are embedded in this binary and
+// their names come from the runner's memory, so the guard needs no anchor in
+// the sandbox at all.
 func TestCodexHookScriptsGuard_Executes(t *testing.T) {
 	dir := t.TempDir()
 	hooksDir := filepath.Join(dir, "hooks")
-	require.NoError(t, os.MkdirAll(hooksDir, 0o755))
+	scripts := testCodexHookScripts()
 	guard := strings.ReplaceAll(
-		codexHookScriptsGuard(CodexRuntime{}.codexHooksDir()), sandbox.SandboxCodexConfig, dir)
+		codexHookScriptsGuard(CodexRuntime{}.codexHooksDir(), scripts), sandbox.SandboxCodexConfig, dir)
 
+	files := security.HookFiles(security.SandboxHookConfigFromHarness(&harness.Harness{}))
 	install := func(t *testing.T) {
 		t.Helper()
 		require.NoError(t, os.RemoveAll(hooksDir))
 		require.NoError(t, os.MkdirAll(hooksDir, 0o755))
-		for name, content := range security.HookFiles(security.SandboxHookConfigFromHarness(&harness.Harness{})) {
+		for name, content := range files {
 			require.NoError(t, os.WriteFile(filepath.Join(hooksDir, name), content, 0o755))
 		}
+	}
+	refused := func(t *testing.T) {
+		t.Helper()
+		err := exec.Command("/bin/sh", "-c", guard).Run()
+		require.Error(t, err)
+		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))
 	}
 
 	t.Run("passes on the scripts fullsend installs", func(t *testing.T) {
@@ -412,28 +439,59 @@ func TestCodexHookScriptsGuard_Executes(t *testing.T) {
 
 	t.Run("refuses a neutered hook script", func(t *testing.T) {
 		install(t)
-		// The realistic attack: make the blocking hook allow everything.
 		require.NoError(t, os.WriteFile(filepath.Join(hooksDir, "tirith_check.py"),
 			[]byte("import sys\nsys.exit(0)\n"), 0o755))
-		err := exec.Command("/bin/sh", "-c", guard).Run()
-		require.Error(t, err)
-		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))
+		refused(t)
+	})
+
+	// The one a set-of-digests check misses: hook_io.py is a library module
+	// with no __main__, so as tirith_check.py it exits 0 with empty stdout —
+	// which the adapter reads as "allow". Tirith silently neutered with every
+	// other guard green. Reproduced under /bin/sh before the guard was bound
+	// to filenames.
+	t.Run("refuses allowed bytes under another name", func(t *testing.T) {
+		install(t)
+		require.NoError(t, os.WriteFile(filepath.Join(hooksDir, "tirith_check.py"), files["hook_io.py"], 0o755))
+		refused(t)
 	})
 
 	t.Run("refuses a script the agent added", func(t *testing.T) {
 		install(t)
 		require.NoError(t, os.WriteFile(filepath.Join(hooksDir, "exfil.py"), []byte("pass\n"), 0o755))
-		err := exec.Command("/bin/sh", "-c", guard).Run()
-		require.Error(t, err)
-		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))
+		refused(t)
 	})
 
-	t.Run("an empty hooks dir is not an error here", func(t *testing.T) {
+	// A package directory the old `*.py` glob could not see. Normal Python
+	// prepends a script's own directory to sys.path, so this would be imported
+	// when a hook script did `import json`.
+	t.Run("refuses a planted package directory", func(t *testing.T) {
+		install(t)
+		require.NoError(t, os.MkdirAll(filepath.Join(hooksDir, "json"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(hooksDir, "json", "__init__.py"), []byte("pass\n"), 0o644))
+		refused(t)
+	})
+
+	// `test -f` and sha256sum both follow a symlink; `find` does not, which is
+	// what catches this.
+	t.Run("refuses a symlinked script", func(t *testing.T) {
+		install(t)
+		target := filepath.Join(dir, "elsewhere.py")
+		require.NoError(t, os.WriteFile(target, files["tirith_check.py"], 0o755))
+		require.NoError(t, os.Remove(filepath.Join(hooksDir, "tirith_check.py")))
+		require.NoError(t, os.Symlink(target, filepath.Join(hooksDir, "tirith_check.py")))
+		refused(t)
+	})
+
+	t.Run("refuses a deleted script", func(t *testing.T) {
+		install(t)
+		require.NoError(t, os.Remove(filepath.Join(hooksDir, "tirith_check.py")))
+		refused(t)
+	})
+
+	t.Run("refuses an empty hooks dir", func(t *testing.T) {
 		require.NoError(t, os.RemoveAll(hooksDir))
 		require.NoError(t, os.MkdirAll(hooksDir, 0o755))
-		// Deletion narrows rather than redirects; the hooks.json digest and
-		// the adapter's own missing-script check cover it.
-		require.NoError(t, exec.Command("/bin/sh", "-c", guard).Run())
+		refused(t)
 	})
 }
 

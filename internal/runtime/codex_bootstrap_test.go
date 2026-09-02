@@ -43,7 +43,13 @@ fi
 if [ "$2" = "download" ]; then
   base=$(basename "$4")
   mkdir -p "$5" 2>/dev/null
-  if [ -d "$5" ]; then printf 'fixture\n' > "$5/$base"; else printf 'fixture\n' > "$5"; fi
+  # A real rollout envelope, unless the remote path says it is planted: the
+  # extractor now refuses anything that is not one.
+  case "$4" in
+    *planted*) body='not a rollout' ;;
+    *) body='{"type":"session_meta","payload":{"id":"probe"}}' ;;
+  esac
+  if [ -d "$5" ]; then printf '%s\n' "$body" > "$5/$base"; else printf '%s\n' "$body" > "$5"; fi
   exit 0
 fi
 if [ "$2" = "upload" ]; then
