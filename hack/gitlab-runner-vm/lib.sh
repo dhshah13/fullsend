@@ -64,6 +64,7 @@ build_scope_args() {
   # shellcheck disable=SC2034  # consumed by callers
   scope_args=()
   if [ "${RUNNER_SCOPE}" = "project" ]; then
+    # shellcheck disable=SC2034  # consumed by callers
     scope_args=(
       --data-urlencode "runner_type=project_type"
       --data-urlencode "project_id=${PROJECT_ID}"
