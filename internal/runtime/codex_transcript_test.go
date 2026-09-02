@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/fullsend-ai/fullsend/internal/harness"
+	"github.com/fullsend-ai/fullsend/internal/sandbox"
 	"github.com/fullsend-ai/fullsend/internal/security"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
@@ -448,4 +449,88 @@ func TestCodexValidSessionPath(t *testing.T) {
 	} {
 		assert.Error(t, codexValidSessionPath(dir, path), "%s must be refused", name)
 	}
+}
+
+// The extraction path is a chain of things that can fail against a sandbox
+// that is misbehaving or hostile; none of them may leave a half-written
+// artifact behind or abort the rest of the run.
+func TestCodexExtractTranscripts_FailurePaths(t *testing.T) {
+	r := CodexRuntime{}
+
+	t.Run("an unwritable output dir is an error", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		// A file where the directory should be: MkdirAll cannot proceed.
+		blocked := filepath.Join(t.TempDir(), "transcripts")
+		require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o644))
+
+		err := r.ExtractTranscripts("sb", "smoke", blocked)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "creating output dir")
+	})
+
+	// A `find` that exits non-zero is not an error: the command carries
+	// `|| true` because find reports a non-zero status for an unreadable
+	// subdirectory, which is not a reason to fail the run. What is an error is
+	// not being able to reach the sandbox at all.
+	t.Run("an unreachable sandbox is an error", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+
+		err := r.ExtractTranscripts("sb", "smoke", filepath.Join(t.TempDir(), "out"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "finding transcripts")
+	})
+
+	t.Run("a path outside the sessions dir is skipped, not downloaded", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "openshell.log")
+		// `find` is made to name the workspace .env — the shape a crafted
+		// entry or a followed symlink would have.
+		fakeOpenshellCodex(t, logPath, t.TempDir(), "codex-cli 0.152.1", "",
+			sandbox.SandboxWorkspace+"/.env")
+
+		outDir := filepath.Join(t.TempDir(), "out")
+		require.NoError(t, r.ExtractTranscripts("sb", "smoke", outDir))
+		assert.NotContains(t, readFileString(t, logPath), "download",
+			"a path outside the sessions directory must never reach a download")
+		entries, err := os.ReadDir(outDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+	})
+
+	t.Run("a download that fails leaves nothing behind", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "openshell.log")
+		rollout := r.codexSessionsDir() + "/rollout-x.jsonl"
+		fakeOpenshellCodex(t, logPath, t.TempDir(), "codex-cli 0.152.1", "", rollout)
+		t.Setenv("FULLSEND_TEST_FAIL_MATCH", "download")
+
+		outDir := filepath.Join(t.TempDir(), "out")
+		require.NoError(t, r.ExtractTranscripts("sb", "smoke", outDir),
+			"one failed transcript must not fail the run")
+		entries, err := os.ReadDir(outDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+	})
+}
+
+func TestCodexExtractDebugLog_FailurePaths(t *testing.T) {
+	r := CodexRuntime{}
+
+	t.Run("a download that fails is reported", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		t.Setenv("FULLSEND_TEST_FAIL_MATCH", "download")
+
+		err := r.ExtractDebugLog("sb", filepath.Join(t.TempDir(), "codex-debug.log"), "1")
+		require.Error(t, err)
+	})
+
+	t.Run("the downloaded log is redacted", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		local := filepath.Join(t.TempDir(), "codex-debug.log")
+
+		require.NoError(t, r.ExtractDebugLog("sb", local, "1"))
+		got, err := os.ReadFile(local)
+		require.NoError(t, err)
+		// The fake writes a rollout envelope as the body; what matters is that
+		// the file went through the redactor rather than straight to disk.
+		assert.NotEmpty(t, got)
+	})
 }

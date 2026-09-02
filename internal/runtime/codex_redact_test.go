@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,4 +179,88 @@ func TestCodexRun_TeedOutputIsRedacted(t *testing.T) {
 	te, ok := CodexRuntime{}.ParseTranscriptFile(outPath)
 	require.True(t, ok, "the redacted artifact must still parse as a codex stream")
 	assert.False(t, te.IsError)
+}
+
+// failingWriter fails after n successful writes, standing in for a disk that
+// fills up or a file closed under the tee.
+type failingWriter struct {
+	ok  int
+	err error
+}
+
+func (f *failingWriter) Write(p []byte) (int, error) {
+	if f.ok > 0 {
+		f.ok--
+		return len(p), nil
+	}
+	return 0, f.err
+}
+
+// The tee side of an io.TeeReader must report the full input as consumed even
+// when the sink fails, or the read of an otherwise fine stream is aborted —
+// but the error still has to reach the caller.
+func TestCodexRedactingWriter_SurfacesSinkErrors(t *testing.T) {
+	t.Parallel()
+
+	sink := &failingWriter{err: errors.New("disk full")}
+	w := newCodexRedactingWriter(sink)
+	n, err := w.Write([]byte(`{"type":"turn.completed"}` + "\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "disk full")
+	assert.Equal(t, len(`{"type":"turn.completed"}`)+1, n, "the tee side always reports a full write")
+
+	// The same on the Flush path, where a partial line is written out.
+	flushSink := &failingWriter{err: errors.New("closed")}
+	fw := newCodexRedactingWriter(flushSink)
+	_, err = fw.Write([]byte(`{"partial":`))
+	require.NoError(t, err, "nothing is written until the line completes")
+	require.Error(t, fw.Flush())
+}
+
+// A line that never ends is flushed at the cap rather than buffered forever:
+// the writer is fed by a stream the agent's tool output reaches.
+func TestCodexRedactingWriter_FlushesAtTheLineCap(t *testing.T) {
+	t.Parallel()
+
+	var sink bytes.Buffer
+	w := newCodexRedactingWriter(&sink)
+	chunk := bytes.Repeat([]byte("a"), 1<<20)
+	for range 9 {
+		_, err := w.Write(chunk)
+		require.NoError(t, err)
+	}
+	assert.NotEmpty(t, sink.String(), "a newline-less stream must not buffer without bound")
+	assert.Greater(t, sink.Len(), codexRedactMaxLine)
+}
+
+func TestCodexRedactValue_WalksArrays(t *testing.T) {
+	t.Parallel()
+
+	line := []byte(`{"type":"item.completed","item":{"type":"file_change","changes":` +
+		`[{"path":"a.txt","kind":"add"},{"path":"tok ` + codexTestSecret + `","kind":"add"}]}}`)
+	got := string(codexRedactJSONLine(line))
+	assert.NotContains(t, got, codexTestSecret, "strings nested in arrays are redacted too")
+	assert.Contains(t, got, "a.txt")
+}
+
+func TestCodexRedactFile_ReportsIOFailures(t *testing.T) {
+	t.Parallel()
+
+	assert.Error(t, codexRedactFile(filepath.Join(t.TempDir(), "absent.jsonl")))
+	assert.Error(t, codexRedactTextFile(filepath.Join(t.TempDir(), "absent.log")))
+
+	// A file with no trailing newline still round-trips.
+	path := filepath.Join(t.TempDir(), "tail.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"k":"`+
+		codexTestSecret+`"}}`), 0o644))
+	require.NoError(t, codexRedactFile(path))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(t, string(got), codexTestSecret)
+}
+
+func TestCodexIsRolloutFile_ReportsAMissingFile(t *testing.T) {
+	t.Parallel()
+
+	assert.Error(t, codexIsRolloutFile(filepath.Join(t.TempDir(), "absent.jsonl")))
 }
