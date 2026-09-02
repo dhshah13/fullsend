@@ -50,11 +50,12 @@ NAMESPACE=my-namespace ./delete-openshift-vm.sh --list
 ## Quick start — GCE (Google Compute Engine)
 
 > **Requires:** `gcloud` CLI (authenticated), `python3`, `curl`.
-> VMs have no public IP — SSH access is tunneled via [IAP](https://cloud.google.com/iap/docs/using-tcp-forwarding)
+> By default, VMs have no public IP — SSH access is tunneled via [IAP](https://cloud.google.com/iap/docs/using-tcp-forwarding)
 > (Cloud IAP API must be enabled; operator needs `roles/iap.tunnelResourceAccessor`).
 > The VPC subnet must have [Cloud NAT](https://cloud.google.com/nat/docs/overview)
 > configured — without it, VMs created with `--no-address` cannot reach
 > package mirrors or container registries and `dnf install` will fail.
+> Set `GCP_USE_IAP=false` to create the VM with an external IP and SSH directly.
 
 ```bash
 # 1. Create and provision a VM (auto-numbers):
@@ -107,6 +108,7 @@ GCP_PROJECT=my-gcp-project ./delete-gcp-vm.sh --list
 | `GCP_MACHINE_TYPE` | no | `e2-standard-4` | GCE machine type (4 vCPU, 16 GB — closest to the 4 CPU / 14 GiB KubeVirt spec) |
 | `GCP_NETWORK` | no | `gitlab-runners` | VPC network (must have IAP ingress and egress firewall rules) |
 | `GCP_SUBNET` | no | — | VPC subnet (required for custom-mode VPCs; omit for auto-mode) |
+| `GCP_USE_IAP` | no | `true` | Use IAP tunneling for SSH. Set to `false` to create the VM with an external IP and SSH directly. |
 | `GCP_IMAGE_FAMILY` | no | `fedora-cloud-43` | GCE image family |
 | `GCP_IMAGE_PROJECT` | no | `fedora-cloud` | GCE image project |
 
@@ -125,10 +127,15 @@ GCP_PROJECT=my-gcp-project ./delete-gcp-vm.sh --list
 
 ## Security notes
 
-- GCE VMs are created with `--no-address` (no public IP). SSH access is
-  tunneled through IAP, which requires the operator to have
-  `roles/iap.tunnelResourceAccessor` and authenticates via GCP IAM — mirroring
-  the OpenShift model where SSH is tunneled through the K8s API server.
+- By default (`GCP_USE_IAP=true`), GCE VMs are created with `--no-address`
+  (no public IP) and SSH access is tunneled through IAP, which requires the
+  operator to have `roles/iap.tunnelResourceAccessor` and authenticates via
+  GCP IAM — mirroring the OpenShift model where SSH is tunneled through the
+  K8s API server. When `GCP_USE_IAP=false`, the VM gets an external IP and
+  SSH connects directly with trust-on-first-use host-key verification
+  (`StrictHostKeyChecking=accept-new`) — the first connection accepts the key
+  and subsequent connections within the same run reject changes.
+  The script prints a command to remove the external IP afterward.
 - The CA trust bootstrap uses trust-on-first-use (TOFU). For higher assurance,
   provide the CA bundle out-of-band before running setup.sh.
 - The OCI CA-injection hook fires for all containers on the host. It only

@@ -38,6 +38,10 @@
 #   RUNNER_TAG            — runner tag for job matching (default: fullsend-gitlab-runner)
 #   GITLAB_RUNNER_VERSION — gitlab-runner version to install (default: 19.2.1)
 #   OPENSHELL_VERSION     — OpenShell version (default: from .github/scripts/openshell-version.sh)
+#   GCP_USE_IAP           — use IAP tunneling for SSH (default: true). Set to
+#                           false to create the VM with an external IP and SSH
+#                           directly. Useful for initial provisioning; the
+#                           external IP can be removed afterward.
 #   RUNNER_ACCESS_LEVEL   — not_protected (default) or ref_protected. Protected
 #                           runners only pick up jobs on protected branches and
 #                           tags, so merge-request pipelines never match.
@@ -68,6 +72,7 @@ GCP_NETWORK="${GCP_NETWORK:-gitlab-runners}"
 GCP_SUBNET="${GCP_SUBNET:-}"
 GCP_IMAGE_FAMILY="${GCP_IMAGE_FAMILY:-fedora-cloud-43}"
 GCP_IMAGE_PROJECT="${GCP_IMAGE_PROJECT:-fedora-cloud}"
+GCP_USE_IAP="${GCP_USE_IAP:-true}"
 RUNNER_TAG="${RUNNER_TAG:-fullsend-gitlab-runner}"
 RUNNER_IMAGE="${RUNNER_IMAGE:-}"
 # ref_protected restricts the runner to jobs on protected branches and tags.
@@ -91,25 +96,47 @@ fi
 OPENSHELL_VERSION="${OPENSHELL_VERSION:-0.0.116}"
 PREFIX="fullsend-gitlab-runner"
 
-# Common flags for gcloud compute ssh: IAP tunneling (no public IP) and
-# suppressed host key prompts (ephemeral VMs have no stable host key).
+# Validate GCP_USE_IAP early — it controls flag construction below, so an
+# invalid value (e.g. "yes") must not silently skip --tunnel-through-iap.
+if [[ "${GCP_USE_IAP}" != "true" && "${GCP_USE_IAP}" != "false" ]]; then
+  echo "ERROR: GCP_USE_IAP must be true or false (got: ${GCP_USE_IAP})" >&2
+  exit 1
+fi
+
+if [ "${GCP_USE_IAP}" = "false" ]; then
+  echo "  WARN: GCP_USE_IAP=false — SSH will connect over the public internet." >&2
+  echo "        Host-key verification uses accept-new (TOFU within this session)." >&2
+  echo "        Secrets (REGISTRATION_TOKEN) are transmitted over this session." >&2
+fi
+
+# Common flags for gcloud compute ssh. IAP tunneling is enabled by default
+# (no public IP); set GCP_USE_IAP=false to SSH directly via an external IP.
+#
+# Host-key handling differs by mode:
+#   IAP (default):  StrictHostKeyChecking=no + /dev/null — the IAP relay has no
+#                   stable host key, and the tunnel itself authenticates via IAM.
+#   Direct IP:      StrictHostKeyChecking=accept-new + temp known-hosts file —
+#                   the VM has a stable public IP, so we trust-on-first-use and
+#                   reject key changes for all subsequent connections in this run.
 GCE_SSH_FLAGS=(
-  --tunnel-through-iap
-  --ssh-flag="-o StrictHostKeyChecking=no"
-  --ssh-flag="-o UserKnownHostsFile=/dev/null"
   --ssh-flag="-o ConnectTimeout=10"
   --ssh-flag="-o LogLevel=ERROR"
 )
-
-# Equivalent flags for gcloud compute scp, which requires --scp-flag (not
-# --ssh-flag) for SSH options passed through to the underlying scp/ssh process.
-GCE_SCP_FLAGS=(
-  --tunnel-through-iap
-  --scp-flag="-o StrictHostKeyChecking=no"
-  --scp-flag="-o UserKnownHostsFile=/dev/null"
-  --scp-flag="-o ConnectTimeout=10"
-  --scp-flag="-o LogLevel=ERROR"
-)
+if [ "${GCP_USE_IAP}" = "true" ]; then
+  GCE_SSH_FLAGS=(
+    --tunnel-through-iap
+    --ssh-flag="-o StrictHostKeyChecking=no"
+    --ssh-flag="-o UserKnownHostsFile=/dev/null"
+    "${GCE_SSH_FLAGS[@]}"
+  )
+else
+  _known_hosts=$(mktemp)
+  GCE_SSH_FLAGS=(
+    --ssh-flag="-o StrictHostKeyChecking=accept-new"
+    --ssh-flag="-o UserKnownHostsFile=${_known_hosts}"
+    "${GCE_SSH_FLAGS[@]}"
+  )
+fi
 
 # shellcheck source=lib.sh
 source "${SCRIPT_DIR}/lib.sh"
@@ -123,6 +150,29 @@ gce_ssh() {
     --command="$1"
 }
 
+# Retry a command with exponential backoff for IAP tunnel resilience.
+# After long-running SSH sessions, IAP may rate-limit or exhaust its
+# connection pool, causing subsequent connections to fail with
+# "Connection timed out during banner exchange" or "4003: failed to
+# connect to backend". Diagnostic output goes to stderr to avoid stdout
+# contamination (see docs/contributing/shell-scripting.md).
+with_backoff() {
+  local max_attempts=5 attempt=1 delay=5 rc
+  while true; do
+    rc=0
+    "$@" || rc=$?
+    if [ "${rc}" -eq 0 ]; then return 0; fi
+    if [ "${attempt}" -ge "${max_attempts}" ]; then
+      echo "  ERROR: command failed after ${max_attempts} attempts (exit ${rc})" >&2
+      return "${rc}"
+    fi
+    echo "  WARN: attempt ${attempt}/${max_attempts} failed (exit ${rc}), retrying in ${delay}s..." >&2
+    sleep "${delay}"
+    delay=$(( delay * 2 ))
+    (( attempt++ ))
+  done
+}
+
 # ----------------------------------------------------------------------
 # Validate inputs
 # ----------------------------------------------------------------------
@@ -133,7 +183,7 @@ usage() {
 }
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  head -59 "$0" | tail -57 | sed 's/^# \?//'
+  head -63 "$0" | tail -61 | sed 's/^# \?//'
   exit 0
 fi
 
@@ -183,6 +233,8 @@ if [[ "${RUNNER_ACCESS_LEVEL}" != "not_protected" && "${RUNNER_ACCESS_LEVEL}" !=
   echo "ERROR: RUNNER_ACCESS_LEVEL must be not_protected or ref_protected (got: ${RUNNER_ACCESS_LEVEL})" >&2
   exit 1
 fi
+
+# GCP_USE_IAP is validated early (before GCE_SSH_FLAGS construction).
 
 # Preflight — every tool and file this run depends on. Without this, a missing
 # executor script or an absent `timeout` is discovered only after the VM has
@@ -260,6 +312,11 @@ if [ -n "${GCP_SUBNET}" ]; then
   subnet_flag=(--subnet="${GCP_SUBNET}")
 fi
 
+address_flag=()
+if [ "${GCP_USE_IAP}" = "true" ]; then
+  address_flag=(--no-address)
+fi
+
 gcloud compute instances create "${vm_name}" \
   --project="${GCP_PROJECT}" \
   --zone="${GCP_ZONE}" \
@@ -267,7 +324,7 @@ gcloud compute instances create "${vm_name}" \
   --network="${GCP_NETWORK}" \
   "${subnet_flag[@]+"${subnet_flag[@]}"}" \
   --tags="gitlab-runner" \
-  --no-address \
+  "${address_flag[@]+"${address_flag[@]}"}" \
   --image-family="${GCP_IMAGE_FAMILY}" \
   --image-project="${GCP_IMAGE_PROJECT}" \
   --boot-disk-size="20GB" \
@@ -378,9 +435,9 @@ echo "  OK: runner ID ${runner_id} created"
 # ----------------------------------------------------------------------
 echo "==> Copying setup files to ${vm_name}"
 
-gce_ssh "mkdir -p ~/gitlab-runner-vm/executor ~/gitlab-runner-vm/.github/scripts"
+with_backoff gce_ssh "mkdir -p ~/gitlab-runner-vm"
 
-# Stage files in a local temp directory for batch copy via gcloud compute scp.
+# Stage files in a local temp directory for batch transfer.
 _stage_dir=$(mktemp -d)
 trap 'rm -rf "${_stage_dir}"; cleanup_runner' ERR
 trap 'rm -rf "${_stage_dir}"; cleanup_runner; exit 130' INT
@@ -397,47 +454,44 @@ for file in install-openshell.sh openshell-version.sh; do
   cp "${REPO_ROOT}/.github/scripts/${file}" "${_stage_dir}/.github/scripts/"
 done
 
-# Two scp calls: `*` does not match dotfiles, so .github/ needs its own copy.
-gcloud compute scp --recurse \
-  "${_stage_dir}/setup.sh" \
-  "${_stage_dir}/create-gcp-vm.sh" \
-  "${_stage_dir}/gitlab-runner-version.sh" \
-  "${_stage_dir}/executor" \
-  "${vm_name}:~/gitlab-runner-vm/" \
-  --project="${GCP_PROJECT}" \
-  --zone="${GCP_ZONE}" \
-  "${GCE_SCP_FLAGS[@]}" \
-  --quiet
-gcloud compute scp --recurse \
-  "${_stage_dir}/.github" \
-  "${vm_name}:~/gitlab-runner-vm/" \
-  --project="${GCP_PROJECT}" \
-  --zone="${GCP_ZONE}" \
-  "${GCE_SCP_FLAGS[@]}" \
-  --quiet
+# Transfer all files in a single SSH connection via tar to minimize IAP
+# tunnel usage. This replaces multiple scp calls that each open a separate
+# IAP tunnel, which triggers rate-limiting after long-running sessions.
+copy_files_to_vm() {
+  tar -C "${_stage_dir}" -cf - . \
+    | gcloud compute ssh "${vm_name}" \
+        --project="${GCP_PROJECT}" \
+        --zone="${GCP_ZONE}" \
+        "${GCE_SSH_FLAGS[@]}" \
+        -- "tar -C ~/gitlab-runner-vm -xf -"
+}
+with_backoff copy_files_to_vm
 
 rm -rf "${_stage_dir}"
 trap cleanup_runner ERR
 trap 'cleanup_runner; exit 130' INT
 trap 'cleanup_runner; exit 143' TERM
 
-gce_ssh "chmod +x ~/gitlab-runner-vm/setup.sh ~/gitlab-runner-vm/create-gcp-vm.sh ~/gitlab-runner-vm/executor/*.sh ~/gitlab-runner-vm/.github/scripts/*.sh"
+with_backoff gce_ssh "chmod +x ~/gitlab-runner-vm/setup.sh ~/gitlab-runner-vm/create-gcp-vm.sh ~/gitlab-runner-vm/executor/*.sh ~/gitlab-runner-vm/.github/scripts/*.sh"
 
 # Verify every copy against a locally computed manifest before running it.
 # A dropped SSH channel can leave a truncated setup.sh that then executes an
 # arbitrary prefix of provisioning.
 echo "==> Verifying copied files"
-{
-  (cd "${SCRIPT_DIR}" && sha256sum setup.sh create-gcp-vm.sh gitlab-runner-version.sh \
-    executor/job_id.sh executor/prepare.sh executor/run.sh executor/cleanup.sh)
-  (cd "${REPO_ROOT}/.github/scripts" \
-    && sha256sum install-openshell.sh openshell-version.sh \
-    | sed 's|  |  .github/scripts/|')
-} | gce_ssh "cd ~/gitlab-runner-vm && sha256sum -c --quiet -" || {
+verify_copied_files() {
+  {
+    (cd "${SCRIPT_DIR}" && sha256sum setup.sh create-gcp-vm.sh gitlab-runner-version.sh \
+      executor/job_id.sh executor/prepare.sh executor/run.sh executor/cleanup.sh)
+    (cd "${REPO_ROOT}/.github/scripts" \
+      && sha256sum install-openshell.sh openshell-version.sh \
+      | sed 's|  |  .github/scripts/|')
+  } | gce_ssh "cd ~/gitlab-runner-vm && sha256sum -c --quiet -"
+}
+if ! verify_copied_files; then
   echo "ERROR: copied files failed checksum verification — transfer was truncated" >&2
   cleanup_runner
   exit 1
-}
+fi
 
 echo "  OK: files copied"
 
@@ -462,27 +516,42 @@ done
 # handler that merely returns would swallow the SIGHUP from a dropped SSH
 # connection and let setup.sh keep running while the local side deregisters
 # the runner. Bounded at 20 minutes (image pulls and binary downloads are the
-# bottleneck).
-{
-  printf "REGISTRATION_TOKEN='%s'\n" "${REGISTRATION_TOKEN}"
-  printf "GITLAB_URL='%s'\n" "${GITLAB_URL}"
-  printf "RUNNER_TAG='%s'\n" "${RUNNER_TAG}"
-  printf "RUNNER_IMAGE='%s'\n" "${RUNNER_IMAGE}"
-  printf "OPENSHELL_VERSION='%s'\n" "${OPENSHELL_VERSION}"
-  printf "GITLAB_RUNNER_VERSION='%s'\n" "${GITLAB_RUNNER_VERSION}"
-} | timeout 1200 gcloud compute ssh "${vm_name}" \
-  --project="${GCP_PROJECT}" \
-  --zone="${GCP_ZONE}" \
-  "${GCE_SSH_FLAGS[@]}" \
-  -- "trap 'rm -f ~/gitlab-runner-vm/.env' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; umask 077 && cat > ~/gitlab-runner-vm/.env && set -a && . ~/gitlab-runner-vm/.env && set +a && bash ~/gitlab-runner-vm/setup.sh"
+# bottleneck). Wrapped in with_backoff for IAP tunnel resilience — setup.sh
+# is idempotent (each function checks existing state before acting), so
+# retrying the full invocation after a dropped SSH connection is safe.
+# Note: each retry re-transmits REGISTRATION_TOKEN over a new SSH session.
+# The remote EXIT trap (`rm -f .env`) cleans up the token file on disconnect,
+# and umask 077 ensures it is never world-readable between attempts.
+run_setup_on_vm() {
+  {
+    printf "REGISTRATION_TOKEN='%s'\n" "${REGISTRATION_TOKEN}"
+    printf "GITLAB_URL='%s'\n" "${GITLAB_URL}"
+    printf "RUNNER_TAG='%s'\n" "${RUNNER_TAG}"
+    printf "RUNNER_IMAGE='%s'\n" "${RUNNER_IMAGE}"
+    printf "OPENSHELL_VERSION='%s'\n" "${OPENSHELL_VERSION}"
+    printf "GITLAB_RUNNER_VERSION='%s'\n" "${GITLAB_RUNNER_VERSION}"
+  } | timeout 1200 gcloud compute ssh "${vm_name}" \
+    --project="${GCP_PROJECT}" \
+    --zone="${GCP_ZONE}" \
+    "${GCE_SSH_FLAGS[@]}" \
+    -- "trap 'rm -f ~/gitlab-runner-vm/.env' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; umask 077 && cat > ~/gitlab-runner-vm/.env && set -a && . ~/gitlab-runner-vm/.env && set +a && bash ~/gitlab-runner-vm/setup.sh"
+}
+with_backoff run_setup_on_vm
 
 # Setup succeeded — clear every rollback trap so a stray signal during the
 # final output cannot deregister a healthy runner.
 trap - ERR INT TERM
+rm -f "${_known_hosts:-}"
 
 echo ""
 echo "Done. Runner ${vm_name} (ID ${runner_id}) is ready."
 echo "  Tag:       ${RUNNER_TAG}"
 echo "  Project:   ${GCP_PROJECT}"
 echo "  Zone:      ${GCP_ZONE}"
-echo "  SSH:       gcloud compute ssh ${vm_name} --project=${GCP_PROJECT} --zone=${GCP_ZONE} --tunnel-through-iap"
+if [ "${GCP_USE_IAP}" = "true" ]; then
+  echo "  SSH:       gcloud compute ssh ${vm_name} --project=${GCP_PROJECT} --zone=${GCP_ZONE} --tunnel-through-iap"
+else
+  echo "  SSH:       gcloud compute ssh ${vm_name} --project=${GCP_PROJECT} --zone=${GCP_ZONE}"
+  echo "  NOTE:      VM has an external IP. To remove it after provisioning:"
+  echo "             gcloud compute instances delete-access-config ${vm_name} --project=${GCP_PROJECT} --zone=${GCP_ZONE}"
+fi
