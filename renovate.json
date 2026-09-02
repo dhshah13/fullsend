@@ -75,6 +75,11 @@
       "description": "pi-anthropic-vertex is pinned by tag + tarball SHA256 and tracks specific pi versions; a bump needs the checksum refreshed and its compat.json checked against PI_VERSION (#6464)",
       "matchPackageNames": ["twoGiants/pi-anthropic-vertex"],
       "automerge": false
+    },
+    {
+      "description": "codex minor bumps change the `codex exec --json` wire shape and the hook payloads, so the stream fixtures under internal/runtime/testdata/codex and the hook adapter must be re-verified before a pin move lands, even for patch/pin updates — the same reason pi is not automerged (#6920)",
+      "matchPackageNames": ["@openai/codex"],
+      "automerge": false
     }
   ],
   "postUpdateOptions": ["gomodTidy"],
