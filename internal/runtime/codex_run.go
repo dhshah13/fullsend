@@ -376,7 +376,17 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			printer.StepWarn(fmt.Sprintf("Failed to create %s: ", params.OutputPath) + ferr.Error())
 		} else {
 			defer f.Close()
-			reader = io.TeeReader(stdout, f)
+			// The stream keeps each command's raw aggregated_output even when
+			// a hook blocked the result, and this file is uploaded as a run
+			// artifact — so it is redacted on the way to disk while the parser
+			// still sees the original (codex_redact.go).
+			redacting := newCodexRedactingWriter(f)
+			defer func() {
+				if err := redacting.Flush(); err != nil {
+					printer.StepWarn("Failed to flush " + params.OutputPath + ": " + err.Error())
+				}
+			}()
+			reader = io.TeeReader(stdout, redacting)
 		}
 	}
 

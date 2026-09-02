@@ -65,6 +65,14 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 			fmt.Fprintf(os.Stderr, "  [%s] Failed to copy transcript: %v\n", agentLabel, dlErr)
 			continue
 		}
+		// The rollout carries the same raw tool output the stream does, and it
+		// is uploaded as a run artifact, so it gets the same pattern redaction
+		// (codex_redact.go). A rewrite that fails leaves the file in place and
+		// says so rather than dropping the transcript.
+		if redErr := codexRedactFile(localPath); redErr != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] WARNING: transcript %s was not redacted: %v\n",
+				agentLabel, localName, redErr)
+		}
 		fmt.Fprintf(os.Stderr, "  [%s] Saved transcript: %s\n", agentLabel, localName)
 	}
 	return nil

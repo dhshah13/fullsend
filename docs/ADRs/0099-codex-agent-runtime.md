@@ -87,9 +87,11 @@ config layer including the image's managed `/etc/codex/config.toml`.
 - With a custom provider, codex also issues a `GET /v1/models` catalog refresh at startup, which the
   `fullsend-openai` egress profile denies; it is logged and non-fatal, but "only `POST /v1/responses`
   is attempted" is not true of codex the way it is of pi.
-- The tee'd `output.jsonl` keeps each command's raw `aggregated_output`, so a hook block withholds
-  the output from the *model* but not from the run artifact — the hooks protect context, not
-  artifacts, which is also true of the other runtimes' streams.
+- Codex's own artifacts keep raw tool output — the stream's `aggregated_output` and the rollout
+  session file both survive a hook block, unlike Claude Code's stream, which carries the post-hook
+  result — so both are filtered through the shared secret-pattern redactor on the way to disk. That
+  closes the credential path; it is not the hook chain, so a canary is masked in the artifact rather
+  than withheld, and nothing is condensed or normalized there.
 - Every guard is shell text, so each is executed under `/bin/sh` in tests rather than asserted as a
   string: that is what caught the first draft's fail-open guard, where sh's left-associative `&&`
   and `||` let a trailing check rescue every earlier failure.
