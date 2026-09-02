@@ -118,7 +118,7 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 		// per-message token tracking for throttled TokensEvent
 		totalInput       int
 		totalOutput      int
-		totalReasoning   int // per-message thinking tokens (reset on message_start)
+		msgReasoning     int // per-message thinking tokens (reset on message_start)
 		totalCacheRead   int
 		totalCacheWrite  int
 		lastEmittedTotal int
@@ -129,7 +129,7 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 		cumulativeCacheRead  int
 		cumulativeCacheWrite int
 		seenResult           bool
-		accReasoning         int // accumulated thinking tokens across all messages (for ResultEvent)
+		totalReasoning       int // accumulated thinking tokens across all messages (for ResultEvent)
 	)
 
 	// Emit a final cumulative TokensEvent when the stream ends without
@@ -277,7 +277,7 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 
 					totalInput = msg.Message.Usage.InputTokens
 					totalOutput = 0
-					totalReasoning = 0
+					msgReasoning = 0
 					totalCacheRead = msg.Message.Usage.CacheReadInputTokens
 					totalCacheWrite = msg.Message.Usage.CacheCreationInputTokens
 				}
@@ -293,16 +293,16 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 				}
 				if err := json.Unmarshal(wrapper.Event, &md); err == nil && md.Usage.OutputTokens > 0 {
 					totalOutput = md.Usage.OutputTokens
-					totalReasoning = md.Usage.OutputTokensDetails.ThinkingTokens
-					accReasoning += totalReasoning
+					msgReasoning = md.Usage.OutputTokensDetails.ThinkingTokens
+					totalReasoning += msgReasoning
 					total := cumulativeInput + totalInput + cumulativeOutput + totalOutput +
-						cumulativeCacheRead + totalCacheRead + cumulativeCacheWrite + totalCacheWrite
+						msgReasoning + cumulativeCacheRead + totalCacheRead + cumulativeCacheWrite + totalCacheWrite
 					if total-lastEmittedTotal >= tokenThreshold {
 						lastEmittedTotal = total
 						onEvent(TokensEvent{
 							InputTokens:     cumulativeInput + totalInput,
 							OutputTokens:    cumulativeOutput + totalOutput,
-							ReasoningTokens: totalReasoning,
+							ReasoningTokens: msgReasoning,
 							CacheRead:       cumulativeCacheRead + totalCacheRead,
 							CacheWrite:      cumulativeCacheWrite + totalCacheWrite,
 						})
@@ -324,7 +324,7 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 				Subtype:                  re.Subtype,
 				InputTokens:              re.Usage.InputTokens,
 				OutputTokens:             re.Usage.OutputTokens,
-				ReasoningTokens:          accReasoning,
+				ReasoningTokens:          totalReasoning,
 				CacheCreationInputTokens: re.Usage.CacheCreationInputTokens,
 				CacheReadInputTokens:     re.Usage.CacheReadInputTokens,
 			})
