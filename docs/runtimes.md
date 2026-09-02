@@ -58,8 +58,8 @@ sequenceDiagram
 | Sub-agents | Native (`Agent` tool) | Not wired — agents execute sub-agent definitions inline ([#6527](https://github.com/fullsend-ai/fullsend/issues/6527)) | Not available |
 | Fallback model chain | `FULLSEND_FALLBACK_MODELS`, tried in order | Ignored with a warning | Ignored with a warning |
 | Roles | All | `review`/`retro` stay on Claude Code — they rely on sub-agent rosters | Same — `review`/`retro` stay on Claude Code |
-| Effort | `--effort low..max` | `--thinking`, same levels (`high` when unset) | `model_reasoning_effort`; `max` maps to `xhigh` |
-| Tools | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | Shell + `apply_patch` only; the allowlist hook enforces `tools:` |
+| Effort | `--effort low..max` | `--thinking`, same levels (`high` when unset) | `model_reasoning_effort`, same levels |
+| Tools | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | Shell + `apply_patch` only; `tools:` is recorded, not enforced (the allowlist hook is opt-in) |
 | Security controls | Full matrix | Full matrix; stricter on failed-call sanitizing | Full matrix; post-tool hooks detect and block but cannot rewrite output |
 | Cost in `metrics.json` | Reported | Reported | Not reported — codex sends none |
 
@@ -210,8 +210,8 @@ and are omitted from this table.
 | Harness key | Claude Code | pi | codex |
 |---|---|---|---|
 | `model` | `--model` | alias table, then `provider/id`; see [Models](#models) | `--model <id>`; OpenAI ids only |
-| `effort` | `--effort` | `--thinking` (superset of the harness levels; `high` when unset) | `model_reasoning_effort` (`max` maps to `xhigh`) |
-| `tools:` | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | No native allowlist — the pre-tool hook enforces it, with a warning for unsupported entries |
+| `effort` | `--effort` | `--thinking` (superset of the harness levels; `high` when unset) | `model_reasoning_effort` (same levels) |
+| `tools:` | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | No native allowlist. `Bash(...)` lists are recorded but not enforced, entries with no codex tool are dropped with a warning, and the tool-allowlist hook is opt-in (`FULLSEND_TOOL_ALLOWLIST`) |
 | `skills` | `CLAUDE_CONFIG_DIR/skills/` | `PI_CODING_AGENT_DIR/skills/`, discovered natively | `CODEX_HOME/skills/`, discovered natively |
 | `plugins` | Marketplace layout | Unsupported — warned and skipped | Unsupported — warned and skipped |
 | `security.sandbox_hooks` | `hooks.json` via `--settings` | Hook scripts + manifest + adapter extension | `hooks.json` + adapter script under `CODEX_HOME` |

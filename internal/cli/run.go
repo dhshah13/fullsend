@@ -174,8 +174,8 @@ type aggregateMetrics struct {
 	Iterations int    `json:"iterations"`
 	ToolCalls  int    `json:"tool_calls"`
 	Model      string `json:"model,omitempty"`
-	// Runtime is the backend that ran the iterations (claude, pi, dummy,
-	// dummy-playback), so artifacts record which runtime a per-repo
+	// Runtime is the backend that ran the iterations (claude, pi, codex,
+	// dummy, dummy-playback), so artifacts record which runtime a per-repo
 	// `runtime:` selected.
 	Runtime string `json:"runtime,omitempty"`
 	// RequestedRuntime is the runtime selected for the run (config file or a

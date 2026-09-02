@@ -46,6 +46,18 @@ vars='{"FULLSEND_PI_MODEL":"claude-opus-4-8"}'
 out="$(run AGENT_PREFIX=TRIAGE_ FULLSEND_REPO_VARS="${vars}")"
 check "legacy pi model forwarded" "FULLSEND_PI_MODEL=claude-opus-4-8" "$(grep '^FULLSEND_PI_MODEL=' <<<"${out}")"
 
+# 6b. The codex model knob is forwarded the same way (#6920): a repo on
+# runtime: codex sets it once as a repository variable, and the documented CI
+# route depends on this loop passing it through.
+vars='{"FULLSEND_CODEX_MODEL":"openai/gpt-5.6-luna"}'
+out="$(run AGENT_PREFIX=TRIAGE_ FULLSEND_REPO_VARS="${vars}")"
+check "codex model forwarded" "FULLSEND_CODEX_MODEL=openai/gpt-5.6-luna" "$(grep '^FULLSEND_CODEX_MODEL=' <<<"${out}")"
+
+# 6c. Role-prefixed wins over the plain name, as for every other override.
+vars='{"TRIAGE_FULLSEND_CODEX_MODEL":"openai/gpt-5.6-sol","FULLSEND_CODEX_MODEL":"openai/gpt-5.6-luna"}'
+out="$(run AGENT_PREFIX=TRIAGE_ FULLSEND_REPO_VARS="${vars}")"
+check "role-prefixed codex model wins" "FULLSEND_CODEX_MODEL=openai/gpt-5.6-sol" "$(grep '^FULLSEND_CODEX_MODEL=' <<<"${out}")"
+
 # 6. Fallback chain keeps commas.
 vars='{"FULLSEND_FALLBACK_MODELS":"sonnet,haiku"}'
 out="$(run AGENT_PREFIX=TRIAGE_ FULLSEND_REPO_VARS="${vars}")"

@@ -197,12 +197,32 @@ func TestAssertCodexStreamHasToolCall(t *testing.T) {
 	require.ErrorContains(t, assertCodexStreamHasToolCall(&world.World{ArtifactDir: none}),
 		"no codex output.jsonl stream")
 
+	// An announced command is not a completed one, and a command the hooks
+	// declined is a tool call the agent never got to make. Neither proves
+	// the agent ran a tool, so neither may satisfy the step.
+	const inProgress = `{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"ls .","aggregated_output":"","exit_code":null,"status":"in_progress"}}` + "\n"
+	const declinedCmd = `{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"rm -rf /","aggregated_output":"","exit_code":null,"status":"declined"}}` + "\n"
+	for name, body := range map[string]string{
+		"only announced": started + inProgress + completed,
+		"only declined":  started + declinedCmd + completed,
+	} {
+		dir := t.TempDir()
+		writeArtifact(t, dir, "agent-triage-1/iteration-1/output.jsonl", body)
+		require.ErrorContains(t, assertCodexStreamHasToolCall(&world.World{ArtifactDir: dir}),
+			"none records a command_execution item", name)
+	}
+
 	assert.True(t, isCodexStreamFile([]byte(started)))
 	assert.True(t, isCodexStreamFile([]byte(completed)))
 	// Rollout session files use underscored inner names inside event_msg
 	// envelopes, so they never look like a --json capture.
 	assert.False(t, isCodexStreamFile(
 		[]byte(`{"type":"event_msg","payload":{"type":"item_completed"}}`+"\n")))
+	// Nor does a codex event name nested inside another envelope's payload,
+	// which the old substring scan would have accepted.
+	assert.False(t, isCodexStreamFile(
+		[]byte(`{"type":"wrapper","inner":{"type":"thread.started"}}`+"\n")))
+	assert.False(t, isCodexStreamFile([]byte("not json at all\n")))
 	assert.False(t, isCodexStreamFile(nil))
 }
 

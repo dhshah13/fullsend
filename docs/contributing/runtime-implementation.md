@@ -894,8 +894,7 @@ Two artefacts of the run are worth knowing about:
 
 ### Not yet exercised
 
-`runtime: codex` is implemented but not yet selectable (`config.ValidRuntimes()` gains it with the
-user docs and the behaviour scenario). Outstanding:
+`runtime: codex` is selectable per repo or per agent. Outstanding:
 
 - **No default behaviour-CI coverage.** Codex has no Vertex path, so `features/runtime/codex-openai.feature`
   is gated on an OpenAI organization being mapped to the pool repositories, the same block

@@ -117,7 +117,7 @@ When repos are specified as positional arguments, only those repos are processed
 | `--fullsend-ref` | | Per-repo fullsend workflow ref override |
 | `--mint-url` | | Per-repo mint URL override |
 | `--allowed-remote-resources` | | Per-repo allowed remote resources override |
-| `--runtime` | | Agent runtime (`claude`, `pi`) recorded for repos this command adds; existing entries keep their `runtime` / `defaults.runtime` |
+| `--runtime` | | Agent runtime (`claude`, `pi`, `codex`) recorded for repos this command adds; existing entries keep their `runtime` / `defaults.runtime` |
 | `--gitlab-bot-token` | | GitLab bot PAT for free-tier instances that don't support project access tokens (env: `FULLSEND_GITLAB_BOT_TOKEN`) |
 
 ### GitLab bot token

@@ -15,8 +15,6 @@ func Resolve(name string) (Backend, error) {
 		r := ClaudeRuntime{}
 		return Backend{Runtime: r, Transcripts: r}, nil
 	case "codex":
-		// Stub: registered for dev/testing, kept out of
-		// config.ValidRuntimes() until it is implemented (#6920).
 		r := CodexRuntime{}
 		return Backend{Runtime: r, Transcripts: r}, nil
 	case "dummy":

@@ -42,7 +42,7 @@ done < <(compgen -e | sort -u)
 if [[ -n "${FULLSEND_REPO_VARS:-}" ]]; then
   # FULLSEND_PI_MODEL is the pre-#6526 pi-only name, honoured by the CLI as a
   # lower-precedence alias of FULLSEND_MODEL on pi runs.
-  override_keys=(FULLSEND_RUNTIME FULLSEND_MODEL FULLSEND_EFFORT FULLSEND_FALLBACK_MODELS FULLSEND_PI_PROVIDER FULLSEND_PI_MODEL)
+  override_keys=(FULLSEND_RUNTIME FULLSEND_MODEL FULLSEND_EFFORT FULLSEND_FALLBACK_MODELS FULLSEND_PI_PROVIDER FULLSEND_PI_MODEL FULLSEND_CODEX_MODEL)
   for key in "${override_keys[@]}"; do
     # Role-prefixed first, then plain. jq -r yields "" when absent.
     value="$(printf '%s' "${FULLSEND_REPO_VARS}" | jq -r --arg k "${AGENT_PREFIX}${key}" --arg p "${key}" '(.[$k] // .[$p] // "") | tostring')"

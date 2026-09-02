@@ -199,21 +199,26 @@ flowchart TB
     direction LR
     CC["Claude Code\nclaude -p --agent\nhooks via --settings"]
     PI["pi\npi --print --mode json\nhooks via fullsend-hooks.js"]
+    CX["codex\ncodex exec --json\nhooks via hooks.json + adapter"]
     DM["dummy\nscripted ops\n(behaviour tests)"]
     DP["dummy-playback\nplaylist replay\n(behaviour tests)"]
   end
   RT -->|"/sandbox/claude-config"| CC
   RT -->|"/sandbox/pi-config"| PI
+  RT -->|"/sandbox/codex-config"| CX
   RT --> DM
   RT --> DP
   HOOKS -.-> CC
   HOOKS -.-> PI
+  HOOKS -.-> CX
   VX["Vertex AI — *.googleapis.com\nWIF: OIDC token → STS"]
+  OA["OpenAI — api.openai.com\nWIF: OIDC token → run-scoped provider"]
   CC --> VX
   PI -->|"same credential path"| VX
+  CX -->|"POST /v1/responses only"| OA
   classDef opt fill:#e3e9fb,stroke:#2d5be3,color:#1b2230;
   classDef def fill:#eceee8,stroke:#a9afa4,color:#1b2230;
-  class PI opt;
+  class PI,CX opt;
   class CC,DM,DP def;
 ```
 
