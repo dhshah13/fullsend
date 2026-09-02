@@ -90,6 +90,17 @@ type Client interface {
 	DeleteComment(ctx context.Context, project string, number int, commentID string) error
 }
 
+// StatusCommentClient is an optional capability for trackers that can store
+// run-status identity and lifecycle state outside the visible comment body.
+// Jira implements this with comment entity properties. Trackers without this
+// capability keep using invisible HTML markers in comment bodies.
+type StatusCommentClient interface {
+	CreateStatusComment(ctx context.Context, project string, number int, body Body, marker string, terminal bool) (*Comment, error)
+	UpdateStatusComment(ctx context.Context, project string, number int, commentID string, body Body, marker string, terminal bool) error
+	FindStatusComment(ctx context.Context, project string, number int, marker string) (comment *Comment, terminal bool, err error)
+	IsStatusComment(ctx context.Context, project string, number int, commentID string) (bool, error)
+}
+
 // Reactor is an optional capability for adding and removing emoji
 // reactions on issues and comments. Tracker reaction support varies:
 // GitHub and GitLab support reactions on both issues and comments;

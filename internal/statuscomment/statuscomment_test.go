@@ -1925,13 +1925,19 @@ func TestNotifier_ReactionsSkippedForNonReactorTracker(t *testing.T) {
 
 	n.now = func() time.Time { return fixedTime().Add(5 * time.Minute) }
 	require.NoError(t, n.PostCompletion(context.Background(), "Code", "success"))
+
+	comments, err := jiraFake.ListComments(context.Background(), "PROJ", 123)
+	require.NoError(t, err)
+	require.Len(t, comments, 1)
+	assert.NotContains(t, string(comments[0].Body), "fullsend:agent-status")
+	assert.NotContains(t, string(comments[0].Body), "fullsend:status:terminal")
 }
 
 func TestJiraMarkerMatchesAcrossCreationAndReconciliation(t *testing.T) {
 	// Verify that a status comment created by a Jira-backed notifier
 	// can be found and finalized by ReconcileOrphaned using the same
-	// runID. This exercises the marker round-trip: the notifier embeds
-	// the runID in the HTML marker, and the reconciler searches for it.
+	// runID. Jira stores the marker and terminal state in comment properties,
+	// keeping both implementation details out of the visible body.
 	jiraFake, err := tracker.NewFakeJiraClient("https://acme.atlassian.net")
 	require.NoError(t, err)
 
@@ -1960,5 +1966,11 @@ func TestJiraMarkerMatchesAcrossCreationAndReconciliation(t *testing.T) {
 	require.NoError(t, listErr)
 	require.Len(t, comments, 1)
 	assert.Contains(t, string(comments[0].Body), "Terminated", "orphaned comment should be finalized")
-	assert.Contains(t, string(comments[0].Body), terminalTag, "comment should contain terminal tag")
+	assert.NotContains(t, string(comments[0].Body), "fullsend:agent-status")
+	assert.NotContains(t, string(comments[0].Body), "fullsend:status:terminal")
+
+	statusComment, terminal, findErr := jiraFake.FindStatusComment(ctx, "PROJ", 42, mustBuildMarker(runID))
+	require.NoError(t, findErr)
+	require.NotNil(t, statusComment)
+	assert.True(t, terminal)
 }

@@ -5,8 +5,8 @@
 // accumulate history across multiple runs (e.g. review output),
 // statuscomment manages transient lifecycle markers: a start comment
 // created when the agent begins, then updated or replaced on
-// completion (including cancellation). The two packages share the HTML-marker
-// convention but have different lifecycles and placement heuristics.
+// completion (including cancellation). GitHub and GitLab use invisible HTML
+// markers; Jira stores the same bookkeeping in comment entity properties.
 //
 // The notification destination is dynamically determined by event
 // provenance: a Jira-triggered run posts status to Jira, a
@@ -89,8 +89,8 @@ type Notifier struct {
 
 	startCommentID string
 	// startReactionID is in-memory only, unlike startCommentID which can be
-	// recovered by ReconcileOrphaned via the HTML marker embedded in the
-	// comment body. If the process is hard-killed between PostStart and
+	// recovered by ReconcileOrphaned via tracker-specific status metadata.
+	// If the process is hard-killed between PostStart and
 	// PostCompletionWithDetail, this ID is lost and the start reaction is
 	// never cleaned up — there is no equivalent out-of-process reconciler
 	// for reactions. See ReconcileOrphaned's doc comment.
@@ -102,8 +102,8 @@ type Notifier struct {
 	runInfo          *RunInfo
 }
 
-// New creates a Notifier. The runID is embedded in the HTML marker comment
-// so multiple concurrent runs on the same issue don't collide.
+// New creates a Notifier. The runID becomes either an invisible HTML marker
+// or tracker-native status metadata so concurrent runs don't collide.
 // It panics if runID contains characters outside [a-zA-Z0-9_-].
 //
 // project identifies the issue's container: "owner/repo" for
@@ -264,7 +264,7 @@ func (n *Notifier) PostStart(ctx context.Context, description string) error {
 
 	if postComment {
 		body := n.buildStartBody(description)
-		comment, err := n.client.CreateComment(ctx, n.project, n.number, tracker.Body(body))
+		comment, err := createStatusComment(ctx, n.client, n.project, n.number, tracker.Body(body), n.marker, false)
 		if err != nil {
 			return fmt.Errorf("posting start comment: %w", err)
 		}
@@ -375,20 +375,20 @@ func (n *Notifier) PostCompletionWithDetail(ctx context.Context, description, st
 		agentPosted, startIsLast, err := n.analyzeTimeline(ctx)
 		if err != nil {
 			n.warnf("failed to analyze timeline, updating start comment in place: %v", err)
-			if err := n.client.UpdateComment(ctx, n.project, n.number, n.startCommentID, tracker.Body(body)); err != nil {
+			if err := updateStatusComment(ctx, n.client, n.project, n.number, n.startCommentID, tracker.Body(body), n.marker, true); err != nil {
 				return fmt.Errorf("updating start comment with completion: %w", err)
 			}
 		} else if agentPosted || startIsLast {
-			if err := n.client.UpdateComment(ctx, n.project, n.number, n.startCommentID, tracker.Body(body)); err != nil {
+			if err := updateStatusComment(ctx, n.client, n.project, n.number, n.startCommentID, tracker.Body(body), n.marker, true); err != nil {
 				return fmt.Errorf("updating start comment with completion: %w", err)
 			}
 		} else {
-			if _, err := n.client.CreateComment(ctx, n.project, n.number, tracker.Body(body)); err != nil {
+			if _, err := createStatusComment(ctx, n.client, n.project, n.number, tracker.Body(body), n.marker, true); err != nil {
 				return fmt.Errorf("posting completion comment: %w", err)
 			}
 		}
 	} else {
-		if _, err := n.client.CreateComment(ctx, n.project, n.number, tracker.Body(body)); err != nil {
+		if _, err := createStatusComment(ctx, n.client, n.project, n.number, tracker.Body(body), n.marker, true); err != nil {
 			return fmt.Errorf("posting completion comment: %w", err)
 		}
 	}
@@ -400,6 +400,26 @@ func (n *Notifier) PostCompletionWithDetail(ctx context.Context, description, st
 	n.postCompletionReaction(ctx, status, cleanupReaction, postReaction)
 
 	return nil
+}
+
+func visibleStatusBody(body tracker.Body, marker string) tracker.Body {
+	text := strings.TrimPrefix(string(body), marker+"\n")
+	text = strings.TrimPrefix(text, terminalTag+"\n")
+	return tracker.Body(text)
+}
+
+func createStatusComment(ctx context.Context, client tracker.Client, project string, number int, body tracker.Body, marker string, terminal bool) (*tracker.Comment, error) {
+	if statusClient, ok := client.(tracker.StatusCommentClient); ok {
+		return statusClient.CreateStatusComment(ctx, project, number, visibleStatusBody(body, marker), marker, terminal)
+	}
+	return client.CreateComment(ctx, project, number, body)
+}
+
+func updateStatusComment(ctx context.Context, client tracker.Client, project string, number int, commentID string, body tracker.Body, marker string, terminal bool) error {
+	if statusClient, ok := client.(tracker.StatusCommentClient); ok {
+		return statusClient.UpdateStatusComment(ctx, project, number, commentID, visibleStatusBody(body, marker), marker, terminal)
+	}
+	return client.UpdateComment(ctx, project, number, commentID, body)
 }
 
 // postCompletionReaction manages the reaction lifecycle at run completion:
@@ -453,7 +473,17 @@ func (n *Notifier) analyzeTimeline(ctx context.Context) (agentPosted, startIsLas
 	}
 
 	for _, c := range comments[startIdx+1:] {
-		if c.Author == botUser && !strings.Contains(string(c.Body), "fullsend:agent-status:") {
+		if c.Author != botUser {
+			continue
+		}
+		isStatus := strings.Contains(string(c.Body), "fullsend:agent-status:")
+		if statusClient, ok := n.client.(tracker.StatusCommentClient); ok {
+			isStatus, err = statusClient.IsStatusComment(ctx, n.project, n.number, c.ID)
+			if err != nil {
+				return false, false, fmt.Errorf("checking whether comment %s is a status comment: %w", c.ID, err)
+			}
+		}
+		if !isStatus {
 			agentPosted = true
 			break
 		}
@@ -681,12 +711,11 @@ func statusEmoji(status string) string {
 // "Started" state because the process was hard-killed (SIGKILL, OOM, etc.)
 // before the deferred PostCompletion call could run.
 //
-// It searches for a comment matching the run's HTML marker
-// (<!-- fullsend:agent-status:<runID> -->) that has not yet reached a
-// terminal state. Terminal states are detected by the
-// <!-- fullsend:status:terminal --> tag, which is included in both
-// completion and interrupted comment bodies. If found in a non-terminal
-// state, it updates the comment to "Interrupted" and tags it as terminal.
+// It searches for a comment matching the run's status metadata that has not
+// reached a terminal state. Jira uses comment properties; GitHub and GitLab
+// use the fullsend:agent-status and fullsend:status:terminal HTML markers.
+// If found in a non-terminal state, it updates the comment to "Interrupted"
+// and records it as terminal.
 //
 // completionMode is the configured comment.completion value ("enabled",
 // "on_failure", or "disabled"). It changes what an absent marker means:
@@ -722,7 +751,7 @@ func statusEmoji(status string) string {
 // the process that created it is gone.
 //
 // Known limitation: this does not reconcile an orphaned start reaction
-// (see Notifier.startReactionID). Comments carry a recoverable HTML marker;
+// (see Notifier.startReactionID). Comments carry recoverable status metadata;
 // reactions have no equivalent identity that survives the process, so a
 // hard-killed run can leave a stray 👀 reaction behind indefinitely.
 //
@@ -733,25 +762,36 @@ func ReconcileOrphaned(ctx context.Context, client tracker.Client, project strin
 		return fmt.Errorf("building marker: %w", err)
 	}
 
-	comments, err := client.ListComments(ctx, project, number)
-	if err != nil {
-		return fmt.Errorf("listing comments: %w", err)
+	var matched *tracker.Comment
+	terminal := false
+	if statusClient, ok := client.(tracker.StatusCommentClient); ok {
+		matched, terminal, err = statusClient.FindStatusComment(ctx, project, number, marker)
+		if err != nil {
+			return fmt.Errorf("finding status comment: %w", err)
+		}
+	} else {
+		comments, listErr := client.ListComments(ctx, project, number)
+		if listErr != nil {
+			return fmt.Errorf("listing comments: %w", listErr)
+		}
+		for i := range comments {
+			if strings.Contains(string(comments[i].Body), marker) {
+				matched = &comments[i]
+				terminal = strings.Contains(string(comments[i].Body), terminalTag)
+				break
+			}
+		}
 	}
 
-	for _, c := range comments {
-		if !strings.Contains(string(c.Body), marker) {
-			continue
-		}
-		// Already finalized — nothing to do.
-		if strings.Contains(string(c.Body), terminalTag) {
+	if matched != nil {
+		if terminal {
 			return nil
 		}
 		// Still in "Started" state — finalize it.
-		desc, startTimeStr := parseStartBody(string(c.Body))
+		desc, startTimeStr := parseStartBody(string(matched.Body))
 		endTime := now().UTC()
 		body := buildInterruptedBody(marker, runURL, sha, desc, startTimeStr, endTime, reason)
-		commentID := c.ID
-		if err := client.UpdateComment(ctx, project, number, commentID, tracker.Body(body)); err != nil {
+		if err := updateStatusComment(ctx, client, project, number, matched.ID, tracker.Body(body), marker, true); err != nil {
 			return fmt.Errorf("updating orphaned comment: %w", err)
 		}
 		return nil
@@ -788,7 +828,7 @@ func ReconcileOrphaned(ctx context.Context, client tracker.Client, project strin
 	if shouldSynthesize {
 		endTime := now().UTC()
 		body := buildInterruptedBody(marker, runURL, sha, agentDescription, "", endTime, synthReason)
-		if _, err := client.CreateComment(ctx, project, number, tracker.Body(body)); err != nil {
+		if _, err := createStatusComment(ctx, client, project, number, tracker.Body(body), marker, true); err != nil {
 			return fmt.Errorf("creating synthesized interrupted comment: %w", err)
 		}
 	}

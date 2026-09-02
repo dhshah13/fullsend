@@ -37,10 +37,19 @@ func parseJiraTimestamp(s string) (time.Time, error) {
 // collisions with other Jira apps.
 const stickyPropertyKey = "fullsend.sticky-marker"
 
+// statusPropertyKey stores run-status bookkeeping outside the visible Jira
+// comment body. Jira renders HTML comments as text, unlike GitHub and GitLab.
+const statusPropertyKey = "fullsend.agent-status"
+
 // stickyMarkerProperty is object-shaped because Jira rejects top-level JSON
 // strings in the properties array of the create-comment request.
 type stickyMarkerProperty struct {
 	Marker string `json:"marker"`
+}
+
+type statusCommentProperty struct {
+	Marker   string `json:"marker"`
+	Terminal bool   `json:"terminal"`
 }
 
 // jiraClient is the Jira API surface this adapter needs. Implemented by
@@ -139,6 +148,86 @@ func (c *JiraClient) CreateComment(ctx context.Context, project string, number i
 	}
 	result := fromJiraComment(*comment)
 	return &result, nil
+}
+
+// CreateStatusComment implements StatusCommentClient by storing run identity
+// and terminal state in a Jira comment entity property.
+func (c *JiraClient) CreateStatusComment(ctx context.Context, project string, number int, body Body, marker string, terminal bool) (*Comment, error) {
+	key := issueKey(project, number)
+	// statusCommentProperty contains only a string and bool, so marshaling
+	// cannot fail.
+	value, _ := json.Marshal(statusCommentProperty{Marker: marker, Terminal: terminal})
+	comment, err := c.jira.CreateCommentWithProperties(ctx, key, string(body), []jira.CommentProperty{{
+		Key: statusPropertyKey, Value: value,
+	}})
+	if err != nil {
+		return nil, wrapNotFound(err)
+	}
+	result := fromJiraComment(*comment)
+	return &result, nil
+}
+
+// UpdateStatusComment implements StatusCommentClient. Writing the property
+// first preserves discoverability if the subsequent body update fails.
+func (c *JiraClient) UpdateStatusComment(ctx context.Context, project string, number int, commentID string, body Body, marker string, terminal bool) error {
+	key := issueKey(project, number)
+	property := statusCommentProperty{Marker: marker, Terminal: terminal}
+	if err := c.jira.SetCommentProperty(ctx, key, commentID, statusPropertyKey, property); err != nil {
+		return fmt.Errorf("setting status property on comment %s of %s: %w", commentID, key, err)
+	}
+	return wrapNotFound(c.jira.UpdateComment(ctx, key, commentID, string(body)))
+}
+
+// FindStatusComment implements StatusCommentClient. Property lookup is the
+// primary path; visible-body scanning keeps pre-property comments compatible.
+func (c *JiraClient) FindStatusComment(ctx context.Context, project string, number int, marker string) (*Comment, bool, error) {
+	key := issueKey(project, number)
+	comments, err := c.jira.ListComments(ctx, key)
+	if err != nil {
+		return nil, false, wrapNotFound(err)
+	}
+	for i := range comments {
+		for _, prop := range comments[i].Properties {
+			if prop.Key != statusPropertyKey {
+				continue
+			}
+			var stored statusCommentProperty
+			if json.Unmarshal(prop.Value, &stored) == nil && stored.Marker == marker {
+				result := fromJiraComment(comments[i])
+				return &result, stored.Terminal, nil
+			}
+		}
+	}
+	for i := range comments {
+		body := jira.ADFToMarkdown(comments[i].Body)
+		if strings.Contains(body, marker) {
+			result := fromJiraComment(comments[i])
+			return &result, strings.Contains(body, "fullsend:status:terminal"), nil
+		}
+	}
+	return nil, false, nil
+}
+
+// IsStatusComment implements StatusCommentClient. The legacy body check keeps
+// timeline analysis correct while older marker-bearing comments are present.
+func (c *JiraClient) IsStatusComment(ctx context.Context, project string, number int, commentID string) (bool, error) {
+	key := issueKey(project, number)
+	comments, err := c.jira.ListComments(ctx, key)
+	if err != nil {
+		return false, wrapNotFound(err)
+	}
+	for i := range comments {
+		if comments[i].ID != commentID {
+			continue
+		}
+		for _, prop := range comments[i].Properties {
+			if prop.Key == statusPropertyKey {
+				return true, nil
+			}
+		}
+		return strings.Contains(jira.ADFToMarkdown(comments[i].Body), "fullsend:agent-status:"), nil
+	}
+	return false, nil
 }
 
 // CreateCommentWithMarker creates a comment with the sticky marker
