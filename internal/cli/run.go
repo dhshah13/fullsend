@@ -1031,11 +1031,37 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if overrides.model != "" {
 		h.Model = overrides.model
 	}
+
+	// Resolve per-repo model aliases from config (#6882). The alias map
+	// is passed to RunParams so each runtime can merge it into its own
+	// alias table; the echo here shows the mapping for visibility.
+	var configModelAliases map[string]string
+	if runCfg.perRepo != nil {
+		configModelAliases = runCfg.perRepo.ConfigModelAliases()
+	}
+	// The load path does not run Validate (only the write paths do, and
+	// nothing writes this block through the CLI), so check the effective
+	// map here: an unknown key must fail before the sandbox exists, not
+	// become a working alias.
+	if err := config.ValidateModelAliases(configModelAliases); err != nil {
+		printer.StepFail(err.Error())
+		return fmt.Errorf("%s: %w", runCfg.source, err)
+	}
+	// resolvedModel is the alias-table target when models.aliases remaps
+	// h.Model, h.Model otherwise. It is what the echo and the Claude Code
+	// warning look at; pi still prefixes a bare id with its provider.
+	resolvedModel, modelRemapped := h.Model, false
+	if id, ok := configModelAliases[h.Model]; ok {
+		resolvedModel, modelRemapped = id, true
+	}
+
 	// provider/id is pi's model form; Claude Code takes an alias or an
 	// Anthropic model id. The syntax is accepted for every runtime (ids are
 	// not a closed set), so flag the likely mismatch instead of rejecting it.
-	if runtimeBackend.Runtime.Name() == "claude" && strings.Contains(h.Model, "/") {
-		printer.StepWarn(fmt.Sprintf("model %q has a provider/id form, which is pi's; Claude Code expects an alias (opus, sonnet, ...) or an Anthropic model id", h.Model))
+	// Check the resolved value: an alias whose entry is a provider/id spec
+	// reaches Claude Code as that spec.
+	if runtimeBackend.Runtime.Name() == "claude" && strings.Contains(resolvedModel, "/") {
+		printer.StepWarn(fmt.Sprintf("model %q has a provider/id form, which is pi's; Claude Code expects an alias (opus, sonnet, ...) or an Anthropic model id", resolvedModel))
 	}
 	if overrides.effort != "" {
 		if !config.ValidEffort(overrides.effort) {
@@ -1058,13 +1084,28 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		printer.KeyValue("Policy", h.Policy)
 	}
 	if h.Model != "" {
-		printer.KeyValue("Model", withSource(h.Model, overrides.modelSource))
+		modelDisplay := withSource(h.Model, overrides.modelSource)
+		if modelRemapped {
+			// Keep the alias's own source (e.g. "--model flag") and add
+			// the remap, so neither decision is hidden.
+			modelDisplay = fmt.Sprintf("%s → %s (from %s models.aliases)", modelDisplay, resolvedModel, runCfg.source)
+		}
+		printer.KeyValue("Model", modelDisplay)
 	}
 	if h.Effort != "" {
 		printer.KeyValue("Effort", withSource(h.Effort, overrides.effortSource))
 	}
 	if len(overrides.fallbackModels) > 0 {
-		printer.KeyValue("Fallback models", withSource(strings.Join(overrides.fallbackModels, ", "), overrides.fallbackSource))
+		// Aliased entries are remapped by models.aliases at Run (claude.go),
+		// so show each one as "alias → id"; literal ids print as written.
+		fallbacks := make([]string, len(overrides.fallbackModels))
+		for i, fb := range overrides.fallbackModels {
+			if id, ok := configModelAliases[fb]; ok {
+				fb = fb + " → " + id
+			}
+			fallbacks[i] = fb
+		}
+		printer.KeyValue("Fallback models", withSource(strings.Join(fallbacks, ", "), overrides.fallbackSource))
 	}
 	printer.KeyValue("Runtime", fmt.Sprintf("%s (from %s)", runtimeBackend.Runtime.Name(), runtimeConfigSource))
 	if h.Image != "" {
@@ -1368,7 +1409,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			// the Vertex provider without making every run resolve an
 			// OpenAI credential (#6920); the profile is not imported and
 			// the instance is not created or attached.
-			if !agentruntime.NeedsOpenAIProvider(runtimeBackend.Runtime.Name(), h.Model, agentDefModel) {
+			if !agentruntime.NeedsOpenAIProvider(runtimeBackend.Runtime.Name(), h.Model, agentDefModel, configModelAliases) {
 				skippedProviders[pd.Name] = struct{}{}
 				// Counts as handled, so the "declared but no definition
 				// found" warning below does not also fire for it.
@@ -1754,12 +1795,15 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	if overrides.modelSource != "" {
 		fmt.Fprintf(os.Stderr, "model: requested %q from %s\n", h.Model, overrides.modelSource)
 	}
+	if modelRemapped {
+		fmt.Fprintf(os.Stderr, "model: alias %q remapped to %q from %s models.aliases\n", h.Model, resolvedModel, runCfg.source)
+	}
 	rt := backend.Runtime
 	aggMetrics.Runtime = rt.Name()
 	aggMetrics.RequestedRuntime = rt.Name()
 	aggMetrics.RuntimeSource = configSource
 	aggMetrics.RequestedModel = h.Model
-	aggMetrics.OverrideSource = modelOverrideSource(overrides, h.Model)
+	aggMetrics.OverrideSource = aliasOverrideSource(modelOverrideSource(overrides, h.Model), modelRemapped, runCfg.source)
 	tx := backend.Transcripts
 
 	// 6. Start runtime fetch service (Phase 4, ADR-0038).
@@ -2145,6 +2189,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			OutputPath:        filepath.Join(iterDir, "output.jsonl"),
 			Prompt:            agentPrompt,
 			Forge:             forgePlatform,
+			ModelAliases:      configModelAliases,
 			OnEvent:           contentEventHandler(agentruntime.NewEventRenderer(printer).Handle, collector),
 		}, printer, agentStart, &metrics)
 		close(heartbeatDone)
