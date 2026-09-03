@@ -110,7 +110,7 @@ When repos are specified as positional arguments, only those repos are processed
 | `--roles` | `triage,coder,review,fix,retro,prioritize` | Agent roles to install |
 | `--direct` | `false` | Push scaffold directly to default branch (skip PR) |
 | `--inference-project` | | GCP project ID for inference (written as `FULLSEND_GCP_PROJECT_ID` secret) |
-| `--inference-project-number` | | Numeric GCP project number for WIF provider computation (auto-derived from `--inference-project` when omitted) |
+| `--inference-wif-provider` | | Full WIF provider resource name (`projects/{number}/locations/global/workloadIdentityPools/{pool}/providers/{id}`); uses this provider for all repos instead of deriving per-repo providers. Project number is embedded in the path, so no auto-derivation is needed. |
 | `--forge` | | Forge type for new repos (`github` or `gitlab`). Required when adding repos not already in the manifest; inferred from existing platform sections when unambiguous. |
 | `--force` | `false` | Allow scaffold ref downgrades |
 | `--inference-region` | | Per-repo GCP inference region override (default: global when `--inference-project` is set; install-time only, not stored in the manifest) |
