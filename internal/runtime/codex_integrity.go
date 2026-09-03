@@ -41,8 +41,11 @@ import (
 type codexRunnerHeldDigestSet struct {
 	ConfigTOML string
 	HooksJSON  string
-	// SecurityEnv is the hook configuration the runner derived from the
-	// harness — the same values appendHookEnv wrote into the workspace .env.
+	// SecurityEnv is the hook configuration the runner knows at Bootstrap:
+	// what it derived from SandboxHookConfig, plus the harness-supplied
+	// variables read back from the workspace .env before any agent iteration
+	// could touch it. Between them these are the values appendHookEnv and the
+	// harness env wrote into that file.
 	// That file is agent-writable, so iteration 1 can rewrite the SSRF
 	// allowlist or clear TIRITH_REQUIRED for iteration 2; re-exporting these
 	// after .env from what the runner knows means the .env copy cannot win.
@@ -73,10 +76,11 @@ type codexEnvPair struct {
 // codexSecurityEnv returns the hook configuration values the runner can
 // re-assert after .env, in a stable order.
 //
-// Only what SandboxHookConfig knows: FULLSEND_CANARY_TOKEN and
-// FULLSEND_TOOL_ALLOWLIST come from the harness's own env/host_files rather
-// than from the hook config, so the runtime has no runner-side copy of them to
-// re-export and they keep the exposure Claude Code and pi have.
+// This covers what SandboxHookConfig knows. The harness-supplied pair —
+// FULLSEND_CANARY_TOKEN and FULLSEND_TOOL_ALLOWLIST — has no typed runner-side
+// copy, so Bootstrap reads it from the workspace .env instead
+// (codexReadHarnessSecurityEnv) while that file is still pristine, and appends
+// it to the same list.
 func codexSecurityEnv(hooks security.SandboxHookConfig) []codexEnvPair {
 	var env []codexEnvPair
 	if failOn := hooks.TirithFailOn(); failOn != "" {

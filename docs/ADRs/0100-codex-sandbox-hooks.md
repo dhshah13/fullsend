@@ -61,9 +61,9 @@ derived from the harness after `.env` so the agent's copy cannot win.
   before every invocation, the hooks directory must hold exactly the installed files, and the
   interpreter, `PATH` and the scripts' own configuration are all pinned past `.env`. On the other
   two runtimes each of those is agent-writable between iterations with no check.
-- `FULLSEND_CANARY_TOKEN` and `FULLSEND_TOOL_ALLOWLIST` are **not** covered by that re-assertion:
-  they come from the harness's own `env`/`host_files` rather than from `SandboxHookConfig`, so the
-  runtime has no runner-side copy to re-export and they keep the exposure the other runtimes have.
+- The harness-supplied `FULLSEND_CANARY_TOKEN` and `FULLSEND_TOOL_ALLOWLIST` are covered too, even
+  though `SandboxHookConfig` does not carry them: Bootstrap reads them back from the workspace
+  `.env` while that file is still exactly what the runner wrote, before any iteration has run.
 - Codex artifacts keep raw tool output where Claude Code's stream carries the post-hook result, so
   `output.jsonl` and the extracted rollout are filtered through the shared secret-pattern redactor:
   a credential is masked there, a canary is not withheld.

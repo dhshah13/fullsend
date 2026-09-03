@@ -214,7 +214,19 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		}
 		// Exactly what was installed, by name: Run cannot re-derive the set
 		// because it does not see the harness's hook config.
-		digests.SecurityEnv = codexSecurityEnv(hooks)
+		securityEnv := codexSecurityEnv(hooks)
+		// FULLSEND_CANARY_TOKEN and FULLSEND_TOOL_ALLOWLIST are harness-supplied
+		// (env.sandbox / host_files) rather than derived from SandboxHookConfig,
+		// so the runner has no typed copy to re-export. It can still read them
+		// here: the runner writes .env and then calls Bootstrap, and no agent
+		// iteration has run yet, so the file is still exactly what the runner
+		// put there. Reading them later — in Run — would read whatever the
+		// previous iteration left behind, which is the problem.
+		harnessEnv, err := codexReadHarnessSecurityEnv(sandboxName)
+		if err != nil {
+			return err
+		}
+		digests.SecurityEnv = append(securityEnv, harnessEnv...)
 		digests.HookScripts = map[string]string{}
 		for name, content := range security.HookFiles(hooks) {
 			digests.HookScripts[name] = codexAssetSHA256(content)
@@ -388,6 +400,53 @@ func codexPreflightVersion(sandboxName string) (string, error) {
 // whole "codex-cli <pin>" string), so a change here shows up as a build
 // failure before it reaches a run.
 const codexVersionPrefix = "codex-cli "
+
+// codexHarnessSecurityEnvKeys are the hook-configuration variables the harness
+// supplies through the sandbox environment rather than through
+// SandboxHookConfig, so the runner learns them by reading the file it just
+// wrote rather than from its own state.
+var codexHarnessSecurityEnvKeys = []string{"FULLSEND_CANARY_TOKEN", "FULLSEND_TOOL_ALLOWLIST"}
+
+// codexEnvReadSeparator delimits the values read back, chosen so a plausible
+// token or allowlist cannot contain it.
+const codexEnvReadSeparator = "|fullsend-env-sep|"
+
+// codexReadHarnessSecurityEnv reads the harness-supplied hook variables from
+// the workspace .env, which at Bootstrap time is still exactly what the runner
+// wrote — no agent iteration has run. Values that are unset or empty are
+// skipped: there is nothing to re-assert, and an agent that *sets* one later
+// can only cause spurious blocks, not slip past a check.
+func codexReadHarnessSecurityEnv(sandboxName string) ([]codexEnvPair, error) {
+	var refs []string
+	for _, key := range codexHarnessSecurityEnvKeys {
+		refs = append(refs, fmt.Sprintf("${%s:-}", key))
+	}
+	cmd := fmt.Sprintf(". %s 2>/dev/null; printf '%%s' %s",
+		shellQuote(sandbox.SandboxWorkspace+"/.env"),
+		shellQuote(strings.Join(refs, codexEnvReadSeparator)))
+
+	stdout, stderr, exitCode, err := sandbox.Exec(sandboxName, cmd, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("reading the harness hook environment: %w", err)
+	}
+	if exitCode != 0 {
+		return nil, fmt.Errorf("reading the harness hook environment: exited %d: %s",
+			exitCode, strings.TrimSpace(sanitizeOutput(stderr)))
+	}
+
+	values := strings.Split(stdout, codexEnvReadSeparator)
+	if len(values) != len(codexHarnessSecurityEnvKeys) {
+		return nil, fmt.Errorf("reading the harness hook environment: expected %d values, got %d",
+			len(codexHarnessSecurityEnvKeys), len(values))
+	}
+	var env []codexEnvPair
+	for i, key := range codexHarnessSecurityEnvKeys {
+		if v := strings.TrimSpace(values[i]); v != "" {
+			env = append(env, codexEnvPair{key, v})
+		}
+	}
+	return env, nil
+}
 
 // codexPreflightPython resolves the absolute interpreter the hook handlers
 // will name. It is resolved here, on a shell the agent has not touched, rather

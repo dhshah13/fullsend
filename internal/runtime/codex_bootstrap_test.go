@@ -63,6 +63,7 @@ if [ "$2" = "exec" ]; then
     "codex --version") echo "` + versionOutput + `"; exit 0 ;;
     "command -v python3") echo "/usr/bin/python3"; exit 0 ;;
     *"sys.version_info"*) echo "${FULLSEND_TEST_PYVER:-3.12}"; exit 0 ;;
+    *fullsend-env-sep*) printf '%s' "${FULLSEND_TEST_ENV_READ-|fullsend-env-sep|}"; exit 0 ;;
     cat\ *) f=$(printf '%s' "${last#cat }" | tr -d "'" | tr '/' '_'); cat '` + storeDir + `'/"$f"; exit $? ;;
     *"exec --json"*) ` + streamCase + ` ;;
     find\ *) ` + findCase + ` ;;
@@ -494,5 +495,96 @@ func TestCodexBootstrap_RecordsRunnerHeldDigests(t *testing.T) {
 	require.Len(t, got.HookScripts, len(want))
 	for name, content := range want {
 		assert.Equal(t, codexAssetSHA256(content), got.HookScripts[name], "digest for %s", name)
+	}
+}
+
+// TestCodexReadHarnessSecurityEnv covers the values the runner has no typed
+// copy of. They are read at Bootstrap because the workspace .env is still
+// exactly what the runner wrote then — reading them in Run would read whatever
+// the previous iteration left behind, which is the exposure this closes.
+func TestCodexReadHarnessSecurityEnv(t *testing.T) {
+	t.Run("reads both values", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		t.Setenv("FULLSEND_TEST_ENV_READ", "canary-abc"+codexEnvReadSeparator+"Bash,Read")
+
+		got, err := codexReadHarnessSecurityEnv("sb")
+		require.NoError(t, err)
+		assert.Equal(t, []codexEnvPair{
+			{"FULLSEND_CANARY_TOKEN", "canary-abc"},
+			{"FULLSEND_TOOL_ALLOWLIST", "Bash,Read"},
+		}, got)
+	})
+
+	// Nothing to re-assert when the harness set neither, and an agent that
+	// *sets* one later can only cause spurious blocks, not slip past a check.
+	t.Run("skips unset values", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		t.Setenv("FULLSEND_TEST_ENV_READ", codexEnvReadSeparator)
+
+		got, err := codexReadHarnessSecurityEnv("sb")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("keeps one when only one is set", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		t.Setenv("FULLSEND_TEST_ENV_READ", "canary-abc"+codexEnvReadSeparator)
+
+		got, err := codexReadHarnessSecurityEnv("sb")
+		require.NoError(t, err)
+		assert.Equal(t, []codexEnvPair{{"FULLSEND_CANARY_TOKEN", "canary-abc"}}, got)
+	})
+
+	t.Run("refuses a malformed answer", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		t.Setenv("FULLSEND_TEST_ENV_READ", "only-one-value")
+
+		_, err := codexReadHarnessSecurityEnv("sb")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected 2 values")
+	})
+}
+
+// TestCodexBootstrap_PinsTheHarnessHookEnv is the end-to-end half: what the
+// harness set at bootstrap is what the hooks receive on a later iteration,
+// whatever the agent wrote into .env in between.
+func TestCodexBootstrap_PinsTheHarnessHookEnv(t *testing.T) {
+	storeDir := t.TempDir()
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "codex-cli 0.152.1")
+	t.Setenv("FULLSEND_TEST_ENV_READ", "canary-from-harness"+codexEnvReadSeparator+"Bash,Read")
+	forgetRunnerHeldDigests("sb")
+	t.Cleanup(func() { forgetRunnerHeldDigests("sb") })
+
+	r := CodexRuntime{}
+	require.NoError(t, r.Bootstrap(codexHooksBootstrapInput{
+		bootstrapInput: bootstrapInput{
+			sandboxName: "sb",
+			agentPath:   writeAgentFile(t, codexTestAgentDef),
+			agentName:   "triage",
+		},
+		hooks: security.SandboxHookConfigFromHarness(&harness.Harness{}),
+	}))
+
+	held, ok := lookupRunnerHeldDigests("sb")
+	require.True(t, ok)
+	got := map[string]string{}
+	for _, p := range held.SecurityEnv {
+		got[p.Key] = p.Value
+	}
+	assert.Equal(t, "canary-from-harness", got["FULLSEND_CANARY_TOKEN"])
+	assert.Equal(t, "Bash,Read", got["FULLSEND_TOOL_ALLOWLIST"])
+
+	// And the launch re-exports them after .env, so an iteration-1 rewrite of
+	// that file cannot change what iteration 2's hooks see.
+	cmd := buildCodexRunCommand(RunParams{
+		RepoDir:           sandbox.SandboxWorkspace + "/repo",
+		HooksSettingsPath: r.codexHooksPath(),
+	}, "gpt-5-mini", "", true, held)
+	envAt := strings.Index(cmd, ". '"+sandbox.SandboxWorkspace+"/.env'")
+	require.Positive(t, envAt)
+	for key, value := range got {
+		at := strings.Index(cmd, "export "+key+"="+shellQuote(value))
+		require.Positive(t, at, "%s is not re-exported", key)
+		assert.Greater(t, at, envAt, "%s must be re-exported after .env", key)
 	}
 }
