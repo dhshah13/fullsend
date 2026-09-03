@@ -2758,3 +2758,27 @@ func TestConverge_NoWIFProviderFallsBackToPerRepo(t *testing.T) {
 			installed[0].WIFProvider)
 	}
 }
+
+func TestConverge_WIFProviderRequiresInferenceProject(t *testing.T) {
+	repoNames := []string{"acme/api"}
+	fc := newFakeClientForBatch(repoNames...)
+	m := newConvergeManifest(repoNames...)
+
+	sc := &fakeScaffoldCommit{}
+	cfg := ConvergeConfig{
+		Manifest:       m,
+		MaxConcurrency: 4,
+		Roles:          []string{"triage"},
+		Direct:         true,
+		WIFProvider:    "projects/999/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc",
+		// InferenceProject intentionally empty — should be rejected.
+	}
+
+	_, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err == nil {
+		t.Fatal("expected error when WIFProvider is set without InferenceProject")
+	}
+	if !strings.Contains(err.Error(), "--inference-project is required when --inference-wif-provider is set") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}

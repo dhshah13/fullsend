@@ -233,15 +233,18 @@ func Converge(ctx context.Context, cfg ConvergeConfig,
 	// --inference-project-number is not required (the project number is
 	// embedded in the provider path).
 	if cfg.WIFProvider != "" {
-		// Only --inference-project and --inference-region are required
-		// alongside --inference-wif-provider.
-		if cfg.InferenceProject != "" {
-			if !IsValidGCPProjectID(cfg.InferenceProject) {
-				return nil, fmt.Errorf("--inference-project %q is not a valid GCP project ID (must be 6-30 lowercase letters, digits, hyphens; start with a letter)", cfg.InferenceProject)
-			}
-			if cfg.InferenceRegion != "" && !IsValidGCPRegion(cfg.InferenceRegion) {
-				return nil, fmt.Errorf("--inference-region %q is not a valid GCP region (must be lowercase letters, digits, hyphens; start with a letter)", cfg.InferenceRegion)
-			}
+		// --inference-project and --inference-region are required
+		// alongside --inference-wif-provider because the secret-writing
+		// paths gate on InferenceProject to decide whether to write
+		// FULLSEND_GCP_PROJECT_ID and FULLSEND_GCP_WIF_PROVIDER.
+		if cfg.InferenceProject == "" {
+			return nil, fmt.Errorf("--inference-project is required when --inference-wif-provider is set")
+		}
+		if !IsValidGCPProjectID(cfg.InferenceProject) {
+			return nil, fmt.Errorf("--inference-project %q is not a valid GCP project ID (must be 6-30 lowercase letters, digits, hyphens; start with a letter)", cfg.InferenceProject)
+		}
+		if !IsValidGCPRegion(cfg.InferenceRegion) {
+			return nil, fmt.Errorf("--inference-region %q is not a valid GCP region (must be lowercase letters, digits, hyphens; start with a letter)", cfg.InferenceRegion)
 		}
 	} else {
 		inferenceFlags := []struct{ name, val string }{
