@@ -1156,10 +1156,16 @@ func TestReposInstallCmd_ForgeFlag(t *testing.T) {
 
 func TestReposInstallCmd_PerRepoOverrideFlags(t *testing.T) {
 	cmd := newReposInstallCmd()
-	for _, name := range []string{"inference-region", "fullsend-ref", "mint-url", "allowed-remote-resources"} {
+	for _, name := range []string{"inference-region", "inference-wif-provider", "fullsend-ref", "mint-url", "allowed-remote-resources"} {
 		f := cmd.Flags().Lookup(name)
 		require.NotNil(t, f, "expected --%s flag", name)
 	}
+}
+
+func TestReposInstallCmd_NoInferenceProjectNumberFlag(t *testing.T) {
+	cmd := newReposInstallCmd()
+	f := cmd.Flags().Lookup("inference-project-number")
+	assert.Nil(t, f, "--inference-project-number flag should be removed")
 }
 
 func TestRunReposInstall_AddsNewReposToManifest(t *testing.T) {
@@ -1383,16 +1389,16 @@ func TestRunReposInstall_InvalidInferenceProject(t *testing.T) {
 	assert.Contains(t, err.Error(), "--inference-project")
 }
 
-func TestRunReposInstall_InvalidInferenceProjectNumber(t *testing.T) {
+func TestRunReposInstall_InvalidInferenceWIFProvider(t *testing.T) {
 	manifestPath := writeTestManifest(t, testManifestYAML)
 	err := runReposInstall(context.Background(), &reposInstallConfig{
-		manifest:               manifestPath,
-		concurrency:            4,
-		inferenceProjectNumber: "not-a-number",
-		testClient:             newInstallFakeClient(),
+		manifest:             manifestPath,
+		concurrency:          4,
+		inferenceWIFProvider: "not-a-valid-provider",
+		testClient:           newInstallFakeClient(),
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--inference-project-number must be numeric")
+	assert.Contains(t, err.Error(), "--inference-wif-provider")
 }
 
 func TestRunReposInstall_DerivesProjectNumber(t *testing.T) {
@@ -1429,20 +1435,19 @@ func TestRunReposInstall_DerivesProjectNumber(t *testing.T) {
 		"inference region should default to global")
 }
 
-func TestRunReposInstall_ExplicitProjectNumberSkipsLookup(t *testing.T) {
+func TestRunReposInstall_WIFProviderSkipsProjectNumberLookup(t *testing.T) {
 	manifestPath := writeTestManifest(t, testManifestYAML)
 	fc := newInstallFakeClient("acme/api")
 
 	lookupCalled := false
 	err := runReposInstall(context.Background(), &reposInstallConfig{
-		manifest:               manifestPath,
-		concurrency:            4,
-		roles:                  []string{"triage"},
-		direct:                 true,
-		inferenceProject:       "inf-proj",
-		inferenceProjectNumber: "111222333",
-		inferenceRegion:        "us-central1",
-		testClient:             fc,
+		manifest:             manifestPath,
+		concurrency:          4,
+		roles:                []string{"triage"},
+		direct:               true,
+		inferenceProject:     "inf-proj",
+		inferenceWIFProvider: "projects/123456789/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc",
+		testClient:           fc,
 		testProjectNumberFn: func(_ context.Context, _ string) (string, error) {
 			lookupCalled = true
 			return "999", nil
@@ -1450,7 +1455,7 @@ func TestRunReposInstall_ExplicitProjectNumberSkipsLookup(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.False(t, lookupCalled,
-		"project number lookup should be skipped when --inference-project-number is explicit")
+		"project number lookup should be skipped when --inference-wif-provider is set")
 }
 
 func TestRunReposInstall_DefaultsInferenceRegion(t *testing.T) {
@@ -1493,7 +1498,7 @@ func TestRunReposInstall_ProjectNumberLookupError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "deriving project number")
 	assert.Contains(t, err.Error(), "API unavailable")
-	assert.Contains(t, err.Error(), "--inference-project-number")
+	assert.Contains(t, err.Error(), "--inference-wif-provider")
 }
 
 func TestRunReposInstall_PerRepoOverrideFlags_Applied(t *testing.T) {

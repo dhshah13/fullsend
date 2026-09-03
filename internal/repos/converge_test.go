@@ -2623,3 +2623,162 @@ func TestConverge_OrphanProgressWarnings(t *testing.T) {
 		t.Error("a repo with only orphan/none actions should not be marked converged")
 	}
 }
+
+func TestConverge_ExplicitWIFProviderUsedForAllRepos(t *testing.T) {
+	repoNames := []string{"acme/api", "acme/web"}
+	fc := newFakeClientForBatch(repoNames...)
+	m := newConvergeManifest(repoNames...)
+
+	sc := &fakeScaffoldCommit{}
+	explicitWIF := "projects/999/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc"
+	cfg := ConvergeConfig{
+		Manifest:         m,
+		MaxConcurrency:   4,
+		Roles:            []string{"triage"},
+		Direct:           true,
+		InferenceProject: "test-inference",
+		InferenceRegion:  "us-central1",
+		WIFProvider:      explicitWIF,
+	}
+
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	installed := result.Installed()
+	if len(installed) != 2 {
+		t.Errorf("expected 2 installed, got %d", len(installed))
+	}
+	for _, r := range installed {
+		if r.WIFProvider != explicitWIF {
+			t.Errorf("repo %s/%s: expected WIFProvider=%q, got %q",
+				r.Owner, r.Repo, explicitWIF, r.WIFProvider)
+		}
+	}
+	if len(result.Failed()) != 0 {
+		for _, f := range result.Failed() {
+			t.Errorf("unexpected failure: %s/%s: %v", f.Owner, f.Repo, f.Error)
+		}
+	}
+}
+
+func TestConverge_ExplicitWIFProviderSkipsCollisionCheck(t *testing.T) {
+	// Use repo names that would collide via BuildRepoProviderID's
+	// 32-char truncation (if per-repo derivation was used). With an
+	// explicit WIF provider, this must not cause a collision error.
+	repoNames := []string{"acme/api", "acme/web"}
+	fc := newFakeClientForBatch(repoNames...)
+	m := newConvergeManifest(repoNames...)
+
+	sc := &fakeScaffoldCommit{}
+	explicitWIF := "projects/999/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc"
+	cfg := ConvergeConfig{
+		Manifest:         m,
+		MaxConcurrency:   4,
+		Roles:            []string{"triage"},
+		Direct:           true,
+		InferenceProject: "test-inference",
+		InferenceRegion:  "us-central1",
+		WIFProvider:      explicitWIF,
+		// No InferenceProjectNumber — not needed with explicit WIF provider.
+	}
+
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	if len(result.Failed()) != 0 {
+		for _, f := range result.Failed() {
+			t.Errorf("unexpected failure (should not have collision check): %s/%s: %v",
+				f.Owner, f.Repo, f.Error)
+		}
+	}
+}
+
+func TestConverge_ExplicitWIFProviderNoProjectNumberRequired(t *testing.T) {
+	repoNames := []string{"acme/api"}
+	fc := newFakeClientForBatch(repoNames...)
+	m := newConvergeManifest(repoNames...)
+
+	sc := &fakeScaffoldCommit{}
+	cfg := ConvergeConfig{
+		Manifest:         m,
+		MaxConcurrency:   4,
+		Roles:            []string{"triage"},
+		Direct:           true,
+		InferenceProject: "test-inference",
+		InferenceRegion:  "us-central1",
+		WIFProvider:      "projects/999/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc",
+		// InferenceProjectNumber intentionally empty — should work.
+	}
+
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	if len(result.Failed()) != 0 {
+		for _, f := range result.Failed() {
+			t.Errorf("unexpected failure: %s/%s: %v", f.Owner, f.Repo, f.Error)
+		}
+	}
+	installed := result.Installed()
+	if len(installed) != 1 {
+		t.Errorf("expected 1 installed, got %d", len(installed))
+	}
+}
+
+func TestConverge_NoWIFProviderFallsBackToPerRepo(t *testing.T) {
+	repoNames := []string{"acme/api"}
+	fc := newFakeClientForBatch(repoNames...)
+	m := newConvergeManifest(repoNames...)
+
+	sc := &fakeScaffoldCommit{}
+	cfg := convergeCfgWithDefaults(m)
+	// WIFProvider not set — should derive per-repo provider IDs.
+
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	installed := result.Installed()
+	if len(installed) != 1 {
+		t.Fatalf("expected 1 installed, got %d", len(installed))
+	}
+
+	// Per-repo WIF should use BuildRepoProviderID, not be empty.
+	if installed[0].WIFProvider == "" {
+		t.Error("expected non-empty WIFProvider from per-repo derivation")
+	}
+	if !strings.Contains(installed[0].WIFProvider, "123456789") {
+		t.Errorf("expected WIFProvider to contain project number 123456789, got %q",
+			installed[0].WIFProvider)
+	}
+}
+
+func TestConverge_WIFProviderRequiresInferenceProject(t *testing.T) {
+	repoNames := []string{"acme/api"}
+	fc := newFakeClientForBatch(repoNames...)
+	m := newConvergeManifest(repoNames...)
+
+	sc := &fakeScaffoldCommit{}
+	cfg := ConvergeConfig{
+		Manifest:       m,
+		MaxConcurrency: 4,
+		Roles:          []string{"triage"},
+		Direct:         true,
+		WIFProvider:    "projects/999/locations/global/workloadIdentityPools/fullsend-inference/providers/github-oidc",
+		// InferenceProject intentionally empty — should be rejected.
+	}
+
+	_, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err == nil {
+		t.Fatal("expected error when WIFProvider is set without InferenceProject")
+	}
+	if !strings.Contains(err.Error(), "--inference-project is required when --inference-wif-provider is set") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
