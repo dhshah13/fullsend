@@ -323,6 +323,11 @@ providers:
   - openai
 ```
 
+Declaring it costs nothing on runs that do not use it: the run-scoped provider is created only
+when the selected runtime will actually call OpenAI (codex, or pi on an `openai/` model), so the
+same harness can carry the provider for every runtime — a Vertex run notes that the declared
+provider was skipped and needs no OpenAI credential.
+
 A custom agent (a `source:` entry) declares it on its own harness; the built-in fleet agents gain
 it with the GPT pilot in the fullsend-ai/agents repository. `providers/openai.yaml` arrives with
 the other upstream defaults when a run prepares its workspace, and both it and the matching profile

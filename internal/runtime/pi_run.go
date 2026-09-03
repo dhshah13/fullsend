@@ -117,6 +117,18 @@ func translatePiModel(model string) string {
 	return provider + "/" + model
 }
 
+// piModelProvider is the lowercase provider prefix of the pi model spec that
+// model resolves to — the value the gates in buildPiRunCommand and
+// NeedsOpenAIProvider branch on. pi matches provider prefixes
+// case-insensitively, so the prefix is folded here once: otherwise
+// "Anthropic-Vertex/..." would run on Vertex with the ANTHROPIC_* unset
+// skipped, and "OpenAI/..." would not be recognised as needing the OpenAI
+// run-scoped provider.
+func piModelProvider(model string) string {
+	provider, _, _ := strings.Cut(translatePiModel(model), "/")
+	return strings.ToLower(provider)
+}
+
 // normalizeXaiVertexModel renders the canonical three-segment spec for the
 // xai-vertex provider, or reports false when the input is not for it.
 //
@@ -214,18 +226,15 @@ func buildPiRunCommand(params RunParams, m *piManifest) string {
 	hooksEnabled := params.HooksSettingsPath != ""
 	hooksExt := r.ConfigDir() + "/" + piHooksExtensionFile
 
-	model := params.Model
-	if model == "" {
-		model = m.Model
-	}
+	// The agent definition's model is the fallback when the runner resolved
+	// none; EffectiveModel is shared with NeedsOpenAIProvider so the launch
+	// and the provider decision cannot disagree (#6920).
+	model := EffectiveModel(params.Model, m.Model)
 	modelSpec := translatePiModel(model)
-	// pi matches the provider prefix case-insensitively, so the gates must
-	// too or "Anthropic-Vertex/..." would run on Vertex with the unset
-	// skipped.
-	provider, _, _ := strings.Cut(modelSpec, "/")
-	vertex := strings.EqualFold(provider, piDefaultProvider)
-	xaiVertex := strings.EqualFold(provider, piXaiVertexProvider)
-	openai := strings.EqualFold(provider, piOpenAIProvider)
+	provider := piModelProvider(model)
+	vertex := provider == piDefaultProvider
+	xaiVertex := provider == piXaiVertexProvider
+	openai := provider == piOpenAIProvider
 
 	parts := []string{"cd " + shellQuote(params.RepoDir)}
 	// Resolve the pi binary before the agent-writable .env is sourced and
@@ -441,6 +450,17 @@ func PiOpenAIAuthSeed(configDir string) string {
 		` && command -p mv -f ` + tmp + ` ` + final
 }
 
+// OpenAIAuthSeed implements OpenAICredentialSeeder: the fragment that seeds
+// pi's auth.json with the sandbox's current OPENAI_API_KEY placeholder. The
+// runner runs it through `sandbox exec` after every credential refresh; Run
+// emits the same fragment at iteration start.
+func (r PiRuntime) OpenAIAuthSeed() string { return PiOpenAIAuthSeed(r.ConfigDir()) }
+
+// OpenAIAuthFile implements OpenAICredentialSeeder: pi's auth.json inside
+// the sandbox, which the runner greps for the new placeholder to confirm a
+// re-seed landed.
+func (r PiRuntime) OpenAIAuthFile() string { return r.ConfigDir() + "/" + piOpenAIAuthFile }
+
 // piOpenAIConfigGuard is the POSIX sh fragment that fails closed when the
 // pi config directory carries models.json, or an auth.json that is anything
 // but pi's own empty `{}` or the runner-seeded openai placeholder entry
@@ -505,14 +525,8 @@ func (r PiRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printe
 		// tracked on #6527. Say so rather than silently dropping the list.
 		printer.StepWarn(fmt.Sprintf("fallback models %s are not supported on pi yet and are ignored", sanitizeOutput(strings.Join(params.FallbackModels, ","))))
 	}
-	{
-		model := params.Model
-		if model == "" {
-			model = m.Model
-		}
-		if err := validatePiModel(model); err != nil {
-			return -1, err
-		}
+	if err := validatePiModel(EffectiveModel(params.Model, m.Model)); err != nil {
+		return -1, err
 	}
 	cmd := buildPiRunCommand(params, m)
 
@@ -539,11 +553,7 @@ func (r PiRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printe
 		handler = renderer.Handle
 	}
 
-	model := params.Model
-	if model == "" {
-		model = m.Model
-	}
-	modelSpec := translatePiModel(model)
+	modelSpec := translatePiModel(EffectiveModel(params.Model, m.Model))
 	// Telemetry and the renderer get the bare model id, as they do for
 	// Claude Code, so runs group by model across runtimes; the provider is
 	// gen_ai.system's job and stays visible on the command line.
