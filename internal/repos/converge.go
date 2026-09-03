@@ -56,6 +56,12 @@ type ConvergeConfig struct {
 	// ReviewAppClientID is the OAuth client ID of the review agent's
 	// GitHub App.
 	ReviewAppClientID string
+
+	// VendorOverride, when non-nil, overrides the manifest's resolved
+	// vendor setting for all repos in this convergence run. This lets
+	// `repos install --vendor` take effect without modifying the
+	// manifest. When nil, the per-repo resolved Vendor field is used.
+	VendorOverride *bool
 }
 
 // ComponentAction describes an action taken (or planned) on a single
@@ -505,6 +511,15 @@ func convergeRepo(ctx context.Context,
 		rref := resolveTargetRef(ctx, resolved.FullsendRef, cfg.UpstreamRef, cfg.UpstreamTag, refResolver)
 		ref, tag, manifestRef := rref.ref, rref.tag, rref.manifestRef
 
+		vendor := resolved.Vendor
+		if cfg.VendorOverride != nil {
+			vendor = *cfg.VendorOverride
+		}
+		if vendor && resolved.Forge == ForgeGitLab {
+			progress(rr.Owner+"/"+rr.Repo, "vendor",
+				"vendor enabled but GitLab CI templates do not yet reference the vendored binary")
+		}
+
 		installCfg := InstallConfig{
 			Owner:             rr.Owner,
 			Repo:              rr.Repo,
@@ -521,6 +536,7 @@ func convergeRepo(ctx context.Context,
 			Runtime:           resolved.Runtime,
 			Direct:            cfg.Direct,
 			ReuseSecrets:      hasSecrets,
+			VendorBinary:      vendor,
 		}
 
 		if manifestRef != "" && refResolver != nil {
@@ -1273,16 +1289,22 @@ func convergeScaffoldFiles(ctx context.Context,
 	rref := resolveTargetRef(ctx, resolved.FullsendRef, cfg.UpstreamRef, cfg.UpstreamTag, refResolver)
 	ref, tag, manifestRef := rref.ref, rref.tag, rref.manifestRef
 
+	repairVendor := resolved.Vendor
+	if cfg.VendorOverride != nil {
+		repairVendor = *cfg.VendorOverride
+	}
+
 	installCfg := InstallConfig{
-		Owner:       resolved.Owner,
-		Repo:        resolved.Repo,
-		Forge:       resolved.Forge,
-		Roles:       defaultRoles(cfg.Roles),
-		MintURL:     resolved.MintURL,
-		UpstreamRef: ref,
-		UpstreamTag: tag,
-		RunnerTags:  gitlabRunnerTags(cfg.Manifest),
-		Runtime:     resolved.Runtime,
+		Owner:        resolved.Owner,
+		Repo:         resolved.Repo,
+		Forge:        resolved.Forge,
+		Roles:        defaultRoles(cfg.Roles),
+		MintURL:      resolved.MintURL,
+		UpstreamRef:  ref,
+		UpstreamTag:  tag,
+		RunnerTags:   gitlabRunnerTags(cfg.Manifest),
+		Runtime:      resolved.Runtime,
+		VendorBinary: repairVendor,
 	}
 
 	if manifestRef != "" && refResolver != nil {
@@ -1403,6 +1425,9 @@ func convergeContentDriftFiles(ctx context.Context,
 	installCfg.Roles = defaultRoles(cfg.Roles)
 	installCfg.UpstreamRef = ref
 	installCfg.UpstreamTag = tag
+	if cfg.VendorOverride != nil {
+		installCfg.VendorBinary = *cfg.VendorOverride
+	}
 
 	if manifestRef != "" && refResolver != nil {
 		scaffoldFiles, fetchErr := FetchRemoteScaffold(

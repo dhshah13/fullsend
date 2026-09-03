@@ -73,7 +73,8 @@ fullsend
 │   │   ├── --inference-region <region>      #   Per-repo GCP inference region override
 │   │   ├── --fullsend-ref <ref>             #   Per-repo fullsend workflow ref override
 │   │   ├── --mint-url <url>                 #   Per-repo mint URL override
-│   │   └── --allowed-remote-resources <list> #  Per-repo allowed remote resources override
+│   │   ├── --allowed-remote-resources <list> #  Per-repo allowed remote resources override
+│   │   └── --vendor                         #   Vendor binary and content into each repo for offline CI
 │   ├── uninstall    <repos...>              # Tear down fullsend from repos and remove from manifest
 │   │   ├── -f, --manifest <path>            #   Path to repos.yaml (default: repos.yaml)
 │   │   ├── --dry-run                        #   Preview without making changes

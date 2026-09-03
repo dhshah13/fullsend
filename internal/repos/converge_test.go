@@ -2782,3 +2782,136 @@ func TestConverge_WIFProviderRequiresInferenceProject(t *testing.T) {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }
+
+func TestConverge_VendorOverrideSetsVendorBinary(t *testing.T) {
+	repoNames := []string{"acme/api"}
+	fc := newFakeClientForBatch(repoNames...)
+	m := newConvergeManifest(repoNames...)
+
+	sc := &spyScaffoldCommit{}
+	cfg := convergeCfgWithDefaults(m)
+	v := true
+	cfg.VendorOverride = &v
+
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	installed := result.Installed()
+	if len(installed) != 1 {
+		t.Errorf("expected 1 installed, got %d", len(installed))
+	}
+	if len(result.Failed()) != 0 {
+		t.Errorf("expected 0 failed, got %d", len(result.Failed()))
+	}
+	sc.assertVendoredWorkflow(t)
+}
+
+func TestConverge_ManifestVendorFieldSetsVendorBinary(t *testing.T) {
+	v := true
+	m := &Manifest{
+		Version:  1,
+		Defaults: DefaultsConfig{Vendor: &v},
+		GitHub: &PlatformConfig{
+			MintURL:     "https://mint.example.com",
+			FullsendRef: "v1.0.0",
+			Repos:       []RepoEntry{{Name: "acme/api"}},
+		},
+	}
+
+	fc := newFakeClientForBatch("acme/api")
+	sc := &spyScaffoldCommit{}
+	cfg := convergeCfgWithDefaults(m)
+
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	installed := result.Installed()
+	if len(installed) != 1 {
+		t.Errorf("expected 1 installed, got %d", len(installed))
+	}
+	if len(result.Failed()) != 0 {
+		t.Errorf("expected 0 failed, got %d", len(result.Failed()))
+	}
+	sc.assertVendoredWorkflow(t)
+}
+
+func TestConverge_VendorOverrideFalseDisablesManifestVendor(t *testing.T) {
+	v := true
+	m := &Manifest{
+		Version:  1,
+		Defaults: DefaultsConfig{Vendor: &v},
+		GitHub: &PlatformConfig{
+			MintURL:     "https://mint.example.com",
+			FullsendRef: "v1.0.0",
+			Repos:       []RepoEntry{{Name: "acme/api"}},
+		},
+	}
+
+	fc := newFakeClientForBatch("acme/api")
+	sc := &spyScaffoldCommit{}
+	cfg := convergeCfgWithDefaults(m)
+	f := false
+	cfg.VendorOverride = &f
+
+	result, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), noopProgress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	installed := result.Installed()
+	if len(installed) != 1 {
+		t.Errorf("expected 1 installed, got %d", len(installed))
+	}
+	if len(result.Failed()) != 0 {
+		t.Errorf("expected 0 failed, got %d", len(result.Failed()))
+	}
+	sc.assertNonVendoredWorkflow(t)
+}
+
+func TestConverge_VendorGitLabEmitsWarning(t *testing.T) {
+	v := true
+	m := &Manifest{
+		Version: 1,
+		GitLab: &PlatformConfig{
+			URL:         "https://gitlab.example.com",
+			FullsendRef: "v1.0.0",
+			Repos:       []RepoEntry{{Name: "acme/api"}},
+		},
+	}
+
+	fc := newFakeClientForBatch("acme/api")
+	sc := &fakeScaffoldCommit{}
+	cfg := ConvergeConfig{
+		Manifest:               m,
+		MaxConcurrency:         4,
+		Roles:                  []string{"triage"},
+		Direct:                 true,
+		InferenceProject:       "test-inference",
+		InferenceProjectNumber: "123456789",
+		InferenceRegion:        "us-central1",
+		VendorOverride:         &v,
+	}
+
+	var warnings []string
+	progress := func(repo, phase, msg string) {
+		if phase == "vendor" {
+			warnings = append(warnings, msg)
+		}
+	}
+
+	_, err := Converge(context.Background(), cfg, newTestClientFactory(fc), sc.fn(), progress)
+	if err != nil {
+		t.Fatalf("Converge() error: %v", err)
+	}
+
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 vendor warning, got %d: %v", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], "GitLab CI templates do not yet reference the vendored binary") {
+		t.Errorf("unexpected warning: %s", warnings[0])
+	}
+}

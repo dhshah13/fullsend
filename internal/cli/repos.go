@@ -436,6 +436,10 @@ type reposInstallConfig struct {
 	allowedRemoteResources []string
 	runtime                string
 
+	// Vendor flags
+	vendor        bool
+	vendorChanged bool
+
 	// Test overrides
 	testClient          forge.Client
 	testProjectNumberFn func(ctx context.Context, projectID string) (string, error)
@@ -467,6 +471,7 @@ GCP infrastructure (WIF, mint) must be provisioned separately via
 			if opts.gitlabBotToken == "" {
 				opts.gitlabBotToken = os.Getenv(forge.VarGitLabBotToken)
 			}
+			opts.vendorChanged = cmd.Flags().Changed("vendor")
 			return runReposInstall(cmd.Context(), opts)
 		},
 	}
@@ -486,6 +491,7 @@ GCP infrastructure (WIF, mint) must be provisioned separately via
 	cmd.Flags().StringSliceVar(&opts.allowedRemoteResources, "allowed-remote-resources", nil, "per-repo allowed remote resources override")
 	cmd.Flags().StringVar(&opts.runtime, "runtime", "", "agent runtime written to the per-repo config for repos added by this command (claude, pi, codex); repos already in the manifest keep their entry/defaults.runtime")
 	cmd.Flags().StringVar(&opts.gitlabBotToken, "gitlab-bot-token", "", "GitLab bot PAT for free-tier instances that don't support project access tokens")
+	cmd.Flags().BoolVar(&opts.vendor, "vendor", false, "vendor binary, reusable workflows, actions, and agent content into each repo for offline CI")
 
 	return cmd
 }
@@ -615,6 +621,9 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 			if forgeName != repos.ForgeGitHub && opts.mintURL != "" {
 				printer.StepWarn(fmt.Sprintf("--mint-url is only used with GitHub repos; ignored for %s", forgeName))
 			}
+			if forgeName != repos.ForgeGitHub && opts.vendorChanged && opts.vendor {
+				printer.StepWarn("--vendor only fully supported for GitHub repos; GitLab CI templates do not yet reference the vendored binary")
+			}
 			if opts.runtime != "" {
 				if err := validateRuntimeName(opts.runtime); err != nil {
 					return fmt.Errorf("--runtime: %w", err)
@@ -638,6 +647,16 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 				}
 				if opts.runtime != "" && opts.runtime != manifest.Defaults.Runtime {
 					entry.Runtime = opts.runtime
+				}
+				if opts.vendorChanged {
+					defaultVendor := manifest.Defaults.Vendor != nil && *manifest.Defaults.Vendor
+					if opts.vendor && !defaultVendor {
+						v := true
+						entry.Vendor = &v
+					} else if !opts.vendor && defaultVendor {
+						v := false
+						entry.Vendor = &v
+					}
 				}
 				entries[i] = entry
 			}
@@ -686,6 +705,15 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		return err
 	}
 
+	// When --vendor is explicitly set on the CLI, override the manifest
+	// vendor setting for all repos in this run. Both --vendor and
+	// --vendor=false are honored so the CLI can enable or disable
+	// vendoring for a one-off run.
+	var vendorOverride *bool
+	if opts.vendorChanged {
+		vendorOverride = &opts.vendor
+	}
+
 	upstreamRef, upstreamTag := resolveUpstreamRef()
 
 	scaffoldCommitFn := func(ctx context.Context, owner, repo string, files []forge.TreeFile, direct bool, installed bool) error {
@@ -697,6 +725,22 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		if fcErr != nil {
 			return fcErr
 		}
+
+		// When vendor is enabled (CLI flag or manifest), append vendored
+		// binary and content files to the scaffold commit so they are
+		// delivered atomically.
+		repoVendor := rc.Vendor
+		if vendorOverride != nil {
+			repoVendor = *vendorOverride
+		}
+		if repoVendor {
+			var vendorErr error
+			files, _, vendorErr = appendVendorTreeFiles(ctx, fc.Client, printer, owner, repo, files, true, "", "")
+			if vendorErr != nil {
+				return fmt.Errorf("collecting vendored assets: %w", vendorErr)
+			}
+		}
+
 		targetRepo, repoErr := fc.Client.GetRepo(ctx, owner, repo)
 		if repoErr != nil {
 			return fmt.Errorf("getting repo info: %w", repoErr)
@@ -734,6 +778,7 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		InferenceRegion:        opts.inferenceRegion,
 		WIFProvider:            opts.inferenceWIFProvider,
 		ReviewAppClientID:      reviewAppClientID,
+		VendorOverride:         vendorOverride,
 	}
 
 	progressFn := func(repo, phase, msg string) {
