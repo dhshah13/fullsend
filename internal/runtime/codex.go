@@ -1,32 +1,30 @@
 package runtime
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"io"
-	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/sandbox"
-	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
 // codexDebugLogFile is the per-iteration debug artifact for codex runs
 // (codex writes its tracing output to stderr, which Run will tee here).
 const codexDebugLogFile = "codex-debug.log"
 
-// codexNotImplemented is the shared not-implemented message. Every stub
-// method names the tracking issue so a CI log never shows an unattributed
-// failure.
-const codexNotImplemented = "codex runtime is not yet implemented (#6920)"
-
-// CodexRuntime is a stub implementation of the Runtime and TranscriptHandler
-// interfaces for the Codex agent runtime (openai/codex, CLI `codex`, pinned
-// in the sandbox image by CODEX_VERSION). All methods are no-ops or return
-// not-implemented errors; subsequent PRs fill in stream parsing, bootstrap,
-// run execution, and transcript extraction (#6920). It is registered in
-// Resolve() but deliberately absent from config.ValidRuntimes(), so no
-// per-repo config (nor an agents: entry) can select it until it works.
+// CodexRuntime drives the Codex agent runtime (openai/codex, CLI `codex`,
+// pinned in the sandbox image by CODEX_VERSION). Bootstrap
+// (codex_bootstrap.go) translates the Claude-style agent definition into a
+// runner-owned config.toml and installs the sandbox hook scripts behind an
+// adapter codex invokes from hooks.json (codex_config.go); Run (codex_run.go)
+// executes `codex exec --json` against a run-scoped OpenAI provider whose
+// bearer token comes from a runner-seeded file, and normalizes the stream via
+// parseCodexStream (codex_progress.go); transcripts are codex's rollout
+// session JSONL files (codex_transcript.go). Selectable with `runtime: codex`
+// once PR E adds it to config.ValidRuntimes() — per-repo config or an
+// `agents:` entry (#6920, ADR 0099).
+//
+// It is registered in Resolve() but deliberately absent from
+// config.ValidRuntimes() until then, so nothing can select it before the user
+// docs and the behaviour scenario land.
 type CodexRuntime struct{}
 
 func (CodexRuntime) Name() string { return "codex" }
@@ -57,59 +55,46 @@ func (r CodexRuntime) EnvExports() []string {
 	return []string{fmt.Sprintf("export CODEX_HOME=%s", r.ConfigDir())}
 }
 
-func (CodexRuntime) Bootstrap(_ BootstrapInput) error {
-	return errors.New(codexNotImplemented)
-}
-
-func (CodexRuntime) Run(_ context.Context, _ RunParams, _ *ui.Printer, _ time.Time, _ *RunMetrics) (int, error) {
-	return -1, errors.New(codexNotImplemented)
-}
-
-// ClearIterationArtifacts is a no-op while Run is a stub: nothing has run in
-// the sandbox, so there is nothing to clear. When Run is implemented this
-// must sweep stray sandbox processes (clearStrayProcesses, see
-// killStrayProcesses) before removing the iteration's files, like the other
-// runtimes — the Runtime interface documents that as part of the contract.
-func (CodexRuntime) ClearIterationArtifacts(_ string) error { return nil }
-
 // DebugLogName implements DebugLogNamer: the local artifact for codex's
 // stderr trace output.
 func (CodexRuntime) DebugLogName() string { return codexDebugLogFile }
 
-// OpenAIAuthSeed implements OpenAICredentialSeeder. It is a stub until
-// Bootstrap exists (#6920): codex reads its bearer token by running an auth
-// command that prints the placeholder from a runner-owned token file under
-// CODEX_HOME, and the fragment that writes that file is Bootstrap's to
-// emit. An empty seed is how a backend tells the runner it has no re-seed
-// to perform, so until then a codex run's run-scoped provider is created
-// and refreshed but nothing is re-seeded inside the sandbox.
-func (CodexRuntime) OpenAIAuthSeed() string { return "" }
+// OpenAIAuthFile implements runtime.OpenAICredentialSeeder: the runner-owned
+// file codex's auth command prints. codex caches the token for
+// refresh_interval_ms and then re-runs the command, so re-seeding this file is
+// what lets a running iteration follow a credential refresh — the same role
+// pi's auth.json plays, and for the same reason (OpenShell 0.0.115 pins a
+// revision-scoped placeholder to the generation it was issued for and refuses
+// the unrevisioned alias, so the process environment cannot carry a
+// placeholder that survives a refresh; a file the process re-reads can).
+func (r CodexRuntime) OpenAIAuthFile() string { return r.ConfigDir() + "/" + codexTokenFile }
 
-// OpenAIAuthFile implements OpenAICredentialSeeder: the token file the auth
-// command reads, which the runner greps to confirm a re-seed landed. Empty
-// for the same reason as OpenAIAuthSeed — Bootstrap names it (#6920).
-func (CodexRuntime) OpenAIAuthFile() string { return "" }
-
-// TranscriptHandler stub methods — return not-implemented errors for extract
-// methods (to avoid silent success claims in CI logs) and no-ops for parse
-// methods (which correctly indicate "nothing found"). See #6920.
-
-func (CodexRuntime) ExtractTranscripts(_, _, _ string) error {
-	return errors.New("codex transcript extraction not implemented (#6920)")
-}
-
-func (CodexRuntime) ExtractDebugLog(_, _, _ string) error {
-	return errors.New("codex debug log extraction not implemented (#6920)")
-}
-
-func (CodexRuntime) ParseTranscriptErrors(_ string) []TranscriptError { return nil }
-
-func (CodexRuntime) ParseTranscriptFile(_ string) (TranscriptError, bool) {
-	return TranscriptError{}, false
-}
-
-func (CodexRuntime) EmitTranscriptErrors(w io.Writer, summaries []TranscriptError) {
-	emitTranscriptErrors(w, summaries)
+// OpenAIAuthSeed implements runtime.OpenAICredentialSeeder: the POSIX sh
+// fragment that writes the placeholder the sandbox environment carries for
+// OPENAI_API_KEY into the token file, atomically via rename so the auth
+// command never reads a half-written file.
+//
+// It runs at iteration start, before the agent-writable .env is sourced, and
+// the runner re-runs it through `sandbox exec` after every credential refresh
+// once the sandbox has observed the new generation: an exec'd shell's
+// environment holds the current placeholder, so the runner never needs to know
+// the opaque revision. A value that is not a gateway placeholder fails the
+// run — a real key in the sandbox environment would mean the provider path was
+// bypassed, and forwarding it would defeat the design (ADR 0092).
+func (r CodexRuntime) OpenAIAuthSeed() string {
+	dir := shellQuote(r.ConfigDir())
+	final := shellQuote(r.OpenAIAuthFile())
+	tmp := shellQuote(r.OpenAIAuthFile() + ".fullsend")
+	// piPlaceholderPrefix is the OpenShell gateway namespace, not a
+	// pi-specific value; it is assembled from two parts there on purpose and
+	// is referenced rather than copied so there is exactly one spelling of it
+	// in the tree (fullsend#6716).
+	return `case "${OPENAI_API_KEY:-}" in ` + piPlaceholderPrefix +
+		`*OPENAI_API_KEY) ;; *) echo 'fullsend: OPENAI_API_KEY in the sandbox is not a gateway placeholder (openai provider not attached, or a real key reached the sandbox); refusing to run codex' >&2; exit 1 ;; esac` +
+		` && case "$OPENAI_API_KEY" in *[!A-Za-z0-9_:]*) echo 'fullsend: OPENAI_API_KEY placeholder has unexpected characters; refusing to run codex' >&2; exit 1 ;; esac` +
+		` && command -p mkdir -p ` + dir +
+		` && printf '%s' "$OPENAI_API_KEY" > ` + tmp +
+		` && command -p mv -f ` + tmp + ` ` + final
 }
 
 // Compile-time interface assertions.

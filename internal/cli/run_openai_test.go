@@ -1356,13 +1356,19 @@ func TestEnsureOpenAIProvider_SeedComesFromTheSelectedBackend(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		backend  agentruntime.Backend
-		wantSeed bool
+		wantSeed string
 		wantFile string
 	}{
-		{name: "pi seeds its auth.json", backend: newBackend("pi"), wantSeed: true,
+		{name: "pi seeds its auth.json", backend: newBackend("pi"),
+			wantSeed: agentruntime.PiRuntime{}.OpenAIAuthSeed(),
 			wantFile: agentruntime.PiRuntime{}.ConfigDir() + "/auth.json"},
 		{name: "claude has no seeder", backend: newBackend("claude")},
-		{name: "codex's seeder is still a stub", backend: newBackend("codex")},
+		// codex reads its bearer token by running an auth command that prints
+		// the placeholder from this file, so the runner re-seeds it after
+		// every refresh exactly as it does pi's auth.json (#6920).
+		{name: "codex seeds its token file", backend: newBackend("codex"),
+			wantSeed: agentruntime.CodexRuntime{}.OpenAIAuthSeed(),
+			wantFile: agentruntime.CodexRuntime{}.ConfigDir() + "/openai-token"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeOpenshellRecorder(t)
@@ -1375,14 +1381,14 @@ func TestEnsureOpenAIProvider_SeedComesFromTheSelectedBackend(t *testing.T) {
 			h, err := ensureOpenAIProvider(context.Background(), pd, "fs-cod-feedface", config.OpenAIWIFConfig{}, tc.backend, ui.New(io.Discard))
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantFile, h.authFile)
-			if tc.wantSeed {
-				assert.Equal(t, agentruntime.PiRuntime{}.OpenAIAuthSeed(), h.authSeed)
+			if tc.wantSeed != "" {
+				assert.Equal(t, tc.wantSeed, h.authSeed)
 			} else {
 				assert.Empty(t, h.authSeed, "no seeder means no re-seed")
 			}
 			// sandboxReady gates the re-seed on a non-empty fragment.
 			h.sandboxUp.Store(true)
-			assert.Equal(t, tc.wantSeed, h.sandboxReady())
+			assert.Equal(t, tc.wantSeed != "", h.sandboxReady())
 		})
 	}
 }
