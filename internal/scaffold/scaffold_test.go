@@ -1022,3 +1022,21 @@ func TestPrependManagedHeaderNoHeader(t *testing.T) {
 	result := PrependManagedHeader("AGENTS.md", content)
 	assert.Equal(t, content, result, "files without headers should be returned unchanged")
 }
+
+func TestScaffoldVertexProfile_BinaryAllowlist(t *testing.T) {
+	data, err := FullsendRepoFile("profiles/fullsend-vertex-ai.yaml")
+	require.NoError(t, err)
+
+	var profile struct {
+		Binaries []string `yaml:"binaries"`
+	}
+	require.NoError(t, yaml.Unmarshal(data, &profile))
+
+	// Pin the whole list, not just the two entries #6971 added: this copy
+	// must stay in sync with profiles/fullsend-vertex-ai.yaml in
+	// fullsend-ai/agents (the fleet copy), which is what the sandbox
+	// actually enforces. Claude Code 2.1.2xx installs its native binary at
+	// bin/claude.exe even on Linux, so **/claude alone denies it STS access.
+	assert.ElementsMatch(t, []string{"**/claude", "**/claude.exe", "**/node", "**/pi"}, profile.Binaries,
+		"scaffold Vertex profile binaries drifted from the pinned allowlist; keep it in sync with the fullsend-ai/agents copy")
+}
