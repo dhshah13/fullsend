@@ -55,7 +55,7 @@ flowchart TB
   end
   subgraph SB["Sandbox boundary — OpenShell + L7 egress policy (containment)"]
     direction TB
-    EG["egress allowlist: *.googleapis.com · api.anthropic.com\n(+ api.openai.com POST /v1/responses with the openai provider)\nbinaries: **/claude · **/node (pi runs via node) · **/codex"]
+    EG["egress allowlist: *.googleapis.com · api.anthropic.com\n(+ api.openai.com POST /v1/responses with the openai provider)\nbinaries: **/claude · **/claude.exe · **/node (pi runs via node) · **/pi (fleet-profile parity) · **/codex"]
     subgraph PROC["Runtime process — steering, defense in depth"]
       direction LR
       PRE["PreToolUse\nTirith · SSRF\ncanary · allowlist"]
