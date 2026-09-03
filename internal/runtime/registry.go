@@ -15,8 +15,6 @@ func Resolve(name string) (Backend, error) {
 		r := ClaudeRuntime{}
 		return Backend{Runtime: r, Transcripts: r}, nil
 	case "codex":
-		// Stub: registered for dev/testing, kept out of
-		// config.ValidRuntimes() until it is implemented (#6920).
 		r := CodexRuntime{}
 		return Backend{Runtime: r, Transcripts: r}, nil
 	case "dummy":
@@ -99,9 +97,9 @@ func ResolveForAgent(agents []config.AgentEntry, repoRuntime, agent string) (Bac
 }
 
 // validateConfigRuntime checks that rt is in the set of user-facing
-// runtimes allowed in config files.  Stub runtimes (e.g. "opencode",
-// "codex") are intentionally excluded from [config.ValidRuntimes] so
-// they cannot be activated through per-repo config or an agents: entry.
+// runtimes allowed in config files.  Stub runtimes (e.g. "opencode") are
+// intentionally excluded from [config.ValidRuntimes] so they cannot be
+// activated through per-repo config or an agents: entry.
 func validateConfigRuntime(rt string) error {
 	valid := config.ValidRuntimes()
 	if !slices.Contains(valid, rt) {

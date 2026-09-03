@@ -245,6 +245,7 @@ export default defineConfig({
           items: [
             { text: "Claude Code", link: "/runtimes/claude" },
             { text: "Pi", link: "/runtimes/pi" },
+            { text: "Codex", link: "/runtimes/codex" },
           ],
         },
         {

@@ -37,7 +37,7 @@ resolve through fullsend's table, and a bare id gets the provider from `FULLSEND
 > Identity](../guides/infrastructure/openai-workload-identity.md); GitHub Actions only) and keeps it
 > in a provider that belongs to this run, refreshed before it expires and removed when the run
 > ends. Locally, put `OPENAI_API_KEY` in an env file for the runner ([Running agents
-> locally](../guides/user/running-agents-locally.md#get-an-openai-key-gpt-on-pi-only)). Declare
+> locally](../guides/user/running-agents-locally.md#get-an-openai-key-gpt-on-pi-or-codex)). Declare
 > `providers: [openai]` on the harness; the sandbox can then reach `api.openai.com` for the
 > Responses API and nothing else, and never sees the credential
 > ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)). A custom harness must carry a

@@ -117,7 +117,7 @@ When repos are specified as positional arguments, only those repos are processed
 | `--fullsend-ref` | | Per-repo fullsend workflow ref override |
 | `--mint-url` | | Per-repo mint URL override |
 | `--allowed-remote-resources` | | Per-repo allowed remote resources override |
-| `--runtime` | | Agent runtime (`claude`, `pi`) recorded for repos this command adds; existing entries keep their `runtime` / `defaults.runtime` |
+| `--runtime` | | Agent runtime (`claude`, `pi`, `codex`) recorded for repos this command adds; existing entries keep their `runtime` / `defaults.runtime` |
 | `--gitlab-bot-token` | | GitLab bot PAT for free-tier instances that don't support project access tokens (env: `FULLSEND_GITLAB_BOT_TOKEN`) |
 
 ### GitLab bot token
@@ -255,7 +255,7 @@ fullsend repos set-default github.mint_url ""   # removes the key
 | Key | Type | Description |
 |-----|------|-------------|
 | `defaults.allowed_remote_resources` | comma-separated URLs | HTTPS URLs agents may fetch at runtime |
-| `defaults.runtime` | `claude` or `pi` | Agent runtime written as each repo's `runtime:` at install; a per-entry `runtime` overrides it (`none` stops the chain) |
+| `defaults.runtime` | `claude`, `pi` or `codex` | Agent runtime written as each repo's `runtime:` at install; a per-entry `runtime` overrides it (`none` stops the chain) |
 | `github.url` | URL | GitHub instance URL (default: `https://github.com`) |
 | `github.mint_url` | URL | Token mint service URL (defaults to `https://mint.fullsend.sh` in public mode) |
 | `github.mint_mode` | `public` or `private` | Controls the default mint URL: `public` defaults to `https://mint.fullsend.sh`; `private` requires an explicit `mint_url` (default: `public`) |

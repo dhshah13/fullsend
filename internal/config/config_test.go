@@ -411,8 +411,8 @@ func TestValidRuntimes(t *testing.T) {
 	assert.Contains(t, runtimes, "pi")
 	assert.Contains(t, runtimes, "dummy")
 	assert.Contains(t, runtimes, "dummy-playback")
+	assert.Contains(t, runtimes, "codex")
 	assert.NotContains(t, runtimes, "opencode", "opencode is resolved via runtime.Resolve() but not user-selectable until implemented")
-	assert.NotContains(t, runtimes, "codex", "codex is resolved via runtime.Resolve() but not user-selectable until implemented (#6920)")
 }
 
 func TestOrgConfigValidateRuntime(t *testing.T) {
@@ -428,6 +428,10 @@ func TestOrgConfigValidateRuntime(t *testing.T) {
 
 	cfg.Defaults.Runtime = "pi"
 	require.NoError(t, cfg.Validate(), "pi is user-selectable (#6464)")
+
+	// No codex case here: org mode is deprecated (ADR 0044), so codex's
+	// selectability is asserted on the per-repo and agents: paths instead
+	// (TestPerRepoConfigValidate_Runtime, TestResolveForAgent).
 
 	// opencode is resolvable via runtime.Resolve() but not in ValidRuntimes(),
 	// so config validation must reject it until the runtime is implemented.
@@ -686,16 +690,13 @@ func TestPerRepoConfigValidate_Runtime(t *testing.T) {
 	cfg.Runtime = "pi"
 	assert.NoError(t, cfg.Validate(), "pi is user-selectable (#6464)")
 
-	// opencode and codex are resolvable via runtime.Resolve() but not in
-	// ValidRuntimes(), so config validation must reject them until those
-	// runtimes are implemented.
+	cfg.Runtime = "codex"
+	assert.NoError(t, cfg.Validate(), "codex is user-selectable (#6920)")
+
+	// opencode is resolvable via runtime.Resolve() but not in ValidRuntimes(),
+	// so config validation must reject it until the runtime is implemented.
 	cfg.Runtime = "opencode"
 	err := cfg.Validate()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid runtime")
-
-	cfg.Runtime = "codex"
-	err = cfg.Validate()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid runtime")
 
@@ -2603,10 +2604,6 @@ func TestAgentSettings_Validate(t *testing.T) {
 		{"invalid model", "agents:\n  - name: triage\n    model: bad//id\n", `invalid model "bad//id"`},
 		{"leading slash model", "agents:\n  - name: triage\n    model: /leading\n", "invalid model"},
 		{"invalid runtime", "agents:\n  - name: triage\n    runtime: opencode\n", `invalid runtime "opencode"`},
-		// codex is registered in runtime.Resolve() but not in ValidRuntimes()
-		// yet (#6920), so an agents: entry cannot select it. Flip this row to
-		// a positive case in the PR that adds codex to ValidRuntimes().
-		{"stub runtime codex", "agents:\n  - name: triage\n    runtime: codex\n", `invalid runtime "codex"`},
 		{"invalid effort", "agents:\n  - name: triage\n    effort: turbo\n", `invalid effort "turbo"`},
 		{"invalid effort on sourced entry", "agents:\n  - source: harness/lint.yaml\n    effort: turbo\n", `invalid effort "turbo"`},
 		{"duplicate built-in tuning", "agents:\n  - name: triage\n    model: sonnet\n  - name: Triage\n    model: haiku\n", "duplicate agent name"},

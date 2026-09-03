@@ -174,8 +174,8 @@ type aggregateMetrics struct {
 	Iterations int    `json:"iterations"`
 	ToolCalls  int    `json:"tool_calls"`
 	Model      string `json:"model,omitempty"`
-	// Runtime is the backend that ran the iterations (claude, pi, dummy,
-	// dummy-playback), so artifacts record which runtime a per-repo
+	// Runtime is the backend that ran the iterations (claude, pi, codex,
+	// dummy, dummy-playback), so artifacts record which runtime a per-repo
 	// `runtime:` selected.
 	Runtime string `json:"runtime,omitempty"`
 	// RequestedRuntime is the runtime selected for the run (config file or a
@@ -185,12 +185,13 @@ type aggregateMetrics struct {
 	// "FULLSEND_RUNTIME", the config file path, or "default (config not found)".
 	RuntimeSource string `json:"runtime_source,omitempty"`
 	// RequestedModel is the model handed to the runtime after the per-run
-	// overrides (--model, FULLSEND_MODEL, FULLSEND_PI_MODEL on pi) were
-	// applied; Model is what the provider reported.
+	// overrides (--model, FULLSEND_MODEL, and the runtime-scoped
+	// FULLSEND_PI_MODEL / FULLSEND_CODEX_MODEL) were applied; Model is what
+	// the provider reported.
 	RequestedModel string `json:"requested_model,omitempty"`
 	// OverrideSource records where RequestedModel came from ("--model flag",
-	// "FULLSEND_MODEL", "FULLSEND_PI_MODEL", "harness", "default") so a
-	// silent override is visible after the fact.
+	// "FULLSEND_MODEL", "FULLSEND_PI_MODEL", "FULLSEND_CODEX_MODEL",
+	// "harness", "default") so a silent override is visible after the fact.
 	OverrideSource string `json:"override_source,omitempty"`
 }
 
@@ -470,8 +471,8 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().IntVar(&sOpts.statusNum, "status-number", 0, "issue/PR number for status comments")
 	cmd.Flags().IntVar(&sOpts.statusComment, "status-comment-id", 0, "ID of the triggering comment, for comment-scoped reactions on slash-command runs (optional)")
 	cmd.Flags().StringVar(&sOpts.mintURL, "mint-url", "", "mint service URL for on-demand status tokens (default: $FULLSEND_MINT_URL)")
-	cmd.Flags().StringVar(&oFlags.runtime, "runtime", "", "override the agent runtime from config.yaml for this run (claude, pi, dummy or dummy-playback; also $FULLSEND_RUNTIME)")
-	cmd.Flags().StringVar(&oFlags.model, "model", "", "override the harness/agent model for this run (alias such as opus/sonnet/haiku, a model id, or provider/id on pi; also $FULLSEND_MODEL)")
+	cmd.Flags().StringVar(&oFlags.runtime, "runtime", "", "override the agent runtime from config.yaml for this run (claude, pi, codex, dummy or dummy-playback; also $FULLSEND_RUNTIME)")
+	cmd.Flags().StringVar(&oFlags.model, "model", "", "override the harness/agent model for this run (alias such as opus/sonnet/haiku, a model id, or provider/id on pi and codex — codex takes OpenAI ids only; also $FULLSEND_MODEL)")
 	cmd.Flags().StringVar(&oFlags.effort, "effort", "", "override the harness effort level for this run (low, medium, high, xhigh, max; also $FULLSEND_EFFORT)")
 	_ = cmd.MarkFlagRequired("fullsend-dir")
 	_ = cmd.MarkFlagRequired("target-repo")
@@ -976,7 +977,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		return err
 	}
 	// The config file is loaded once here and serves runtime selection, the
-	// FULLSEND_PI_MODEL gate and the agents: settings application below.
+	// runtime-scoped model gate and the agents: settings application below.
 	runCfg, runCfgErr := loadRunConfig(orgConfigPath)
 	if runCfgErr != nil {
 		if errors.Is(runCfgErr, errParsingConfigRuntime) {
@@ -987,9 +988,10 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		return runCfgErr
 	}
 	if overrides.runtime == "" {
-		// The pi-only FULLSEND_PI_MODEL alias depends on which runtime the
-		// config selects; resolve the config runtime first (including
-		// the agents: entry's runtime), then re-run.
+		// The runtime-scoped model aliases (FULLSEND_PI_MODEL,
+		// FULLSEND_CODEX_MODEL) depend on which runtime the config
+		// selects; resolve the config runtime first (including the
+		// agents: entry's runtime), then re-run.
 		if b, _, e := runCfg.backend(agentName); e == nil {
 			overrides, err = resolveRunOverrides(oFlags, os.Getenv, b.Runtime.Name())
 			if err != nil {
