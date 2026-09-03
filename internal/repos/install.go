@@ -71,6 +71,8 @@ type InstallConfig struct {
 	// Empty keeps the code default; ignored when PerRepoConfig is set.
 	Runtime string
 
+	// VendorBinary renders scaffold workflows to reference the vendored
+	// binary path instead of fetching from upstream on each CI run.
 	VendorBinary bool
 
 	// ReviewAppClientID is the OAuth client ID of the review agent's
@@ -300,6 +302,7 @@ func driftInstallConfig(resolved ResolvedConfig, dcfg DriftConfig) InstallConfig
 		UpstreamRef:       ref,
 		UpstreamTag:       ref,
 		Runtime:           resolved.Runtime,
+		VendorBinary:      resolved.Vendor,
 		InferenceRegion:   dcfg.InferenceRegion,
 		ReviewAppClientID: dcfg.ReviewAppClientID,
 		RunnerTags:        dcfg.RunnerTags,

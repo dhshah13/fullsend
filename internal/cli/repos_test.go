@@ -1154,6 +1154,13 @@ func TestReposInstallCmd_ForgeFlag(t *testing.T) {
 	assert.Equal(t, "", forgeFlag.DefValue)
 }
 
+func TestReposInstallCmd_VendorFlag(t *testing.T) {
+	cmd := newReposInstallCmd()
+	f := cmd.Flags().Lookup("vendor")
+	require.NotNil(t, f, "expected --vendor flag")
+	assert.Equal(t, "false", f.DefValue)
+}
+
 func TestReposInstallCmd_PerRepoOverrideFlags(t *testing.T) {
 	cmd := newReposInstallCmd()
 	for _, name := range []string{"inference-region", "inference-wif-provider", "fullsend-ref", "mint-url", "allowed-remote-resources"} {
@@ -1642,6 +1649,8 @@ gitlab:
 		inferenceRegion: "us-central1",
 		fullsendRef:     "v2.0.0",
 		mintURL:         "https://mint.example.com",
+		vendor:          true,
+		vendorChanged:   true,
 		direct:          true,
 		testClient:      fc,
 	})
@@ -1900,4 +1909,102 @@ gitlab:
 	require.NotEmpty(t, fc.CreatedProposals, "expected a scaffold PR to be created")
 	assert.Contains(t, fc.CreatedProposals[0].Title, "[skip ci]",
 		"GitLab scaffold MR title must include [skip ci] to suppress dispatch")
+}
+
+func TestRunReposInstall_VendorFlagPersistsOnNewRepo(t *testing.T) {
+	manifestPath := writeTestManifest(t, testManifestYAML)
+	fc := newInstallFakeClient("acme/api", "acme/web")
+
+	err := runReposInstall(context.Background(), &reposInstallConfig{
+		manifest:               manifestPath,
+		concurrency:            4,
+		repoFilter:             []string{"acme/web"},
+		forge:                  repos.ForgeGitHub,
+		roles:                  []string{"triage"},
+		direct:                 true,
+		inferenceProject:       "inf-proj",
+		inferenceProjectNumber: "123456789",
+		inferenceRegion:        "us-central1",
+		vendor:                 true,
+		vendorChanged:          true,
+		testClient:             fc,
+	})
+	require.NoError(t, err)
+
+	m, loadErr := repos.LoadManifest(context.Background(), manifestPath)
+	require.NoError(t, loadErr)
+	require.NotNil(t, m.GitHub)
+	require.Equal(t, 2, len(m.GitHub.Repos))
+	newEntry := m.GitHub.Repos[1]
+	assert.Equal(t, "acme/web", newEntry.Name)
+	require.NotNil(t, newEntry.Vendor, "vendor should be persisted on new entry")
+	assert.True(t, *newEntry.Vendor)
+}
+
+func TestRunReposInstall_VendorFalsePersistsWhenDefaultTrue(t *testing.T) {
+	vendorManifest := `version: 1
+defaults:
+  vendor: true
+github:
+  mint_url: https://mint.example.com
+  fullsend_ref: v1.0.0
+  repos:
+    - name: acme/api
+`
+	manifestPath := writeTestManifest(t, vendorManifest)
+	fc := newInstallFakeClient("acme/api", "acme/web")
+
+	err := runReposInstall(context.Background(), &reposInstallConfig{
+		manifest:               manifestPath,
+		concurrency:            4,
+		repoFilter:             []string{"acme/web"},
+		forge:                  repos.ForgeGitHub,
+		roles:                  []string{"triage"},
+		direct:                 true,
+		inferenceProject:       "inf-proj",
+		inferenceProjectNumber: "123456789",
+		inferenceRegion:        "us-central1",
+		vendor:                 false,
+		vendorChanged:          true,
+		testClient:             fc,
+	})
+	require.NoError(t, err)
+
+	m, loadErr := repos.LoadManifest(context.Background(), manifestPath)
+	require.NoError(t, loadErr)
+	require.NotNil(t, m.GitHub)
+	require.Equal(t, 2, len(m.GitHub.Repos))
+	newEntry := m.GitHub.Repos[1]
+	assert.Equal(t, "acme/web", newEntry.Name)
+	require.NotNil(t, newEntry.Vendor, "vendor=false should be persisted when defaults.vendor=true")
+	assert.False(t, *newEntry.Vendor)
+}
+
+func TestRunReposInstall_VendorNotPersistedWhenUnchanged(t *testing.T) {
+	manifestPath := writeTestManifest(t, testManifestYAML)
+	fc := newInstallFakeClient("acme/api", "acme/web")
+
+	err := runReposInstall(context.Background(), &reposInstallConfig{
+		manifest:               manifestPath,
+		concurrency:            4,
+		repoFilter:             []string{"acme/web"},
+		forge:                  repos.ForgeGitHub,
+		roles:                  []string{"triage"},
+		direct:                 true,
+		inferenceProject:       "inf-proj",
+		inferenceProjectNumber: "123456789",
+		inferenceRegion:        "us-central1",
+		vendor:                 false,
+		vendorChanged:          false,
+		testClient:             fc,
+	})
+	require.NoError(t, err)
+
+	m, loadErr := repos.LoadManifest(context.Background(), manifestPath)
+	require.NoError(t, loadErr)
+	require.NotNil(t, m.GitHub)
+	require.Equal(t, 2, len(m.GitHub.Repos))
+	newEntry := m.GitHub.Repos[1]
+	assert.Equal(t, "acme/web", newEntry.Name)
+	assert.Nil(t, newEntry.Vendor, "vendor should not be set when --vendor was not passed")
 }
