@@ -436,8 +436,9 @@ function in `internal/cli/run.go` is the canonical implementation.
 2. **Apply `security.SecretRedactor` as a second-pass fallback.**
    The `RunnerEnv` scan only catches credentials the harness declared.
    A `security.NewSecretRedactor().Scan(content)` call catches
-   credentials with recognizable shapes (high-entropy tokens, PEM
-   blocks, connection strings) that never passed through the runner
+   credentials with recognizable shapes (known-prefix tokens such as
+   `ghp_`, `sk-ant-`, `AKIA`, PEM blocks, connection strings) that
+   never passed through the runner
    environment — for example, a key baked into a test fixture or a
    pre-commit hook printing its own secrets.
 
