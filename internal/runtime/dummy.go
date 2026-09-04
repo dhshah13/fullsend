@@ -111,7 +111,7 @@ func (r DummyRuntime) Bootstrap(input BootstrapInput) error {
 		return fmt.Errorf("bootstrap exec: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("bootstrap: exited %d: %s", exitCode, strings.TrimSpace(stderr))
+		return fmt.Errorf("bootstrap failed: %s", strings.TrimSpace(stderr))
 	}
 	return nil
 }
@@ -155,7 +155,7 @@ func (r DummyRuntime) ClearIterationArtifacts(sandboxName string) error {
 		return fmt.Errorf("clear iteration artifacts exec: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("clear iteration artifacts: exited %d: %s", exitCode, strings.TrimSpace(stderr))
+		return fmt.Errorf("clear iteration artifacts failed: %s", strings.TrimSpace(stderr))
 	}
 	return nil
 }

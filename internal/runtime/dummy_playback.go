@@ -107,7 +107,7 @@ func (r DummyPlaybackRuntime) Bootstrap(input BootstrapInput) error {
 		return fmt.Errorf("dummy-playback bootstrap exec: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("bootstrap: exited %d: %s", exitCode, strings.TrimSpace(stderr))
+		return fmt.Errorf("dummy-playback bootstrap failed: %s", strings.TrimSpace(stderr))
 	}
 	return nil
 }
@@ -305,7 +305,7 @@ func (r DummyPlaybackRuntime) ClearIterationArtifacts(sandboxName string) error 
 		return fmt.Errorf("dummy-playback clear iteration artifacts exec: %w", err)
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("clear iteration artifacts: exited %d: %s", exitCode, strings.TrimSpace(stderr))
+		return fmt.Errorf("dummy-playback clear iteration artifacts failed: %s", strings.TrimSpace(stderr))
 	}
 	return nil
 }
