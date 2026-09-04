@@ -40,6 +40,60 @@ On this page:
    wrapper) is not covered by `**/node`
    ([Egress binary identity](#egress-binary-identity-per-runtime)).
 
+### Consumer-completeness touchpoints
+
+After the core implementation above, walk through every file below. Each
+one contains a hardcoded list of valid runtimes or runtime-specific
+content that must be updated whenever a runtime is added or renamed.
+
+**Registration and config:**
+
+- [ ] `internal/runtime/registry.go` — add a `case` to `Resolve()` that
+  returns the new backend (mirrors step 1 above — listed here so the
+  walkthrough is self-contained).
+- [ ] `internal/config/config.go` — add the runtime name to the slice
+  returned by `ValidRuntimes()`.
+
+**Tests:**
+
+- [ ] `internal/runtime/registry_test.go` — add a `Resolve("<name>")`
+  assertion block to `TestResolve` (and to `TestResolveFromConfig` /
+  `TestResolveFromPerRepoConfig` if the runtime is user-selectable).
+- [ ] `internal/config/config_test.go` — update any assertion on
+  `ValidRuntimes()` to include the new name.
+
+**CLI:**
+
+- [ ] `internal/cli/runtime_prompt.go` — if the runtime is test-only
+  (e.g. `dummy`, `dummy-playback`), filter it from
+  `userRuntimeChoices()` so it does not appear in the interactive
+  prompt.
+- [ ] `internal/cli/run.go` — update the `--runtime` flag description
+  to list the new runtime name.
+- [ ] `internal/cli/admin.go` — update the `--runtime` flag description
+  in `newInstallCmd()` to include the new runtime name.
+- [ ] `internal/cli/github.go` — update the `--runtime` flag description
+  in `newGitHubSetupCmd()` to include the new runtime name.
+
+**Documentation:**
+
+- [ ] `docs/runtimes.md` — add a row to the
+  [harness config-keys table](../runtimes.md#harness-config-keys-per-runtime)
+  (item 4 above) and add the runtime to any prose lists of valid values.
+- [ ] `docs/architecture.md` — update the runtime selection diagram
+  (the Mermaid `CFG` node lists valid runtime names) and any prose
+  references.
+- [ ] `docs/cli/run.md` — update any `--runtime` flag description or
+  valid-values list if the page documents runtime flags.
+- [ ] `docs/cli/github.md` — same as `run.md` if this page documents
+  runtime flags.
+- [ ] `docs/guides/infrastructure/layered-config-reference.md` — update
+  the `runtime` field's valid values in the config-key table.
+
+Use this list as a mechanical walkthrough — check every box, even if the
+answer is "no change needed", so omissions are deliberate rather than
+accidental.
+
 ## Security feature matrix
 
 The sandbox is the containment boundary; everything a runtime does with hooks and tool restrictions is steering inside it ([ADR 0027](../ADRs/0027-allowed-and-disallowed-tools-for-agents.md)). Read the matrix with that picture in mind:
