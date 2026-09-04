@@ -541,6 +541,7 @@ Vendoring commit messages use title + body (upload and stale delete). `github st
 ```go
 SandboxWorkspace       = "/sandbox/workspace"
 SandboxClaudeConfig    = "/sandbox/claude-config"
+SandboxCodexConfig     = "/sandbox/codex-config"
 SandboxPiConfig        = "/sandbox/pi-config"
 SandboxPiExtensionsDir = "/usr/local/share/pi-extensions"   // image-baked, read-only pi extensions (loaded only via -e)
 ```
