@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -431,6 +432,10 @@ func TestOTELVariableForwarding(t *testing.T) {
 		"OTEL_EXPORTER_OTLP_CERTIFICATE",
 		"OTEL_RESOURCE_ATTRIBUTES",
 		"OTEL_SDK_DISABLED",
+		// Level 3 content-capture gate: a non-secret toggle, forwarded on
+		// the vars channel exactly like OTEL_SDK_DISABLED so orgs on managed
+		// workflows can enable it (ADR 0050 Level 3).
+		"OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
 	}
 
 	forwardLine := func(v string) string {
@@ -560,6 +565,29 @@ func TestReusableDispatchWorkflowContent(t *testing.T) {
 	assert.Regexp(t, `(?s)ready-for-review"\s*\]\];\s*then\s*\n\s+if \[\[ "\$\{ISSUE_IS_PR\}"`, s)
 }
 
+// TestDispatchPunctuationStrip ensures both dispatch files strip trailing
+// punctuation clusters (not just a single char) from COMMAND and SECOND_WORD.
+// See #5582.
+func TestDispatchPunctuationStrip(t *testing.T) {
+	type workflowCase struct {
+		name    string
+		content func(t *testing.T) []byte
+	}
+	cases := []workflowCase{
+		{"reusable-dispatch.yml", loadRepoFile(".github/workflows/reusable-dispatch.yml")},
+		{"scaffold/dispatch.yml", loadScaffoldFile(".github/workflows/dispatch.yml")},
+	}
+	for _, wc := range cases {
+		t.Run(wc.name, func(t *testing.T) {
+			s := string(wc.content(t))
+			assert.Contains(t, s, `sed 's/[.,;:!?]*$//'`,
+				"COMMAND/SECOND_WORD must strip punctuation clusters via sed with * quantifier")
+			assert.NotContains(t, s, `sed 's/[.,;:!?]$//'`,
+				"single-char strip (without *) should not appear — it misses clusters like ...")
+		})
+	}
+}
+
 // TestDispatchPerStageAuthorization ensures triage-role users can trigger
 // observation stages (triage/review) but not mutation stages (code/fix).
 // See #5223 and ADR 0054.
@@ -639,6 +667,64 @@ func TestShimScaffoldBranchFilter(t *testing.T) {
 				"%s dispatch job must filter scaffold branch PRs to prevent self-dispatch noise", tc.name)
 		})
 	}
+}
+
+// TestShimPerRepoSlashCommandFilter validates that the per-repo shim template
+// filters issue_comment events with both a /fs- prefix check and a bot-type
+// guard, preserving defense-in-depth while short-circuiting non-slash-command
+// comments at the workflow level (#6738).
+func TestShimPerRepoSlashCommandFilter(t *testing.T) {
+	content := loadScaffoldFile("templates/shim-per-repo.yaml")(t)
+
+	var wf callerWorkflow
+	require.NoError(t, yaml.Unmarshal(content, &wf))
+	job, ok := wf.Jobs["dispatch"]
+	require.True(t, ok, "per-repo shim must have a dispatch job")
+
+	assert.Contains(t, job.If, "startsWith(github.event.comment.body, '/fs-')",
+		"per-repo shim dispatch job must filter issue_comment events to /fs-* slash commands")
+
+	assert.Contains(t, job.If, "github.event.comment.user.type != 'Bot'",
+		"per-repo shim must retain bot-type filter for defense-in-depth alongside /fs- prefix check")
+}
+
+// TestShimPerRepoNoFullsendAlias validates that the per-repo dispatch
+// workflow does not route on the removed /fullsend alias (#6738).
+func TestShimPerRepoNoFullsendAlias(t *testing.T) {
+	type workflowCase struct {
+		name    string
+		content func(t *testing.T) []byte
+	}
+	cases := []workflowCase{
+		{"scaffold/dispatch.yml", loadScaffoldFile(".github/workflows/dispatch.yml")},
+		{"reusable-dispatch.yml", loadRepoFile(".github/workflows/reusable-dispatch.yml")},
+	}
+	for _, wc := range cases {
+		t.Run(wc.name, func(t *testing.T) {
+			s := string(wc.content(t))
+			assert.NotContains(t, s, `/fullsend)`,
+				"%s must not route on the /fullsend alias (removed in #6738)", wc.name)
+			assert.NotContains(t, s, `SECOND_WORD`,
+				"%s must not parse SECOND_WORD for the removed /fullsend alias", wc.name)
+		})
+	}
+}
+
+// TestLiveShimSlashCommandFilter validates that the live fullsend.yaml workflow
+// uses both a /fs- prefix filter and bot-type guard for defense-in-depth (#6738).
+func TestLiveShimSlashCommandFilter(t *testing.T) {
+	content := loadRepoFile(".github/workflows/fullsend.yaml")(t)
+
+	var wf callerWorkflow
+	require.NoError(t, yaml.Unmarshal(content, &wf))
+	job, ok := wf.Jobs["dispatch"]
+	require.True(t, ok, "fullsend.yaml must have a dispatch job")
+
+	assert.Contains(t, job.If, "startsWith(github.event.comment.body, '/fs-')",
+		"fullsend.yaml dispatch job must filter issue_comment events to /fs-* slash commands")
+
+	assert.Contains(t, job.If, "github.event.comment.user.type != 'Bot'",
+		"fullsend.yaml must retain bot-type filter for defense-in-depth alongside /fs- prefix check")
 }
 
 // TestDispatchPRHeadResolution validates that both dispatch workflows contain
@@ -782,6 +868,109 @@ func TestReusableDispatchPRHeadSHAPassthrough(t *testing.T) {
 	})
 }
 
+// TestWorkItemKeyEnvCompatibility validates that legacy code dispatch and the
+// common harness-dispatch path expose the forge-neutral key alongside the
+// backwards-compatible GitHub issue number (#6760).
+func TestWorkItemKeyEnvCompatibility(t *testing.T) {
+	t.Run("legacy reusable code", func(t *testing.T) {
+		content := string(loadRepoFile(".github/workflows/reusable-code.yml")(t))
+		section := extractStepSection(t, content, "Run code agent")
+		assert.Contains(t, section,
+			"FULLSEND_WORK_ITEM_URL: ${{ fromJSON(inputs.event_payload).issue.html_url }}")
+		assert.Contains(t, section,
+			"FULLSEND_WORK_ITEM_KEY: ${{ fromJSON(inputs.event_payload).issue.number }}")
+		assert.Contains(t, section,
+			"ISSUE_NUMBER: ${{ fromJSON(inputs.event_payload).issue.number }}")
+	})
+
+	t.Run("route based code", func(t *testing.T) {
+		content := string(loadRepoFile(".github/workflows/reusable-dispatch.yml")(t))
+		section := extractStepSection(t, content, "Run code agent")
+		assert.Contains(t, section,
+			"FULLSEND_WORK_ITEM_KEY: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}")
+		assert.Contains(t, section,
+			"ISSUE_NUMBER: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}")
+	})
+
+	t.Run("harness dispatch", func(t *testing.T) {
+		content := string(loadRepoFile(".github/workflows/reusable-dispatch.yml")(t))
+		exportSection := extractStepSection(t, content, "Export dispatch context env")
+		assert.Contains(t, exportSection,
+			`._normalized_event.entity.key // .issue.number // .pull_request.number // empty`)
+		assert.Contains(t, exportSection,
+			`if ._normalized_event.source.system == "jira" then empty`)
+		assert.Contains(t, exportSection, `echo "work_item_key<<${DELIM}"`)
+		assert.Contains(t, exportSection, `printf '%s' "${WORK_ITEM_KEY}"`)
+		assert.NotContains(t, exportSection, `echo "work_item_key=${WORK_ITEM_KEY}"`)
+
+		runSection := extractStepSection(t, content, "Run harness agent")
+		assert.Contains(t, runSection,
+			"FULLSEND_WORK_ITEM_KEY: ${{ steps.dispatch-env.outputs.work_item_key }}")
+		assert.Contains(t, runSection,
+			"ISSUE_NUMBER: ${{ steps.dispatch-env.outputs.issue_number }}")
+	})
+}
+
+// TestReusableDispatchStatusCommentPassthrough validates that all agent jobs in
+// reusable-dispatch.yml pass run-url, status-repo, and status-number to the
+// action, enabling status comments for every stage (#6397).
+func TestReusableDispatchStatusCommentPassthrough(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "reusable-dispatch.yml"))
+	require.NoError(t, err)
+	s := string(content)
+
+	stages := []string{"triage", "code", "review", "fix", "retro", "prioritize"}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			marker := fmt.Sprintf("Run %s agent", stage)
+			section := extractStepSection(t, s, marker)
+			assert.Contains(t, section, "run-url:",
+				"%s agent step must pass run-url to action.yml", stage)
+			assert.Contains(t, section, "status-repo:",
+				"%s agent step must pass status-repo to action.yml", stage)
+			assert.Contains(t, section, "status-number:",
+				"%s agent step must pass status-number to action.yml", stage)
+		})
+	}
+
+	t.Run("harness-run", func(t *testing.T) {
+		marker := "Run harness agent"
+		section := extractStepSection(t, s, marker)
+		assert.Contains(t, section, "run-url:",
+			"harness-run agent step must pass run-url to action.yml")
+		assert.Contains(t, section, "status-repo:",
+			"harness-run agent step must pass status-repo to action.yml")
+		assert.Contains(t, section, "status-number:",
+			"harness-run agent step must pass status-number to action.yml")
+	})
+}
+
+// TestShimPerRepoProjectNumberPassthrough validates that the per-repo shim
+// template passes project_number to reusable-dispatch.yml (#6397).
+func TestShimPerRepoProjectNumberPassthrough(t *testing.T) {
+	content := loadScaffoldFile("templates/shim-per-repo.yaml")(t)
+	s := string(content)
+	assert.Contains(t, s, "project_number:",
+		"per-repo shim must pass project_number to reusable-dispatch.yml")
+	assert.Contains(t, s, "vars.FULLSEND_PROJECT_NUMBER",
+		"per-repo shim project_number must read from vars.FULLSEND_PROJECT_NUMBER")
+}
+
+// TestPrioritizeThinCallerThreadsProjectNumber validates that the prioritize
+// thin caller template accepts project_number as a workflow_dispatch input
+// and forwards it to the reusable workflow using an input-first fallback
+// expression (#6490).
+func TestPrioritizeThinCallerThreadsProjectNumber(t *testing.T) {
+	content := loadScaffoldFile(".github/workflows/prioritize.yml")(t)
+	s := string(content)
+	assert.Contains(t, s, "project_number:",
+		"prioritize thin caller must declare project_number input")
+	assert.Contains(t, s, "inputs.project_number",
+		"prioritize thin caller must forward inputs.project_number to the reusable workflow")
+	assert.Contains(t, s, "inputs.project_number || vars.FULLSEND_PROJECT_NUMBER",
+		"prioritize thin caller must fall back to vars.FULLSEND_PROJECT_NUMBER when input is empty")
+}
+
 // TestShimLabeledEventFiltering validates that shim workflows use the ready-
 // prefix filter at the if: guard level and label-aware concurrency keys so
 // routing labels don't cancel each other (#2452).
@@ -796,7 +985,7 @@ func TestShimLabeledEventFiltering(t *testing.T) {
 	}
 
 	cases := []shimCase{
-		{"fullsend.yaml", loadRepoFile(".github/workflows/fullsend.yaml"), true},
+		{"fullsend.yaml", loadRepoFile(".github/workflows/fullsend.yaml"), false},
 		{"scaffold/shim-workflow-call.yaml", loadScaffoldFile("templates/shim-workflow-call.yaml"), true},
 		{"scaffold/shim-per-repo.yaml", loadScaffoldFile("templates/shim-per-repo.yaml"), false},
 	}
@@ -994,6 +1183,125 @@ func TestRoleCheckCaseBranches(t *testing.T) {
 				"triage must not be remapped")
 			assert.NotRegexp(t, `review\).*STAGE_ROLE=`, s,
 				"review must not be remapped")
+		})
+	}
+}
+
+// TestOpenAIVariableForwarding validates that the OpenAI WIF identifiers
+// (#6689, ADR 0092) reach the agent step of every stage the way the OTEL
+// variables do: repository/organization variables are visible inside a
+// reusable workflow without forwarding, but only an explicit `env:` entry
+// on the `fullsend run` step puts them in the runner's environment.
+func TestOpenAIVariableForwarding(t *testing.T) {
+	openAIVars := []string{
+		"FULLSEND_OPENAI_AUDIENCE",
+		"FULLSEND_OPENAI_IDENTITY_PROVIDER_ID",
+		"FULLSEND_OPENAI_SERVICE_ACCOUNT_ID",
+	}
+	forwardLine := func(v string) string {
+		return v + ": ${{ vars." + v + " }}"
+	}
+
+	stages := []string{"triage", "code", "review", "fix", "retro", "prioritize"}
+	for _, stage := range stages {
+		t.Run("reusable-"+stage+".yml", func(t *testing.T) {
+			content := string(loadRepoFile(fmt.Sprintf(".github/workflows/reusable-%s.yml", stage))(t))
+			for _, v := range openAIVars {
+				assert.Contains(t, content, forwardLine(v),
+					"reusable-%s.yml must inject %s into agent env", stage, v)
+			}
+		})
+	}
+
+	t.Run("reusable-dispatch.yml", func(t *testing.T) {
+		content := string(loadRepoFile(".github/workflows/reusable-dispatch.yml")(t))
+		stepMarkers := []string{
+			"Run triage agent",
+			"Run code agent",
+			"Run review agent",
+			"Run fix agent",
+			"Run retro agent",
+			"Run prioritize agent",
+			"Run harness agent",
+		}
+		for _, marker := range stepMarkers {
+			t.Run(marker, func(t *testing.T) {
+				section := extractStepSection(t, content, marker)
+				for _, v := range openAIVars {
+					assert.Contains(t, section, forwardLine(v),
+						"%q step must inject %s", marker, v)
+				}
+			})
+		}
+	})
+}
+
+// TestHarnessRunResolvesBotIdentity validates that the common matrix path
+// exports the app-derived commit identity before it configures and runs an
+// agent (#6762). Harnesses intentionally require this identity so commits are
+// associated with the GitHub App, including for DCO checks.
+func TestHarnessRunResolvesBotIdentity(t *testing.T) {
+	content := string(loadRepoFile(".github/workflows/reusable-dispatch.yml")(t))
+	harnessStart := strings.Index(content, "  harness-run:\n")
+	require.NotEqual(t, -1, harnessStart, "reusable-dispatch.yml must define harness-run")
+	harnessJob := content[harnessStart:]
+
+	identity := extractStepSection(t, harnessJob, "Resolve bot identity")
+	assert.Contains(t, identity, "GH_TOKEN: ${{ steps.app-token.outputs.token }}")
+	assert.Contains(t, identity, "viewer { login databaseId }")
+	assert.Contains(t, identity, `GIT_BOT_EMAIL="${BOT_USER_ID}+${BOT_LOGIN}@users.noreply.github.com"`)
+	assert.Contains(t, identity, `echo "GIT_BOT_EMAIL=${GIT_BOT_EMAIL}" >> "${GITHUB_ENV}"`)
+	assert.Contains(t, identity, `git config --global user.email "${GIT_BOT_EMAIL}"`)
+	assert.Contains(t, identity, `git config --global user.name "${BOT_LOGIN}"`)
+
+	identityIndex := strings.Index(harnessJob, "      - name: Resolve bot identity\n")
+	setupIndex := strings.Index(harnessJob, "      - name: Setup agent environment\n")
+	require.NotEqual(t, -1, setupIndex, "harness-run must set up the agent environment")
+	assert.Less(t, identityIndex, setupIndex, "harness-run must resolve identity before agent environment setup")
+}
+
+// TestLayeredDirsMatchWorkspacePreparation pins the LAYERED_DIRS list in
+// every workspace-preparation step to scaffold.layeredDirs. The scaffold
+// skips these directories at install time on the promise that workspace
+// preparation materialises them from upstream at run time; providers/ was
+// on the skip list without being on the copy list, which left per-repo
+// installs with only a .gitkeep and no way to declare a provider by name
+// (#6689). profiles/ stays off the copy list on purpose: the run imports
+// every profile in .fullsend/profiles, and the scaffold's copies would
+// replace the canonical profiles the fleet resolves from fullsend-ai/agents
+// (fullsend-github-ro, fullsend-vertex-ai, ...). A profile a runner needs
+// for its own provider type — fullsend-openai — is imported from the
+// embedded scaffold by `fullsend run` instead.
+func TestLayeredDirsMatchWorkspacePreparation(t *testing.T) {
+	notLayered := map[string]bool{"profiles": true}
+	want := make([]string, 0, len(layeredDirs))
+	for _, d := range layeredDirs {
+		if d := strings.TrimSuffix(d, "/"); !notLayered[d] {
+			want = append(want, d)
+		}
+	}
+	sort.Strings(want)
+
+	files := []struct {
+		name    string
+		content func(t *testing.T) []byte
+	}{
+		{"actions/prepare-workspace/action.yml", loadRepoFile(".github/actions/prepare-workspace/action.yml")},
+	}
+	for _, stage := range []string{"triage", "code", "review", "fix", "retro", "prioritize", "dispatch"} {
+		files = append(files, struct {
+			name    string
+			content func(t *testing.T) []byte
+		}{"reusable-" + stage + ".yml", loadRepoFile(".github/workflows/reusable-" + stage + ".yml")})
+	}
+	re := regexp.MustCompile(`LAYERED_DIRS="([^"]*)"`)
+	for _, f := range files {
+		t.Run(f.name, func(t *testing.T) {
+			m := re.FindStringSubmatch(string(f.content(t)))
+			require.NotNil(t, m, "%s must define LAYERED_DIRS", f.name)
+			got := strings.Fields(m[1])
+			sort.Strings(got)
+			assert.Equal(t, want, got, "%s LAYERED_DIRS must match scaffold.layeredDirs", f.name)
 		})
 	}
 }

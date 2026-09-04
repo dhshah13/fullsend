@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
 )
 
 // resourceKey returns a stable entity-based key for concurrency control.
@@ -61,6 +63,8 @@ func (p *Poller) dispatch(ctx context.Context, owner, repo, stage string, event 
 		"EVENT_PAYLOAD_B64": encoded,
 		"RESOURCE_KEY":      rk,
 		"IS_FORK":           strconv.FormatBool(isFork),
+		"ORIGINATING_URL":   entityURL(p.gitlabURL, p.projectPath, event.Type, event.IID),
+		"REPO_FULL_NAME":    p.projectPath,
 	}
 	if event.MRAuthorID != 0 {
 		variables["MR_AUTHOR_ID"] = strconv.Itoa(event.MRAuthorID)
@@ -72,11 +76,11 @@ func (p *Poller) dispatch(ctx context.Context, owner, repo, stage string, event 
 		variables["STATUS_IID"] = strconv.Itoa(event.IID)
 	}
 	if p.opts.PollJobURL != "" {
-		variables["FULLSEND_POLL_JOB_URL"] = p.opts.PollJobURL
+		variables[forge.VarPollJobURL] = p.opts.PollJobURL
 	}
 
 	if p.opts.DispatchSecret != "" {
-		variables["FULLSEND_DISPATCH_HMAC"] = computeDispatchHMAC(p.opts.DispatchSecret, variables)
+		variables[forge.VarDispatchHMAC] = computeDispatchHMAC(p.opts.DispatchSecret, variables)
 	} else if !p.warnedNoHMAC {
 		p.warnedNoHMAC = true
 		log.Printf("WARNING: FULLSEND_DISPATCH_SECRET not set — dispatch variables are unsigned; configure a protected, masked CI/CD variable to enable HMAC verification")
@@ -113,9 +117,11 @@ var signedDispatchKeys = []string{
 	"ACTOR_ID",
 	"EVENT_PAYLOAD_B64",
 	"EVENT_TYPE",
-	"FULLSEND_POLL_JOB_URL",
+	forge.VarPollJobURL,
 	"IS_FORK",
 	"MR_AUTHOR_ID",
+	"ORIGINATING_URL",
+	"REPO_FULL_NAME",
 	"RESOURCE_KEY",
 	"STAGE",
 	"STATUS_IID",

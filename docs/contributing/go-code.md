@@ -1,10 +1,10 @@
 # Go Code
 
 **Mint function:** The mint Cloud Function source lives in two places that must stay in sync:
-- `internal/mint/main.go` — the source of truth (has its own `go.mod`, tests run from `internal/mint/`)
-- `internal/dispatch/gcf/mintsrc/main.go.embed` — the embedded copy deployed as a GCP Cloud Function
+- `internal/mint/` — the source of truth (has its own `go.mod`, tests run from `internal/mint/`)
+- `internal/dispatch/gcf/mintsrc/` — the embedded copies (`.embed` suffix) deployed as a GCP Cloud Function
 
-When changing `internal/mint/main.go`, always copy it to `internal/dispatch/gcf/mintsrc/main.go.embed`. If `go.mod` or `go.sum` changed, sync those to `go.mod.embed` and `go.sum.embed` too.
+When changing **any** non-test `.go` file in `internal/mint/`, copy it to the corresponding `.embed` file in `internal/dispatch/gcf/mintsrc/`. If `go.mod` or `go.sum` changed, sync those to `go.mod.embed` and `go.sum.embed` too. The `lint-mint-embed-sync` pre-commit hook checks all files — not just `main.go`.
 
 **Standalone mint:** `cmd/mint/` is a standalone HTTP server variant of the token mint that serves the same purpose as the GCF mint (`internal/mint/`) but runs without GCP infrastructure. Both use the shared `internal/mintcore/` library for token minting logic; they differ only in deployment model (filesystem PEM vs Secret Manager, JWKS vs STS verification). It supports custom role permissions via `CUSTOM_ROLE_PERMISSIONS` and a fallback proxy to an upstream mint. It has its own `go.mod` and tests run from `cmd/mint/`.
 
@@ -17,7 +17,21 @@ The `internal/mintcore/` module is shared between the mint and devmint. Its file
 **When adding a new file to `internal/mintcore/`:**
 1. **Create the `.embed` copy:** Place it in `internal/dispatch/gcf/mintsrc/mintcore/` (required for all files — `lint-mint-embed-sync` enforces this).
 2. **Register in `embeddedMintFiles`:** If the file will be included in the GCF bundle — either no build tag (e.g., `config.go`) or `//go:build !js` (e.g., `sts_verifier.go`, `gcp_pem.go`, `wif.go`) — add it to `embeddedMintFiles` in `internal/dispatch/gcf/provisioner.go` and to the `go:embed` directive.
-3. **Add to `gcfSkip`:** If the file should NOT be in the GCF bundle — Worker-only files (`//go:build js`) or standalone-mint-only files — add it to the `gcfSkip` map in `TestEmbeddedMintSource_MatchesOriginal` in `provisioner_test.go` instead of `embeddedMintFiles`. The three current entries are `fetch_js.go` and `pem_js.go` (Worker-only, `//go:build js`) and `file_pem.go` (standalone-mint-only, `//go:build !js`).
+3. **Add to `gcfSkip`:** If the file should NOT be in the GCF bundle — Worker-only files (`//go:build js`) or standalone-mint-only files — add it to the `gcfSkip` map in `TestEmbeddedMintSource_MatchesOriginal` in `provisioner_test.go` instead of `embeddedMintFiles`. The five current entries are `env_js.go`, `fetch_js.go`, `http_client_js.go`, and `pem_js.go` (Worker-only, `//go:build js`) and `file_pem.go` (standalone-mint-only, `//go:build !js`).
+
+**Verifying embed sync:** After modifying any file under `internal/mint/` or `internal/mintcore/`, run the lint script to verify all copies are in sync:
+
+```bash
+./hack/lint-mint-embed-sync
+```
+
+You can also run the embed test to catch desyncs:
+
+```bash
+go test -race -count=1 -run TestEmbeddedMintSource ./internal/dispatch/gcf/
+```
+
+Both checks run in CI, but running them locally before committing catches desyncs early and avoids wasted CI iterations.
 
 **Dispatch workflows:** See [Workflow Contracts](workflow-contracts.md) for dispatch sync rules, secret/input threading across installation-mode chains, and review instructions.
 
@@ -41,7 +55,7 @@ The `make wasm-build` target enforces these limits automatically — run it afte
 - **Construct concrete verifiers at the load site** (see `cmd/mint/main.go`, `internal/mint/main.go`, `cmd/mint-wasm/main.go`). Each load site creates the appropriate `OIDCVerifier` — `NewJWKSVerifier` for standalone/Worker/devmint, `NewSTSVerifier` for the Cloud Function — and passes it directly into `NewHandler`. Runtime constants such as the OIDC audience live in `mintconsts.OIDCAudience` and are applied inside the verifier constructors, so load sites do not need to thread configuration through closures or factories.
 - **`mintEnv` and `mintHTTP` are package-internal accessors** in `internal/mintcore/`. `NewHandler` reads configuration via `mintEnv(key)` and all HTTP calls go through `mintHTTP(req)`. On native platforms (`//go:build !js`), `mintEnv` delegates to `os.Getenv` and `mintHTTP` uses a cached `*http.Client` with 30-second timeout. On WASM (`//go:build js`), the CF Worker calls `RegisterEnv` and `RegisterHTTP` once during `mintcoreInitMint` to supply JS callbacks. **Do not** pass HTTP clients from entrypoints into verifier configs or handler constructors — call `mintHTTP(req)` directly at use sites inside `internal/mintcore`. Tests override the HTTP function with `SetMintHTTPForTest(t, fake)` and use `t.Setenv` for environment variables.
 
-When making changes to Go code under `cmd/` or `internal/`:
+When making changes to Go code under `cmd/`, `internal/`, or `pkg/`:
 
 1. **Unit tests:** Run `make go-test` (or `go test ./...`) and fix any failures before committing.
 2. **Coverage:** CI enforces thresholds via [Codecov](https://about.codecov.io/) (see [`.codecov.yml`](../../.codecov.yml)). **Patch coverage** on changed lines must meet **80%** (with a 5% tolerance). **Project coverage** must not drop more than **1%** below the base branch. `make go-test` alone does **not** enforce these thresholds — you must verify coverage locally before committing. See [Verifying patch coverage locally](#verifying-patch-coverage-locally) below for the exact commands.
@@ -58,7 +72,10 @@ of `codecov/patch` failures on first push.
 
 ### Step-by-step
 
-1. **Identify changed Go files** (excluding tests and generated code):
+1. **Identify changed Go files** (excluding tests and generated code).
+   **Stage new files first** (`git add`) — `git diff --name-only` only
+   sees tracked or staged files, so an unstaged new file would be
+   invisible and the check would silently skip it.
 
    ```bash
    git diff --name-only main -- '*.go' | grep -v '_test.go'
@@ -229,6 +246,31 @@ goroutines as a **medium-severity** finding, and recommend collecting a
 `[]error` and returning `errors.Join`. Do not flag intentional fail-fast
 cancellation patterns.
 
+## Context-aware blocking
+
+Functions that accept `context.Context` must not use `time.Sleep` or other
+unconditionally-blocking calls. Use `select` to respect cancellation:
+
+```go
+// Good — respects context cancellation.
+select {
+case <-ctx.Done():
+    return ctx.Err()
+case <-time.After(backoff):
+}
+
+// Bad — blocks unconditionally, ignores cancellation.
+time.Sleep(backoff)
+```
+
+This applies to retry loops, polling intervals, and any deliberate delay.
+For retry patterns specifically, check whether the package already provides
+an injectable sleep function (e.g., `sandbox.RetrySleepFn`) for testability.
+
+For blocking syscalls like `syscall.Flock(LOCK_EX)` that cannot be
+interrupted, add a comment documenting the worst-case blocking duration
+and why it is acceptable.
+
 ## Error handling and naming conventions
 
 ### Use typed constants over string literals
@@ -286,6 +328,90 @@ This matches the pattern in `internal/cli/tracker_client.go` and `internal/cli/f
 ### Consistent error message content
 
 When multiple code paths produce errors for the same condition across different forges or providers, ensure they mention the same remediation options. For example, if one "no token found" error suggests both the environment variable and the `--token` flag, other forge-specific token errors should do the same — so users see consistent guidance regardless of which code path triggers.
+
+## Go pitfalls
+
+### `Timeout() bool` interface and `context.DeadlineExceeded`
+
+`context.DeadlineExceeded` implements `interface{ Timeout() bool }` and returns `true`. This means any timeout detection that uses an interface type assertion will incorrectly classify context deadline errors as timeouts:
+
+```go
+// WRONG — matches context.DeadlineExceeded, which is not a transient
+// network timeout but an intentional cancellation by the caller.
+var te interface{ Timeout() bool }
+if errors.As(err, &te) && te.Timeout() {
+    return true // retries context deadlines — incorrect
+}
+```
+
+Context deadline and cancellation errors represent intentional cancellation by the caller (e.g., a request timeout set by the application, a user-initiated cancel). They should never be classified as transient or retried — the caller chose to stop waiting, and retrying re-creates the same deadline.
+
+**Always guard against context errors before checking `Timeout()`:**
+
+```go
+// CORRECT — context errors are excluded before the Timeout() check.
+if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+    return false
+}
+var te interface{ Timeout() bool }
+if errors.As(err, &te) && te.Timeout() {
+    return true // only matches genuine network timeouts (e.g. net/http.Client.Timeout)
+}
+```
+
+See [`forge.IsTransient`](../../internal/forge/forge.go) for the canonical example of the correct pattern.
+
+**When reviewing PRs:** Flag any `Timeout() bool` interface assertion without a preceding `errors.Is(err, context.DeadlineExceeded)` guard as a medium-severity finding. The fix is to add the context-error check before the `Timeout()` check.
+
+### Template map iteration
+
+Go's `text/template` `range` action visits map keys of basic types (string,
+int, uint, float) in **sorted order** — unlike bare `range` over a map in Go code.
+Do **not** flag `{{ range $k, $v := .SomeMap }}` in templates as
+non-deterministic when the key type is a basic type. See
+[text/template documentation](https://pkg.go.dev/text/template) (search
+"sorted key order").
+
+**When reviewing PRs:** Do not flag `range` over a basic-type-keyed map
+inside a `text/template` as non-deterministic output. The `text/template`
+package guarantees sorted iteration for string, int, uint, and float keys. This
+is a well-documented exception to Go's general rule that map iteration
+order is unspecified.
+
+## Injectable function variables (test seams)
+
+Package-level variables that hold function values for test overriding must:
+
+- Use an `XxxFn` suffix (e.g., `BuildWASMFn`, `RetrySleepFn`, `WranglerWhoamiFn`). Both exported (`XxxFn`) and unexported (`xxxFn`) variables follow this suffix pattern
+- Default to the real implementation
+- Include a doc comment following Go convention (starting with the variable name) that contains an "Override in tests to..." sentence describing the override behavior
+- Be restored in a `t.Cleanup` callback when overridden
+
+Examples: `internal/sandbox/sandbox.go` (`RetrySleepFn`), `internal/dispatch/cf/provisioner.go` (`BuildWASMFn`, `CopyWASMExecFn`).
+
+## Secure HTTP clients
+
+**Scope.** These requirements apply to any client whose target URL is derived from **untrusted configuration, user input, or remote content** — that is where SSRF lives. A client that talks to a **fixed first-party endpoint supplied by the sandbox/runner bootstrap** is out of scope for the SSRF hardening below. For example, `internal/cli/fetchskill.go` POSTs to the runner-side fetch service on the host, which is bound to `0.0.0.0` per ADR 0046, bearer-token authenticated, and reached over a private address. The runner injects `FULLSEND_FETCH_URL` and `FULLSEND_FETCH_TOKEN` as reserved keys that harness YAML cannot shadow, so this is a deliberate trusted channel rather than an arbitrary configuration URL. Such clients should still set a timeout and bound the response body, but do not need IP filtering, proxy disabling, or an HTTPS-only rule. The current `fetchskill.go` client sets a timeout but does not yet bound its decoded response body; that gap is not an example to copy.
+
+**Prefer the shared, SSRF-hardened fetcher `internal/fetch.FetchURL` over constructing a raw `http.Client`.** Pass it a `fetch.FetchPolicy` (see `fetch.DefaultPolicy` for the GitHub-content defaults) rather than re-implementing the protections. `internal/fetch/fetch.go` is the canonical reference.
+
+`FetchURL` has a deliberately narrow envelope — reach for it only when all of these hold, otherwise it will reject the request or can't express what you need:
+
+- **The legitimate host set is known up front.** `FetchURL` requires a non-empty `AllowedDomains` allowlist — an empty allowlist rejects *every* URL (`isAllowedDomain` returns false), so the allowlist is mandatory, not optional.
+- **GET, HTTP 200, no custom headers.** It issues a `GET` and sends no request headers — so it cannot carry authentication or use another method. Transient HTTP status codes (429, 502, 503) are retried with exponential backoff, but the function ultimately requires a 200 response.
+- **Whole body buffered, port 443.** It reads the entire body into memory and defaults `AllowedPorts` to `{"443"}`.
+
+When the fetch falls outside that envelope you must build a custom client. Common reasons: **the legitimate host set is not knowable up front** (e.g. `internal/repos/manifest.go`'s `LoadManifest` accepts any user-supplied `https://` host, so no allowlist covers it — this is why `fetchManifestURL`/`safeDialContext` exist and deliberately do *not* use `FetchURL`), authenticated requests, non-GET methods, non-200 handling, streaming, or a client reused across many calls. The complete worked pattern is `LoadManifest`'s initial HTTPS-only gate together with `fetchManifestURL`/`safeDialContext`; the fetch functions enforce the remaining controls and HTTPS-only redirects, but do not independently reject a non-HTTPS initial URL. A custom in-scope client **must** apply all of these properties:
+
+- **HTTPS only.** Reject `http://` inputs, and validate the scheme on redirects too — a `CheckRedirect` that lets an `https://` origin bounce to `http://` reopens the hole.
+- **Reject internal/reserved IPs, on every connection.** Inside a custom `DialContext`, resolve the host the transport actually asks for (split the `addr` it passes you, resolve it, check every IP with `netutil.CheckIP` / `netutil.IsInternal`), then dial one of those validated IPs — never re-dial the hostname. Validating and dialing the exact same IP is the DNS-rebinding defense. Do this **per connection**, the way `safeDialContext` does, so a redirect to a different host is resolved and validated before that connection. `fetch.FetchURL`'s single up-front resolution and pinning is safe because it blocks redirects outright (its `CheckRedirect` returns `http.ErrUseLastResponse`); it cannot validate a redirect to a different host, so never copy that pattern into a client that follows redirects.
+- **Keep the original hostname on the request.** Only the dial *address* changes to the validated IP — the `http.Request` URL, and therefore SNI and certificate verification, must still carry the original hostname, or TLS verification breaks. Build the request from the original URL and let `DialContext` swap the address, exactly as `fetch.FetchURL` does (`http.NewRequestWithContext(ctx, …, rawURL, …)` while its `DialContext` dials the IP). **Never** rewrite the request URL to the IP, and never reach for `InsecureSkipVerify` to paper over the resulting cert failure.
+- **Disable proxies.** Set `Transport.Proxy = nil` so `HTTP(S)_PROXY` env vars can't redirect the request.
+- **Bound the time.** Set an explicit timeout (30s is the repo default) via `context.WithTimeout` and/or `http.Client.Timeout`.
+- **Bound the size.** Wrap the response body in `io.LimitReader(body, max+1)` and error if the read exceeds `max` (1 MB is the manifest default; pick a limit appropriate to the payload). Never `io.ReadAll` — or `json.NewDecoder` — an unbounded body.
+- **Constrain redirects.** Block them (as `fetch.FetchURL` does) or cap the hop count; and if you allow any hop, re-run the checks above against each redirect target — both the scheme check and, via per-connection dialing, the internal-IP check — not just the scheme.
+
+When the set of legitimate hosts *is* known, add a domain allowlist too, even on the custom path.
 
 ## Running the fullsend CLI
 

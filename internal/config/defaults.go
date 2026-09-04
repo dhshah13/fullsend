@@ -78,3 +78,12 @@ func (d *perRepoDefaults) ConfigInferenceRegion() string { return DefaultPerRepo
 // ConfigInferenceWIFProvider returns the default WIF provider (empty —
 // must be provided by the installer or existing secret).
 func (d *perRepoDefaults) ConfigInferenceWIFProvider() string { return "" }
+
+// ConfigInferenceOpenAI returns the default OpenAI WIF identifiers (none —
+// set by `fullsend github setup --openai-*` or the FULLSEND_OPENAI_*
+// runner variables).
+func (d *perRepoDefaults) ConfigInferenceOpenAI() OpenAIWIFConfig { return OpenAIWIFConfig{} }
+
+// ConfigModelAliases returns the default model aliases (none — fleet
+// defaults are compiled into the runtimes).
+func (d *perRepoDefaults) ConfigModelAliases() map[string]string { return nil }

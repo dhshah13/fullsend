@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -406,7 +408,10 @@ func TestValidProviders(t *testing.T) {
 func TestValidRuntimes(t *testing.T) {
 	runtimes := ValidRuntimes()
 	assert.Contains(t, runtimes, "claude")
+	assert.Contains(t, runtimes, "pi")
 	assert.Contains(t, runtimes, "dummy")
+	assert.Contains(t, runtimes, "dummy-playback")
+	assert.Contains(t, runtimes, "codex")
 	assert.NotContains(t, runtimes, "opencode", "opencode is resolved via runtime.Resolve() but not user-selectable until implemented")
 }
 
@@ -420,6 +425,13 @@ func TestOrgConfigValidateRuntime(t *testing.T) {
 		},
 	}
 	require.NoError(t, cfg.Validate())
+
+	cfg.Defaults.Runtime = "pi"
+	require.NoError(t, cfg.Validate(), "pi is user-selectable (#6464)")
+
+	// No codex case here: org mode is deprecated (ADR 0044), so codex's
+	// selectability is asserted on the per-repo and agents: paths instead
+	// (TestPerRepoConfigValidate_Runtime, TestResolveForAgent).
 
 	// opencode is resolvable via runtime.Resolve() but not in ValidRuntimes(),
 	// so config validation must reject it until the runtime is implemented.
@@ -675,6 +687,12 @@ func TestPerRepoConfigValidate_Runtime(t *testing.T) {
 	}
 	assert.NoError(t, cfg.Validate())
 
+	cfg.Runtime = "pi"
+	assert.NoError(t, cfg.Validate(), "pi is user-selectable (#6464)")
+
+	cfg.Runtime = "codex"
+	assert.NoError(t, cfg.Validate(), "codex is user-selectable (#6920)")
+
 	// opencode is resolvable via runtime.Resolve() but not in ValidRuntimes(),
 	// so config validation must reject it until the runtime is implemented.
 	cfg.Runtime = "opencode"
@@ -731,6 +749,13 @@ func TestPerRepoConfigMarshal_KillSwitchOmitted(t *testing.T) {
 	data, err := cfg.Marshal()
 	require.NoError(t, err)
 	assert.NotContains(t, string(data), "kill_switch")
+}
+
+func TestPerRepoConfigHeaderPointsToUserDocs(t *testing.T) {
+	assert.NotContains(t, perRepoConfigHeader, "ADR",
+		"per-repo config header must not reference internal ADRs")
+	assert.Contains(t, perRepoConfigHeader, "https://fullsend.sh/",
+		"per-repo config header should link to user-facing docs")
 }
 
 func TestPerRepoConfig_RoundTrip(t *testing.T) {
@@ -965,6 +990,131 @@ repos: {}
 	require.NotNil(t, cfg.StatusNotifications())
 	assert.Equal(t, "disabled", cfg.StatusNotifications().Comment.Start)
 	assert.Equal(t, "on_failure", cfg.StatusNotifications().Comment.Completion)
+}
+
+// --- Reaction notification tests ---
+
+func TestParseOrgConfig_WithReactionNotifications(t *testing.T) {
+	yamlData := `
+version: "1"
+dispatch:
+  platform: github-actions
+defaults:
+  roles:
+    - fullsend
+  max_implementation_retries: 2
+  status_notifications:
+    reaction:
+      start: enabled
+      completion: on_failure
+agents: []
+repos: {}
+`
+	cfg, err := ParseOrgConfig([]byte(yamlData))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.StatusNotifications())
+	assert.Equal(t, "enabled", cfg.StatusNotifications().Reaction.Start)
+	assert.Equal(t, "on_failure", cfg.StatusNotifications().Reaction.Completion)
+}
+
+func TestOrgConfigValidate_ValidReactionNotifications(t *testing.T) {
+	cfg := &orgConfig{
+		Version:  "1",
+		Dispatch: DispatchConfig{Platform: "github-actions"},
+		Defaults: RepoDefaults{
+			Roles:                    []string{"fullsend"},
+			MaxImplementationRetries: 2,
+			StatusNotifications: &StatusNotificationConfig{
+				Reaction: ReactionNotificationConfig{Start: "enabled", Completion: "disabled"},
+			},
+		},
+	}
+	assert.NoError(t, cfg.Validate())
+}
+
+func TestOrgConfigValidate_InvalidReactionStart(t *testing.T) {
+	cfg := &orgConfig{
+		Version:  "1",
+		Dispatch: DispatchConfig{Platform: "github-actions"},
+		Defaults: RepoDefaults{
+			Roles:                    []string{"fullsend"},
+			MaxImplementationRetries: 2,
+			StatusNotifications: &StatusNotificationConfig{
+				Reaction: ReactionNotificationConfig{Start: "bogus"},
+			},
+		},
+	}
+	err := cfg.Validate()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "status_notifications.reaction.start")
+}
+
+func TestOrgConfigValidate_InvalidReactionCompletion(t *testing.T) {
+	cfg := &orgConfig{
+		Version:  "1",
+		Dispatch: DispatchConfig{Platform: "github-actions"},
+		Defaults: RepoDefaults{
+			Roles:                    []string{"fullsend"},
+			MaxImplementationRetries: 2,
+			StatusNotifications: &StatusNotificationConfig{
+				Reaction: ReactionNotificationConfig{Completion: "bogus"},
+			},
+		},
+	}
+	err := cfg.Validate()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "status_notifications.reaction.completion")
+}
+
+func TestOrgConfigValidate_OnFailureReactionCompletion(t *testing.T) {
+	cfg := &orgConfig{
+		Version:  "1",
+		Dispatch: DispatchConfig{Platform: "github-actions"},
+		Defaults: RepoDefaults{
+			Roles:                    []string{"fullsend"},
+			MaxImplementationRetries: 2,
+			StatusNotifications: &StatusNotificationConfig{
+				Reaction: ReactionNotificationConfig{Completion: "on_failure"},
+			},
+		},
+	}
+	assert.NoError(t, cfg.Validate(), "on_failure should be valid for reaction.completion")
+}
+
+func TestOrgConfigValidate_OnFailureReactionStart_Rejected(t *testing.T) {
+	cfg := &orgConfig{
+		Version:  "1",
+		Dispatch: DispatchConfig{Platform: "github-actions"},
+		Defaults: RepoDefaults{
+			Roles:                    []string{"fullsend"},
+			MaxImplementationRetries: 2,
+			StatusNotifications: &StatusNotificationConfig{
+				Reaction: ReactionNotificationConfig{Start: "on_failure"},
+			},
+		},
+	}
+	err := cfg.Validate()
+	assert.Error(t, err, "on_failure should be rejected for reaction.start")
+	assert.Contains(t, err.Error(), "status_notifications.reaction.start")
+}
+
+func TestOrgConfigMarshal_WithReactionNotifications(t *testing.T) {
+	cfg := &orgConfig{
+		Version:  "1",
+		Dispatch: DispatchConfig{Platform: "github-actions"},
+		Defaults: RepoDefaults{
+			Roles:                    []string{"fullsend"},
+			MaxImplementationRetries: 2,
+			StatusNotifications: &StatusNotificationConfig{
+				Reaction: ReactionNotificationConfig{Start: "enabled"},
+			},
+		},
+		Repos: map[string]RepoConfig{},
+	}
+	data, err := cfg.Marshal()
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "reaction:")
+	assert.Contains(t, string(data), "start: enabled")
 }
 
 func TestOrgConfigMarshal_WithStatusNotifications(t *testing.T) {
@@ -2345,4 +2495,477 @@ repos:
 	require.NotNil(t, ci)
 	assert.Contains(t, ci.AllowTargets.Repos, "acme/api")
 	assert.Contains(t, ci.AllowTargets.Repos, "fullsend-ai/fullsend")
+}
+
+func TestValidModelRef(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		ref  string
+		want bool
+	}{
+		{"opus", true},
+		{"sonnet", true},
+		{"claude-opus-4-6", true},
+		{"claude-sonnet-4-6@20250514", true},
+		{"google-vertex/gemini-3.7-flash", true},
+		{"xai-vertex/xai/grok-4.6", true},
+		{"anthropic-vertex/claude-opus-4-6", true},
+		{"", false},
+		{"/leading", false},
+		{"trailing/", false},
+		{"a//b", false},
+		{"has space", false},
+		{"has$special", false},
+	} {
+		t.Run(tc.ref, func(t *testing.T) {
+			assert.Equal(t, tc.want, ValidModelRef(tc.ref), "ValidModelRef(%q)", tc.ref)
+		})
+	}
+}
+
+func TestValidAgentNames(t *testing.T) {
+	names := ValidAgentNames()
+	assert.Contains(t, names, "triage")
+	assert.Contains(t, names, "code")
+	assert.Contains(t, names, "review")
+	assert.Contains(t, names, "fix")
+	assert.Contains(t, names, "retro")
+	assert.Contains(t, names, "prioritize")
+	// "coder" is NOT a valid agent name (it's a role name); the
+	// validation should hint "did you mean code" for it.
+	assert.NotContains(t, names, "coder")
+}
+
+func TestValidEffort(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, []string{"low", "medium", "high", "xhigh", "max"}, ValidEffortLevels())
+	for _, level := range ValidEffortLevels() {
+		assert.True(t, ValidEffort(level), level)
+	}
+	assert.False(t, ValidEffort(""))
+	assert.False(t, ValidEffort("turbo"))
+	assert.False(t, ValidEffort("High"))
+}
+
+// --- per-agent settings on agents: entries (ADR 0091) ---
+
+func parseAgentSettingsConfig(t *testing.T, doc string) PerRepoConfigReader {
+	t.Helper()
+	cfg, err := ParsePerRepoConfig([]byte("# fullsend per-repo configuration\nversion: \"1\"\n" + doc))
+	require.NoError(t, err)
+	return cfg.(PerRepoConfigReader)
+}
+
+func TestAgentSettings_ParseAndValidate(t *testing.T) {
+	t.Parallel()
+	cfg := parseAgentSettingsConfig(t, `runtime: pi
+agents:
+  - name: triage
+    model: xai-vertex/xai/grok-4.6
+  - name: code
+    runtime: claude
+    model: sonnet
+    effort: high
+  - source: harness/lint.yaml
+    model: haiku
+`)
+	require.NoError(t, cfg.(ConfigWriter).Validate())
+	assert.Equal(t, "pi", cfg.ConfigRuntime())
+
+	triage, ok := AgentSettingsFor(cfg.AgentEntries(), "triage")
+	require.True(t, ok)
+	assert.Equal(t, "xai-vertex/xai/grok-4.6", triage.Model)
+	assert.Empty(t, triage.Runtime, "repo-wide runtime applies")
+	assert.True(t, triage.IsOverrideOnly())
+
+	code, ok := AgentSettingsFor(cfg.AgentEntries(), "Code")
+	require.True(t, ok, "lookup is case-insensitive")
+	assert.Equal(t, AgentEntry{Name: "code", Runtime: "claude", Model: "sonnet", Effort: "high"}, code)
+
+	lint, ok := AgentSettingsFor(cfg.AgentEntries(), "lint")
+	require.True(t, ok)
+	assert.Equal(t, "harness/lint.yaml", lint.Source, "a sourced custom agent carries settings too")
+	assert.Equal(t, "haiku", lint.Model)
+	assert.False(t, lint.IsOverrideOnly())
+
+	_, ok = AgentSettingsFor(cfg.AgentEntries(), "review")
+	assert.False(t, ok)
+}
+
+func TestAgentSettings_Validate(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, doc, want string
+	}{
+		{"unknown built-in with hint", "agents:\n  - name: coder\n    model: sonnet\n", `did you mean "code"`},
+		{"unknown custom without source", "agents:\n  - name: lint\n    model: sonnet\n", "give a custom agent its source"},
+		{"name-only entry without settings", "agents:\n  - name: triage\n", "must have a source"},
+		{"settings without a name", "agents:\n  - model: sonnet\n", "must name the agent"},
+		{"invalid model", "agents:\n  - name: triage\n    model: bad//id\n", `invalid model "bad//id"`},
+		{"leading slash model", "agents:\n  - name: triage\n    model: /leading\n", "invalid model"},
+		{"invalid runtime", "agents:\n  - name: triage\n    runtime: opencode\n", `invalid runtime "opencode"`},
+		{"invalid effort", "agents:\n  - name: triage\n    effort: turbo\n", `invalid effort "turbo"`},
+		{"invalid effort on sourced entry", "agents:\n  - source: harness/lint.yaml\n    effort: turbo\n", `invalid effort "turbo"`},
+		{"duplicate built-in tuning", "agents:\n  - name: triage\n    model: sonnet\n  - name: Triage\n    model: haiku\n", "duplicate agent name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := parseAgentSettingsConfig(t, tc.doc)
+			err := cfg.(ConfigWriter).Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+	for _, model := range []string{"opus", "claude-haiku-4-5@20251001", "google-vertex/gemini-3.7-flash", "xai-vertex/xai/grok-4.6"} {
+		cfg := parseAgentSettingsConfig(t, "agents:\n  - name: triage\n    model: "+model+"\n")
+		assert.NoError(t, cfg.(ConfigWriter).Validate(), model)
+	}
+}
+
+func TestAgentSettings_MarshalRoundTrip(t *testing.T) {
+	t.Parallel()
+	cfg := NewPerRepoConfig([]string{"triage"}, "")
+	cfg.SetAgents(UpsertAgentSettings(nil, "code", "claude", "sonnet", "high"))
+	cfg.SetAgents(UpsertAgentSettings(cfg.AgentEntries(), "triage", "", "xai-vertex/xai/grok-4.6", ""))
+	require.NoError(t, cfg.Validate())
+	data, err := cfg.Marshal()
+	require.NoError(t, err)
+	s := string(data)
+	assert.Contains(t, s, "name: code")
+	assert.Contains(t, s, "runtime: claude")
+	assert.NotContains(t, s, "source: \"\"", "override-only entries carry no source key")
+
+	back, err := ParsePerRepoConfig(data)
+	require.NoError(t, err)
+	code, ok := AgentSettingsFor(back.AgentEntries(), "code")
+	require.True(t, ok)
+	assert.Equal(t, AgentEntry{Name: "code", Runtime: "claude", Model: "sonnet", Effort: "high"}, code)
+
+	// Upsert replaces settings on the existing entry; empty clears.
+	cfg.SetAgents(UpsertAgentSettings(cfg.AgentEntries(), "CODE", "", "haiku", ""))
+	code, _ = AgentSettingsFor(cfg.AgentEntries(), "code")
+	assert.Equal(t, AgentEntry{Name: "code", Model: "haiku"}, code)
+	assert.Len(t, cfg.AgentEntries(), 2)
+}
+
+func TestAgentSettings_LayeredMerge(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.base.yaml"), []byte(`# fullsend per-repo configuration
+version: "1"
+runtime: pi
+agents:
+  - source: harness/lint.yaml
+    model: opus
+    effort: high
+  - name: triage
+    model: opus
+`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(`# fullsend per-repo configuration
+version: "1"
+agents:
+  - name: lint
+    effort: medium
+  - name: Triage
+    runtime: claude
+  - name: code
+    model: sonnet
+`), 0o644))
+	cfg, err := LoadConfigWriter(dir, LoadOpts{})
+	require.NoError(t, err)
+	// An overlay entry that only tunes a base-registered custom agent is
+	// valid: the merged entry carries the base's source.
+	require.NoError(t, cfg.Validate())
+	agents := cfg.AgentEntries()
+
+	lint, ok := AgentSettingsFor(agents, "lint")
+	require.True(t, ok)
+	assert.Equal(t, "harness/lint.yaml", lint.Source)
+	assert.Equal(t, "opus", lint.Model, "base model inherited (empty overlay value does not unset)")
+	assert.Equal(t, "medium", lint.Effort, "overlay wins per field")
+
+	triage, ok := AgentSettingsFor(agents, "triage")
+	require.True(t, ok)
+	assert.Equal(t, "claude", triage.Runtime)
+	assert.Equal(t, "opus", triage.Model)
+
+	code, ok := AgentSettingsFor(agents, "code")
+	require.True(t, ok)
+	assert.Equal(t, "sonnet", code.Model)
+
+	// A bad entry in the base layer is caught by Validate on the overlay.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.base.yaml"), []byte("# fullsend per-repo configuration\nversion: \"1\"\nagents:\n  - name: coder\n    model: sonnet\n"), 0o644))
+	cfg, err = LoadConfigWriter(dir, LoadOpts{})
+	require.NoError(t, err)
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `did you mean "code"`)
+}
+
+func TestAgentSettings_DisabledEntryStillValid(t *testing.T) {
+	t.Parallel()
+	cfg := parseAgentSettingsConfig(t, "agents:\n  - name: retro\n    enabled: false\n")
+	require.NoError(t, cfg.(ConfigWriter).Validate())
+	assert.True(t, IsAgentExplicitlyDisabled(cfg.AgentEntries(), "retro"))
+}
+
+// --- models.aliases tests (#6882) ---
+
+func TestModelsAliases_PerKeyMerge(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// base sets sonnet, overlay sets fable — both effective in the merged config.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.base.yaml"), []byte(`version: "1"
+models:
+  aliases:
+    sonnet: claude-sonnet-5
+`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(`version: "1"
+models:
+  aliases:
+    fable: claude-fable-5-1
+`), 0o644))
+	cfg, err := LoadConfig(dir, LoadOpts{})
+	require.NoError(t, err)
+	pr := cfg.(PerRepoConfigReader)
+	aliases := pr.ConfigModelAliases()
+	assert.Equal(t, "claude-sonnet-5", aliases["sonnet"], "base layer's alias")
+	assert.Equal(t, "claude-fable-5-1", aliases["fable"], "overlay layer's alias")
+}
+
+func TestModelsAliases_OverlayOverridesBase(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.base.yaml"), []byte(`version: "1"
+models:
+  aliases:
+    sonnet: claude-sonnet-4-6
+`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(`version: "1"
+models:
+  aliases:
+    sonnet: claude-sonnet-5
+`), 0o644))
+	cfg, err := LoadConfig(dir, LoadOpts{})
+	require.NoError(t, err)
+	pr := cfg.(PerRepoConfigReader)
+	aliases := pr.ConfigModelAliases()
+	assert.Equal(t, "claude-sonnet-5", aliases["sonnet"], "overlay wins over base")
+}
+
+func TestModelsAliases_UnknownKeyRejected(t *testing.T) {
+	t.Parallel()
+	cfg := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"grok": "grok-4.6"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown alias key")
+	assert.Contains(t, err.Error(), "grok")
+}
+
+func TestModelsAliases_InvalidModelRefRejected(t *testing.T) {
+	t.Parallel()
+	cfg := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"sonnet": "bad//id"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid model reference")
+	assert.Contains(t, err.Error(), "bad//id")
+}
+
+func TestModelsAliases_ValidConfigPasses(t *testing.T) {
+	t.Parallel()
+	cfg := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{
+				"sonnet": "claude-sonnet-5",
+				"fable":  "claude-fable-5-1",
+			},
+		},
+		parent: &perRepoDefaults{},
+	}
+	require.NoError(t, cfg.Validate())
+}
+
+func TestModelsAliases_ProviderIDAccepted(t *testing.T) {
+	t.Parallel()
+	cfg := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{
+				"sonnet": "anthropic-vertex/claude-sonnet-5",
+			},
+		},
+		parent: &perRepoDefaults{},
+	}
+	require.NoError(t, cfg.Validate())
+}
+
+func TestModelsAliases_AliasNameAsValueRejected(t *testing.T) {
+	t.Parallel()
+	// Aliases resolve once: `sonnet: opus` would reach the provider as the
+	// literal id "opus", so the value must be a model id, not another alias.
+	cfg := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"sonnet": "opus"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is the alias name")
+	assert.Contains(t, err.Error(), "models.aliases.sonnet")
+
+	// The check is case-insensitive: "Opus" passes ValidModelRef and would
+	// otherwise be sent to the provider as a literal id.
+	cfg.Models.Aliases["sonnet"] = "Opus"
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is the alias name")
+
+	// …and it looks at the id segment of a provider/id spec: pi passes a
+	// "/" value straight through, so "anthropic-vertex/opus" would send the
+	// wire id "opus".
+	cfg.Models.Aliases["sonnet"] = "anthropic-vertex/opus"
+	err = cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is the alias name")
+
+	// A real id whose segment merely contains an alias name is fine.
+	cfg.Models.Aliases["sonnet"] = "anthropic-vertex/claude-opus-4-6"
+	require.NoError(t, cfg.Validate())
+}
+
+func TestModelsAliases_ValidateSeesBaseLayer(t *testing.T) {
+	t.Parallel()
+	// Validate checks the merged map, so a bad key in config.base.yaml is
+	// caught even when the overlay omits models: entirely.
+	base := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"grok": "grok-4.6"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	overlay := &perRepoConfig{Version: "1", parent: base}
+	err := overlay.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown alias key")
+	assert.Contains(t, err.Error(), "grok")
+}
+
+func TestValidateModelAliases_NilIsValid(t *testing.T) {
+	t.Parallel()
+	require.NoError(t, ValidateModelAliases(nil))
+	require.NoError(t, ValidateModelAliases(map[string]string{}))
+}
+
+func TestModelsAliases_NilReturnsParent(t *testing.T) {
+	t.Parallel()
+	parent := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"sonnet": "claude-sonnet-5"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	child := &perRepoConfig{
+		Version: "1",
+		parent:  parent,
+	}
+	aliases := child.ConfigModelAliases()
+	assert.Equal(t, "claude-sonnet-5", aliases["sonnet"], "parent's alias inherited")
+}
+
+func TestModelsAliases_EmptyMapReturnsParent(t *testing.T) {
+	t.Parallel()
+	parent := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"sonnet": "claude-sonnet-5"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	child := &perRepoConfig{
+		Version: "1",
+		Models:  &ModelsConfig{},
+		parent:  parent,
+	}
+	aliases := child.ConfigModelAliases()
+	assert.Equal(t, "claude-sonnet-5", aliases["sonnet"], "parent's alias inherited with empty overlay")
+}
+
+func TestModelsAliases_DefaultsReturnNil(t *testing.T) {
+	t.Parallel()
+	d := &perRepoDefaults{}
+	assert.Nil(t, d.ConfigModelAliases())
+}
+
+func TestModelsAliases_MarshalRoundtrip(t *testing.T) {
+	t.Parallel()
+	cfg := &perRepoConfig{
+		Version: "1",
+		Models: &ModelsConfig{
+			Aliases: map[string]string{"sonnet": "claude-sonnet-5"},
+		},
+		parent: &perRepoDefaults{},
+	}
+	data, err := cfg.Marshal()
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "models:")
+	assert.Contains(t, string(data), "aliases:")
+	assert.Contains(t, string(data), "sonnet: claude-sonnet-5")
+
+	parsed, parseErr := ParsePerRepoConfig(data)
+	require.NoError(t, parseErr)
+	assert.Equal(t, "claude-sonnet-5", parsed.ConfigModelAliases()["sonnet"])
+}
+
+func TestModelsAliases_OmittedWhenEmpty(t *testing.T) {
+	t.Parallel()
+	cfg := &perRepoConfig{
+		Version: "1",
+		parent:  &perRepoDefaults{},
+	}
+	data, err := cfg.Marshal()
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "models:")
+}
+
+func TestModelsAliases_SetterAndGetter(t *testing.T) {
+	t.Parallel()
+	cfg := NewPerRepoConfig(nil, "")
+	pw := cfg.(PerRepoConfigWriter)
+	pw.SetModelAliases(map[string]string{"opus": "claude-opus-5"})
+	pr := cfg.(PerRepoConfigReader)
+	assert.Equal(t, "claude-opus-5", pr.ConfigModelAliases()["opus"])
+
+	// Clear with nil.
+	pw.SetModelAliases(nil)
+	assert.Nil(t, pr.ConfigModelAliases())
+}
+
+func TestPerRepoConfig_LocalAgentEntries(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.base.yaml"), []byte("# fullsend per-repo configuration\nversion: \"1\"\nagents:\n  - source: harness/lint.yaml\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("# fullsend per-repo configuration\nversion: \"1\"\nagents:\n  - name: code\n    model: sonnet\n"), 0o644))
+	cfg, err := LoadConfig(dir, LoadOpts{})
+	require.NoError(t, err)
+	local := cfg.(interface{ LocalAgentEntries() []AgentEntry }).LocalAgentEntries()
+	assert.Equal(t, []AgentEntry{{Name: "code", Model: "sonnet"}}, local, "only the overlay's own entries")
+	assert.Len(t, cfg.AgentEntries(), 2, "merged view includes the base")
 }

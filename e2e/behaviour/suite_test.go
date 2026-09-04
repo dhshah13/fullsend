@@ -11,10 +11,14 @@ import (
 	"github.com/cucumber/godog"
 	"github.com/google/uuid"
 
+	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/ci"
 	gaci "github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/ci/githubactions"
+	glci "github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/ci/gitlabci"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/env"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/install"
+	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/scm"
 	scmgh "github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/scm/github"
+	scmgl "github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/scm/gitlab"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/suite"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/world"
 	"github.com/fullsend-ai/fullsend/pkg/e2etest"
@@ -79,10 +83,38 @@ func TestBehaviourSuite(t *testing.T) {
 		t.Logf("WARNING: GODOG_CONCURRENCY=%d exceeds driver capacity %d; excess workers will block in AllocateRepo", concurrency, driver.Capacity())
 	}
 
+	var scmDriver scm.Driver
+	switch cfg.SCM {
+	case "github":
+		scmDriver = scmgh.New(client)
+	case "gitlab":
+		// TODO: client is a GitHub forge.Client (from e2etest.NewLiveClient).
+		// When BEHAVIOUR_SCM=gitlab is used in CI, this must be replaced with
+		// a GitLab-backed forge.Client. Currently latent: no CI job sets
+		// BEHAVIOUR_SCM=gitlab and @skip:gitlab tag removal is still pending.
+		scmDriver = scmgl.New(client)
+	default:
+		t.Fatalf("unsupported BEHAVIOUR_SCM %q", cfg.SCM)
+	}
+
+	var ciDriver ci.Driver
+	switch cfg.CI {
+	case "githubactions":
+		ciDriver = gaci.New(client, token)
+	case "gitlabci":
+		// TODO: client is a GitHub forge.Client (from e2etest.NewLiveClient).
+		// When BEHAVIOUR_CI=gitlabci is used in CI, this must be replaced with
+		// a GitLab-backed forge.Client. Currently latent: no CI job sets
+		// BEHAVIOUR_CI=gitlabci.
+		ciDriver = glci.New(client, token)
+	default:
+		t.Fatalf("unsupported BEHAVIOUR_CI %q", cfg.CI)
+	}
+
 	template := &world.World{
 		Config:       cfg,
-		SCM:          scmgh.New(client),
-		CI:           gaci.New(client, token),
+		SCM:          scmDriver,
+		CI:           ciDriver,
 		Driver:       driver,
 		Org:          org,
 		Token:        token,

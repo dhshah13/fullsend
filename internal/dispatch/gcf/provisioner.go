@@ -44,7 +44,7 @@ const (
 // ErrFunctionNotFound is returned when the mint function does not exist.
 var ErrFunctionNotFound = errors.New("mint function not found")
 
-//go:embed mintsrc/go.mod.embed mintsrc/go.sum.embed mintsrc/main.go.embed mintsrc/mintcore/go.mod.embed mintsrc/mintcore/go.sum.embed mintsrc/mintcore/claims.go.embed mintsrc/mintcore/config.go.embed mintsrc/mintcore/env.go.embed mintsrc/mintcore/foreign.go.embed mintsrc/mintcore/gcp_pem.go.embed mintsrc/mintcore/github.go.embed mintsrc/mintcore/handler.go.embed mintsrc/mintcore/http_client.go.embed mintsrc/mintcore/interfaces.go.embed mintsrc/mintcore/jwks_verifier.go.embed mintsrc/mintcore/mintconsts/mintconsts.go.embed mintsrc/mintcore/patterns.go.embed mintsrc/mintcore/repos_scope.go.embed mintsrc/mintcore/sts_verifier.go.embed mintsrc/mintcore/version.go.embed mintsrc/mintcore/wif.go.embed
+//go:embed mintsrc/go.mod.embed mintsrc/go.sum.embed mintsrc/main.go.embed mintsrc/mintcore/go.mod.embed mintsrc/mintcore/go.sum.embed mintsrc/mintcore/claims.go.embed mintsrc/mintcore/config.go.embed mintsrc/mintcore/env.go.embed mintsrc/mintcore/foreign.go.embed mintsrc/mintcore/gcp_pem.go.embed mintsrc/mintcore/github.go.embed mintsrc/mintcore/handler.go.embed mintsrc/mintcore/http_client.go.embed mintsrc/mintcore/interfaces.go.embed mintsrc/mintcore/jwks_verifier.go.embed mintsrc/mintcore/mintconsts/mintconsts.go.embed mintsrc/mintcore/oidc_verify.go.embed mintsrc/mintcore/patterns.go.embed mintsrc/mintcore/repos_scope.go.embed mintsrc/mintcore/status_auth.go.embed mintsrc/mintcore/status_consts.go.embed mintsrc/mintcore/status_github.go.embed mintsrc/mintcore/status_github_stub.go.embed mintsrc/mintcore/sts_verifier.go.embed mintsrc/mintcore/version.go.embed mintsrc/mintcore/wif.go.embed
 var embeddedMintSource embed.FS
 
 // embeddedMintFiles maps embedded filenames (.embed suffix avoids
@@ -67,8 +67,13 @@ var embeddedMintFiles = map[string]string{
 	"mintcore/interfaces.go.embed":            "mintcore/interfaces.go",
 	"mintcore/jwks_verifier.go.embed":         "mintcore/jwks_verifier.go",
 	"mintcore/mintconsts/mintconsts.go.embed": "mintcore/mintconsts/mintconsts.go",
+	"mintcore/oidc_verify.go.embed":           "mintcore/oidc_verify.go",
 	"mintcore/patterns.go.embed":              "mintcore/patterns.go",
 	"mintcore/repos_scope.go.embed":           "mintcore/repos_scope.go",
+	"mintcore/status_auth.go.embed":           "mintcore/status_auth.go",
+	"mintcore/status_consts.go.embed":         "mintcore/status_consts.go",
+	"mintcore/status_github.go.embed":         "mintcore/status_github.go",
+	"mintcore/status_github_stub.go.embed":    "mintcore/status_github_stub.go",
 	"mintcore/sts_verifier.go.embed":          "mintcore/sts_verifier.go",
 	"mintcore/version.go.embed":               "mintcore/version.go",
 	"mintcore/wif.go.embed":                   "mintcore/wif.go",
@@ -136,8 +141,19 @@ type Config struct {
 	// Commit is the git commit SHA to stamp on the deployed mint.
 	// Embedded directly into the source code at bundle time.
 	Commit string
-	// PublicMint bootstraps ALLOWED_ORGS=* and a permissive WIF provider CEL.
+	// PublicMint bootstraps PER_REPO_WIF_REPOS=* and a permissive WIF provider CEL.
 	PublicMint bool
+
+	// StatusGitHub holds the GitHub status auth config stamped into
+	// the source at bundle time alongside Version and Commit.
+	StatusGitHub StatusGitHubAuth
+}
+
+// StatusGitHubAuth bundles the GitHub status auth configuration
+// passed through provisioner and bundle functions.
+type StatusGitHubAuth struct {
+	// Group is the ORG/TEAM slug for the GitHub status validator.
+	Group string
 }
 
 // Provisioner creates GCP infrastructure for OIDC-based token minting.
@@ -466,20 +482,32 @@ func (p *Provisioner) validateMintDeployMode(ctx context.Context) error {
 	}
 	switch {
 	case p.cfg.PublicMint && !existingPublic:
-		return fmt.Errorf("cannot deploy public mint: existing mint is in tight mode (ALLOWED_ORGS does not contain *)")
+		return fmt.Errorf("cannot deploy public mint: existing mint is in tight mode (PER_REPO_WIF_REPOS does not contain *)")
 	case !p.cfg.PublicMint && existingPublic:
-		return fmt.Errorf("existing mint is in public mode (ALLOWED_ORGS=*); redeploy with --public")
+		return fmt.Errorf("existing mint is in public mode (PER_REPO_WIF_REPOS=*); redeploy with --public")
 	}
 	return nil
 }
 
-// isTrafficMintPublic reports whether the traffic-serving revision has public mint mode.
+// isTrafficMintPublic reports whether the traffic-serving revision has public
+// mint mode. Per ADR-0078, public mode is expressed as PER_REPO_WIF_REPOS=*.
 func (p *Provisioner) isTrafficMintPublic(ctx context.Context) (bool, error) {
 	trafficEnvVars, err := p.gcpAPI.GetServiceTrafficEnvVars(ctx, p.cfg.ProjectID, p.cfg.Region, functionName)
 	if err != nil {
 		return false, fmt.Errorf("reading traffic-serving env vars: %w", err)
 	}
-	return mintcore.IsPublicMint(mintcore.ParseAllowedOrgs(trafficEnvVars["ALLOWED_ORGS"])), nil
+	return isPublicMintEnv(trafficEnvVars), nil
+}
+
+// isPublicMintEnv reports whether the given env vars indicate public mint mode
+// by checking PER_REPO_WIF_REPOS for the wildcard "*" entry (ADR-0078).
+func isPublicMintEnv(envVars map[string]string) bool {
+	for _, entry := range mintcore.SplitCSV(envVars["PER_REPO_WIF_REPOS"]) {
+		if entry == "*" {
+			return true
+		}
+	}
+	return false
 }
 
 // EnsureOrgInMint validates that a mint function exists at expectedURL and
@@ -510,7 +538,7 @@ func (p *Provisioner) EnsureOrgInMint(ctx context.Context, expectedURL string, o
 		return fmt.Errorf("reading traffic-serving env vars: %w", err)
 	}
 
-	if mintcore.IsPublicMint(mintcore.ParseAllowedOrgs(trafficEnvVars["ALLOWED_ORGS"])) {
+	if isPublicMintEnv(trafficEnvVars) {
 		return nil
 	}
 
@@ -574,8 +602,8 @@ func (p *Provisioner) RegisterPerRepoWIF(ctx context.Context, repo string) error
 		return fmt.Errorf("reading traffic-serving env vars: %w", err)
 	}
 
-	if mintcore.IsPublicMint(mintcore.ParseAllowedOrgs(trafficEnvVars["ALLOWED_ORGS"])) {
-		return fmt.Errorf("per-repo WIF registration is not supported when mint is in public mode (ALLOWED_ORGS=*)")
+	if isPublicMintEnv(trafficEnvVars) {
+		return fmt.Errorf("per-repo WIF registration is not supported when mint is in public mode (PER_REPO_WIF_REPOS=*)")
 	}
 
 	repo = strings.ToLower(repo)
@@ -823,7 +851,7 @@ func (p *Provisioner) provisionSelfManaged(ctx context.Context) (map[string]stri
 			case p.cfg.FunctionSourceDir == "":
 				needsDeploy = false
 			default: // DeployAuto
-				earlySourceZip, err = bundleFunctionSource(p.cfg.FunctionSourceDir, p.cfg.Version, p.cfg.Commit)
+				earlySourceZip, err = bundleFunctionSource(p.cfg.FunctionSourceDir, p.cfg.Version, p.cfg.Commit, p.cfg.StatusGitHub)
 				if err != nil {
 					return nil, fmt.Errorf("validating function source: %w", err)
 				}
@@ -842,7 +870,7 @@ func (p *Provisioner) provisionSelfManaged(ctx context.Context) (map[string]stri
 
 	// Code deployment path — bundle source.
 	if earlySourceZip == nil {
-		earlySourceZip, err = bundleFunctionSource(p.cfg.FunctionSourceDir, p.cfg.Version, p.cfg.Commit)
+		earlySourceZip, err = bundleFunctionSource(p.cfg.FunctionSourceDir, p.cfg.Version, p.cfg.Commit, p.cfg.StatusGitHub)
 		if err != nil {
 			return nil, fmt.Errorf("validating function source: %w", err)
 		}
@@ -882,6 +910,9 @@ func (p *Provisioner) provisionSelfManaged(ctx context.Context) (map[string]stri
 		"WIF_PROVIDER_NAME":  p.cfg.WIFProvider,
 		"ALLOWED_ORGS":       strings.Join(allOrgs, ","),
 		"ROLE_APP_IDS":       roleAppIDsJSON,
+	}
+	if p.cfg.PublicMint {
+		envVars["PER_REPO_WIF_REPOS"] = "*"
 	}
 
 	// Step 6b: Code deployment — only when source hash changes.
@@ -1240,7 +1271,7 @@ func (p *Provisioner) ensureWIFPoolAndProvider(ctx context.Context, installingOr
 	var allOrgs []string
 	var attrCondition string
 	if p.cfg.PublicMint {
-		allOrgs = []string{"*"}
+		allOrgs = []string{PlaceholderOrg}
 		attrCondition = buildPublicAttributeCondition()
 	} else {
 		allOrgs = make([]string, len(installingOrgs))
@@ -1639,8 +1670,8 @@ func (p *Provisioner) RemoveOrgFromMint(ctx context.Context, org string) error {
 		return fmt.Errorf("reading traffic-serving env vars: %w", err)
 	}
 
-	if mintcore.IsPublicMint(mintcore.ParseAllowedOrgs(trafficEnvVars["ALLOWED_ORGS"])) {
-		return fmt.Errorf("cannot remove individual orgs when mint is in public mode (ALLOWED_ORGS=*); set an explicit org list instead")
+	if isPublicMintEnv(trafficEnvVars) {
+		return fmt.Errorf("cannot remove individual orgs when mint is in public mode (PER_REPO_WIF_REPOS=*); set an explicit org list instead")
 	}
 
 	updated := make(map[string]string, len(trafficEnvVars))
@@ -1874,15 +1905,15 @@ func sortedByteMapKeys(m map[string][]byte) []string {
 // Version and commit are stamped directly into the source by generating a
 // mintcore/version.go file in the zip, so the deployed code carries its own
 // version identity without relying on environment variables.
-func bundleFunctionSource(dir, version, commit string) ([]byte, error) {
+func bundleFunctionSource(dir, version, commit string, statusGitHub StatusGitHubAuth) ([]byte, error) {
 	if dir == "" {
-		return bundleEmbeddedMintSource(version, commit)
+		return bundleEmbeddedMintSource(version, commit, statusGitHub)
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return bundleEmbeddedMintSource(version, commit)
+			return bundleEmbeddedMintSource(version, commit, statusGitHub)
 		}
 		return nil, fmt.Errorf("reading function source dir: %w", err)
 	}
@@ -1933,9 +1964,12 @@ func bundleFunctionSource(dir, version, commit string) ([]byte, error) {
 
 	// Include the mintcore module as a subdirectory (sibling on disk,
 	// nested in the zip so the replace ./mintcore directive resolves).
-	// Skip version.go — it's generated below with stamped values.
+	// Skip version.go and status_consts.go — generated below with stamped values.
+	// Skip status_github.go and status_github_stub.go — selected below
+	// based on whether GitHub status auth is enabled (GCF doesn't
+	// support custom build tags, so selection happens at bundle time).
 	mintcoreDir := filepath.Join(dir, "..", "mintcore")
-	skip := map[string]bool{"version.go": true}
+	skip := map[string]bool{"version.go": true, "status_consts.go": true, "status_github.go": true, "status_github_stub.go": true}
 	if err := addDirToZip(w, mintcoreDir, "mintcore", skip); err != nil {
 		return nil, fmt.Errorf("bundling mintcore: %w", err)
 	}
@@ -1943,6 +1977,32 @@ func bundleFunctionSource(dir, version, commit string) ([]byte, error) {
 	// Stamp version info directly into the source.
 	if err := writeVersionGoToZip(w, "mintcore/version.go", version, commit); err != nil {
 		return nil, fmt.Errorf("writing version.go: %w", err)
+	}
+
+	// Stamp status auth consts into the source.
+	if err := writeStatusConstsGoToZip(w, "mintcore/status_consts.go", statusGitHub.Group); err != nil {
+		return nil, fmt.Errorf("writing status_consts.go: %w", err)
+	}
+
+	// Select the correct status GitHub file based on config. Build
+	// constraints are stripped since GCF compiles without custom tags.
+	// When the file doesn't exist on disk (older checkout or minimal
+	// test directory), skip — addDirToZip may have already copied it
+	// with its build constraint intact, which is fine for the default
+	// (non-github) case.
+	statusGitHubFile := "status_github_stub.go"
+	if statusGitHub.Group != "" {
+		statusGitHubFile = "status_github.go"
+	}
+	statusGitHubData, err := os.ReadFile(filepath.Join(mintcoreDir, statusGitHubFile))
+	if err == nil {
+		if err := writeStatusGitHubFileToZip(w, statusGitHubData, "mintcore/"+statusGitHubFile); err != nil {
+			return nil, fmt.Errorf("writing %s: %w", statusGitHubFile, err)
+		}
+	} else if statusGitHub.Group != "" {
+		// Only fail for missing github file when github mode is active —
+		// the stub file is optional (harmless if absent).
+		return nil, fmt.Errorf("reading %s: %w", statusGitHubFile, err)
 	}
 
 	if fileCount == 0 {
@@ -2021,7 +2081,7 @@ func addDirToZipRooted(w *zip.Writer, absRoot, srcDir, zipPrefix string, skip ma
 // toolchain from treating the directory as a module root, and are renamed
 // to their real names in the zip. The version.go entry is replaced with
 // generated content that stamps the provided version and commit.
-func bundleEmbeddedMintSource(version, commit string) ([]byte, error) {
+func bundleEmbeddedMintSource(version, commit string, statusGitHub StatusGitHubAuth) ([]byte, error) {
 	var buf bytes.Buffer
 	w := zip.NewWriter(&buf)
 
@@ -2031,10 +2091,25 @@ func bundleEmbeddedMintSource(version, commit string) ([]byte, error) {
 	}
 	sort.Strings(keys)
 
+	// Determine which status GitHub file to include. GCF compiles
+	// without custom build tags, so the bundler selects at bundle time.
+	wantGitHubFile := "mintcore/status_github_stub.go"
+	skipGitHubFile := "mintcore/status_github.go"
+	if statusGitHub.Group != "" {
+		wantGitHubFile = "mintcore/status_github.go"
+		skipGitHubFile = "mintcore/status_github_stub.go"
+	}
+
 	for _, embeddedName := range keys {
 		realName := embeddedMintFiles[embeddedName]
-		// Skip version.go — it's generated below with stamped values.
-		if realName == "mintcore/version.go" {
+		// Skip generated files — version.go and status_consts.go are
+		// generated below with stamped values.
+		if realName == "mintcore/version.go" || realName == "mintcore/status_consts.go" {
+			continue
+		}
+		// Skip the unwanted GitHub file; the wanted one is written
+		// below with its build constraint stripped.
+		if realName == skipGitHubFile || realName == wantGitHubFile {
 			continue
 		}
 		data, err := embeddedMintSource.ReadFile("mintsrc/" + embeddedName)
@@ -2055,6 +2130,27 @@ func bundleEmbeddedMintSource(version, commit string) ([]byte, error) {
 		return nil, fmt.Errorf("writing version.go: %w", err)
 	}
 
+	// Stamp status auth consts into the source.
+	if err := writeStatusConstsGoToZip(w, "mintcore/status_consts.go", statusGitHub.Group); err != nil {
+		return nil, fmt.Errorf("writing status_consts.go: %w", err)
+	}
+
+	// Write the selected status GitHub file with build constraint stripped.
+	ghEmbedName := ""
+	for k, v := range embeddedMintFiles {
+		if v == wantGitHubFile {
+			ghEmbedName = k
+			break
+		}
+	}
+	ghData, err := embeddedMintSource.ReadFile("mintsrc/" + ghEmbedName)
+	if err != nil {
+		return nil, fmt.Errorf("reading embedded file %s: %w", ghEmbedName, err)
+	}
+	if err := writeStatusGitHubFileToZip(w, ghData, wantGitHubFile); err != nil {
+		return nil, fmt.Errorf("writing %s: %w", wantGitHubFile, err)
+	}
+
 	if err := w.Close(); err != nil {
 		return nil, fmt.Errorf("closing zip: %w", err)
 	}
@@ -2072,6 +2168,40 @@ func writeVersionGoToZip(w *zip.Writer, path, version, commit string) error {
 		return err
 	}
 	_, err = f.Write([]byte(src))
+	return err
+}
+
+// writeStatusConstsGoToZip writes a generated status_consts.go into the
+// zip archive with the provided status auth configuration values.
+func writeStatusConstsGoToZip(w *zip.Writer, path, githubGroup string) error {
+	src := fmt.Sprintf("package mintcore\n\nvar StatusGitHubGroup = %q\n", githubGroup)
+	f, err := w.Create(path)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write([]byte(src))
+	return err
+}
+
+// writeStatusGitHubFileToZip writes either status_github.go or
+// status_github_stub.go into the zip, with build constraints stripped.
+// GCF compiles source server-side without custom build tags, so the
+// bundler selects the correct file at bundle time instead of relying
+// on build tags at compile time.
+func writeStatusGitHubFileToZip(w *zip.Writer, data []byte, zipPath string) error {
+	// Strip //go:build lines so the file compiles unconditionally.
+	var cleaned []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//go:build ") {
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+	f, err := w.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write([]byte(strings.Join(cleaned, "\n")))
 	return err
 }
 

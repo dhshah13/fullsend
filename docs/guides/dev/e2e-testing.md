@@ -68,6 +68,16 @@ Required repository secrets:
 
 Mint URL uses the hosted public endpoint by default (same as `fullsend admin --mint-url`). Override with org/repo variable `FULLSEND_MINT_URL` if needed; no separate e2e secret.
 
+### Behaviour job GitHub Environments
+
+The behaviour job in `e2e.yml` binds to GitHub Environments `dev` (authorized pull requests and the merge queue) and `stage` (push to `main`). It skips `workflow_dispatch` and other triggers. The job sets `ENVIRONMENT` to the same value for the suite (`dev` or `stage`). GitHub auto-creates those environments on first use.
+
+After the environments exist, restrict `stage` to `main`:
+
+1. Open the repository **Settings → Environments → `stage`**.
+2. Under **Deployment branches and tags**, choose **Selected branches and tags**.
+3. Add a branch rule for `main`.
+
 ### Cloudflare Worker mint BT credentials
 
 The behaviour job wires `TEST_CLOUDFLARE_*` into Wrangler’s standard `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` env names so CF mint BT (#5109) can upload versions of Worker **`mint-test`**. These secrets must **not** reuse the production site-deploy `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` used by `site-deploy.yml` (Worker `site`).
@@ -114,7 +124,7 @@ Each pool org must be provisioned before e2e can use it:
 3. Test actor permissions granted (see [Test actor permissions](#test-actor-permissions) below)
 4. All role apps installed, including `fullsend-ai-e2e` with **Repository → Variables: Read and write** (`actions_variables`) and **Organization → Variables: Read and write** (`organization_actions_variables`)
 5. `FULLSEND_FOREIGN_E2E_REPOS` includes `fullsend-ai/fullsend` with org-wide visibility (`visibility: all`)
-6. Mint enrolled: org in `ALLOWED_ORGS`, `${ORG}/e2e` in `ROLE_APP_IDS`, e2e app PEM enrolled
+6. Mint enrolled: org in `ALLOWED_ORGS`, `e2e` in `ROLE_APP_IDS`, e2e app PEM enrolled
 
 Use the idempotent setup script:
 
@@ -292,12 +302,25 @@ registration setting.
 |------|-------------|
 | fullsend | `actions:write`, `actions_variables:read`, `administration:write`, `checks:read`, `contents:write`, `issues:read`, `members:read`, `organization_projects:read`, `pull_requests:write`, `workflows:write` |
 | triage | `contents:read`, `issues:write` |
-| coder | `checks:read`, `contents:write`, `issues:write`, `pull_requests:write` |
+| coder | `checks:read`, `contents:write`, `issues:write`, `packages:read`, `pull_requests:write` |
+| fix | Reuses the coder app and PEM; the fix stage mints the `coder` role and therefore uses the coder permission set. |
 | review | `checks:read`, `contents:read`, `issues:write`, `pull_requests:write` |
 | retro | `actions:read`, `contents:read`, `issues:write`, `pull_requests:write` |
 | prioritize | `contents:read`, `issues:write`, `organization_projects:write` |
 
+The `fix` row is a hosted-mint dispatch alias: fix workflows mint the `coder`
+role and reuse `fullsend-test-coder` and `TEST_CODER_PEM`; it is not a separate
+App registration in that setup. Per-repo setup may still request the literal
+`fix` role and create a role-specific App for that repository.
+
 ### Operator notes
+
+**Permission rollout for the coder App:** When adding a permission such as
+`packages:read`, update the `fullsend-test-coder` App registration first. Then
+have the installation owner for each existing pool org (`halfsend-01` through
+`halfsend-12`) Accept the pending permission update. New pool-org installs
+receive the permission during installation; existing installs may otherwise
+continue using the mint's rollout warning path.
 
 **PEM rotation:** Generate a new private key on the app's settings page
 (`https://github.com/apps/<slug>/settings`), then update the corresponding

@@ -53,7 +53,7 @@ fullsend is pinned to — the source of truth is
 in the fullsend repo at your release tag (also printed on Fullsend workflow runs).
 
 ```bash
-export OPENSHELL_VERSION=0.0.83  # check the pin file for the current version
+export OPENSHELL_VERSION=0.0.116  # check the pin file for the current version
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/v${OPENSHELL_VERSION}/install.sh | OPENSHELL_VERSION=v${OPENSHELL_VERSION} sh
 openshell --version
 ```
@@ -96,6 +96,44 @@ GOOGLE_APPLICATION_CREDENTIALS=fullsend-local-credentials.json
 instead of the native binary, keep the key file and env file in your
 working directory — the container mounts it as `/work` and resolves
 `GOOGLE_APPLICATION_CREDENTIALS` relative to it.
+
+## Get an OpenAI key (GPT on pi or codex)
+
+<a id="get-an-openai-key-gpt-on-pi-only"></a>
+
+GPT models run on the [pi](../../runtimes/pi.md) and [codex](../../runtimes/codex.md) runtimes,
+with the credential kept out of the sandbox by an OpenShell provider. In CI the runner obtains it from OpenAI with the job's GitHub
+identity ([OpenAI Workload Identity](../infrastructure/openai-workload-identity.md)); on your
+machine there is no such identity, so use an API key from the same OpenAI project. Put it in an
+environment file, like the GCP settings above — never in the harness YAML and never under
+`env.sandbox` (the runner refuses to export it into the sandbox):
+
+```bash
+# fullsend-openai.env
+OPENAI_API_KEY=sk-...
+```
+
+Then pick a GPT model when you run:
+
+```bash
+fullsend run triage --runtime pi --model openai/gpt-5.6-luna \
+  --env-file fullsend-openai.env --env-file fullsend-triage.env ...
+```
+
+Codex takes the same key and the same harness requirements — swap `--runtime pi` for
+`--runtime codex`.
+
+A committed `inference.openai` block in the repository's `config.yaml` is ignored here while
+`OPENAI_API_KEY` is set (there is no GitHub OIDC endpoint to exchange with), so the same checkout
+works in CI and on your machine.
+
+The agent's harness must declare the provider (`providers: [openai]`; both the definition and the
+`fullsend-openai` profile are built into fullsend, nothing needs to be on disk) and a sandbox policy
+(`policy: policies/base.yaml` — the fleet's agents already have it; a custom harness needs it because
+the sandbox image's default policy leaves an uninspected route to `api.openai.com`, which the gateway
+refuses to carry the credential over). The sandbox only ever sees a placeholder; the provider holding
+your key belongs to this run, expires an hour after the run at the latest and is deleted when the run
+ends.
 
 ## Get a GitHub token
 
@@ -201,6 +239,34 @@ fullsend run code \
   --env-file fullsend-gcp.env \
   --env-file fullsend-code.env
 ```
+
+### Choosing the runtime
+
+<a id="run-a-minimal-agent-on-the-pi-runtime"></a><a id="troubleshooting-pi-runtime"></a><a id="platform-notes-pi"></a>
+
+Every example above runs on **Claude Code**, the default runtime. Fullsend
+also has two opt-in runtimes — **pi** and **codex** — and any example on
+this page runs on either by adding one flag to the same command:
+
+```bash
+fullsend run triage \
+  --fullsend-dir /tmp/fullsend-agents/ \
+  --target-repo /tmp/target-repo/ \
+  --env-file fullsend-gcp.env \
+  --env-file fullsend-triage.env \
+  --runtime pi
+```
+
+Codex is selected the same way (`--runtime codex`); it runs OpenAI models
+only, so pair it with `--model openai/gpt-5.6-luna` and the OpenAI key
+above.
+
+Everything else about runtimes lives in one place: [Agent
+runtimes](../../runtimes.md) for selecting and overriding the runtime,
+model and effort — per run, or per agent in `config.yaml` — and
+[Pi › Running it locally](../../runtimes/pi.md#running-it-locally) or
+[Codex › Running it locally](../../runtimes/codex.md#running-it-locally)
+for what a local run on either needs, its models and its troubleshooting.
 
 ### Remote resource flags
 
@@ -378,6 +444,10 @@ to the server (gateway). It is likely that you need to bind the gateway to `0.0.
 **`Syntax error: "(" unexpected` inside sandbox**
 - The macOS Mach-O binary was injected instead of a Linux ELF. Update to fullsend 0.4.0+ which auto-resolves the correct binary, or provide one explicitly with `--fullsend-binary`
 
+**`API Error: Error code policy_denied` on the first model call (agent exits after ~2 s, 0 tokens)**
+- The gateway denied the agent's binary, not the model. Run `grep DENIED <run-dir>/logs/openshell-sandbox.log`; a line ending in `binary '…/claude.exe' not allowed in policy '_provider_vertex_ai'` means the Vertex profile lacks `**/claude.exe` (Claude Code 2.1.2xx runs as `claude.exe`, even on Linux)
+- If `--fullsend-dir` contains a `profiles/` directory, its copy of the profile is imported after the harness's and is the one to fix; `fullsend run` prints a `Profile "…" is defined both in … and by the harness` warning when that happens
+
 **Agent fails with missing environment variable**
 - Check your env file contains all variables listed in the agent's harness YAML (`harness/{agent}.yaml` in the `.fullsend` config directory)
 
@@ -530,3 +600,10 @@ curl -sf https://api.example.com/healthz
   diff <(grep DENIED run-1/logs/openshell-sandbox.log) \
        <(grep DENIED run-2/logs/openshell-sandbox.log)
   ```
+
+## See also
+
+- [Agent runtimes](../../runtimes.md) — choosing a runtime and overriding runtime, model and effort per run or per agent
+- [Pi › Running it locally](../../runtimes/pi.md#running-it-locally) — what a local pi run needs, its models and troubleshooting
+- [fullsend run](../../cli/run.md) — the full flag reference
+- [Configuring agent behavior](customizing-agents.md) — harness configuration and `base:` composition

@@ -21,6 +21,8 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	"github.com/fullsend-ai/fullsend/internal/netutil"
 	"gopkg.in/yaml.v3"
+
+	"github.com/fullsend-ai/fullsend/internal/config"
 )
 
 const maxManifestBytes = 1 << 20 // 1 MB
@@ -89,12 +91,24 @@ type RepoEntry struct {
 	MintURL                string   `yaml:"mint_url,omitempty"`
 	MintMode               string   `yaml:"mint_mode,omitempty"`
 	AllowedRemoteResources []string `yaml:"allowed_remote_resources,omitempty"`
+	// Runtime is the agent runtime written as the repo's `runtime:` at
+	// install time (claude, pi, codex); empty inherits defaults.runtime,
+	// and an empty resolved value keeps the code default (claude).
+	Runtime string `yaml:"runtime,omitempty"`
+	// Vendor overrides the default vendor setting for this repo.
+	// nil inherits defaults.vendor; non-nil overrides it.
+	Vendor *bool `yaml:"vendor,omitempty"`
 }
 
 // DefaultsConfig holds default field values applied to every repo
 // across all platforms.
 type DefaultsConfig struct {
 	AllowedRemoteResources []string `yaml:"allowed_remote_resources,omitempty"`
+	// Runtime is the default agent runtime for every repo (claude, pi, codex).
+	Runtime string `yaml:"runtime,omitempty"`
+	// Vendor, when true, vendors the fullsend binary and content into
+	// each repo so CI does not need network access to fetch them.
+	Vendor *bool `yaml:"vendor,omitempty"`
 }
 
 // DefaultGitHubURL is the default forge URL for GitHub.com.
@@ -122,6 +136,12 @@ type ResolvedConfig struct {
 	MintMode               string
 	FullsendRef            string
 	AllowedRemoteResources []string
+	// Runtime is the resolved agent runtime (entry, then defaults); empty
+	// means the code default.
+	Runtime string
+	// Vendor is true when the fullsend binary and content should be
+	// vendored into the repo for offline CI.
+	Vendor bool
 }
 
 func parseManifestBytes(data []byte, m *Manifest) error {
@@ -327,6 +347,23 @@ func (m *Manifest) AllRepos() []RepoEntry {
 func (m *Manifest) Validate() error {
 	if m.Version != 1 {
 		return fmt.Errorf("unsupported manifest version %d (expected 1)", m.Version)
+	}
+
+	if err := validateRuntimeValue("defaults.runtime", m.Defaults.Runtime); err != nil {
+		return err
+	}
+	for _, p := range []struct {
+		name string
+		cfg  *PlatformConfig
+	}{{"github", m.GitHub}, {"gitlab", m.GitLab}} {
+		if p.cfg == nil {
+			continue
+		}
+		for _, e := range p.cfg.Repos {
+			if err := validateRuntimeValue(fmt.Sprintf("%s.repos[%s].runtime", p.name, e.Name), e.Runtime); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Track all repo names across platforms for cross-platform duplicate detection.
@@ -729,6 +766,11 @@ func (m *Manifest) resolveWithEntry(owner, repo, forgeName string, platform *Pla
 	} else {
 		cfg.AllowedRemoteResources = m.Defaults.AllowedRemoteResources
 	}
+	// Runtime: per-repo overrides the global default; "none" stops the
+	// chain like the other string fields.
+	cfg.Runtime = resolveField(entry.Runtime, m.Defaults.Runtime, "")
+	// Vendor: per-repo *bool overrides defaults *bool; default is false.
+	cfg.Vendor = resolveBoolField(entry.Vendor, m.Defaults.Vendor, false)
 
 	// Source infrastructure config from the platform-level section,
 	// with per-repo overrides via the string fallback chain.
@@ -749,6 +791,18 @@ func (m *Manifest) resolveWithEntry(owner, repo, forgeName string, platform *Pla
 		cfg.FullsendRef = resolveField(entry.FullsendRef, platform.FullsendRef, "")
 	}
 	return cfg
+}
+
+// resolveBoolField implements the three-level fallback chain for a
+// boolean override field. A nil pointer falls through to the next level.
+func resolveBoolField(perRepo, defaultVal *bool, builtinDefault bool) bool {
+	if perRepo != nil {
+		return *perRepo
+	}
+	if defaultVal != nil {
+		return *defaultVal
+	}
+	return builtinDefault
 }
 
 // resolveField implements the three-level fallback chain for an
@@ -873,4 +927,19 @@ func IsNumeric(s string) bool {
 // Marshal serializes the manifest back to YAML.
 func (m *Manifest) Marshal() ([]byte, error) {
 	return yaml.Marshal(m)
+}
+
+// validateRuntimeValue accepts an empty value (inherit), the "none" sentinel
+// (stop the chain; code default) or a runtime the per-repo config would
+// accept, so a manifest cannot install a runtime config.yaml would reject.
+func validateRuntimeValue(key, value string) error {
+	if value == "" || value == NoneSentinel {
+		return nil
+	}
+	for _, v := range config.ValidRuntimes() {
+		if value == v {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s %q is not a valid runtime; valid runtimes: %s", key, value, strings.Join(config.ValidRuntimes(), ", "))
 }

@@ -9,16 +9,10 @@ export default defineConfig({
   root: workerRoot,
   plugins: [
     cloudflareTest({
+      // The Worker is a static-asset passthrough: the only binding it needs is
+      // ASSETS, which comes from wrangler.toml. No vars or secrets.
       wrangler: {
         configPath: path.join(workerRoot, "..", "wrangler.toml"),
-      },
-      miniflare: {
-        bindings: {
-          GITHUB_APP_CLIENT_ID: "test_github_client_id",
-          GITHUB_APP_CLIENT_SECRET: "test_github_client_secret",
-          TURNSTILE_SITE_KEY: "1x00000000000000000000AA",
-          TURNSTILE_SECRET_KEY: "1x0000000000000000000000000000000AA",
-        },
       },
     }),
   ],

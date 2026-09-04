@@ -120,7 +120,7 @@ jobs:
             exit 1
           fi
           SRC=".defaults/internal/scaffold/fullsend-repo"
-          LAYERED_DIRS="agents skills schemas harness plugins policies scripts env"
+          LAYERED_DIRS="agents skills schemas harness plugins policies providers scripts env"
           DEST=""
           if [[ "${INSTALL_MODE}" == "per-repo" ]]; then
             DEST=".fullsend/"
@@ -251,6 +251,7 @@ jobs:
             if [[ -n "${COMMENT_BODY}" ]]; then
               # Strip the /fs-fix prefix to get the instruction.
               INSTRUCTION="${COMMENT_BODY#/fs-fix}"
+              INSTRUCTION="$(printf '%s\n' "${INSTRUCTION}" | sed 's/^[.,;:!?]*//')"
               INSTRUCTION="${INSTRUCTION#"${INSTRUCTION%%[![:space:]]*}"}"
             fi
             if [[ -z "${INSTRUCTION}" && -n "${INPUT_INSTRUCTION}" ]]; then
@@ -320,8 +321,9 @@ jobs:
         run: |
           REVIEW_FILE="${GITHUB_WORKSPACE}/review-body.txt"
           REVIEW_BOT="${ORG_NAME}-review[bot]"
+          SHARED_REVIEW_BOT="fullsend-ai-review[bot]"
           gh api "repos/${SOURCE_REPO}/pulls/${PR_NUM}/reviews" \
-            --jq "[.[] | select(.state == \"CHANGES_REQUESTED\" and .user.login == \"${REVIEW_BOT}\")] | last | .body // \"\"" \
+            --jq "[.[] | select(.state == \"CHANGES_REQUESTED\" and (.user.login == \"${REVIEW_BOT}\" or .user.login == \"${SHARED_REVIEW_BOT}\"))] | last | .body // \"\"" \
             > "${REVIEW_FILE}" 2>/dev/null || echo "" > "${REVIEW_FILE}"
           BYTE_COUNT="$(wc -c < "${REVIEW_FILE}")"
           echo "Pre-fetched review body: ${BYTE_COUNT} bytes"
@@ -354,6 +356,9 @@ jobs:
           FIX_HUMAN_INSTRUCTION: ${{ steps.context.outputs.instruction }}
           FIX_FIX_ITERATION: ${{ steps.context.outputs.iteration }}
           FIX_REPO_FULL_NAME: ${{ inputs.source_repo }}
+          # Per-run runtime/model/effort overrides from repository variables
+          # (FULLSEND_MODEL, FIX_FULLSEND_MODEL, ...); see docs/runtimes.md.
+          FULLSEND_REPO_VARS: ${{ toJSON(vars) }}
         run: bash .github/scripts/setup-agent-env.sh
 
       - name: Run fix agent
@@ -374,6 +379,13 @@ jobs:
           OTEL_EXPORTER_OTLP_CERTIFICATE: ${{ vars.OTEL_EXPORTER_OTLP_CERTIFICATE }}
           OTEL_RESOURCE_ATTRIBUTES: ${{ vars.OTEL_RESOURCE_ATTRIBUTES }}
           OTEL_SDK_DISABLED: ${{ vars.OTEL_SDK_DISABLED }}
+          OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${{ vars.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT }}
+          # OpenAI Workload Identity Federation for the pi runtime (ADR 0092):
+          # non-secret identifiers the runner exchanges the job's OIDC token
+          # against. Unset = the openai provider is not usable in this repo.
+          FULLSEND_OPENAI_AUDIENCE: ${{ vars.FULLSEND_OPENAI_AUDIENCE }}
+          FULLSEND_OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.FULLSEND_OPENAI_IDENTITY_PROVIDER_ID }}
+          FULLSEND_OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.FULLSEND_OPENAI_SERVICE_ACCOUNT_ID }}
         with:
           agent: fix
           version: ${{ inputs.fullsend_version || job.workflow_sha }}
@@ -381,4 +393,5 @@ jobs:
           run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           status-repo: ${{ inputs.source_repo }}
           status-number: ${{ steps.context.outputs.pr_number }}
+          status-comment-id: ${{ fromJSON(inputs.event_payload).comment.id }}
           mint-url: ${{ inputs.mint_url }}

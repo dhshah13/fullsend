@@ -180,5 +180,5 @@ repos:
         name: lint-staged (web)
         entry: npx lint-staged --allow-empty
         language: system
-        files: ^(web/admin/src/|docs/\.vitepress/)
+        files: ^docs/\.vitepress/
         pass_filenames: false

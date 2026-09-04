@@ -8,11 +8,18 @@
 # second workflow_call hop. Standalone reusable-{stage}.yml files are kept for
 # per-org mode until it's removed (ADR 44).
 #
+# Pre-computed matrix: The optional `matrix` input allows custom pollers in
+# external repos to skip the dispatch step and directly invoke harness agents.
+# When provided, the harness-dispatch job is skipped, and harness-run uses the
+# caller-provided matrix. This enables reuse without extracting separate workflows
+# while preserving ADR 62's inlining decision.
+#
 # Concurrency: each stage job declares a per-role cancel-in-progress group
 # (fullsend-{stage}-…). Roles operate independently — review dispatches do
 # not cancel triage, code, fix, etc.
 #
 # Flow: shim (per-repo) → reusable-dispatch.yml (route + inlined stage logic)
+# Or: custom poller → reusable-dispatch.yml (pre-computed matrix → harness-run)
 # Nesting: 2 levels of workflow_call (previously 3 before inlining)
 #
 # Security: all user-controlled inputs (comment body, labels, usernames)
@@ -23,9 +30,10 @@ on:
   workflow_call:
     inputs:
       event_action:
-        description: "The event action (github.event.action) forwarded by the shim"
-        required: true
+        description: "The event action (github.event.action) forwarded by the shim. Not required when matrix is provided."
+        required: false
         type: string
+        default: ""
       install_mode:
         description: "Installation mode: per-repo (default) or per-org"
         required: false
@@ -59,6 +67,16 @@ on:
         type: string
         required: false
         default: "ubuntu-24.04"
+      matrix:
+        description: "Pre-computed harness matrix (skips harness-dispatch if provided). Enables custom pollers to invoke harness agents directly. Format matches fullsend dispatch --output-driver gha-matrix."
+        required: false
+        type: string
+        default: ""
+      jira_base_url:
+        description: "Jira instance base URL (e.g., https://mysite.atlassian.net) for Jira-based agents"
+        required: false
+        type: string
+        default: ""
     secrets:
       FULLSEND_GCP_WIF_PROVIDER:
         required: false
@@ -73,10 +91,17 @@ on:
         required: false
       OTEL_EXPORTER_OTLP_HEADERS:
         required: false
+      JIRA_TOKEN:
+        description: "Jira Cloud API token for Jira-based agents"
+        required: false
+      JIRA_USER_EMAIL:
+        description: "Jira account email for Basic auth"
+        required: false
 
 jobs:
   route:
     name: Route
+    if: ${{ inputs.matrix == '' }}
     runs-on: ${{ inputs.runner_image }}
     permissions:
       contents: read
@@ -87,6 +112,12 @@ jobs:
       trigger_source: ${{ steps.route.outputs.trigger_source }}
       event_payload: ${{ steps.payload.outputs.event_payload }}
     steps:
+      - name: Validate event_action
+        if: ${{ inputs.event_action == '' }}
+        run: |
+          echo "::error::event_action is required when matrix is not provided"
+          exit 1
+
       - name: Checkout caller repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -108,7 +139,7 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_USER_TYPE: ${{ github.event.comment.user.type }}
           COMMENT_USER_LOGIN: ${{ github.event.comment.user.login }}
-          COMMENT_AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
+
           ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           ISSUE_IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
@@ -163,10 +194,6 @@ jobs:
             has_repo_permission "${1:-}" "${2:-write}"
           }
 
-          is_issue_author() {
-            [[ "${COMMENT_USER_LOGIN}" == "${ISSUE_USER_LOGIN}" ]]
-          }
-
           has_label() {
             local needle="$1"
             local csv="${2:-${ISSUE_LABELS}}"
@@ -179,7 +206,7 @@ jobs:
 
           COMMAND=""
           if [[ -n "${COMMENT_BODY:-}" ]]; then
-            COMMAND="$(printf '%s\n' "${COMMENT_BODY}" | head -1 | tr -d '\r' | awk '{print $1}')"
+            COMMAND="$(printf '%s\n' "${COMMENT_BODY}" | head -1 | tr -d '\r' | awk '{print $1}' | sed 's/[.,;:!?]*$//')"
           fi
 
           case "${EVENT_NAME}" in
@@ -212,16 +239,9 @@ jobs:
                     fi
                   fi
                   ;;
-                /fs-retro|/fullsend)
+                /fs-retro)
                   if [[ "${COMMENT_USER_TYPE}" != "Bot" ]] && is_authorized; then
-                    if [[ "${COMMAND}" == "/fullsend" ]]; then
-                      SECOND_WORD="$(printf '%s\n' "${COMMENT_BODY}" | head -1 | tr -d '\r' | awk '{print $2}')"
-                      if [[ "${SECOND_WORD}" == "retro" ]]; then
-                        STAGE="retro"
-                      fi
-                    else
-                      STAGE="retro"
-                    fi
+                    STAGE="retro"
                   fi
                   ;;
                 /fs-prioritize)
@@ -230,17 +250,8 @@ jobs:
                   fi
                   ;;
                 *)
-                  # Intentionally weaker gate: allows external reporters to
-                  # re-trigger triage by providing clarification on needs-info
-                  # issues. Full write-permission check is not required here.
-                  if has_label "needs-info" && ! has_label "feature"; then
-                    if [[ "${COMMENT_USER_TYPE}" != "Bot" ]]; then
-                      if [[ "${COMMENT_AUTHOR_ASSOC}" != "NONE" ]] || is_issue_author; then
-                        STAGE="triage"
-                      fi
-                    fi
-                  fi
                   ;;
+
               esac
               ;;
 
@@ -292,7 +303,9 @@ jobs:
             pull_request_review)
               if [[ "${EVENT_ACTION}" == "submitted" && "${REVIEW_STATE}" == "changes_requested" ]]; then
                 REVIEW_BOT="${ORG_NAME}-review[bot]"
-                if [[ "${REVIEW_USER_LOGIN}" == "${REVIEW_BOT}" ]]; then
+                SHARED_REVIEW_BOT="fullsend-ai-review[bot]"
+                if [[ "${REVIEW_USER_LOGIN}" == "${REVIEW_BOT}" || "${REVIEW_USER_LOGIN}" == "${SHARED_REVIEW_BOT}" ]]; then
+                  # Block fork PRs — fail closed if we cannot determine.
                   # Human PRs need fullsend-fix + write+ author (not triage-only).
                   if [[ -n "${PR_HEAD_REPO}" && -n "${PR_BASE_REPO}" ]]; then
                     if [[ "${PR_HEAD_REPO}" == "${PR_BASE_REPO}" ]]; then
@@ -426,9 +439,11 @@ jobs:
             echo "::error::config.yaml: disabled agent entry without a name field — add 'name:' to identify which agent to disable"
             exit 1
           fi
-          BAD_SOURCE=$(yq '.agents[] | select(type == "!!map" and .enabled != false and (.source == null or .source == "")) | line' .fullsend/config.yaml 2>/dev/null || echo "")
+          # An enabled entry may omit source when it only tunes a built-in
+          # agent by name (runtime/model/effort; ADR 0091).
+          BAD_SOURCE=$(yq '.agents[] | select(type == "!!map" and .enabled != false and (.source == null or .source == "") and (.runtime == null and .model == null and .effort == null)) | line' .fullsend/config.yaml 2>/dev/null || echo "")
           if [[ -n "$BAD_SOURCE" ]]; then
-            echo "::error::config.yaml: enabled agent entry without a source field"
+            echo "::error::config.yaml: enabled agent entry without a source field (an entry with only a name must set runtime, model or effort to tune a built-in agent)"
             exit 1
           fi
           DUPES_ENABLED=$(yq '.agents[] | select(type == "!!map" and .enabled != false) | (.name // "") | select(. != "") | downcase' .fullsend/config.yaml 2>/dev/null | sort | uniq -d)
@@ -544,7 +559,7 @@ jobs:
             pull_request: (.pull_request // null | if . then {number, html_url,
               head: {ref: .head.ref, sha: .head.sha, repo: {full_name: .head.repo.full_name}},
               base: {ref: .base.ref, repo: {full_name: .base.repo.full_name}}} else null end),
-            comment: (.comment // null | if . then {body: .body[:4096]} else null end)
+            comment: (.comment // null | if . then {id, body: .body[:4096]} else null end)
           }' "$GITHUB_EVENT_PATH") || {
             echo "::error::Failed to extract event payload from GITHUB_EVENT_PATH"
             exit 1
@@ -640,12 +655,16 @@ jobs:
           TRIAGE_TARGET_REPO_DIR: target-repo
           TRIAGE_ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}
           TRIAGE_CLOUD_ML_REGION: ${{ inputs.gcp_region }}
+          # Per-run runtime/model/effort overrides from repository variables
+          # (FULLSEND_MODEL, TRIAGE_FULLSEND_MODEL, ...); see docs/runtimes.md.
+          FULLSEND_REPO_VARS: ${{ toJSON(vars) }}
         run: bash .github/scripts/setup-agent-env.sh
 
       - name: Run triage agent
         uses: ./.defaults/
         env:
           GITHUB_ISSUE_URL: ${{ fromJSON(needs.route.outputs.event_payload).issue.html_url }}
+          FULLSEND_WORK_ITEM_URL: ${{ fromJSON(needs.route.outputs.event_payload).issue.html_url }}
           REPO_FULL_NAME: ${{ github.repository }}
           OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
           OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT }}
@@ -654,6 +673,13 @@ jobs:
           OTEL_EXPORTER_OTLP_CERTIFICATE: ${{ vars.OTEL_EXPORTER_OTLP_CERTIFICATE }}
           OTEL_RESOURCE_ATTRIBUTES: ${{ vars.OTEL_RESOURCE_ATTRIBUTES }}
           OTEL_SDK_DISABLED: ${{ vars.OTEL_SDK_DISABLED }}
+          OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${{ vars.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT }}
+          # OpenAI Workload Identity Federation for the pi runtime (ADR 0092):
+          # non-secret identifiers the runner exchanges the job's OIDC token
+          # against. Unset = the openai provider is not usable in this repo.
+          FULLSEND_OPENAI_AUDIENCE: ${{ vars.FULLSEND_OPENAI_AUDIENCE }}
+          FULLSEND_OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.FULLSEND_OPENAI_IDENTITY_PROVIDER_ID }}
+          FULLSEND_OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.FULLSEND_OPENAI_SERVICE_ACCOUNT_ID }}
         with:
           agent: triage
           fullsend-dir: ${{ inputs.install_mode == 'per-repo' && '.fullsend' || '' }}
@@ -661,6 +687,7 @@ jobs:
           run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           status-repo: ${{ github.repository }}
           status-number: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}
+          status-comment-id: ${{ fromJSON(needs.route.outputs.event_payload).comment.id }}
           mint-url: ${{ inputs.mint_url }}
           pr-head-sha: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.head.sha || '' }}
 
@@ -755,12 +782,17 @@ jobs:
           CODE_ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}
           CODE_CLOUD_ML_REGION: ${{ inputs.gcp_region }}
           CODE_ISSUE_NUMBER: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}
+          # Per-run runtime/model/effort overrides from repository variables
+          # (FULLSEND_MODEL, CODE_FULLSEND_MODEL, ...); see docs/runtimes.md.
+          FULLSEND_REPO_VARS: ${{ toJSON(vars) }}
         run: bash .github/scripts/setup-agent-env.sh
 
       - name: Run code agent
         uses: ./.defaults/
         env:
           GITHUB_ISSUE_URL: ${{ fromJSON(needs.route.outputs.event_payload).issue.html_url }}
+          FULLSEND_WORK_ITEM_URL: ${{ fromJSON(needs.route.outputs.event_payload).issue.html_url }}
+          FULLSEND_WORK_ITEM_KEY: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}
           ISSUE_NUMBER: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}
           # Reaches the harness pre-script inside fullsend run, which reads it
           # for its --force override of the existing-PR check (pre-script
@@ -780,6 +812,13 @@ jobs:
           OTEL_EXPORTER_OTLP_CERTIFICATE: ${{ vars.OTEL_EXPORTER_OTLP_CERTIFICATE }}
           OTEL_RESOURCE_ATTRIBUTES: ${{ vars.OTEL_RESOURCE_ATTRIBUTES }}
           OTEL_SDK_DISABLED: ${{ vars.OTEL_SDK_DISABLED }}
+          OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${{ vars.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT }}
+          # OpenAI Workload Identity Federation for the pi runtime (ADR 0092):
+          # non-secret identifiers the runner exchanges the job's OIDC token
+          # against. Unset = the openai provider is not usable in this repo.
+          FULLSEND_OPENAI_AUDIENCE: ${{ vars.FULLSEND_OPENAI_AUDIENCE }}
+          FULLSEND_OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.FULLSEND_OPENAI_IDENTITY_PROVIDER_ID }}
+          FULLSEND_OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.FULLSEND_OPENAI_SERVICE_ACCOUNT_ID }}
         with:
           agent: code
           fullsend-dir: ${{ inputs.install_mode == 'per-repo' && '.fullsend' || '' }}
@@ -787,6 +826,7 @@ jobs:
           run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           status-repo: ${{ github.repository }}
           status-number: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}
+          status-comment-id: ${{ fromJSON(needs.route.outputs.event_payload).comment.id }}
           mint-url: ${{ inputs.mint_url }}
           pr-head-sha: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.head.sha || '' }}
 
@@ -877,12 +917,16 @@ jobs:
           REVIEW_TARGET_REPO_DIR: target-repo
           REVIEW_ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}
           REVIEW_CLOUD_ML_REGION: ${{ inputs.gcp_region }}
+          # Per-run runtime/model/effort overrides from repository variables
+          # (FULLSEND_MODEL, REVIEW_FULLSEND_MODEL, ...); see docs/runtimes.md.
+          FULLSEND_REPO_VARS: ${{ toJSON(vars) }}
         run: bash .github/scripts/setup-agent-env.sh
 
       - name: Run review agent
         uses: ./.defaults/
         env:
           GITHUB_ISSUE_URL: ${{ fromJSON(needs.route.outputs.event_payload).issue.html_url }}
+          FULLSEND_WORK_ITEM_URL: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.html_url || fromJSON(needs.route.outputs.event_payload).issue.html_url }}
           GITHUB_PR_URL: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.html_url || fromJSON(needs.route.outputs.event_payload).issue.html_url }}
           REPO_FULL_NAME: ${{ github.repository }}
           PR_NUMBER: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.number || fromJSON(needs.route.outputs.event_payload).issue.number }}
@@ -896,6 +940,13 @@ jobs:
           OTEL_EXPORTER_OTLP_CERTIFICATE: ${{ vars.OTEL_EXPORTER_OTLP_CERTIFICATE }}
           OTEL_RESOURCE_ATTRIBUTES: ${{ vars.OTEL_RESOURCE_ATTRIBUTES }}
           OTEL_SDK_DISABLED: ${{ vars.OTEL_SDK_DISABLED }}
+          OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${{ vars.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT }}
+          # OpenAI Workload Identity Federation for the pi runtime (ADR 0092):
+          # non-secret identifiers the runner exchanges the job's OIDC token
+          # against. Unset = the openai provider is not usable in this repo.
+          FULLSEND_OPENAI_AUDIENCE: ${{ vars.FULLSEND_OPENAI_AUDIENCE }}
+          FULLSEND_OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.FULLSEND_OPENAI_IDENTITY_PROVIDER_ID }}
+          FULLSEND_OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.FULLSEND_OPENAI_SERVICE_ACCOUNT_ID }}
         with:
           agent: review
           fullsend-dir: ${{ inputs.install_mode == 'per-repo' && '.fullsend' || '' }}
@@ -903,6 +954,7 @@ jobs:
           run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           status-repo: ${{ github.repository }}
           status-number: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.number || fromJSON(needs.route.outputs.event_payload).issue.number }}
+          status-comment-id: ${{ fromJSON(needs.route.outputs.event_payload).comment.id }}
           mint-url: ${{ inputs.mint_url }}
           pr-head-sha: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.head.sha || '' }}
 
@@ -1048,6 +1100,7 @@ jobs:
             COMMENT_BODY="$(echo "${EVENT_PAYLOAD}" | jq -r '.comment.body // empty')"
             if [[ -n "${COMMENT_BODY}" ]]; then
               INSTRUCTION="${COMMENT_BODY#/fs-fix}"
+              INSTRUCTION="$(printf '%s\n' "${INSTRUCTION}" | sed 's/^[.,;:!?]*//')"
               INSTRUCTION="${INSTRUCTION#"${INSTRUCTION%%[![:space:]]*}"}"
             fi
             if [[ -z "${INSTRUCTION}" && -n "${INPUT_INSTRUCTION}" ]]; then
@@ -1109,8 +1162,9 @@ jobs:
         run: |
           REVIEW_FILE="${GITHUB_WORKSPACE}/review-body.txt"
           REVIEW_BOT="${ORG_NAME}-review[bot]"
+          SHARED_REVIEW_BOT="fullsend-ai-review[bot]"
           gh api "repos/${SOURCE_REPO}/pulls/${PR_NUM}/reviews" \
-            --jq "[.[] | select(.state == \"CHANGES_REQUESTED\" and .user.login == \"${REVIEW_BOT}\")] | last | .body // \"\"" \
+            --jq "[.[] | select(.state == \"CHANGES_REQUESTED\" and (.user.login == \"${REVIEW_BOT}\" or .user.login == \"${SHARED_REVIEW_BOT}\"))] | last | .body // \"\"" \
             > "${REVIEW_FILE}" 2>/dev/null || echo "" > "${REVIEW_FILE}"
           BYTE_COUNT="$(wc -c < "${REVIEW_FILE}")"
           echo "Pre-fetched review body: ${BYTE_COUNT} bytes"
@@ -1143,6 +1197,9 @@ jobs:
           FIX_HUMAN_INSTRUCTION: ${{ steps.context.outputs.instruction }}
           FIX_FIX_ITERATION: ${{ steps.context.outputs.iteration }}
           FIX_REPO_FULL_NAME: ${{ github.repository }}
+          # Per-run runtime/model/effort overrides from repository variables
+          # (FULLSEND_MODEL, FIX_FULLSEND_MODEL, ...); see docs/runtimes.md.
+          FULLSEND_REPO_VARS: ${{ toJSON(vars) }}
         run: bash .github/scripts/setup-agent-env.sh
 
       - name: Run fix agent
@@ -1163,6 +1220,13 @@ jobs:
           OTEL_EXPORTER_OTLP_CERTIFICATE: ${{ vars.OTEL_EXPORTER_OTLP_CERTIFICATE }}
           OTEL_RESOURCE_ATTRIBUTES: ${{ vars.OTEL_RESOURCE_ATTRIBUTES }}
           OTEL_SDK_DISABLED: ${{ vars.OTEL_SDK_DISABLED }}
+          OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${{ vars.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT }}
+          # OpenAI Workload Identity Federation for the pi runtime (ADR 0092):
+          # non-secret identifiers the runner exchanges the job's OIDC token
+          # against. Unset = the openai provider is not usable in this repo.
+          FULLSEND_OPENAI_AUDIENCE: ${{ vars.FULLSEND_OPENAI_AUDIENCE }}
+          FULLSEND_OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.FULLSEND_OPENAI_IDENTITY_PROVIDER_ID }}
+          FULLSEND_OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.FULLSEND_OPENAI_SERVICE_ACCOUNT_ID }}
         with:
           agent: fix
           fullsend-dir: ${{ inputs.install_mode == 'per-repo' && '.fullsend' || '' }}
@@ -1170,6 +1234,7 @@ jobs:
           run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           status-repo: ${{ github.repository }}
           status-number: ${{ steps.context.outputs.pr_number }}
+          status-comment-id: ${{ fromJSON(needs.route.outputs.event_payload).comment.id }}
           mint-url: ${{ inputs.mint_url }}
           pr-head-sha: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.head.sha || '' }}
 
@@ -1246,6 +1311,9 @@ jobs:
           RETRO_TARGET_REPO_DIR: target-repo
           RETRO_ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}
           RETRO_CLOUD_ML_REGION: ${{ inputs.gcp_region }}
+          # Per-run runtime/model/effort overrides from repository variables
+          # (FULLSEND_MODEL, RETRO_FULLSEND_MODEL, ...); see docs/runtimes.md.
+          FULLSEND_REPO_VARS: ${{ toJSON(vars) }}
         run: bash .github/scripts/setup-agent-env.sh
 
       - name: Run retro agent
@@ -1262,6 +1330,13 @@ jobs:
           OTEL_EXPORTER_OTLP_CERTIFICATE: ${{ vars.OTEL_EXPORTER_OTLP_CERTIFICATE }}
           OTEL_RESOURCE_ATTRIBUTES: ${{ vars.OTEL_RESOURCE_ATTRIBUTES }}
           OTEL_SDK_DISABLED: ${{ vars.OTEL_SDK_DISABLED }}
+          OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${{ vars.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT }}
+          # OpenAI Workload Identity Federation for the pi runtime (ADR 0092):
+          # non-secret identifiers the runner exchanges the job's OIDC token
+          # against. Unset = the openai provider is not usable in this repo.
+          FULLSEND_OPENAI_AUDIENCE: ${{ vars.FULLSEND_OPENAI_AUDIENCE }}
+          FULLSEND_OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.FULLSEND_OPENAI_IDENTITY_PROVIDER_ID }}
+          FULLSEND_OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.FULLSEND_OPENAI_SERVICE_ACCOUNT_ID }}
         with:
           agent: retro
           fullsend-dir: ${{ inputs.install_mode == 'per-repo' && '.fullsend' || '' }}
@@ -1269,6 +1344,7 @@ jobs:
           run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           status-repo: ${{ github.repository }}
           status-number: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.number || fromJSON(needs.route.outputs.event_payload).issue.number }}
+          status-comment-id: ${{ fromJSON(needs.route.outputs.event_payload).comment.id }}
           mint-url: ${{ inputs.mint_url }}
           pr-head-sha: ${{ fromJSON(needs.route.outputs.event_payload).pull_request.head.sha || '' }}
 
@@ -1329,6 +1405,9 @@ jobs:
           PRIORITIZE_PROJECT_NUMBER: ${{ inputs.project_number }}
           PRIORITIZE_ANTHROPIC_VERTEX_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}
           PRIORITIZE_CLOUD_ML_REGION: ${{ inputs.gcp_region }}
+          # Per-run runtime/model/effort overrides from repository variables
+          # (FULLSEND_MODEL, PRIORITIZE_FULLSEND_MODEL, ...); see docs/runtimes.md.
+          FULLSEND_REPO_VARS: ${{ toJSON(vars) }}
         run: bash .github/scripts/setup-agent-env.sh
 
       - name: Create empty target-repo directory
@@ -1338,6 +1417,7 @@ jobs:
         uses: ./.defaults/
         env:
           GITHUB_ISSUE_URL: ${{ fromJSON(needs.route.outputs.event_payload).issue.html_url }}
+          FULLSEND_WORK_ITEM_URL: ${{ fromJSON(needs.route.outputs.event_payload).issue.html_url }}
           REPO_FULL_NAME: ${{ github.repository }}
           OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
           OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT }}
@@ -1346,21 +1426,39 @@ jobs:
           OTEL_EXPORTER_OTLP_CERTIFICATE: ${{ vars.OTEL_EXPORTER_OTLP_CERTIFICATE }}
           OTEL_RESOURCE_ATTRIBUTES: ${{ vars.OTEL_RESOURCE_ATTRIBUTES }}
           OTEL_SDK_DISABLED: ${{ vars.OTEL_SDK_DISABLED }}
+          OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${{ vars.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT }}
+          # OpenAI Workload Identity Federation for the pi runtime (ADR 0092):
+          # non-secret identifiers the runner exchanges the job's OIDC token
+          # against. Unset = the openai provider is not usable in this repo.
+          FULLSEND_OPENAI_AUDIENCE: ${{ vars.FULLSEND_OPENAI_AUDIENCE }}
+          FULLSEND_OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.FULLSEND_OPENAI_IDENTITY_PROVIDER_ID }}
+          FULLSEND_OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.FULLSEND_OPENAI_SERVICE_ACCOUNT_ID }}
         with:
           agent: prioritize
           fullsend-dir: ${{ inputs.install_mode == 'per-repo' && '.fullsend' || '' }}
           version: ${{ inputs.fullsend_version || job.workflow_sha }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          status-repo: ${{ github.repository }}
+          status-number: ${{ fromJSON(needs.route.outputs.event_payload).issue.number }}
           mint-url: ${{ inputs.mint_url }}
 
   harness-dispatch:
     name: Harness dispatch
+    if: ${{ inputs.matrix == '' }}
     runs-on: ${{ inputs.runner_image }}
     permissions:
+      actions: write
       contents: read
       pull-requests: read
     outputs:
       matrix: ${{ steps.dispatch.outputs.matrix }}
     steps:
+      - name: Validate event_action
+        if: ${{ inputs.event_action == '' }}
+        run: |
+          echo "::error::event_action is required when matrix is not provided"
+          exit 1
+
       - name: Checkout caller repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1418,7 +1516,7 @@ jobs:
       - name: Restore fullsend CLI cache
         if: steps.triggers.outputs.has_triggers == 'true'
         id: cli-cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/fullsend-cache
           key: fullsend-cli-${{ steps.mode.outputs.mode }}-${{ job.workflow_sha }}
@@ -1473,7 +1571,7 @@ jobs:
 
       - name: Save fullsend CLI cache
         if: steps.triggers.outputs.has_triggers == 'true' && steps.cli-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/fullsend-cache
           key: fullsend-cli-${{ steps.mode.outputs.mode }}-${{ job.workflow_sha }}
@@ -1505,13 +1603,13 @@ jobs:
 
   harness-run:
     name: Harness run (${{ matrix.agent }})
-    needs: harness-dispatch
-    if: ${{ needs.harness-dispatch.outputs.matrix != '' && fromJSON(needs.harness-dispatch.outputs.matrix).include[0] != null }}
+    needs: [harness-dispatch]
+    if: ${{ !cancelled() && ((inputs.matrix != '' && fromJSON(inputs.matrix).include[0] != null) || (needs.harness-dispatch.outputs.matrix != '' && fromJSON(needs.harness-dispatch.outputs.matrix).include[0] != null)) }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.harness-dispatch.outputs.matrix) }}
+      matrix: ${{ fromJSON(inputs.matrix != '' && inputs.matrix || (needs.harness-dispatch.outputs.matrix != '' && needs.harness-dispatch.outputs.matrix || '{"include":[]}')) }}
     concurrency:
-      group: fullsend-harness-${{ matrix.agent }}-${{ github.repository }}-${{ matrix.status_number }}
+      group: fullsend-harness-${{ matrix.agent }}-${{ github.repository }}-${{ matrix.status_repo }}-${{ matrix.status_number }}
       cancel-in-progress: true
     runs-on: ${{ inputs.runner_image }}
     permissions:
@@ -1553,7 +1651,7 @@ jobs:
             exit 1
           fi
           SRC=".defaults/internal/scaffold/fullsend-repo"
-          LAYERED_DIRS="agents skills schemas harness plugins policies scripts env"
+          LAYERED_DIRS="agents skills schemas harness plugins policies providers scripts env"
           DEST=""
           if [[ "${INSTALL_MODE}" == "per-repo" ]]; then
             DEST=".fullsend/"
@@ -1610,12 +1708,30 @@ jobs:
           gcp_project_id: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}
           fullsend-dir: ${{ inputs.install_mode == 'per-repo' && '.fullsend' || '' }}
 
+      - name: Resolve bot identity
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          read -r BOT_LOGIN BOT_USER_ID < <(
+            gh api graphql -f query='{ viewer { login databaseId } }' \
+              | jq -r '.data.viewer | "\(.login) \(.databaseId)"'
+          )
+          GIT_BOT_EMAIL="${BOT_USER_ID}+${BOT_LOGIN}@users.noreply.github.com"
+          echo "Resolved bot identity: ${BOT_LOGIN} (${BOT_USER_ID})"
+          echo "GIT_BOT_EMAIL=${GIT_BOT_EMAIL}" >> "${GITHUB_ENV}"
+          git config --global user.email "${GIT_BOT_EMAIL}"
+          git config --global user.name "${BOT_LOGIN}"
+
       - name: Setup agent environment
         shell: bash
         env:
           MATRIX_ROLE: ${{ matrix.role }}
           GCP_PROJECT: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}
           GCP_REGION: ${{ inputs.gcp_region }}
+          # Per-run runtime/model/effort overrides from repository variables
+          # (FULLSEND_MODEL, <ROLE>_FULLSEND_MODEL, ...); see docs/runtimes.md.
+          FULLSEND_REPO_VARS: ${{ toJSON(vars) }}
         run: |
           set -euo pipefail
           ROLE_UPPER=$(echo "${MATRIX_ROLE}" | tr '[:lower:]' '[:upper:]')
@@ -1637,18 +1753,32 @@ jobs:
             echo "::error::event_payload missing issue or pull_request html_url"
             exit 1
           fi
+          WORK_ITEM_KEY=$(printf '%s' "${EVENT_PAYLOAD}" | jq -r '._normalized_event.entity.key // .issue.number // .pull_request.number // empty')
+          if [[ -z "${WORK_ITEM_KEY}" ]]; then
+            echo "::error::event_payload missing normalized entity key, issue number, or pull request number"
+            exit 1
+          fi
+          ISSUE_NUMBER=$(printf '%s' "${EVENT_PAYLOAD}" | jq -r 'if ._normalized_event.source.system == "jira" then empty else (.issue.number // .pull_request.number // empty) end')
           DELIM="ISSUE_URL_$(openssl rand -hex 8)"
           {
             echo "issue_url<<${DELIM}"
             printf '%s' "${URL}"
             echo
             echo "${DELIM}"
+            echo "work_item_key<<${DELIM}"
+            printf '%s' "${WORK_ITEM_KEY}"
+            echo
+            echo "${DELIM}"
+            echo "issue_number=${ISSUE_NUMBER}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Run harness agent
         uses: ./.defaults/
         env:
           GITHUB_ISSUE_URL: ${{ steps.dispatch-env.outputs.issue_url }}
+          FULLSEND_WORK_ITEM_URL: ${{ steps.dispatch-env.outputs.issue_url }}
+          FULLSEND_WORK_ITEM_KEY: ${{ steps.dispatch-env.outputs.work_item_key }}
+          ISSUE_NUMBER: ${{ steps.dispatch-env.outputs.issue_number }}
           REPO_FULL_NAME: ${{ matrix.source_repo }}
           OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
           OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT }}
@@ -1657,6 +1787,16 @@ jobs:
           OTEL_EXPORTER_OTLP_CERTIFICATE: ${{ vars.OTEL_EXPORTER_OTLP_CERTIFICATE }}
           OTEL_RESOURCE_ATTRIBUTES: ${{ vars.OTEL_RESOURCE_ATTRIBUTES }}
           OTEL_SDK_DISABLED: ${{ vars.OTEL_SDK_DISABLED }}
+          OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: ${{ vars.OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT }}
+          # OpenAI Workload Identity Federation for the pi runtime (ADR 0092):
+          # non-secret identifiers the runner exchanges the job's OIDC token
+          # against. Unset = the openai provider is not usable in this repo.
+          FULLSEND_OPENAI_AUDIENCE: ${{ vars.FULLSEND_OPENAI_AUDIENCE }}
+          FULLSEND_OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.FULLSEND_OPENAI_IDENTITY_PROVIDER_ID }}
+          FULLSEND_OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.FULLSEND_OPENAI_SERVICE_ACCOUNT_ID }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_BASE_URL: ${{ inputs.jira_base_url || vars.JIRA_BASE_URL }}
         with:
           agent: ${{ matrix.agent }}
           version: ${{ inputs.fullsend_version || job.workflow_sha }}
@@ -1664,5 +1804,6 @@ jobs:
           run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           status-repo: ${{ matrix.status_repo }}
           status-number: ${{ matrix.status_number }}
+          status-comment-id: ${{ fromJSON(matrix.event_payload).comment.id }}
           mint-url: ${{ inputs.mint_url }}
           pr-head-sha: ${{ fromJSON(matrix.event_payload).pull_request.head.sha || '' }}

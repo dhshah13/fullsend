@@ -84,8 +84,42 @@ the overlay → base → code defaults chain.
 | `inference.project` | `string` (nested) | Scalar override | `""` (empty) |
 | `inference.region` | `string` (nested) | Scalar override | `"global"` |
 | `inference.wif_provider` | `string` (nested) | Scalar override | `""` (empty) |
+| `inference.openai.audience` | `string` (nested) | Scalar override | `""` (empty) |
+| `inference.openai.identity_provider_id` | `string` (nested) | Scalar override | `""` (empty) |
+| `inference.openai.service_account_id` | `string` (nested) | Scalar override | `""` (empty) |
+| `models.aliases` | `map[string]string` (nested) | Per-key merge | `nil` (fleet defaults) |
 | `create_issues` | `*CreateIssuesConfig` | Replace whole object if set | `nil` |
 | `status_notifications` | `*StatusNotificationConfig` | Replace whole object if set | `nil` |
+
+### Per-agent `runtime`, `model`, `effort` on `agents:` entries
+
+An `agents:` entry may set `runtime`, `model` and `effort` for that agent.
+The `ref` field records the branch or tag that was resolved when the agent was
+adopted via `agent add`; `agent update` re-resolves against this ref instead
+of the default branch when it is present (empty for SHA-pinned or legacy entries).
+
+An enabled entry without `source:` is an *override-only* entry that tunes a
+built-in agent by name (or, in an overlay, a custom agent registered in the
+base layer). The keyed merge by `DerivedName()` carries the three settings
+field by field: the overlay's non-empty value wins, an empty value inherits
+the parent's. There is no way to unset a parent's value from the overlay
+short of restating the entry.
+
+```yaml
+# config.base.yaml (preset)
+agents:
+  - source: harness/lint.yaml   # name derived from the file: lint
+    model: opus
+# config.yaml (overlay)
+agents:
+  - name: lint          # merges onto the base entry: source kept, effort added
+    effort: medium
+  - name: code          # built-in agent tuned by name
+    runtime: claude
+```
+
+Precedence at run time: flag > env var > the agent's entry > repo-wide
+`runtime:` / harness default.
 
 ### Scalar override fields
 
@@ -96,7 +130,8 @@ unset, the accessor falls through to the base layer, then to code defaults.
 - **`version`**: Schema version string. Unset (`""`) falls through to parent.
   Code default is `"1"`.
 - **`runtime`**: Agent runtime identifier. Unset (`""`) falls through to
-  parent. Code default is `"claude"`. Valid values: `claude`, `dummy`.
+  parent. Code default is `"claude"`. Valid values: `claude`, `pi`, `codex`, `dummy`,
+  `dummy-playback`.
 - **`kill_switch`**: Pointer to bool (`*bool`). Using a pointer allows
   distinguishing between three states:
   - `nil` (key omitted) — unset, falls through to parent.
@@ -113,8 +148,8 @@ unset (`""`) falls through to parent, then to code default
 
 **`inference`** groups inference backend settings under a single YAML key
 (`inference:`) using the `PerRepoInferenceConfig` struct. Each subfield
-(`provider`, `project`, `region`, `wif_provider`) resolves independently
-through scalar override semantics:
+(`provider`, `project`, `region`, `wif_provider`, and the three under
+`openai`) resolves independently through scalar override semantics:
 
 - **`inference.provider`**: Inference provider identifier (e.g. `"vertex"`).
   Unset (`""`) falls through to parent, then to code default `"vertex"`.
@@ -124,10 +159,15 @@ through scalar override semantics:
   through to parent, then to code default `"global"`.
 - **`inference.wif_provider`**: Full WIF provider resource name. Unset (`""`)
   falls through to parent (no code default — must be provided by the installer).
+- **`inference.openai.{audience,identity_provider_id,service_account_id}`**:
+  the OpenAI Workload Identity identifiers for GPT on pi or codex (ADR 0092), written
+  by `fullsend github setup --openai-*`. Each resolves independently through
+  the layers; a run needs all three from one source. The `FULLSEND_OPENAI_*`
+  runner variables, when any is set, replace the resolved block entirely.
 
 The `inference` pointer itself (`*PerRepoInferenceConfig`) uses nil to mean
 "no local inference settings" — if the entire `inference:` key is omitted
-from YAML, all four subfields fall through to the parent layer. If the key
+from YAML, all subfields fall through to the parent layer. If the key
 is present, each subfield is checked independently.
 
 Example:
@@ -150,6 +190,38 @@ inference:
 #   inference.project: my-project (from overlay)
 #   inference.region: us-central1 (from base)
 #   inference.wif_provider: ...base... (from base)
+```
+
+### `models.aliases` — per-key merge
+
+`models.aliases` overrides fullsend's pinned model alias table per key
+(#6882). Keys are the existing alias vocabulary (`opus`, `sonnet`,
+`haiku`, `fable`); values are model ids or `provider/id` specs validated
+with `ValidModelRef`, and never another alias name — bare or as the id
+segment of a `provider/id` spec (aliases resolve once, so `sonnet: opus`
+or `sonnet: anthropic-vertex/opus` would reach the provider as the
+literal id `opus`). An unknown key is a config validation error.
+
+Merge is per key across layers: an overlay that sets `fable` inherits
+the base's `sonnet` entry without restating it. A `nil` Models block
+(key omitted from YAML) falls through to the parent layer. Validation
+runs on the merged map, so a bad key in `config.base.yaml` fails an
+overlay write (and `fullsend run`) even when the overlay omits
+`models:`.
+
+```yaml
+# config.base.yaml
+models:
+  aliases:
+    sonnet: claude-sonnet-5
+
+# config.yaml (overlay)
+models:
+  aliases:
+    fable: claude-fable-5-1
+
+# Effective: sonnet → claude-sonnet-5 (from base), fable → claude-fable-5-1 (from overlay),
+# opus and haiku → fleet defaults (compiled-in).
 ```
 
 ### `tracker` — scalar override
@@ -314,6 +386,7 @@ compiled-in defaults apply:
 | `inference.project` | `""` (empty — must be provided) |
 | `inference.region` | `"global"` |
 | `inference.wif_provider` | `""` (empty — must be provided) |
+| `models.aliases` | `nil` (fleet alias table compiled into the runtimes) |
 | `create_issues` | `nil` |
 | `status_notifications` | `nil` |
 

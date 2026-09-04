@@ -46,7 +46,8 @@ Accepted
 > artifact — only the poller could produce them. With API-triggered pipelines,
 > any user with pipeline-create access on the protected branch can POST
 > arbitrary variables (STAGE, EVENT_TYPE, EVENT_PAYLOAD_B64, RESOURCE_KEY,
-> IS_FORK, MR_AUTHOR_ID, ACTOR_ID, STATUS_IID, FULLSEND_POLL_JOB_URL). The
+> IS_FORK, MR_AUTHOR_ID, ACTOR_ID, STATUS_IID, FULLSEND_POLL_JOB_URL,
+> ORIGINATING_URL, REPO_FULL_NAME). The
 > in-job authorization gate and fork
 > protection read these attacker-supplied variables. Mitigation #1 is
 > implemented: the agent job uses the Pipelines API
@@ -339,7 +340,7 @@ configuration.
 | Issue label `ready-to-code` added | Cron poll (label state diff) | code |
 | Issue label `ready-for-review` added | Cron poll (label state diff) | review |
 | Issue note starting with `/fs-{triage,code,review,fix,retro,prioritize}` | Cron poll (note body prefix) | corresponding stage |
-| Issue note (non-command) on issue with `needs-info` label | Cron poll (label check); Reporter+ or issue author | triage |
+| ~~Issue note (non-command) on issue with `needs-info` label~~ | ~~Cron poll (label check); Reporter+ or issue author~~ | ~~triage~~ Removed in [#6740](https://github.com/fullsend-ai/fullsend/issues/6740) — use `/fs-triage` instead |
 | MR opened/updated/reopened | Native CI (`merge_request_event`) | review |
 | MR merged | Cron poll (MR `merged_at` > watermark) | retro |
 | MR note with `<!-- fullsend:changes-requested -->` | Cron poll (note body marker) | fix (same-project MRs only) |
@@ -442,13 +443,13 @@ injection > insider > drift > supply chain):
   `source_project_id != target_project_id`.
 - **Slash command authorization.** Only users with Developer-level (30+)
   project access can trigger agent stages via `/fs-*` commands.
-  Exception: non-command comments on issues with the `needs-info` label
+  ~~Exception: non-command comments on issues with the `needs-info` label
   trigger triage with a reduced authorization gate — the commenter must
   have at least Reporter-level (20+) project access or be the issue
-  author. This mirrors the GitHub path where ADR 0054 requires
-  `author_association != NONE` or issue authorship for non-command
-  triage triggers, preventing unauthenticated cost exposure on public
-  projects.
+  author.~~ The needs-info re-triage exception was removed in
+  [#6740](https://github.com/fullsend-ai/fullsend/issues/6740) — use
+  `/fs-triage` to re-trigger triage after providing requested
+  information.
 
 **Security properties of the credential model:**
 

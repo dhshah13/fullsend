@@ -35,6 +35,12 @@ inputs:
   status-number:
     description: Issue/PR number for status comments (optional).
     default: ""
+  status-comment-id:
+    description: >-
+      ID of the comment that triggered this run via a slash command
+      (optional). When set, status reactions target that comment instead
+      of the issue/PR.
+    default: ""
   mint-url:
     description: >-
       Mint service URL for on-demand GitHub App tokens. Used for both
@@ -380,6 +386,7 @@ runs:
         STATUS_RUN_URL: ${{ inputs.run-url }}
         STATUS_REPO: ${{ inputs.status-repo }}
         STATUS_NUMBER: ${{ inputs.status-number }}
+        STATUS_COMMENT_ID: ${{ inputs.status-comment-id }}
         MINT_URL: ${{ inputs.mint-url }}
         PR_HEAD_SHA: ${{ inputs.pr-head-sha }}
       run: |
@@ -397,6 +404,9 @@ runs:
           if [[ -n "${STATUS_RUN_URL}" ]]; then
             STATUS_FLAGS+=(--run-url "${STATUS_RUN_URL}")
           fi
+          if [[ -n "${STATUS_COMMENT_ID}" ]]; then
+            STATUS_FLAGS+=(--status-comment-id "${STATUS_COMMENT_ID}")
+          fi
         fi
         MINT_FLAGS=()
         if [[ -n "${MINT_URL}" ]]; then
@@ -408,6 +418,60 @@ runs:
           --target-repo "${TARGET_REPO}" \
           "${STATUS_FLAGS[@]+"${STATUS_FLAGS[@]}"}" \
           "${MINT_FLAGS[@]+"${MINT_FLAGS[@]}"}"
+
+    # Eval measurements (fail-open): score run-telemetry.jsonl with the agents
+    # measurement manifest. Same job as fullsend run; never fails the agent.
+    # Writes eval-measurements.jsonl when at least one new score row is produced
+    # (tool-agnostic artifact); missing telemetry/manifest skips with no file.
+    # Manifest trust: prefer a local override from the PR base SHA (same
+    # trusted tip reusable-* workflows check out for kill-switch config).
+    # Path prefix comes from inputs.fullsend-dir (install layout: per-repo
+    # `.fullsend/` or per-org workspace root); file bytes come from the
+    # trusted ref — never from a PR-head working tree. When no trusted
+    # override exists, fetch SHA-pinned agents@v0 (no --fullsend-dir).
+    - name: Eval measurements
+      if: always() && inputs.agent != '__install_only__'
+      continue-on-error: true
+      shell: bash
+      env:
+        AGENT: ${{ inputs.agent }}
+        FULLSEND_DIR: ${{ inputs.fullsend-dir }}
+        # For GetRef of agents@v0 (SHA pin). Not sent to raw.githubusercontent.com.
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        MEASURE_ARGS=(--agent "${AGENT}" --output-dir "${GITHUB_WORKSPACE}/output")
+        TRUSTED_REF="${PR_BASE_SHA:-}"
+        if [[ -z "${TRUSTED_REF}" ]]; then
+          TRUSTED_REF="${GITHUB_SHA:-}"
+        fi
+        FULLSEND_DIR="${FULLSEND_DIR:-.fullsend}"
+        MEASURE_REL=""
+        case "${FULLSEND_DIR}" in
+          "${GITHUB_WORKSPACE}"/*)
+            MEASURE_REL="${FULLSEND_DIR#"${GITHUB_WORKSPACE}"/}"
+            ;;
+          /*)
+            MEASURE_REL=""
+            ;;
+          *)
+            MEASURE_REL="${FULLSEND_DIR}"
+            ;;
+        esac
+        MEASURE_REL="${MEASURE_REL#./}"
+        MEASURE_REL="${MEASURE_REL%/}"
+        if [[ -n "${TRUSTED_REF}" && -n "${MEASURE_REL}" ]] \
+          && git cat-file -e "${TRUSTED_REF}:${MEASURE_REL}/eval/measurements/${AGENT}.yaml" 2>/dev/null; then
+          MEASURE_FILE="${GITHUB_WORKSPACE}/output/.fullsend-measure-${AGENT}.yaml"
+          mkdir -p "${GITHUB_WORKSPACE}/output"
+          git show "${TRUSTED_REF}:${MEASURE_REL}/eval/measurements/${AGENT}.yaml" > "${MEASURE_FILE}"
+          MEASURE_ARGS+=(--registry "${MEASURE_FILE}")
+        fi
+        # Binary resolves SHA-pinned agents@v0 when --registry is unset
+        # (allowlist/hash/audit) and scores only platform run-telemetry.jsonl
+        # at the top of each runDir.
+        fullsend eval-measure "${MEASURE_ARGS[@]}"
 
     - name: Upload fullsend artifacts
       if: always() && inputs.agent != '__install_only__'

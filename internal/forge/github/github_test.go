@@ -2749,6 +2749,34 @@ func TestIsTransientStatus(t *testing.T) {
 	}
 }
 
+func TestAPIError_IsTransient(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		code int
+		want bool
+	}{
+		{name: "429 rate limit", code: 429, want: true},
+		{name: "500 internal server error", code: 500, want: true},
+		{name: "502 bad gateway", code: 502, want: true},
+		{name: "503 service unavailable", code: 503, want: true},
+		{name: "504 gateway timeout", code: 504, want: true},
+		{name: "200 OK", code: 200, want: false},
+		{name: "401 unauthorized", code: 401, want: false},
+		{name: "403 forbidden", code: 403, want: false},
+		{name: "404 not found", code: 404, want: false},
+		{name: "422 unprocessable entity", code: 422, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := &APIError{StatusCode: tt.code, Message: http.StatusText(tt.code)}
+			assert.Equal(t, tt.want, err.IsTransient())
+		})
+	}
+}
+
 func TestIsRetryable_PrimaryRateLimitAs403(t *testing.T) {
 	// GitHub sometimes returns primary rate limits as 403 with body
 	// containing "API rate limit exceeded" instead of 429. This must
@@ -4381,4 +4409,142 @@ func TestUnsupportedMethods(t *testing.T) {
 		err := client.CreateProtectedCIVariable(ctx, "o", "r", "KEY", "val")
 		assert.ErrorIs(t, err, forge.ErrNotSupported)
 	})
+}
+
+func TestDo_ObservesRateLimitHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4321")
+		w.Header().Set("X-RateLimit-Reset", "1767225600") // 2026-01-01T00:00:00Z
+		w.Header().Set("X-RateLimit-Resource", "core")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{"name": "test-repo", "full_name": "org/test-repo", "default_branch": "main"})
+	}))
+	defer srv.Close()
+	client := &LiveClient{token: "test-token", baseURL: srv.URL, http: srv.Client(), afterFunc: noWaitAfter}
+
+	_, seen := client.RateLimit()
+	assert.False(t, seen, "nothing observed before the first response")
+
+	_, err := client.GetRepo(context.Background(), "org", "test-repo")
+	require.NoError(t, err)
+
+	rl, seen := client.RateLimit()
+	require.True(t, seen)
+	assert.Equal(t, 5000, rl.Limit)
+	assert.Equal(t, 4321, rl.Remaining)
+	assert.Equal(t, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), rl.Reset.UTC())
+	assert.Equal(t, "core", rl.Resource)
+	assert.False(t, rl.Observed.IsZero())
+	assert.Equal(t, "remaining=4321/5000 reset=2026-01-01T00:00:00Z resource=core", rl.String())
+}
+
+func TestDo_ResponseWithoutRateLimitHeadersKeepsPreviousObservation(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("X-RateLimit-Limit", "5000")
+			w.Header().Set("X-RateLimit-Remaining", "10")
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{"name": "test-repo", "full_name": "org/test-repo", "default_branch": "main"})
+	}))
+	defer srv.Close()
+	client := &LiveClient{token: "test-token", baseURL: srv.URL, http: srv.Client(), afterFunc: noWaitAfter}
+	for i := 0; i < 2; i++ {
+		_, err := client.GetRepo(context.Background(), "org", "test-repo")
+		require.NoError(t, err)
+	}
+	rl, seen := client.RateLimit()
+	require.True(t, seen)
+	assert.Equal(t, 10, rl.Remaining)
+}
+
+func TestDo_RateLimitExhaustedErrorSelfIdentifies(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset", "1767225600")
+		w.Header().Set("X-RateLimit-Resource", "core")
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"message": "API rate limit exceeded for installation ID 1."})
+	}))
+	defer srv.Close()
+	client := &LiveClient{token: "test-token", baseURL: srv.URL, http: srv.Client(), afterFunc: noWaitAfter}
+	origBackoff := secondaryRateLimitBackoff
+	defer func() { secondaryRateLimitBackoff = origBackoff }()
+	secondaryRateLimitBackoff = time.Millisecond
+
+	_, err := client.GetRepo(context.Background(), "org", "test-repo")
+	require.Error(t, err)
+	assert.Equal(t, maxRetries, attempts)
+	assert.True(t, IsRateLimitError(err), "an exhausted-retry 403 must be recognised as a rate limit: %v", err)
+	assert.Contains(t, err.Error(), "rate limit: retryable error after 5 attempts on GET /repos/org/test-repo")
+	assert.Contains(t, err.Error(), "[remaining=0/5000 reset=2026-01-01T00:00:00Z resource=core]")
+}
+
+func TestDo_RateLimitExhaustedWithoutHeadersNamesLastObservation(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// A healthy response establishes the last observation.
+			w.Header().Set("X-RateLimit-Limit", "5000")
+			w.Header().Set("X-RateLimit-Remaining", "4000")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]any{"name": "test-repo", "full_name": "org/test-repo", "default_branch": "main"})
+			return
+		}
+		// Secondary-limit shape: Retry-After, no X-RateLimit-* headers.
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"message": "You have exceeded a secondary rate limit"})
+	}))
+	defer srv.Close()
+	client := &LiveClient{token: "test-token", baseURL: srv.URL, http: srv.Client(), afterFunc: noWaitAfter}
+	_, err := client.GetRepo(context.Background(), "org", "test-repo")
+	require.NoError(t, err)
+
+	_, err = client.GetRepo(context.Background(), "org", "test-repo")
+	require.Error(t, err)
+	assert.True(t, IsRateLimitError(err))
+	assert.Contains(t, err.Error(), "rate limit: retryable error after 5 attempts")
+	assert.Contains(t, err.Error(), "[rate-limit headers absent; last seen remaining=4000/5000 reset=unknown resource=unknown, ")
+	assert.NotContains(t, err.Error(), "[remaining=4000", "a stale observation must not be presented as the failing response's budget")
+}
+
+func TestDo_RateLimitExhaustedWithoutAnyObservationSaysSo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]string{"message": "You have exceeded a secondary rate limit"})
+	}))
+	defer srv.Close()
+	client := &LiveClient{token: "test-token", baseURL: srv.URL, http: srv.Client(), afterFunc: noWaitAfter}
+
+	_, err := client.GetRepo(context.Background(), "org", "test-repo")
+	require.Error(t, err)
+	assert.True(t, IsRateLimitError(err))
+	assert.Contains(t, err.Error(), "[rate-limit headers absent; no prior observation]")
+}
+
+func TestRateLimitString_UnknownFields(t *testing.T) {
+	assert.Equal(t, "remaining=7 reset=unknown resource=unknown", forge.RateLimit{Remaining: 7}.String())
+}
+
+func TestDo_ServerErrorExhaustedIsNotARateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	client := &LiveClient{token: "test-token", baseURL: srv.URL, http: srv.Client(), afterFunc: noWaitAfter}
+
+	_, err := client.GetRepo(context.Background(), "org", "test-repo")
+	require.Error(t, err)
+	assert.False(t, IsRateLimitError(err))
+	assert.NotContains(t, err.Error(), "rate limit:")
+	assert.Contains(t, err.Error(), "retryable error after 5 attempts")
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -674,21 +675,22 @@ func TestPinAgentURL_ResolvesRef(t *testing.T) {
 
 	// Non-GitHub URL with non-SHA ref — should fail
 	printer := ui.New(os.Stdout)
-	_, err := pinAgentURL(context.Background(), srv.URL+"/my-org/agents/main/harness/triage.yaml", client, printer)
+	_, _, err := pinAgentURL(context.Background(), srv.URL+"/my-org/agents/main/harness/triage.yaml", client, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "non-GitHub URLs must use a pinned commit SHA")
 
 	// Non-GitHub URL with SHA ref — should succeed
 	source := srv.URL + "/my-org/agents/" + resolvedSHA + "/harness/triage.yaml"
-	result, err := pinAgentURL(context.Background(), source, client, printer)
+	result, ref, err := pinAgentURL(context.Background(), source, client, printer)
 	require.NoError(t, err)
 	assert.Contains(t, result, resolvedSHA)
 	assert.Contains(t, result, "#sha256="+harnessHash)
+	assert.Empty(t, ref, "SHA-pinned URL should not produce an original ref")
 }
 
 func TestPinAgentURL_NilForgeClient(t *testing.T) {
 	printer := ui.New(os.Stdout)
-	_, err := pinAgentURL(context.Background(), "https://github.com/org/repo/blob/main/harness/triage.yaml", nil, printer)
+	_, _, err := pinAgentURL(context.Background(), "https://github.com/org/repo/blob/main/harness/triage.yaml", nil, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "forge client for branch resolution")
 }
@@ -716,7 +718,7 @@ func TestPinAgentURL_RefFallbackToDefaultBranch(t *testing.T) {
 
 	var buf strings.Builder
 	printer := ui.New(&buf)
-	_, err := pinAgentURL(context.Background(), source, client, printer)
+	_, _, err := pinAgentURL(context.Background(), source, client, printer)
 	// Fetch fails (raw.githubusercontent.com != test server) but resolution path was exercised
 	require.Error(t, err)
 	assert.Contains(t, buf.String(), "falling back to default branch")
@@ -731,7 +733,7 @@ func TestPinAgentURL_TransientErrorDoesNotFallback(t *testing.T) {
 	}}
 
 	printer := ui.New(os.Stdout)
-	_, err := pinAgentURL(context.Background(), "https://raw.githubusercontent.com/org/repo/feature-branch/harness/triage.yaml", client, printer)
+	_, _, err := pinAgentURL(context.Background(), "https://raw.githubusercontent.com/org/repo/feature-branch/harness/triage.yaml", client, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "resolving ref")
 	assert.Contains(t, err.Error(), "internal server error")
@@ -743,9 +745,35 @@ func TestPinAgentURL_InvalidResolvedSHA(t *testing.T) {
 	client.BranchRefs["org/repo/main"] = "not-a-valid-sha"
 
 	printer := ui.New(os.Stdout)
-	_, err := pinAgentURL(context.Background(), "https://raw.githubusercontent.com/org/repo/main/harness/triage.yaml", client, printer)
+	_, _, err := pinAgentURL(context.Background(), "https://raw.githubusercontent.com/org/repo/main/harness/triage.yaml", client, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a valid commit SHA")
+}
+
+func TestPinAgentURL_GitHubBranchRefCapture(t *testing.T) {
+	// Verify that pinAgentURL correctly resolves a GitHub branch URL
+	// and captures the branch name as originalRef. The fetch step
+	// fails because buildRawURL constructs a raw.githubusercontent.com
+	// URL that cannot be served by the test server, but the resolution
+	// path — including originalRef capture — is fully exercised and
+	// verified through printer output.
+	resolvedSHA := "c1c2c3c4c5c6c7c8c9c0d1d2d3d4d5d6d7d8d9d0"
+
+	client := forge.NewFakeClient()
+	client.BranchRefs["org/repo/release-2.0"] = resolvedSHA
+
+	var buf strings.Builder
+	printer := ui.New(&buf)
+	_, ref, err := pinAgentURL(context.Background(),
+		"https://raw.githubusercontent.com/org/repo/release-2.0/harness/triage.yaml",
+		client, printer)
+	require.Error(t, err, "expected fetch error because raw.githubusercontent.com is unreachable in tests")
+	assert.Contains(t, err.Error(), "fetching")
+	assert.Empty(t, ref, "originalRef is cleared on error return")
+
+	output := buf.String()
+	assert.Contains(t, output, "org/repo@release-2.0", "should resolve against the branch ref")
+	assert.Contains(t, output, "Resolved to "+resolvedSHA[:12], "should show resolved SHA")
 }
 
 func TestRunAgentUpdate_GitHubURLUsesRawURL(t *testing.T) {
@@ -780,6 +808,85 @@ allowed_remote_resources:
 	require.Len(t, agents, 1)
 	assert.Contains(t, agents[0].Source, newSHA)
 	assert.Contains(t, agents[0].Source, "#sha256="+newHash)
+}
+
+func TestAgentEntryRefRoundtrip(t *testing.T) {
+	// Verify the Ref field survives a YAML write-read roundtrip.
+	dir := t.TempDir()
+	hash := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	writeOrgConfig(t, dir, `agents:
+  - source: "https://raw.githubusercontent.com/org/repo/`+testCommitSHA+`/harness/triage.yaml#sha256=`+hash+`"
+    ref: release-1.0
+allowed_remote_resources:
+  - "https://raw.githubusercontent.com/org/repo/"
+`)
+
+	cfg, err := loadAgentConfig(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	agents := cfg.AgentEntries()
+	require.Len(t, agents, 1)
+	assert.Equal(t, "release-1.0", agents[0].Ref, "Ref should survive YAML roundtrip")
+
+	// Re-marshal and re-parse to verify the field persists.
+	data, err := cfg.Marshal()
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "ref: release-1.0")
+}
+
+func TestRunAgentUpdate_UsesStoredRef(t *testing.T) {
+	newSHA := "d1d2d3d4d5d6d7d8d9d0e1e2e3e4e5e6e7e8e9e0"
+
+	dir := t.TempDir()
+	oldHash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	writeOrgConfig(t, dir, `agents:
+  - source: "https://raw.githubusercontent.com/org/repo/`+testCommitSHA+`/harness/triage.yaml#sha256=`+oldHash+`"
+    ref: release-1.0
+allowed_remote_resources:
+  - "https://raw.githubusercontent.com/org/repo/"
+`)
+
+	client := forge.NewFakeClient()
+	// Only set the release-1.0 branch — do NOT set a default branch.
+	// If the stored ref is ignored, GetRepo will be called and fail (no repo configured).
+	client.BranchRefs["org/repo/release-1.0"] = newSHA
+
+	var buf strings.Builder
+	printer := ui.New(&buf)
+	err := runAgentUpdate(context.Background(), "triage", "", dir, client, printer)
+	// Fetch fails (raw.githubusercontent.com != test server) but branch
+	// resolution was exercised against the stored ref, not the default branch.
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fetching content")
+	assert.Contains(t, buf.String(), "org/repo@release-1.0", "should resolve against stored ref")
+}
+
+func TestRunAgentUpdate_FallsBackToDefaultBranchWhenNoRef(t *testing.T) {
+	newSHA := "e1e2e3e4e5e6e7e8e9e0f1f2f3f4f5f6f7f8f9f0"
+
+	dir := t.TempDir()
+	oldHash := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	// No ref field — simulates a pre-existing config entry without Ref.
+	writeOrgConfig(t, dir, `agents:
+  - source: "https://raw.githubusercontent.com/org/repo/`+testCommitSHA+`/harness/triage.yaml#sha256=`+oldHash+`"
+allowed_remote_resources:
+  - "https://raw.githubusercontent.com/org/repo/"
+`)
+
+	client := forge.NewFakeClient()
+	client.Repos = []forge.Repository{{
+		FullName:      "org/repo",
+		DefaultBranch: "main",
+	}}
+	client.BranchRefs["org/repo/main"] = newSHA
+
+	var buf strings.Builder
+	printer := ui.New(&buf)
+	err := runAgentUpdate(context.Background(), "triage", "", dir, client, printer)
+	// Fetch fails (raw.githubusercontent.com != test server) but branch
+	// resolution was exercised against the default branch.
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fetching content")
+	assert.Contains(t, buf.String(), "org/repo@main", "should fall back to default branch")
 }
 
 func TestRunAgentUpdate_ForgeResolvesDefaultBranch(t *testing.T) {
@@ -1077,7 +1184,7 @@ func TestRunAgentUpdate_ParseSourceURLError(t *testing.T) {
 
 func TestPinAgentURL_ParseError(t *testing.T) {
 	printer := ui.New(os.Stdout)
-	_, err := pinAgentURL(context.Background(), "https://x.com/y", nil, printer)
+	_, _, err := pinAgentURL(context.Background(), "https://x.com/y", nil, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot parse URL")
 }
@@ -1132,7 +1239,7 @@ func TestPinAgentURL_GetRepoErrorWrapsRepoErr(t *testing.T) {
 	client.Errors["GetRepo"] = fmt.Errorf("auth failure")
 
 	printer := ui.New(os.Stdout)
-	_, err := pinAgentURL(context.Background(), "https://raw.githubusercontent.com/org/repo/feature/harness/triage.yaml", client, printer)
+	_, _, err := pinAgentURL(context.Background(), "https://raw.githubusercontent.com/org/repo/feature/harness/triage.yaml", client, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "auth failure")
 	assert.Contains(t, err.Error(), "looking up repo")
@@ -1201,7 +1308,7 @@ allowed_remote_resources:
 
 func TestNewAgentCmd_HasSubcommands(t *testing.T) {
 	cmd := newAgentCmd()
-	assert.Len(t, cmd.Commands(), 4)
+	assert.Len(t, cmd.Commands(), 5)
 	names := make([]string, len(cmd.Commands()))
 	for i, c := range cmd.Commands() {
 		names[i] = c.Name()
@@ -1211,4 +1318,131 @@ func TestNewAgentCmd_HasSubcommands(t *testing.T) {
 	assert.Contains(t, names, "update")
 	assert.Contains(t, names, "remove")
 	assert.NotContains(t, names, "migrate-customizations", "should not exist — removed per ADR-0064")
+}
+
+func TestRunAgentRemove_DropsSettingsWithTheEntry(t *testing.T) {
+	dir := t.TempDir()
+	writePerRepoConfig(t, dir, `agents:
+  - source: harness/lint.yaml
+    model: sonnet
+  - source: harness/review.yaml
+    effort: high
+`)
+	require.NoError(t, runAgentRemove(dir, "lint", ui.New(os.Stdout)))
+	cfg, err := loadAgentConfig(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	require.Len(t, cfg.AgentEntries(), 1)
+	_, found := config.AgentSettingsFor(cfg.AgentEntries(), "lint")
+	assert.False(t, found)
+	review, found := config.AgentSettingsFor(cfg.AgentEntries(), "review")
+	require.True(t, found)
+	assert.Equal(t, "high", review.Effort, "other entries keep their settings")
+}
+
+func TestRunAgentSet(t *testing.T) {
+	dir := t.TempDir()
+	writePerRepoConfig(t, dir, `runtime: pi
+agents:
+  - source: harness/lint.yaml
+`)
+	var out bytes.Buffer
+
+	// A built-in agent gets a name-only entry.
+	require.NoError(t, runAgentSet(dir, "code", agentSetFlags{runtime: "claude", runtimeSet: true, model: "sonnet", modelSet: true}, ui.New(&out)))
+	cfg, err := loadAgentConfig(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	code, found := config.AgentSettingsFor(cfg.AgentEntries(), "code")
+	require.True(t, found)
+	assert.Equal(t, config.AgentEntry{Name: "code", Runtime: "claude", Model: "sonnet"}, code)
+
+	// A second call changes only the flags given; "" clears.
+	require.NoError(t, runAgentSet(dir, "code", agentSetFlags{effort: "high", effortSet: true, model: "", modelSet: true}, ui.New(&out)))
+	cfg, err = loadAgentConfig(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	code, _ = config.AgentSettingsFor(cfg.AgentEntries(), "code")
+	assert.Equal(t, config.AgentEntry{Name: "code", Runtime: "claude", Effort: "high"}, code)
+
+	// A custom agent's settings land on its sourced entry.
+	require.NoError(t, runAgentSet(dir, "lint", agentSetFlags{model: "haiku", modelSet: true}, ui.New(&out)))
+	cfg, err = loadAgentConfig(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	lint, _ := config.AgentSettingsFor(cfg.AgentEntries(), "lint")
+	assert.Equal(t, "harness/lint.yaml", lint.Source)
+	assert.Equal(t, "haiku", lint.Model)
+	assert.Len(t, cfg.AgentEntries(), 2)
+
+	// Validation guards the write: unknown built-in, bad values, no flags.
+	err = runAgentSet(dir, "coder", agentSetFlags{model: "sonnet", modelSet: true}, ui.New(&out))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `did you mean "code"`)
+	err = runAgentSet(dir, "triage", agentSetFlags{effort: "turbo", effortSet: true}, ui.New(&out))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `invalid effort "turbo"`)
+	require.Error(t, runAgentSet(dir, "triage", agentSetFlags{}, ui.New(&out)))
+	cfg, err = loadAgentConfig(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	_, found = config.AgentSettingsFor(cfg.AgentEntries(), "triage")
+	assert.False(t, found, "failed sets write nothing")
+}
+
+func TestRunAgentSet_BaseLayerAgentGetsOverlayEntry(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.base.yaml"), []byte(`# fullsend per-repo configuration
+version: "1"
+agents:
+  - source: harness/lint.yaml
+    model: opus
+`), 0o644))
+	writePerRepoConfig(t, dir, "")
+	require.NoError(t, runAgentSet(dir, "lint", agentSetFlags{effort: "medium", effortSet: true}, ui.New(os.Stdout)))
+
+	// The overlay gains a name-only entry that merges onto the base one;
+	// the base file is untouched.
+	overlay, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	assert.Contains(t, string(overlay), "name: lint")
+	assert.NotContains(t, string(overlay), "harness/lint.yaml")
+	cfg, err := loadAgentConfig(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	lint, found := config.AgentSettingsFor(cfg.AgentEntries(), "lint")
+	require.True(t, found)
+	assert.Equal(t, "harness/lint.yaml", lint.Source)
+	assert.Equal(t, "opus", lint.Model, "base model kept (unset flag inherits)")
+	assert.Equal(t, "medium", lint.Effort)
+}
+
+func TestAgentSetCmd_ExecutesAndTracksChangedFlags(t *testing.T) {
+	dir := t.TempDir()
+	writePerRepoConfig(t, dir, "")
+	cmd := newAgentSetCmd()
+	cmd.SetArgs([]string{"review", "--fullsend-dir", dir, "--effort", "low"})
+	cmd.SetOut(&bytes.Buffer{})
+	require.NoError(t, cmd.Execute())
+	cfg, err := loadAgentConfig(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	review, found := config.AgentSettingsFor(cfg.AgentEntries(), "review")
+	require.True(t, found)
+	assert.Equal(t, config.AgentEntry{Name: "review", Effort: "low"}, review, "only the flag given is set")
+
+	// No flags is an error before anything is written.
+	cmd = newAgentSetCmd()
+	cmd.SetArgs([]string{"review", "--fullsend-dir", dir})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	require.Error(t, cmd.Execute())
+}
+
+func TestRunAgentSet_RejectsOrgConfig(t *testing.T) {
+	dir := t.TempDir()
+	writeOrgConfig(t, dir, "")
+	err := runAgentSet(dir, "triage", agentSetFlags{model: "sonnet", modelSet: true}, ui.New(os.Stdout))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "per-repo configs")
+}
+
+func TestLocalAgentEntries_FallsBackToMergedForOtherReaders(t *testing.T) {
+	t.Parallel()
+	org, err := config.ParseOrgConfig([]byte("version: \"1\"\ndispatch:\n  platform: github\ndefaults:\n  roles: [triage]\nrepos: {}\nagents:\n  - source: harness/lint.yaml\n"))
+	require.NoError(t, err)
+	assert.Len(t, localAgentEntries(org), 1, "readers without a local view return their entries")
 }

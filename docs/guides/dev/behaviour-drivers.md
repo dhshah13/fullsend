@@ -14,7 +14,9 @@ Behaviour tests isolate forge-specific code behind drivers so Gherkin scenarios 
 v1 reference implementations:
 
 - `pkg/behaviourtest/drivers/scm/github/`
+- `pkg/behaviourtest/drivers/scm/gitlab/`
 - `pkg/behaviourtest/drivers/ci/githubactions/`
+- `pkg/behaviourtest/drivers/ci/gitlabci/`
 - `pkg/behaviourtest/drivers/install/repopool_cfmint_previews.go` (RepoPoolCFMintPreviews)
 - `pkg/behaviourtest/drivers/install/repopool_external_mint.go` (RepoPoolExternalMint)
 
@@ -23,12 +25,13 @@ v1 reference implementations:
 Set when starting the suite (not in feature files):
 
 ```
-BEHAVIOUR_SCM=github              # future: gitlab, forgejo
-BEHAVIOUR_CI=githubactions        # future: tekton, gitlabci
+BEHAVIOUR_SCM=github              # also: gitlab; future: forgejo
+BEHAVIOUR_CI=githubactions        # also: gitlabci; future: tekton
 BEHAVIOUR_INSTALL_MODE=per-repo   # v1 default and only supported value
+ENVIRONMENT=dev                   # mint/infra target: dev (default) or stage
 ```
 
-The suite in `e2e/behaviour/suite_test.go` (or an external runner) acquires a pool org via `pkg/e2etest`, runs pre-install cleanup, calls an `install.Factory` (e.g. `install.NewRepoPoolCFMintPreviews(...)`) to get a unified `install.Driver` that owns mint deploy, pool allocation, repo ensure, and teardown. The suite constructs SCM and CI drivers, then runs godog with `pkg/behaviourtest/suite.InitScenario`. `InitScenario` clones a template `*world.World` per scenario. When a scenario calls "Given the enrolled test repository", `Driver.AllocateRepo` leases a unique repo name and ensures it is created and installed. `Driver.DeallocateRepo` returns the name in the After hook. `Driver.Finalize` tears down suite-scoped resources (e.g. preview mint) and reclaims outstanding leases. Unsupported `BEHAVIOUR_INSTALL_MODE` values fail at suite startup.
+The suite in `e2e/behaviour/suite_test.go` (or an external runner) acquires a pool org via `pkg/e2etest`, runs pre-install cleanup, calls an `install.Factory` (e.g. `install.NewRepoPoolCFMintPreviews(...)`) to get a unified `install.Driver` that owns mint deploy, pool allocation, repo ensure, and teardown. The suite constructs SCM and CI drivers, then runs godog with `pkg/behaviourtest/suite.InitScenario`. `InitScenario` clones a template `*world.World` per scenario. When a scenario calls "Given the enrolled test repository", `Driver.AllocateRepo` leases a unique repo name and ensures it is created and installed. `Driver.DeallocateRepo` returns the name in the After hook. `Driver.Finalize` tears down suite-scoped resources (e.g. preview mint) and reclaims outstanding leases. Unsupported `BEHAVIOUR_INSTALL_MODE` or `ENVIRONMENT` values fail at suite startup. `ENVIRONMENT` is `dev` or `stage` (empty defaults to `dev`).
 
 ### Install driver (unified)
 
@@ -72,6 +75,7 @@ Prefer unit tests with `httptest` for REST helpers. Optional smoke scenarios aga
 
 ## Future backends checklist
 
-- [ ] GitLab SCM driver + `@skip:gitlab` tag removal
-- [ ] Tekton or GitLab CI driver
+- [x] GitLab SCM driver (implemented; `@skip:gitlab` tag removal pending)
+- [x] GitLab CI driver (implemented; suite wiring currently uses a GitHub-backed `forge.Client` — not yet live-testable against real GitLab backends)
+- [ ] Tekton CI driver
 - [ ] Non-GitHub install backends

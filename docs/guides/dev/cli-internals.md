@@ -27,10 +27,23 @@ fullsend
 │       ├── --repos <list>                   #   Comma-separated repo names
 │       ├── --mint-url <url>                 #   Mint service URL ($FULLSEND_MINT_URL)
 │       └── --audience <string>              #   OIDC audience (default: fullsend-mint)
-├── inference                                # GCP: inference WIF management
+├── inference                                # Inference credentials (GCP Vertex, OpenAI)
 │   ├── provision    <org|owner/repo>        # Create WIF pool/provider for Agent Platform
 │   ├── deprovision  <org|owner/repo>        # Remove WIF access for org or repo
-│   └── status       <org|owner/repo>        # Check WIF health, print config
+│   ├── status       <org|owner/repo>        # Check WIF health, print config
+│   └── openai                               # OpenAI WIF enrolment (GPT on pi or codex)
+│       ├── request  <owner/repo>[,...]      # Generate the provider/mapping request for an admin
+│       │   ├── --audience <string>          #   Provider audience (default: fullsend://<owner>)
+│       │   ├── --project <name|id>          #   OpenAI project to bill the runs to
+│       │   ├── --service-account <id>       #   Map an existing service account
+│       │   ├── --ref <ref>                  #   Tighten to a ref: emits this ref + refs/pull/*
+│       │   ├── --format <json|md>           #   Document format
+│       │   └── --out <file>                 #   Write to a file instead of stdout
+│       ├── import   [reply.json]            # Record the admin's reply in config.yaml
+│       │   ├── --audience/--identity-provider-id/--service-account-id
+│       │   ├── --variables                  #   Set FULLSEND_OPENAI_* repo variables instead
+│       │   └── --repo <owner/repo>          #   Select from a multi-repo reply; target for --variables
+│       └── status   <owner/repo>            # Resolved identifiers, and the exchange inside Actions
 ├── github                                   # GitHub-only configuration
 │   ├── setup        <org|owner/repo>        # Configure fullsend (no GCP needed)
 │   ├── enroll       <org> [repo...]         # Enable repos for agent workflows
@@ -48,19 +61,20 @@ fullsend
 │   │   ├── --direct                         #   Push scaffold to default branch (skip PR)
 │   │   ├── --concurrency <int>              #   Parallel limit (1-32, default: 4)
 │   │   └── -f, --manifest <path>            #   Output path for repos.yaml (default: repos.yaml)
-│   ├── install      [repos...]              # Converge repos to desired state (provision, sync, upgrade)
+│   ├── install      [repos...]              # Converge repos to desired state (provision, repair drift, upgrade)
 │   │   ├── -f, --manifest <path>            #   Path or URL to repos.yaml (default: repos.yaml)
 │   │   ├── --dry-run                        #   Preview without making changes
 │   │   ├── --concurrency <int>              #   Max parallel operations (1-32, default: 4)
 │   │   ├── --roles <list>                   #   Agent roles (default: triage,coder,review,fix,retro,prioritize)
 │   │   ├── --direct                         #   Push scaffold to default branch (skip PR)
 │   │   ├── --inference-project <id>         #   GCP project ID for inference (install-time only)
-│   │   ├── --inference-project-number <num> #   Numeric GCP project number for WIF (auto-derived; install-time only)
+│   │   ├── --inference-wif-provider <path>  #   Full WIF provider resource name (uses verbatim; skips per-repo derivation)
 │   │   ├── --forge <type>                   #   Forge type for new repos (github or gitlab)
 │   │   ├── --inference-region <region>      #   Per-repo GCP inference region override
 │   │   ├── --fullsend-ref <ref>             #   Per-repo fullsend workflow ref override
 │   │   ├── --mint-url <url>                 #   Per-repo mint URL override
-│   │   └── --allowed-remote-resources <list> #  Per-repo allowed remote resources override
+│   │   ├── --allowed-remote-resources <list> #  Per-repo allowed remote resources override
+│   │   └── --vendor                         #   Vendor binary and content into each repo for offline CI
 │   ├── uninstall    <repos...>              # Tear down fullsend from repos and remove from manifest
 │   │   ├── -f, --manifest <path>            #   Path to repos.yaml (default: repos.yaml)
 │   │   ├── --dry-run                        #   Preview without making changes
@@ -76,6 +90,10 @@ fullsend
 ├── agent                                    # Manage agent registrations in config
 │   ├── add          <url-or-path>            # Register an agent (URL auto-pinned)
 │   ├── list                                  # List registered agents
+│   ├── set          <name>                   # Set an agent's runtime, model or effort (per-repo)
+│   │   ├── --runtime <claude|pi>            #   Runtime for this agent
+│   │   ├── --model <alias|id|provider/id>   #   Model for this agent
+│   │   └── --effort <level>                 #   Effort level for this agent
 │   ├── update       <name> [sha]             # Re-pin URL agent to new commit SHA
 │   └── remove       <name>                   # Unregister agent from config
 ├── lock             [agent-name]              # Pin remote deps to lock.yaml
@@ -93,7 +111,7 @@ fullsend
 │   ├── --env-file <path>                    #   Load env vars from dotenv file (repeatable)
 │   ├── --forge <platform>                   #   Forge platform (github, gitlab); auto-detected from CI env
 │   ├── --no-post-script                     #   Skip post-script execution
-│   ├── --debug [filter]                     #   Enable Claude Code debug logging
+│   ├── --debug [filter]                     #   Enable agent runtime debug logging
 │   ├── --offline                            #   Reject network fetches
 │   ├── --max-depth <int>                    #   Max transitive dependency depth (0 disables)
 │   ├── --max-resources <int>                #   Max total remote resources per harness
@@ -116,7 +134,7 @@ fullsend
 │       ├── --tracker <tracker>              #     Tracker backend: github, gitlab, or jira
 │       ├── --project <project>              #     Project: owner/repo (GitHub/GitLab) or key (Jira)
 │       ├── --number <int>                   #     Issue number
-│       └── --marker <string>                #     Hidden HTML marker for idempotent updates
+│       └── --marker <string>                #     Sticky marker for idempotent updates (HTML comment or Jira property)
 ├── post-review                              # Post PR/MR review comments to GitHub or GitLab
 │   ├── --forge <forge>                      #   Forge backend: github (default) or gitlab
 │   ├── --base-url <url>                     #   Forge instance URL (e.g. https://gitlab.example.com)
@@ -127,9 +145,17 @@ fullsend
 │   ├── --head-sha <sha>                     #   Expected PR HEAD SHA (skips review if HEAD moved)
 │   └── --dry-run                            #   Print what would be posted without API calls
 ├── post-comment                             # Post issue/PR comments to GitHub (deprecated)
+├── eval-measure                             # Score wild-run traces (eval measurements)
+│   ├── --telemetry <path>                   #   Path to run-telemetry.jsonl (or --output-dir)
+│   ├── --output-dir <path>                  #   CI output base or runDir (managed-job form)
+│   ├── --registry <path>                    #   Agents measurement manifest YAML (or --agent)
+│   ├── --agent <name>                       #   Agent name for manifest resolution (managed-job form)
+│   ├── --fullsend-dir <path>                #   .fullsend dir (local manifest override + fetch cache)
+│   ├── --offline                            #   Reject network fetches (local manifest only)
+│   └── --out-dir <path>                     #   Output dir (default: telemetry directory)
 └── reconcile-status                         # Finalize orphaned status comments
-    ├── --repo <owner/repo>                  #   Repository in owner/repo format
-    ├── --number <int>                       #   Issue/PR number
+    ├── --repo <owner/repo>                  #   Repository in owner/repo format (required for GitHub/GitLab)
+    ├── --number <int>                       #   Issue/PR number (required for GitHub/GitLab; derived from entity.key for Jira)
     ├── --run-id <string>                    #   Workflow run ID (marker key)
     ├── --run-url <url>                      #   Workflow run URL (optional)
     ├── --sha <string>                       #   Commit SHA (optional)
@@ -137,7 +163,7 @@ fullsend
     ├── --mint-url <url>                     #   Mint service URL for on-demand token (default: $FULLSEND_MINT_URL)
     ├── --role <string>                      #   Agent role for minting (required with --mint-url)
     ├── --forge <platform>                   #   Forge platform (github, gitlab); auto-detected from CI env
-    ├── --fullsend-dir <path>                #   Path to fullsend config directory (completion mode detection)
+    ├── --fullsend-dir <path>                #   Path to fullsend config directory (completion mode detection and tracker routing)
     ├── --job-status <string>                #   Job outcome from CI runner (e.g. success, failure, cancelled)
     └── --was-skipped                        #   Pre-script decided to skip the run; forces synthesis under on_failure
 ```
@@ -268,6 +294,7 @@ Both per-org and per-repo modes share the same core pipeline. The code follows t
 │  │    Variables (managed by sync):                            │ │
 │  │              FULLSEND_GCP_REGION                           │ │
 │  │              FULLSEND_MINT_URL                             │ │
+│  │              FULLSEND_REVIEW_CLIENT_ID (best-effort)       │ │
 │  │                                                            │ │
 │  │  ┌──────────────────────────────────────────┐              │ │
 │  │  │ Per-org:  secrets → .fullsend config repo│              │ │
@@ -305,7 +332,7 @@ Both modes call the same functions (`runAppSetup`, `gcf.NewProvisioner`, `Provis
 | **2. App setup** | `runAppSetup()` → PEMs + App IDs | All 7 roles by default | Excludes "fullsend" role |
 | **3. Mint** | `gcf.Provision()` or `EnsureOrgInMint()` | — | — (use `mint enroll` separately) |
 | **4. WIF** | `ProvisionWIF()` | Org-wide provider ID | `mintcore.BuildRepoProviderID()` (repo-scoped, GitHub only; GitLab uses shared `gitlab-oidc` provider) |
-| **5. Scaffold** | `repos.BuildScaffoldFiles()` (via `scaffold.CollectPerRepoInstallFiles()`) | Creates `.fullsend` repo, pushes workflows + optional binary | Writes `.fullsend/` dir + shim workflow + optional binary in target repo (committed after secrets in per-repo, see #6122) |
+| **5. Scaffold** | `repos.BuildScaffoldFiles()` (via `scaffold.CollectPerRepoInstallFiles()`) | Creates `.fullsend` repo, pushes workflows + optional binary | Writes `.fullsend/` dir + shim workflow + thin caller workflows + optional binary in target repo (committed after secrets in per-repo, see #6122) |
 | **6. Secrets** | Same secret names, same API calls | Config repo + org variable | Target repo + `PER_REPO_GUARD` (written before scaffold commit in per-repo, see #6122) |
 | **7. Enrollment** | — | `EnrollmentLayer` enables repos | No-op (self-contained) |
 
@@ -369,7 +396,10 @@ Vendoring commit messages use title + body (upload and stale delete). `github st
 │         ▼                                                       │
 │  ┌──────────────────┐                                           │
 │  │ ImportProfile()   │ Import openshell provider profiles       │
-│  │                   │ (from resolved openshell.profiles)       │
+│  │                   │ (from resolved openshell.profiles;       │
+│  │                   │  on GitLab, a fullsend-gitlab-forge      │
+│  │                   │  profile is auto-generated from the      │
+│  │                   │  forge host URL — see #6615)             │
 │  └──────┬───────────┘                                           │
 │         ▼                                                       │
 │  ┌──────────────────┐                                           │
@@ -421,11 +451,12 @@ Vendoring commit messages use title + body (upload and stale delete). `github st
 │  ┌──────────────────────────────────────────┐                   │
 │  │ Exec() — Run agent in sandbox            │                   │
 │  │                                          │                   │
-│  │ Command built by buildClaudeCommand():   │                   │
+│  │ Command built by buildRunCommand():      │                   │
 │  │  cd {repoDir} &&                         │                   │
 │  │  . {envFile} &&                          │                   │
 │  │  claude --print --verbose                │                   │
 │  │    --output-format stream-json           │                   │
+│  │    [--settings {hooksSettingsPath}]      │                   │
 │  │    --model {model}                       │                   │
 │  │    --effort {effort}                     │                   │
 │  │    --agent {agent}                       │                   │
@@ -451,6 +482,8 @@ Vendoring commit messages use title + body (upload and stale delete). `github st
 │  │                                          │                   │
 │  │ Phase 1 — inline validation:             │                   │
 │  │ for i := 1; i <= max_iterations; i++ {   │                   │
+│  │   if i > 1: ClearIterationArtifacts      │                   │
+│  │     (sweep stray processes, clear output)│                   │
 │  │   run agent → extract output             │                   │
 │  │   SafeDownload repo (non-fatal on fail)  │                   │
 │  │   run validation script                  │                   │
@@ -506,8 +539,10 @@ Vendoring commit messages use title + body (upload and stale delete). `github st
 ### Sandbox Constants
 
 ```go
-SandboxWorkspace    = "/sandbox/workspace"
-SandboxClaudeConfig = "/sandbox/claude-config"
+SandboxWorkspace       = "/sandbox/workspace"
+SandboxClaudeConfig    = "/sandbox/claude-config"
+SandboxPiConfig        = "/sandbox/pi-config"
+SandboxPiExtensionsDir = "/usr/local/share/pi-extensions"   // image-baked, read-only pi extensions (loaded only via -e)
 ```
 
 For sandbox workspace layout, agent rule layering, and security scanning
@@ -575,10 +610,10 @@ fullsend-repo/                      (embedded template)
 | Category | Installed? | Source | Purpose |
 |----------|-----------|--------|---------|
 | **Installed** | Yes | Scaffold → `.fullsend` repo | Workflows, configs, static files |
-| **Layered** | No (runtime) or yes with `--vendor` | Upstream `@v0` sparse checkout, or vendored at install | agents/, skills/, harness/, plugins/, policies/, scripts/, schemas/, env/ |
+| **Layered** | No (runtime) or yes with `--vendor` | Upstream `@main` sparse checkout, or vendored at install | agents/, skills/, harness/, plugins/, policies/, scripts/, schemas/, env/ |
 | **Upstream-only** | No (layered) or yes with `--vendor` | Referenced directly or vendored at install | .github/actions/, .github/scripts/ |
 
-Runtime skips upstream fetch when `.defaults/action.yml` is present (vendored); layered installs sparse-checkout `fullsend-ai/fullsend@v0` into `.defaults/`.
+Runtime skips upstream fetch when `.defaults/action.yml` is present (vendored); layered installs sparse-checkout `fullsend-ai/fullsend@main` into `.defaults/`.
 
 ### File Mode Tracking
 
@@ -663,7 +698,8 @@ var executableFiles = map[string]struct{}{
 | `internal/cli/root.go` | ~34 | CLI entry point, command registration |
 | `internal/cli/admin.go` | ~2415 | Install/uninstall/analyze/enable/disable |
 | `internal/cli/mint.go` | ~1022 | Mint deploy/enroll/unenroll/status |
-| `internal/cli/inference.go` | ~408 | Inference WIF provision/status |
+| `internal/cli/inference.go` | ~408 | Inference WIF provision/status (GCP) |
+| `internal/cli/inference_openai.go` | ~900 | OpenAI WIF enrolment: request document, reply import, status/exchange |
 | `internal/cli/github.go` | ~966 | GitHub setup/set/status/uninstall/sync-scaffold/enroll/unenroll |
 | `internal/cli/issues.go` | ~430 | Issue read/write commands (`fullsend issues get`, `post-comment`) |
 | `internal/cli/tracker_client.go` | ~122 | Tracker client factory (GitHub/GitLab/Jira) |
@@ -682,6 +718,8 @@ var executableFiles = map[string]struct{}{
 | `internal/scaffold/scaffold.go` | ~146 | Embedded template system |
 | `internal/inference/inference.go` | ~26 | Provider interface |
 | `internal/inference/vertex/vertex.go` | ~80 | Agent Platform (Vertex AI) implementation |
+| `internal/inference/openaiwif/openaiwif.go` | ~330 | OpenAI Workload Identity Federation token exchange (runner-side) |
+| `internal/cli/run_openai.go` | ~550 | OpenAI credential resolution, run-scoped provider lifecycle and refresh |
 | `internal/config/config.go` | ~264 | Org/repo config structures |
 
 ## See Also

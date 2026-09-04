@@ -1842,3 +1842,147 @@ func TestIsValidGCPProjectID(t *testing.T) {
 	assert.False(t, IsValidGCPProjectID("a-project-id-that-is-way-too-long-for-gcp"))
 	assert.False(t, IsValidGCPProjectID("my-project-"))
 }
+
+func TestManifest_RuntimeResolvesAndValidates(t *testing.T) {
+	t.Parallel()
+	m := &Manifest{
+		Version:  1,
+		Defaults: DefaultsConfig{Runtime: "pi"},
+		GitHub: &PlatformConfig{Repos: []RepoEntry{
+			{Name: "acme/a"},
+			{Name: "acme/b", Runtime: "claude"},
+			{Name: "acme/c", Runtime: NoneSentinel},
+		}},
+	}
+	require.NoError(t, m.Validate())
+
+	rc, ok := m.ResolveConfig("acme", "a")
+	require.True(t, ok)
+	assert.Equal(t, "pi", rc.Runtime, "entry inherits defaults.runtime")
+	rc, _ = m.ResolveConfig("acme", "b")
+	assert.Equal(t, "claude", rc.Runtime, "entry overrides the default")
+	rc, _ = m.ResolveConfig("acme", "c")
+	assert.Equal(t, "", rc.Runtime, "none stops the chain: code default")
+
+	bad := &Manifest{Version: 1, Defaults: DefaultsConfig{Runtime: "opencode"}}
+	err := bad.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `defaults.runtime "opencode" is not a valid runtime`)
+
+	bad = &Manifest{Version: 1, GitHub: &PlatformConfig{Repos: []RepoEntry{{Name: "acme/x", Runtime: "nope"}}}}
+	err = bad.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `github.repos[acme/x].runtime "nope"`)
+}
+
+func TestResolveBoolField(t *testing.T) {
+	boolPtr := func(v bool) *bool { return &v }
+
+	t.Run("per_repo_true_overrides_default_false", func(t *testing.T) {
+		got := resolveBoolField(boolPtr(true), boolPtr(false), false)
+		assert.True(t, got)
+	})
+	t.Run("per_repo_false_overrides_default_true", func(t *testing.T) {
+		got := resolveBoolField(boolPtr(false), boolPtr(true), true)
+		assert.False(t, got)
+	})
+	t.Run("nil_per_repo_inherits_default_true", func(t *testing.T) {
+		got := resolveBoolField(nil, boolPtr(true), false)
+		assert.True(t, got)
+	})
+	t.Run("nil_per_repo_inherits_default_false", func(t *testing.T) {
+		got := resolveBoolField(nil, boolPtr(false), true)
+		assert.False(t, got)
+	})
+	t.Run("all_nil_returns_builtin_default", func(t *testing.T) {
+		got := resolveBoolField(nil, nil, true)
+		assert.True(t, got)
+		got = resolveBoolField(nil, nil, false)
+		assert.False(t, got)
+	})
+}
+
+func TestResolveConfig_VendorField(t *testing.T) {
+	boolPtr := func(v bool) *bool { return &v }
+
+	t.Run("defaults_vendor_true_inherited", func(t *testing.T) {
+		input := `
+version: 1
+defaults:
+  vendor: true
+github:
+  mint_url: https://mint.example.com
+  repos:
+    - name: acme/app
+`
+		var m Manifest
+		require.NoError(t, yaml.Unmarshal([]byte(input), &m))
+
+		cfg, found := m.ResolveConfig("acme", "app")
+		require.True(t, found)
+		assert.True(t, cfg.Vendor)
+	})
+
+	t.Run("per_repo_vendor_overrides_default", func(t *testing.T) {
+		m := Manifest{
+			Version:  1,
+			Defaults: DefaultsConfig{Vendor: boolPtr(true)},
+			GitHub: &PlatformConfig{
+				MintURL: "https://mint.example.com",
+				Repos: []RepoEntry{
+					{Name: "acme/vendored"},
+					{Name: "acme/not-vendored", Vendor: boolPtr(false)},
+				},
+			},
+		}
+
+		cfg, found := m.ResolveConfig("acme", "vendored")
+		require.True(t, found)
+		assert.True(t, cfg.Vendor, "inherits defaults.vendor=true")
+
+		cfg, found = m.ResolveConfig("acme", "not-vendored")
+		require.True(t, found)
+		assert.False(t, cfg.Vendor, "per-repo vendor=false overrides default")
+	})
+
+	t.Run("no_vendor_defaults_to_false", func(t *testing.T) {
+		input := `
+version: 1
+github:
+  mint_url: https://mint.example.com
+  repos:
+    - name: acme/app
+`
+		var m Manifest
+		require.NoError(t, yaml.Unmarshal([]byte(input), &m))
+
+		cfg, found := m.ResolveConfig("acme", "app")
+		require.True(t, found)
+		assert.False(t, cfg.Vendor, "default vendor is false when unset")
+	})
+
+	t.Run("vendor_yaml_roundtrip", func(t *testing.T) {
+		m := Manifest{
+			Version:  1,
+			Defaults: DefaultsConfig{Vendor: boolPtr(true)},
+			GitHub: &PlatformConfig{
+				MintURL: "https://mint.example.com",
+				Repos: []RepoEntry{
+					{Name: "acme/a"},
+					{Name: "acme/b", Vendor: boolPtr(false)},
+				},
+			},
+		}
+		data, err := m.Marshal()
+		require.NoError(t, err)
+
+		var roundTripped Manifest
+		require.NoError(t, yaml.Unmarshal(data, &roundTripped))
+		require.NotNil(t, roundTripped.Defaults.Vendor)
+		assert.True(t, *roundTripped.Defaults.Vendor)
+
+		require.Nil(t, roundTripped.GitHub.Repos[0].Vendor, "omitempty omits nil vendor")
+		require.NotNil(t, roundTripped.GitHub.Repos[1].Vendor)
+		assert.False(t, *roundTripped.GitHub.Repos[1].Vendor)
+	})
+}

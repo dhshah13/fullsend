@@ -136,6 +136,29 @@ func TestPerRepoConfig_AgentEntries(t *testing.T) {
 	assert.Equal(t, agents, cfg.AgentEntries())
 }
 
+func TestPerRepoConfig_AgentEntries_RefSurvivesLayeredMerge(t *testing.T) {
+	// Parent defines an agent without a Ref (pre-existing entry).
+	parent := &perRepoConfig{
+		Agents: []AgentEntry{{
+			Source: "https://raw.githubusercontent.com/org/repo/abc123/harness/triage.yaml#sha256=aaa",
+			Name:   "triage",
+		}},
+	}
+	// Overlay re-declares the same agent with a Ref from adoption.
+	overlay := &perRepoConfig{
+		parent: parent,
+		Agents: []AgentEntry{{
+			Name: "triage",
+			Ref:  "release-1.0",
+		}},
+	}
+	merged := overlay.AgentEntries()
+	require.Len(t, merged, 1)
+	assert.Equal(t, "release-1.0", merged[0].Ref, "Ref from overlay must survive layered merge")
+	// Source should still come from parent since overlay didn't set it.
+	assert.Contains(t, merged[0].Source, "raw.githubusercontent.com")
+}
+
 func TestPerRepoConfig_IsKillSwitchActive(t *testing.T) {
 	tr := true
 	cfg := &perRepoConfig{KillSwitch: &tr}
@@ -827,4 +850,44 @@ inference:
   region: us-central1
 `
 	assert.True(t, IsPerRepoYAML([]byte(yamlData)))
+}
+
+// --- InferenceOpenAI fallback ---
+
+func TestPerRepoConfig_InferenceOpenAI_Fallback(t *testing.T) {
+	base := &perRepoConfig{
+		Inference: &PerRepoInferenceConfig{OpenAI: &OpenAIWIFConfig{
+			Audience:           "fullsend://acme",
+			IdentityProviderID: "idp_base",
+			ServiceAccountID:   "sa_base",
+		}},
+		parent: &perRepoDefaults{},
+	}
+	t.Run("empty falls through to parent", func(t *testing.T) {
+		overlay := &perRepoConfig{parent: base}
+		assert.Equal(t, OpenAIWIFConfig{Audience: "fullsend://acme", IdentityProviderID: "idp_base", ServiceAccountID: "sa_base"}, overlay.ConfigInferenceOpenAI())
+	})
+	t.Run("each identifier overrides independently", func(t *testing.T) {
+		overlay := &perRepoConfig{
+			Inference: &PerRepoInferenceConfig{OpenAI: &OpenAIWIFConfig{ServiceAccountID: "sa_overlay"}},
+			parent:    base,
+		}
+		assert.Equal(t, OpenAIWIFConfig{Audience: "fullsend://acme", IdentityProviderID: "idp_base", ServiceAccountID: "sa_overlay"}, overlay.ConfigInferenceOpenAI())
+	})
+	t.Run("falls through to defaults when unset", func(t *testing.T) {
+		cfg := &perRepoConfig{parent: &perRepoDefaults{}}
+		assert.True(t, cfg.ConfigInferenceOpenAI().IsZero())
+	})
+	t.Run("setter round-trips through YAML and a zero value removes the block", func(t *testing.T) {
+		w := NewEmptyPerRepoOverlay()
+		w.SetInferenceOpenAI(OpenAIWIFConfig{Audience: "fullsend://acme", IdentityProviderID: "idp_1", ServiceAccountID: "sa_1"})
+		out, err := w.Marshal()
+		require.NoError(t, err)
+		assert.Contains(t, string(out), "openai:\n        audience: fullsend://acme\n        identity_provider_id: idp_1\n        service_account_id: sa_1")
+		w.SetInferenceOpenAI(OpenAIWIFConfig{})
+		out, err = w.Marshal()
+		require.NoError(t, err)
+		assert.NotContains(t, string(out), "openai:")
+	})
+	assert.Equal(t, []string{"identity_provider_id", "service_account_id"}, OpenAIWIFConfig{Audience: "a"}.Missing())
 }

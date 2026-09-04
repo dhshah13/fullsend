@@ -10,8 +10,10 @@ import (
 
 func TestGitLabPerRepoFilesExist(t *testing.T) {
 	expected := []string{
+		".gitignore",
 		".gitlab-ci.yml",
 		".fullsend/config.yaml",
+		".gitlab/ci/fullsend-pipeline.yml",
 		".gitlab/ci/fullsend-dispatch.yml",
 		".gitlab/ci/fullsend-poll.yml",
 		".gitlab/ci/fullsend-agent.yml",
@@ -29,6 +31,40 @@ func TestGitLabConfigContent(t *testing.T) {
 	require.NoError(t, err)
 	s := string(content)
 	assert.Contains(t, s, "forge: gitlab")
+}
+
+func TestGitLabGitignoreExcludesOutput(t *testing.T) {
+	content, err := GitLabPerRepoFile(".gitignore")
+	require.NoError(t, err)
+	s := string(content)
+	assert.Contains(t, s, "output/")
+}
+
+func TestCollectGitLabPerRepoInstallFiles_SkipsGitignore(t *testing.T) {
+	files, err := CollectGitLabPerRepoInstallFiles(nil, "", "")
+	require.NoError(t, err)
+	for _, f := range files {
+		assert.NotEqual(t, ".gitignore", f.Path,
+			"install must not overwrite consumer .gitignore with the scaffold fragment")
+	}
+}
+
+func TestCollectGitLabPerRepoInstallFiles_SkipsRootPipeline(t *testing.T) {
+	files, err := CollectGitLabPerRepoInstallFiles(nil, "", "")
+	require.NoError(t, err)
+	for _, f := range files {
+		assert.NotEqual(t, ".gitlab-ci.yml", f.Path,
+			"install must not overwrite consumer .gitlab-ci.yml — "+
+				"root file is merged dynamically by the install flow")
+	}
+	// Pipeline wrapper must still be present.
+	var hasPipeline bool
+	for _, f := range files {
+		if f.Path == ".gitlab/ci/fullsend-pipeline.yml" {
+			hasPipeline = true
+		}
+	}
+	assert.True(t, hasPipeline, "pipeline wrapper must be in install files")
 }
 
 func TestGitLabPerRepoFileNotFound(t *testing.T) {
@@ -141,6 +177,9 @@ func TestGitLabDispatchContent(t *testing.T) {
 	assert.Contains(t, s, "CEL:")
 	assert.Contains(t, s, "entity.kind")
 	assert.Contains(t, s, "transition.kind")
+	// [skip ci] / [ci skip] in MR title suppresses dispatch on merged-results pipelines
+	assert.Contains(t, s, `CI_MERGE_REQUEST_TITLE =~ /\[(skip ci|ci skip)\]/i`)
+	assert.Contains(t, s, "when: never")
 	// Child pipeline includes the generic agent template
 	assert.Contains(t, s, "fullsend-agent.yml")
 	assert.NotContains(t, s, "fullsend-${STAGE}.yml")
@@ -155,6 +194,30 @@ func TestGitLabAgentTemplateContent(t *testing.T) {
 	assert.Contains(t, s, "- agent")
 	// Generic template parameterized by STAGE
 	assert.Contains(t, s, `fullsend run "${STAGE}"`)
+	assert.Contains(t, s, `fullsend eval-measure`)
+	assert.Contains(t, s, "RUN_STATUS=$?")
+	assert.Contains(t, s, `exit "${RUN_STATUS}"`)
+	assert.Contains(t, s, "|| true")
+	assert.Contains(t, s, "60 req/hr")
+	assert.Contains(t, s, "artifacts:")
+	assert.Contains(t, s, "when: always")
+	assert.Contains(t, s, `${CI_PROJECT_DIR}/output`)
+	assert.NotContains(t, s, "/tmp/fullsend-output")
+	// Measurement override from default branch tip — never MR-tree --fullsend-dir.
+	assert.Contains(t, s, "DEFAULT_BRANCH_SHA")
+	assert.Contains(t, s, `git show "${DEFAULT_BRANCH_SHA}:.fullsend/eval/measurements/${STAGE}.yaml"`)
+	assert.Contains(t, s, `MEASURE_ARGS+=(--registry "${MEASURE_FILE}")`)
+	assert.Contains(t, s, `fullsend eval-measure "${MEASURE_ARGS[@]}"`)
+	assert.NotContains(t, s, `eval-measure \
+        --agent "${STAGE}" \
+        --fullsend-dir .fullsend`)
+	// work_item URL must not invent …/issues/0 when IID is missing, but
+	// GITLAB_ISSUE_URL must still be exported (empty OK) so harness env
+	// validation does not reject a truly unset variable.
+	assert.NotContains(t, s, `/-/issues/${STATUS_IID:-0}`)
+	assert.Contains(t, s, `"${STATUS_IID}" != "0"`)
+	assert.Contains(t, s, `GITLAB_ISSUE_URL=""`)
+	assert.Contains(t, s, "export GITLAB_ISSUE_URL")
 	assert.Contains(t, s, "--fullsend-dir")
 	assert.Contains(t, s, "--target-repo")
 	assert.Contains(t, s, "--output-dir")
@@ -168,6 +231,8 @@ func TestGitLabAgentTemplateContent(t *testing.T) {
 	assert.Contains(t, s, "PRIOR_REVIEW_FILE")
 	assert.Contains(t, s, "PRIOR_REVIEW_SHA")
 	assert.Contains(t, s, "PRIOR_REVIEW_PROVENANCE")
+	// Fix stage fetches review body from MR notes
+	assert.Contains(t, s, "REVIEW_BODY_FILE")
 	// Provenance values match the review agent prompt's expected labels
 	assert.Contains(t, s, `bot-verified`)
 	assert.Contains(t, s, `unverifiable-wrong-user`)
@@ -197,7 +262,7 @@ func TestGitLabAgentTemplateContent(t *testing.T) {
 	assert.Contains(t, s, "unexpected pipeline source")
 	assert.Contains(t, s, "rejecting forged dispatch")
 	// Generic runner image, not agent-specific
-	assert.Contains(t, s, "fullsend-runner:latest")
+	assert.Contains(t, s, "fullsend-runner:dev")
 	assert.NotContains(t, s, "fullsend-code:latest")
 	// Resource group parameterized by STAGE
 	assert.Contains(t, s, `fullsend-${STAGE}-${RESOURCE_KEY}`)
@@ -218,6 +283,132 @@ func TestGitLabAgentTemplateContent(t *testing.T) {
 	// Harness passthrough variables must be declared so os.Expand doesn't
 	// reject unset variables during harness env validation (#6273).
 	assert.Contains(t, s, "CODE_ALLOWED_TARGET_BRANCHES")
+	// RUNNER_TEMP must be exported with /tmp fallback so harness host_files
+	// paths that reference ${RUNNER_TEMP} resolve on GitLab CI (#6460).
+	assert.Contains(t, s, `export RUNNER_TEMP="${RUNNER_TEMP:-/tmp}"`)
+	// Runtime CLI install via before_script (#6445)
+	assert.Contains(t, s, "before_script:")
+	// CI_DEBUG_TRACE guard must be in before_script, before token-bearing commands
+	assert.Contains(t, s, "CI_DEBUG_TRACE")
+	assert.Contains(t, s, "__FULLSEND_VERSION__")
+	assert.Contains(t, s, "fullsend-ai/fullsend")
+	assert.Contains(t, s, "fullsend --version")
+	// Release path downloads pre-built binary with checksum verification
+	assert.Contains(t, s, "github.com/${FULLSEND_REPO}/releases/download")
+	assert.Contains(t, s, "checksums.txt")
+	assert.Contains(t, s, "sha256sum -c")
+	// Source-build path clones and builds from source (direct go build, no make)
+	assert.Contains(t, s, "go build")
+	assert.Contains(t, s, "./cmd/fullsend/")
+	// Source-build path sets GOPATH and GOCACHE so go build works on
+	// non-root runners where /root/go is not writable (#6477).
+	assert.Contains(t, s, `export GOPATH="${RUNNER_TEMP:-/tmp}/go"`)
+	assert.Contains(t, s, `export GOCACHE="${RUNNER_TEMP:-/tmp}/go-cache"`)
+	// "latest" resolution via GitHub API
+	assert.Contains(t, s, "releases/latest")
+	// tar extraction uses --no-same-owner for non-root containers (#6720)
+	assert.Contains(t, s, "tar --no-same-owner")
+	assert.NotContains(t, s, "tar xzf /tmp/fullsend.tar.gz")
+}
+
+func TestGitLabAgentTemplateFixReviewBodyPreFetch(t *testing.T) {
+	content, err := GitLabPerRepoFile(".gitlab/ci/fullsend-agent.yml")
+	require.NoError(t, err)
+	s := string(content)
+	// Fix stage exports REVIEW_BODY_FILE for the fix harness
+	assert.Contains(t, s, "REVIEW_BODY_FILE")
+	assert.Contains(t, s, `"fix"`)
+	// Uses the review-agent marker to find the review note
+	assert.Contains(t, s, "fullsend:review-agent")
+	// Validates size (1 MB limit, matching GitHub reusable-fix.yml)
+	assert.Contains(t, s, "1048576")
+	// Bot-triggered runs require non-empty review body (checks is_bot, not PIPELINE_SOURCE)
+	assert.Contains(t, s, "Bot-triggered run but review body is empty")
+	assert.Contains(t, s, "_IS_BOT_TRIGGER")
+	// Uses BOT_USER_ID (numeric ID) for author verification (#5550)
+	assert.Contains(t, s, "BOT_USER_ID")
+	assert.Contains(t, s, "BOT_ID")
+	// Paginates through MR notes (same pattern as review pre-fetch)
+	assert.Contains(t, s, "notes?sort=desc&per_page=100")
+
+	// Defense-in-depth author mismatch logs a warning (not silent)
+	assert.Contains(t, s, "does not match bot")
+	// Fix-stage environment variables (parallel to reusable-fix.yml)
+	assert.Contains(t, s, "export TARGET_BRANCH")
+	assert.Contains(t, s, "export TRIGGER_SOURCE")
+	assert.Contains(t, s, "export HUMAN_INSTRUCTION")
+	assert.Contains(t, s, "export FIX_ITERATION")
+	assert.Contains(t, s, "export PRE_AGENT_HEAD")
+	// Trigger source resolves from event payload (bot vs human)
+	assert.Contains(t, s, "EVENT_PAYLOAD_B64")
+	assert.Contains(t, s, "is_bot")
+	assert.Contains(t, s, "note_author_id")
+	// Numeric validation on note_author_id before curl URL interpolation
+	assert.Contains(t, s, `*[!0-9]*`)
+	// Human instruction extracted from /fs-fix note body
+	assert.Contains(t, s, "/fs-fix")
+	assert.Contains(t, s, "note_body")
+	// Fix iteration counts prior fix-agent commits
+	assert.Contains(t, s, "fullsend-fix")
+	assert.Contains(t, s, "author_name")
+	// Pre-agent HEAD recorded before agent runs
+	assert.Contains(t, s, "git rev-parse HEAD")
+	// Forge.gitlab env vars for fix post-script — REPO_FULL_NAME is now
+	// set by run.go from --status-repo (#6865); PUSH_TOKEN, PUSH_TOKEN_SOURCE,
+	// GIT_BOT_EMAIL, MR_NUMBER, and GITLAB_MR_URL are in the shared
+	// code|fix|review block (#6865).
+	assert.NotContains(t, s[strings.Index(s, `"fix"`):], "export REPO_FULL_NAME")
+	// MR_NUMBER and GITLAB_MR_URL should NOT be in the fix-only block —
+	// they moved to the shared block.
+	fixOnlyMarker := `if [ "${STAGE}" = "fix" ]; then`
+	fixOnlyIdx := strings.Index(s, fixOnlyMarker)
+	require.NotEqual(t, -1, fixOnlyIdx, "fix-only block marker not found")
+	fixBlock := s[fixOnlyIdx:]
+	runIdx := strings.Index(fixBlock, "fullsend run")
+	require.NotEqual(t, -1, runIdx, "fullsend run not found after fix block")
+	fixBlock = fixBlock[:runIdx]
+	assert.NotContains(t, fixBlock, "export MR_NUMBER")
+	assert.NotContains(t, fixBlock, "export GITLAB_MR_URL")
+}
+
+// TestGitLabAgentTemplateSharedCodeFixEnvVars verifies that PUSH_TOKEN,
+// PUSH_TOKEN_SOURCE, GIT_BOT_EMAIL, MR_NUMBER, and GITLAB_MR_URL are
+// exported in the shared code|fix|review block so all three stages
+// receive them (#6865).
+func TestGitLabAgentTemplateSharedCodeFixEnvVars(t *testing.T) {
+	content, err := GitLabPerRepoFile(".gitlab/ci/fullsend-agent.yml")
+	require.NoError(t, err)
+	s := string(content)
+
+	// Shared block guards on code, fix, or review
+	assert.Contains(t, s, `"${STAGE}" = "code"`)
+	assert.Contains(t, s, `"${STAGE}" = "fix"`)
+	assert.Contains(t, s, `"${STAGE}" = "review"`)
+
+	// PUSH_TOKEN, PUSH_TOKEN_SOURCE, GIT_BOT_EMAIL are in the shared block
+	assert.Contains(t, s, "export PUSH_TOKEN")
+	assert.Contains(t, s, "export PUSH_TOKEN_SOURCE")
+	assert.Contains(t, s, "export GIT_BOT_EMAIL")
+
+	// MR_NUMBER and GITLAB_MR_URL are in the shared block
+	assert.Contains(t, s, "export MR_NUMBER")
+	assert.Contains(t, s, "export GITLAB_MR_URL")
+
+	// Bot username resolution for GIT_BOT_EMAIL (reuses BOT_RESPONSE
+	// from bot identity verification when available)
+	assert.Contains(t, s, "_BOT_USERNAME")
+	assert.Contains(t, s, "BOT_RESPONSE")
+
+	// REPO_FULL_NAME is NOT exported in the scaffold — run.go sets it
+	// from --status-repo (#6865). Verify it does not appear as an
+	// export outside the fullsend run invocation line.
+	lines := strings.Split(s, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "export REPO_FULL_NAME") {
+			t.Error("REPO_FULL_NAME should not be exported in the scaffold — run.go sets it from --status-repo")
+		}
+	}
 }
 
 func TestGitLabAgentTemplateKillSwitch(t *testing.T) {
@@ -229,6 +420,7 @@ func TestGitLabAgentTemplateKillSwitch(t *testing.T) {
 	assert.Contains(t, s, "kill_switch: false")
 	// Config read from default branch (trusted), not MR source
 	assert.Contains(t, s, "CI_DEFAULT_BRANCH")
+	assert.Contains(t, s, "DEFAULT_BRANCH_SHA")
 	assert.Contains(t, s, "FETCH_HEAD")
 	assert.Contains(t, s, "CONFIG_YAML")
 	// Fetch failure fails the job (not silently permissive)
@@ -324,19 +516,39 @@ func TestGitLabPollContent(t *testing.T) {
 	// No dotenv gating
 	assert.NotContains(t, s, "dispatch.env")
 	assert.NotContains(t, s, "HAS_DISPATCHES")
+	// Runtime CLI install via before_script (#6445)
+	assert.Contains(t, s, "before_script:")
+	assert.Contains(t, s, "__FULLSEND_VERSION__")
+	assert.Contains(t, s, "fullsend-ai/fullsend")
+	assert.Contains(t, s, "fullsend --version")
+	assert.Contains(t, s, "checksums.txt")
+	assert.Contains(t, s, "sha256sum -c")
+	assert.Contains(t, s, "releases/latest")
+	// Source-build path sets GOPATH and GOCACHE so go build works on
+	// non-root runners where /root/go is not writable (#6477).
+	assert.Contains(t, s, `export GOPATH="${RUNNER_TEMP:-/tmp}/go"`)
+	assert.Contains(t, s, `export GOCACHE="${RUNNER_TEMP:-/tmp}/go-cache"`)
+	// tar extraction uses --no-same-owner for non-root containers (#6720)
+	assert.Contains(t, s, "tar --no-same-owner")
+	assert.NotContains(t, s, "tar xzf /tmp/fullsend.tar.gz")
 }
 
 func TestGitLabRootPipelineContent(t *testing.T) {
 	content, err := GitLabPerRepoFile(".gitlab-ci.yml")
 	require.NoError(t, err)
 	s := string(content)
-	assert.Contains(t, s, "stages:")
-	assert.Contains(t, s, "- dispatch")
-	assert.Contains(t, s, "- poll")
-	assert.NotContains(t, s, "- generate")
-	assert.Contains(t, s, "- agent")
-	assert.Contains(t, s, "fullsend-dispatch.yml")
-	assert.Contains(t, s, "fullsend-poll.yml")
+	// Root file now includes only the pipeline wrapper and workflow block.
+	// Stage declarations and component includes are in fullsend-pipeline.yml.
+	assert.Contains(t, s, "fullsend-pipeline.yml",
+		"root must include the fullsend pipeline wrapper")
+	assert.NotContains(t, s, "stages:",
+		"stages moved to fullsend-pipeline.yml")
+	assert.NotContains(t, s, "fullsend-dispatch.yml",
+		"component includes moved to fullsend-pipeline.yml")
+	assert.NotContains(t, s, "fullsend-poll.yml",
+		"component includes moved to fullsend-pipeline.yml")
+	assert.NotContains(t, s, "fullsend-agent.yml",
+		"component includes moved to fullsend-pipeline.yml")
 	// Auto-cancel disabled to prevent queued agent pipelines from being killed
 	assert.Contains(t, s, "auto_cancel")
 	assert.Contains(t, s, "on_new_commit: none")
@@ -344,8 +556,6 @@ func TestGitLabRootPipelineContent(t *testing.T) {
 	// Requires API source + protected branch + STAGE variable
 	assert.Contains(t, s, `$CI_PIPELINE_SOURCE == "api"`)
 	assert.NotContains(t, s, `$STAGE != ""`)
-	// Agent template included for API-triggered pipelines
-	assert.Contains(t, s, "fullsend-agent.yml")
 	// push pipelines intentionally excluded — documented in workflow comment
 	assert.Contains(t, s, "Push-triggered pipelines are intentionally excluded")
 	// no catch-all rule — workflow:rules is open-ended so adopters
@@ -353,6 +563,29 @@ func TestGitLabRootPipelineContent(t *testing.T) {
 	assert.NotContains(t, s, "- when: never")
 	// parent_pipeline rule removed (child pipelines don't inherit workflow:rules)
 	assert.NotContains(t, s, `$CI_PIPELINE_SOURCE == "parent_pipeline"`)
+}
+
+func TestGitLabPipelineWrapperContent(t *testing.T) {
+	content, err := GitLabPerRepoFile(".gitlab/ci/fullsend-pipeline.yml")
+	require.NoError(t, err)
+	s := string(content)
+	// Pipeline wrapper contains includes and stages moved from root.
+	assert.Contains(t, s, "fullsend-dispatch.yml")
+	assert.Contains(t, s, "fullsend-poll.yml")
+	assert.Contains(t, s, "fullsend-agent.yml")
+	assert.Contains(t, s, "stages:")
+	assert.Contains(t, s, "- dispatch")
+	assert.Contains(t, s, "- poll")
+	assert.Contains(t, s, "- agent")
+	assert.NotContains(t, s, "- generate")
+	// Pipeline wrapper must NOT define a workflow: YAML key (stays in root).
+	// The comment text mentions "workflow:" for documentation, so we check
+	// for the YAML key pattern rather than the bare string.
+	assert.NotContains(t, s, "\nworkflow:",
+		"pipeline wrapper must not define workflow: key — it stays in root")
+	// Must start with YAML document start marker.
+	assert.True(t, strings.HasPrefix(s, "---\n"),
+		"must start with YAML document start marker (---)")
 }
 
 func TestGitLabRunnerTagsPlaceholder(t *testing.T) {
@@ -479,6 +712,59 @@ func TestFormatVersionMarker(t *testing.T) {
 	assert.Equal(t, "# fullsend-ref: abc123", FormatVersionMarker("abc123", "abc123"))
 }
 
+func TestResolveFullsendVersion(t *testing.T) {
+	assert.Equal(t, "latest", ResolveFullsendVersion("", ""))
+	assert.Equal(t, "v0.42.0", ResolveFullsendVersion("abc123", "v0.42.0"))
+	assert.Equal(t, "v0.42.0", ResolveFullsendVersion("", "v0.42.0"))
+	assert.Equal(t, "abc123", ResolveFullsendVersion("abc123", ""))
+}
+
+func TestCollectGitLabPerRepoInstallFiles_VersionPlaceholderReplaced(t *testing.T) {
+	files, err := CollectGitLabPerRepoInstallFiles(nil, "abc123def", "v0.42.0")
+	require.NoError(t, err)
+
+	for _, f := range files {
+		s := string(f.Content)
+		assert.NotContains(t, s, "__FULLSEND_VERSION__",
+			"%s should have __FULLSEND_VERSION__ replaced", f.Path)
+	}
+
+	// Agent and poll templates should contain the rendered version
+	for _, f := range files {
+		if f.Path == ".gitlab/ci/fullsend-agent.yml" || f.Path == ".gitlab/ci/fullsend-poll.yml" {
+			s := string(f.Content)
+			assert.Contains(t, s, `FULLSEND_VERSION="v0.42.0"`,
+				"%s should contain the rendered version tag", f.Path)
+		}
+	}
+}
+
+func TestCollectGitLabPerRepoInstallFiles_SHAFallbackWhenNoTag(t *testing.T) {
+	files, err := CollectGitLabPerRepoInstallFiles(nil, "abc123def", "")
+	require.NoError(t, err)
+
+	for _, f := range files {
+		if f.Path == ".gitlab/ci/fullsend-agent.yml" || f.Path == ".gitlab/ci/fullsend-poll.yml" {
+			s := string(f.Content)
+			assert.Contains(t, s, `FULLSEND_VERSION="abc123def"`,
+				"%s should contain the SHA when no tag is available", f.Path)
+		}
+	}
+}
+
+func TestCollectGitLabPerRepoInstallFiles_LatestWhenNoVersion(t *testing.T) {
+	files, err := CollectGitLabPerRepoInstallFiles(nil, "", "")
+	require.NoError(t, err)
+
+	for _, f := range files {
+		if f.Path == ".gitlab/ci/fullsend-agent.yml" || f.Path == ".gitlab/ci/fullsend-poll.yml" {
+			s := string(f.Content)
+			assert.Contains(t, s, `FULLSEND_VERSION="latest"`,
+				"%s should fall back to latest when no ref/tag provided", f.Path)
+		}
+	}
+}
+
 func TestInsertAfterDocStart(t *testing.T) {
 	t.Run("with document start", func(t *testing.T) {
 		result := InsertAfterDocStart("---\ncontent", "# marker")
@@ -490,11 +776,26 @@ func TestInsertAfterDocStart(t *testing.T) {
 	})
 }
 
+func TestGitLabAgentTemplateRunnerTempBeforeRun(t *testing.T) {
+	content, err := GitLabPerRepoFile(".gitlab/ci/fullsend-agent.yml")
+	require.NoError(t, err)
+	s := string(content)
+
+	exportIdx := strings.Index(s, "export RUNNER_TEMP=")
+	require.Greater(t, exportIdx, 0, "RUNNER_TEMP export must exist")
+
+	runIdx := strings.Index(s, "fullsend run")
+	require.Greater(t, runIdx, 0, "fullsend run must exist")
+
+	assert.Less(t, exportIdx, runIdx,
+		"RUNNER_TEMP must be exported before fullsend run is invoked")
+}
+
 // TestGitLabAgentTemplateHarnessPassthroughVars validates that harness
 // passthrough variables declared in the GitHub reusable workflows are also
 // present in the GitLab agent template's variables: section. When a harness
 // YAML uses ${VAR} passthrough syntax, the harness engine's os.Expand rejects
-// unset variables. GitHub workflows set these to ” in their env: blocks; the
+// unset variables. GitHub workflows set these to " in their env: blocks; the
 // GitLab template must do the same or the agent aborts at env validation (#6273).
 func TestGitLabAgentTemplateHarnessPassthroughVars(t *testing.T) {
 	// Variables that GitHub reusable workflows set for harness passthrough.

@@ -11,10 +11,12 @@
 dispatch:
   stage: dispatch
   image:
-    name: ghcr.io/fullsend-ai/fullsend-runner:latest
+    name: ghcr.io/fullsend-ai/fullsend-runner:dev
     entrypoint: [""]
   tags: __RUNNER_TAGS__
   rules:
+    - if: '$CI_MERGE_REQUEST_TITLE =~ /\[(skip ci|ci skip)\]/i'
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:
     - |
@@ -236,6 +238,8 @@ dispatch:
 dispatch-mr-agents:
   stage: agent
   rules:
+    - if: '$CI_MERGE_REQUEST_TITLE =~ /\[(skip ci|ci skip)\]/i'
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   needs:
     - job: dispatch

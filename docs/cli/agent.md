@@ -4,7 +4,7 @@ sidebar_label: fullsend agent
 
 # fullsend agent
 
-Manage agent registrations in fullsend config. Add, list, update, and remove agents.
+Manage agent registrations in fullsend config. Add, list, set (runtime, model, effort), update, and remove agents.
 
 `agent add` and `agent update` fetch remote content and resolve GitHub URLs. Authentication is via `gh` CLI or `GH_TOKEN` environment variable.
 
@@ -15,11 +15,12 @@ Manage agent registrations in fullsend config. Add, list, update, and remove age
 | `fullsend agent add <url-or-path>` | Register an agent in config |
 | `fullsend agent list` | List registered agents |
 | `fullsend agent update <name> [sha]` | Update a URL agent to a new commit SHA |
+| `fullsend agent set <name>` | Set an agent's runtime, model or effort |
 | `fullsend agent remove <name>` | Remove an agent from config |
 
 ## `agent add`
 
-Register an agent in config by URL or local path. URL sources are automatically pinned to a specific commit SHA and annotated with a `#sha256=...` integrity hash. The URL prefix is added to `allowed_remote_resources` if not already present.
+Register an agent in config by URL or local path. URL sources are automatically pinned to a specific commit SHA and annotated with a `#sha256=...` integrity hash. When a URL references a branch or tag (rather than a commit SHA), the original ref is stored in the config entry's `ref` field so that subsequent `agent update` calls re-resolve against the same branch. The URL prefix is added to `allowed_remote_resources` if not already present.
 
 ```bash
 fullsend agent add https://github.com/my-org/agents/blob/main/harness/lint.yaml --fullsend-dir .fullsend
@@ -60,7 +61,7 @@ my-lint  harness/my-lint.yaml
 
 ## `agent update`
 
-Update a URL-based agent to a new commit SHA and recompute the `#sha256=...` integrity hash. If no SHA is provided, the default branch HEAD is resolved automatically.
+Update a URL-based agent to a new commit SHA and recompute the `#sha256=...` integrity hash. If no SHA is provided, the branch ref stored at adoption time is re-resolved; if no ref was stored (backward-compatible entries), the default branch HEAD is used.
 
 ```bash
 fullsend agent update triage --fullsend-dir .fullsend
@@ -74,6 +75,31 @@ fullsend agent update triage a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 --fullsend
 | `--fullsend-dir` | | Path to the `.fullsend` configuration directory (required) |
 
 Only URL agents can be updated — local path agents have nothing to pin. Non-GitHub URL agents require an explicit SHA argument. The integrity hash is recomputed by fetching the content at the new SHA.
+
+## `agent set`
+
+Sets `runtime`, `model` and/or `effort` for one agent in `.fullsend/config.yaml` (per-repo
+configs). A built-in agent (`triage`, `code`, `review`, `fix`, `retro`, `prioritize`) without an
+entry gets a name-only entry; a custom agent's settings land on its `source:` entry (or, for an
+agent registered in `config.base.yaml`, on a name-only overlay entry that merges onto it). Only the
+flags given change; pass an empty value (`--model ""`) to clear a setting. The result is validated
+before it is written.
+
+```bash
+fullsend agent set code --fullsend-dir .fullsend --runtime claude --model sonnet --effort high
+fullsend agent set triage --fullsend-dir .fullsend --model xai-vertex/xai/grok-4.6
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--fullsend-dir` | Path to the `.fullsend` configuration directory (required) |
+| `--runtime` | Agent runtime for this agent (`claude`, `pi` or `codex`) |
+| `--model` | Model for this agent — an alias, a model id, or `provider/id` on pi and codex (codex takes OpenAI ids only) |
+| `--effort` | Effort level for this agent (`low`, `medium`, `high`, `xhigh`, `max`) |
+
+See [Runtimes — per-agent settings](../runtimes.md#per-agent-runtime-model-and-effort) for precedence.
 
 ## `agent remove`
 

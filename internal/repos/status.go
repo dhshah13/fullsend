@@ -19,28 +19,44 @@ type RepoState struct {
 }
 
 // ProbeRepoState reads a repo's current per-repo installation state
-// from forge variables and workflow files.
-func ProbeRepoState(ctx context.Context, client forge.Client, owner, repo string, fc ForgeConfig) (RepoState, error) {
-	vars, err := client.ListRepoVariables(ctx, owner, repo)
+// by probing all installation components (workflow files, variables,
+// secrets). A repo is considered per-repo installed when at least one
+// required variable is present — a workflow file alone may come from
+// per-org enrollment. Returns a zero RepoState when no required
+// variables are found.
+func ProbeRepoState(ctx context.Context, client forge.Client, owner, repo, forgeName string, fc ForgeConfig) (RepoState, error) {
+	components, err := ProbeComponents(ctx, client, owner, repo, forgeName, fc, nil)
 	if err != nil {
-		return RepoState{}, fmt.Errorf("listing variables for %s/%s: %w", owner, repo, err)
+		return RepoState{}, fmt.Errorf("probing components for %s/%s: %w", owner, repo, err)
 	}
 
-	if vars[forge.PerRepoGuardVar] != "true" {
+	// Check required variables — these distinguish per-repo from per-org.
+	hasRequiredVar := false
+	state := RepoState{}
+	for _, c := range components {
+		if !c.Present {
+			continue
+		}
+		switch c.Name {
+		case "var:" + forge.VarMintURL:
+			hasRequiredVar = true
+			state.MintURL = c.Actual
+		case "var:" + forge.VarLastPollAtFast, "var:" + forge.VarLastPollAtFull, "var:" + forge.VarLabelState:
+			hasRequiredVar = true
+		case "workflow":
+			state.FullsendRef = c.Actual
+		}
+	}
+
+	if !hasRequiredVar {
 		return RepoState{}, nil
 	}
+	state.Installed = true
 
-	state := RepoState{
-		Installed:       true,
-		MintURL:         vars["FULLSEND_MINT_URL"],
-		InferenceRegion: vars["FULLSEND_GCP_REGION"],
+	region, _, regionErr := client.GetRepoVariable(ctx, owner, repo, forge.VarGCPRegion)
+	if regionErr == nil {
+		state.InferenceRegion = region
 	}
-
-	ref, err := readWorkflowRef(ctx, client, owner, repo, fc)
-	if err != nil {
-		return state, fmt.Errorf("reading workflow for %s/%s: %w", owner, repo, err)
-	}
-	state.FullsendRef = ref
 
 	return state, nil
 }
@@ -70,7 +86,7 @@ type RepoStatus struct {
 
 // StatusSummary provides aggregate counts across all repos.
 // Counts are not mutually exclusive: a repo can be both Installed and
-// Errored (e.g. guard variable set but workflow read fails), so
+// Errored (e.g. variables present but workflow read fails), so
 // Installed + NotInstalled + Errored may exceed Total.
 type StatusSummary struct {
 	Total        int `json:"total"`
@@ -121,6 +137,16 @@ func Status(ctx context.Context, manifest *Manifest, clients ForgeClientFactory,
 		refResolver = NewRefResolver(ghFC.Client)
 	}
 
+	// Build the drift config from the manifest. InferenceRegion and
+	// ReviewAppClientID are CLI flags on the install command and are
+	// not available in the status path, so value drift for
+	// GCP region and review client ID can only be
+	// detected by repos install, not repos status. RunnerTags come
+	// from the manifest's GitLab platform section.
+	dcfg := DriftConfig{
+		RunnerTags: gitlabRunnerTags(manifest),
+	}
+
 	results := make([]RepoStatus, len(resolved))
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
@@ -148,7 +174,7 @@ func Status(ctx context.Context, manifest *Manifest, clients ForgeClientFactory,
 				return
 			}
 			cfg.ForgeConfig = fc
-			status := checkRepoStatus(ctx, cfg, refResolver)
+			status := checkRepoStatus(ctx, cfg, dcfg, refResolver)
 			results[idx] = status
 		}(i, rr)
 	}
@@ -172,7 +198,7 @@ func Status(ctx context.Context, manifest *Manifest, clients ForgeClientFactory,
 	return &StatusResult{Repos: results, Summary: summary, Warnings: warnings}, nil
 }
 
-func checkRepoStatus(ctx context.Context, cfg ResolvedConfig, resolver *RefResolver) RepoStatus {
+func checkRepoStatus(ctx context.Context, cfg ResolvedConfig, dcfg DriftConfig, resolver *RefResolver) RepoStatus {
 	owner := cfg.Owner
 	repo := cfg.Repo
 	client := cfg.ForgeConfig.Client
@@ -185,59 +211,73 @@ func checkRepoStatus(ctx context.Context, cfg ResolvedConfig, resolver *RefResol
 		ExpectedMintURL: cfg.MintURL,
 	}
 
-	state, err := ProbeRepoState(ctx, client, owner, repo, fc)
-	if err != nil {
-		status.Error = err.Error()
+	// Build expected values for all static variables using the same
+	// function as the converge path, so variable classification
+	// (static vs dynamic) cannot diverge between the two paths.
+	expectedVars, varValErr := staticExpectedVarValues(InstallConfig{
+		Forge:             cfg.Forge,
+		MintURL:           cfg.MintURL,
+		InferenceRegion:   dcfg.InferenceRegion,
+		ReviewAppClientID: dcfg.ReviewAppClientID,
+	}, cfg.MintURL)
+	if varValErr != nil {
+		status.Error = fmt.Sprintf("building expected variable values for %s/%s: %v", owner, repo, varValErr)
+		return status
 	}
-
-	if !state.Installed {
+	components, probeErr := ProbeComponents(ctx, client, owner, repo, cfg.Forge, fc, expectedVars)
+	if probeErr != nil {
+		status.Error = fmt.Sprintf("probing components for %s/%s: %v", owner, repo, probeErr)
+		return status
+	}
+	if !anyComponentPresent(components) {
 		return status
 	}
 	status.Installed = true
-	status.MintURL = state.MintURL
-	status.Region = state.InferenceRegion
-	status.CurrentRef = state.FullsendRef
 
-	if err != nil {
-		return status
+	// Extract display values from probe results.
+	workflowPresent := false
+	for _, c := range components {
+		if c.Name == "var:"+forge.VarMintURL {
+			status.MintURL = c.Actual
+		}
+		if c.Name == "workflow" {
+			status.CurrentRef = c.Actual
+			workflowPresent = c.Present
+		}
 	}
 
-	if cfg.MintURL != "" && status.MintURL != cfg.MintURL {
+	// Convert non-matching components to drift entries before
+	// display-only reads, so drifts are preserved on later errors.
+	for _, c := range components {
+		if c.Match {
+			continue
+		}
+		field := DriftFieldName(c.Name)
+		expected := c.Expected
+		if expected == "" {
+			expected = "present"
+		}
+		actual := c.Actual
+		if !c.Present {
+			actual = "missing"
+		}
 		status.Drifts = append(status.Drifts, Drift{
-			Field:    "FULLSEND_MINT_URL",
-			Expected: cfg.MintURL,
-			Actual:   status.MintURL,
+			Field:    field,
+			Expected: expected,
+			Actual:   actual,
 		})
 	}
 
-	// Inference secrets are always required.
-	for _, secretName := range requiredSecretsForForge() {
-		exists, secretErr := client.RepoSecretExists(ctx, owner, repo, secretName)
-		if secretErr != nil {
-			if status.Error == "" {
-				status.Error = fmt.Sprintf("checking secret %s: %v", secretName, secretErr)
-			}
-			break
-		}
-		if !exists {
-			status.Drifts = append(status.Drifts, Drift{
-				Field:    secretName,
-				Expected: "present",
-				Actual:   "missing",
-			})
-		}
-	}
-
 	// Resolve the manifest's fullsend_ref to a commit SHA for
-	// comparison. This handles floating refs like "main" — if the
-	// branch has moved, the resolved SHA differs from the installed
-	// SHA and drift is correctly reported.
+	// comparison. Skip when the workflow is absent — that is already
+	// reported as a component drift; an empty ref is a consequence,
+	// not a separate problem.
 	//
 	// When the symbolic refs already match (e.g. both are "v0"), skip
 	// SHA resolution entirely. This avoids false drift reports where
 	// the resolver converts the expected ref to a SHA while the
 	// installed ref stays symbolic.
-	if cfg.FullsendRef != "" && status.CurrentRef != cfg.FullsendRef {
+	if workflowPresent && cfg.FullsendRef != "" && status.CurrentRef != cfg.FullsendRef {
 		expectedSHA := cfg.FullsendRef
 		if resolver != nil {
 			expectedSHA = resolver.Resolve(ctx, cfg.FullsendRef)
@@ -250,6 +290,25 @@ func checkRepoStatus(ctx context.Context, cfg ResolvedConfig, resolver *RefResol
 			})
 		}
 	}
+
+	// Content drift: compare installed scaffold content against expected
+	// template output. This catches template changes (new jobs, permissions,
+	// restructured thin callers) that are invisible to the ref-string and
+	// presence checks above. Refs are normalized before comparison so that
+	// ref-format differences do not produce false content-drift reports —
+	// ref drift is already detected separately.
+	checkScaffoldContentDrift(ctx, client, cfg, dcfg, resolver, &status)
+	if status.Error != "" {
+		return status
+	}
+
+	// Read display-only variable not covered by required vars.
+	region, _, regionErr := client.GetRepoVariable(ctx, owner, repo, forge.VarGCPRegion)
+	if regionErr != nil {
+		status.Error = fmt.Sprintf("reading variable %s for %s/%s: %v", forge.VarGCPRegion, owner, repo, regionErr)
+		return status
+	}
+	status.Region = region
 
 	return status
 }
@@ -284,9 +343,8 @@ func extractWorkflowRef(content []byte, fc ForgeConfig) string {
 // can surface a non-zero exit code.
 //
 // Callers surface unmatched-pattern warnings through two mechanisms:
-// Status, Diff, and Sync collect them into a result struct field;
-// BatchInstall and Upgrade emit them via progress callbacks. This
-// dual-surface design reflects each caller's existing output architecture.
+// Status collects them into a result struct field; Converge and
+// migrateRepo emit them via progress callbacks.
 func filterRepos(repos []ResolvedRepo, filter []string) ([]ResolvedRepo, []string, error) {
 	matched := make(map[string]bool)
 	var result []ResolvedRepo
@@ -323,4 +381,68 @@ func filterRepos(repos []ResolvedRepo, filter []string) ([]ResolvedRepo, []strin
 	}
 
 	return result, unmatched, nil
+}
+
+// checkScaffoldContentDrift compares installed scaffold file content
+// against expected template output and appends content drift entries to
+// status.Drifts for any mismatches. Uses the shared CheckFileContentDrift
+// function so that status and converge apply the same comparison logic.
+//
+// The refResolver is used to fetch remote scaffold templates when
+// fullsend_ref pins a version that differs from the running binary,
+// ensuring the baseline matches the pinned version's templates.
+func checkScaffoldContentDrift(ctx context.Context, client forge.Client, cfg ResolvedConfig, dcfg DriftConfig, refResolver *RefResolver, status *RepoStatus) {
+	expectedFiles, err := ExpectedScaffoldContent(ctx, cfg, dcfg, refResolver)
+	if err != nil {
+		status.Error = fmt.Sprintf("rendering expected scaffold for %s/%s: %v", cfg.Owner, cfg.Repo, err)
+		return
+	}
+	if expectedFiles == nil {
+		return
+	}
+
+	drifted, driftErr := CheckFileContentDrift(ctx, client, cfg.Owner, cfg.Repo, cfg.ForgeConfig, cfg.Forge, expectedFiles)
+	if driftErr != nil {
+		status.Error = fmt.Sprintf("checking scaffold content drift for %s/%s: %v", cfg.Owner, cfg.Repo, driftErr)
+		return
+	}
+
+	for _, d := range drifted {
+		status.Drifts = append(status.Drifts, Drift{
+			Field:    d.InstalledPath,
+			Expected: "current template",
+			Actual:   "installed content differs",
+		})
+	}
+
+	// Orphan detection: check for managed scaffold files that exist on
+	// the forge but are no longer produced by the current template.
+	orphanFiles, orphanErr := CheckOrphanFiles(ctx, client, cfg.Owner, cfg.Repo, cfg.ForgeConfig, cfg.Forge, expectedFiles)
+	if orphanErr != nil {
+		status.Error = fmt.Sprintf("checking orphan files for %s/%s: %v", cfg.Owner, cfg.Repo, orphanErr)
+		return
+	}
+	for _, o := range orphanFiles {
+		status.Drifts = append(status.Drifts, Drift{
+			Field:    o.Path,
+			Expected: "absent",
+			Actual:   "orphan file (no longer in template)",
+		})
+	}
+
+	// Orphan variable detection: check for FULLSEND_-prefixed variables
+	// on the forge that are not in the managed variable set.
+	installCfg := driftInstallConfig(cfg, dcfg)
+	orphanVars, orphanVarErr := CheckOrphanVars(ctx, client, cfg.Owner, cfg.Repo, installCfg, cfg.MintURL)
+	if orphanVarErr != nil {
+		status.Error = fmt.Sprintf("checking orphan variables for %s/%s: %v", cfg.Owner, cfg.Repo, orphanVarErr)
+		return
+	}
+	for _, o := range orphanVars {
+		status.Drifts = append(status.Drifts, Drift{
+			Field:    o.Name,
+			Expected: "absent",
+			Actual:   "orphan variable (not in managed set)",
+		})
+	}
 }

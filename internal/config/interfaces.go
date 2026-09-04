@@ -81,6 +81,12 @@ type PerRepoConfigReader interface {
 	ConfigInferenceProject() string
 	ConfigInferenceRegion() string
 	ConfigInferenceWIFProvider() string
+	ConfigInferenceOpenAI() OpenAIWIFConfig
+	// ConfigModelAliases returns the effective model alias map, merged
+	// per-key through the parent chain. nil (the code default) means no
+	// aliases are configured: every alias resolves through the runtime's
+	// compiled-in table.
+	ConfigModelAliases() map[string]string
 }
 
 // --- Write superset interfaces ---
@@ -92,6 +98,7 @@ type ConfigWriter interface {
 	SetKillSwitch(bool)
 	SetAgents([]AgentEntry)
 	SetAllowedRemoteResources([]string)
+	SetStatusNotifications(*StatusNotificationConfig)
 	Marshal() ([]byte, error)
 	Validate() error
 }
@@ -119,6 +126,8 @@ type PerRepoConfigWriter interface {
 	SetInferenceProject(string)
 	SetInferenceRegion(string)
 	SetInferenceWIFProvider(string)
+	SetInferenceOpenAI(OpenAIWIFConfig)
+	SetModelAliases(map[string]string)
 }
 
 // --- Compile-time assertions ---
@@ -194,6 +203,11 @@ func (c *orgConfig) SetInference(i InferenceConfig) { c.Inference = i }
 // SetDefaultRuntime replaces the default agent runtime.
 func (c *orgConfig) SetDefaultRuntime(rt string) { c.Defaults.Runtime = rt }
 
+// SetStatusNotifications sets the status notification configuration.
+func (c *orgConfig) SetStatusNotifications(sn *StatusNotificationConfig) {
+	c.Defaults.StatusNotifications = sn
+}
+
 // SetRepo adds or replaces a per-repo configuration entry.
 // Callers should use this method instead of mutating the map returned
 // by RepoMap() to keep mutations on the writer interface.
@@ -258,11 +272,26 @@ func (c *perRepoConfig) AgentEntries() []AgentEntry {
 			if oi.entry.Source != "" {
 				merged.Source = oi.entry.Source
 			}
+			if oi.entry.Ref != "" {
+				merged.Ref = oi.entry.Ref
+			}
 			if oi.entry.Enabled != nil {
 				merged.Enabled = oi.entry.Enabled
 			}
 			if oi.entry.Name != "" {
 				merged.Name = oi.entry.Name
+			}
+			// Per-agent settings merge field by field; an empty value
+			// inherits the parent's (there is no way to unset a parent's
+			// value from the overlay short of restating the entry).
+			if oi.entry.Runtime != "" {
+				merged.Runtime = oi.entry.Runtime
+			}
+			if oi.entry.Model != "" {
+				merged.Model = oi.entry.Model
+			}
+			if oi.entry.Effort != "" {
+				merged.Effort = oi.entry.Effort
 			}
 		}
 		result = append(result, merged)
@@ -277,6 +306,10 @@ func (c *perRepoConfig) AgentEntries() []AgentEntry {
 
 	return result
 }
+
+// LocalAgentEntries returns only this layer's own agents: entries (what
+// Marshal writes), as opposed to the merged set from AgentEntries.
+func (c *perRepoConfig) LocalAgentEntries() []AgentEntry { return c.Agents }
 
 // IsKillSwitchActive reports whether the kill switch is engaged.
 // KillSwitch is a *bool: nil falls through to parent, non-nil
@@ -473,6 +506,57 @@ func (c *perRepoConfig) ConfigInferenceWIFProvider() string {
 	return ""
 }
 
+// ConfigInferenceOpenAI returns the OpenAI WIF identifiers. Each of the
+// three resolves independently through the layers, like the other
+// inference scalars, so an overlay can restate one without the others.
+func (c *perRepoConfig) ConfigInferenceOpenAI() OpenAIWIFConfig {
+	var out OpenAIWIFConfig
+	if c.parent != nil {
+		out = c.parent.ConfigInferenceOpenAI()
+	}
+	if c.Inference != nil && c.Inference.OpenAI != nil {
+		if v := c.Inference.OpenAI.Audience; v != "" {
+			out.Audience = v
+		}
+		if v := c.Inference.OpenAI.IdentityProviderID; v != "" {
+			out.IdentityProviderID = v
+		}
+		if v := c.Inference.OpenAI.ServiceAccountID; v != "" {
+			out.ServiceAccountID = v
+		}
+	}
+	return out
+}
+
+// ConfigModelAliases returns the effective model alias map, merged per
+// key through the parent chain. Each key in the local Models.Aliases
+// overrides the same key from the parent; unstated keys inherit the
+// parent's value.
+func (c *perRepoConfig) ConfigModelAliases() map[string]string {
+	var parentAliases map[string]string
+	if c.parent != nil {
+		parentAliases = c.parent.ConfigModelAliases()
+	}
+	if c.Models == nil || len(c.Models.Aliases) == 0 {
+		return parentAliases
+	}
+	if len(parentAliases) == 0 {
+		result := make(map[string]string, len(c.Models.Aliases))
+		for k, v := range c.Models.Aliases {
+			result[k] = v
+		}
+		return result
+	}
+	merged := make(map[string]string, len(parentAliases)+len(c.Models.Aliases))
+	for k, v := range parentAliases {
+		merged[k] = v
+	}
+	for k, v := range c.Models.Aliases {
+		merged[k] = v
+	}
+	return merged
+}
+
 // --- perRepoConfig setter methods ---
 
 // SetKillSwitch sets the kill switch state. Stores a *bool so that
@@ -508,9 +592,39 @@ func (c *perRepoConfig) SetInferenceProject(project string) { c.ensureInference(
 // SetInferenceRegion sets the GCP region for inference.
 func (c *perRepoConfig) SetInferenceRegion(region string) { c.ensureInference().Region = region }
 
+// SetStatusNotifications sets the status notification configuration.
+func (c *perRepoConfig) SetStatusNotifications(sn *StatusNotificationConfig) {
+	c.Notifications = sn
+}
+
 // SetInferenceWIFProvider sets the WIF provider resource name.
 func (c *perRepoConfig) SetInferenceWIFProvider(wifProvider string) {
 	c.ensureInference().WIFProvider = wifProvider
+}
+
+// SetModelAliases sets the per-repo model alias overrides; a nil or
+// empty map removes the block.
+func (c *perRepoConfig) SetModelAliases(aliases map[string]string) {
+	if len(aliases) == 0 {
+		c.Models = nil
+		return
+	}
+	if c.Models == nil {
+		c.Models = &ModelsConfig{}
+	}
+	c.Models.Aliases = aliases
+}
+
+// SetInferenceOpenAI sets the OpenAI WIF identifiers; a zero value
+// removes the block.
+func (c *perRepoConfig) SetInferenceOpenAI(ids OpenAIWIFConfig) {
+	inf := c.ensureInference()
+	if ids.IsZero() {
+		inf.OpenAI = nil
+		return
+	}
+	cp := ids
+	inf.OpenAI = &cp
 }
 
 // ensureInference lazily initializes the Inference struct.
@@ -522,6 +636,12 @@ func (c *perRepoConfig) ensureInference() *PerRepoInferenceConfig {
 }
 
 // --- LoadConfig / LoadConfigWriter factories ---
+
+// Layer file names of a per-repo config directory (ADR 0069).
+const (
+	OverlayConfigFile = "config.yaml"
+	BaseConfigFile    = "config.base.yaml"
+)
 
 // LoadOpts controls how LoadConfig handles a missing config.yaml.
 type LoadOpts struct {
@@ -609,8 +729,8 @@ func LoadConfigWriter(dir string, opts LoadOpts) (ConfigWriter, error) {
 // Returns data and existence flags for each file. Genuine I/O errors
 // (not "file not found") are returned immediately.
 func readConfigFiles(dir string) (overlayData []byte, haveOverlay bool, baseData []byte, haveBase bool, err error) {
-	overlayData, overlayErr := os.ReadFile(filepath.Join(dir, "config.yaml"))
-	baseData, baseErr := os.ReadFile(filepath.Join(dir, "config.base.yaml"))
+	overlayData, overlayErr := os.ReadFile(filepath.Join(dir, OverlayConfigFile))
+	baseData, baseErr := os.ReadFile(filepath.Join(dir, BaseConfigFile))
 
 	if overlayErr != nil && !os.IsNotExist(overlayErr) {
 		return nil, false, nil, false, fmt.Errorf("reading config: %w", overlayErr)
@@ -619,6 +739,17 @@ func readConfigFiles(dir string) (overlayData []byte, haveOverlay bool, baseData
 		return nil, false, nil, false, fmt.Errorf("reading base config: %w", baseErr)
 	}
 	return overlayData, overlayErr == nil, baseData, baseErr == nil, nil
+}
+
+// ParsePerRepoConfigWriterLayered parses overlay and optional base YAML
+// bytes into a PerRepoConfigWriter with the parent chain
+// overlay → base → code defaults. When baseData is nil the result is
+// equivalent to ParsePerRepoConfigWriter (parent = code defaults only).
+// This is the preferred entry point when both layers are available as
+// raw bytes (e.g. fetched from a forge API) rather than on the local
+// filesystem (where LoadConfigWriter should be used instead).
+func ParsePerRepoConfigWriterLayered(overlayData []byte, baseData []byte) (PerRepoConfigWriter, error) {
+	return loadPerRepoLayers(overlayData, true, baseData, len(baseData) > 0)
 }
 
 // loadPerRepoLayers parses per-repo config layers and wires the parent

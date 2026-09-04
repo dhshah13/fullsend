@@ -87,8 +87,9 @@ architecture constraints — without modifying any fullsend configuration.
 
 Repo skills **extend** the agent's skill set. They do not replace built-in
 skills. If a repo skill has the same name as a built-in skill, the built-in
-version takes precedence and the repo version is silently ignored. Use a
-unique name to ensure your skill is discoverable.
+version takes precedence and the repo version is ignored. Fullsend warns about
+the collision before the agent starts. Use a unique name to extend the agent,
+or intentionally replace it through [`base:` harness composition](#overriding-built-in-skills).
 
 ### Skill precedence
 
@@ -104,7 +105,8 @@ Personal (CLAUDE_CONFIG_DIR/skills/)  >  Project (.claude/skills/)
 
 A repo skill with a novel name (no collision) is always available. A repo
 skill with a name matching a built-in skill is shadowed — the agent never
-sees it.
+sees it. Fullsend logs a warning naming the shadowed skill and the supported
+extension and override paths.
 
 ### Extension points
 
@@ -171,7 +173,7 @@ For the full procedure, use the contributor skill
 `skills/author-fullsend-augmentations/`).
 
 Bring Your Own Agent covers the same decision frame in
-[Tuning agents with augmentation skills](bring-your-own-agent.md#tuning-agents-with-augmentation-skills).
+[Tuning agents with augmentation skills](customizing-agents.md#tuning-agents-with-augmentation-skills).
 
 > **Planned:** Per-file overrides inside skill directories
 > ([#6158](https://github.com/fullsend-ai/fullsend/issues/6158)) will make
@@ -187,8 +189,9 @@ Bring Your Own Agent covers the same decision frame in
 
 ## See also
 
+- [Customizing Agents](customizing-overview.md) — overview of all customization approaches
 - [Bring Your Own Agent](bring-your-own-agent.md) — building, registering, and
-  [tuning existing agents](bring-your-own-agent.md#tuning-agents-with-augmentation-skills)
+  [tuning existing agents](customizing-agents.md#tuning-agents-with-augmentation-skills)
 - [`author-fullsend-augmentations`](../../../skills/author-fullsend-augmentations/SKILL.md)
   — discovery-driven authoring procedure for augmentations and sub-agents
 - [Default, derived, and custom agents](../../agents/topics/default-vs-custom.md)

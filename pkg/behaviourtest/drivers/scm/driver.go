@@ -8,12 +8,12 @@ import (
 
 // Driver abstracts SCM operations for behaviour tests.
 //
-// Concurrency: the github.Driver implementation is an immutable wrapper
-// around forge.Client (which is itself safe for concurrent use) and
-// holds no unsynchronized mutable fields. Sharing a single Driver
-// across goroutines via World.Clone is safe by design for
-// GODOG_CONCURRENCY>1. TestConcurrentAccess in package
-// github exercises the real driver under -race with a FakeClient.
+// Concurrency: the github.Driver and gitlab.Driver implementations are
+// immutable wrappers around forge.Client (which is itself safe for
+// concurrent use) and hold no unsynchronized mutable fields. Sharing a
+// single Driver across goroutines via World.Clone is safe by design for
+// GODOG_CONCURRENCY>1. TestConcurrentAccess in packages github and
+// gitlab exercises the real driver under -race with a FakeClient.
 //
 // If a future implementation adds mutable state (caches, counters,
 // buffers), it must synchronize access or be deep-copied per scenario
@@ -38,6 +38,9 @@ type Driver interface {
 	ListOpenChangeProposals(ctx context.Context, owner, repo string) ([]forge.ChangeProposal, error)
 	// ListComments returns the comments on an issue or pull request.
 	ListComments(ctx context.Context, owner, repo string, number int) ([]forge.IssueComment, error)
+	// ListIssueReactions returns the emoji reactions on an issue or
+	// pull request. Used by reaction notification assertions.
+	ListIssueReactions(ctx context.Context, owner, repo string, number int) ([]forge.Reaction, error)
 
 	// CreateRepo creates a new repository in the given org. It is
 	// idempotent — if a repo with the given name already exists,

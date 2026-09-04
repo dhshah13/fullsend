@@ -15,8 +15,10 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -30,11 +32,65 @@ type LiveClient struct {
 	token     string
 	baseURL   string
 	afterFunc func(time.Duration) <-chan time.Time
+
+	// rate is the last X-RateLimit-* state seen on any response; see
+	// RateLimit. It is the primary-quota view (secondary limits can
+	// fire with remaining > 0), kept so callers can log how a shared
+	// installation token's budget drains and tell primary exhaustion
+	// from secondary throttling (#6702).
+	rateMu   sync.Mutex
+	rate     forge.RateLimit
+	rateSeen bool
 }
 
 // Compile-time interface checks.
 var _ forge.Client = (*LiveClient)(nil)
 var _ forge.GitHubExtensions = (*LiveClient)(nil)
+var _ forge.RateLimitReporter = (*LiveClient)(nil)
+
+// RateLimit returns the most recent rate-limit state observed on a
+// response from this client, and whether one has been observed yet.
+func (c *LiveClient) RateLimit() (forge.RateLimit, bool) {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	return c.rate, c.rateSeen
+}
+
+// parseRateLimit reads the X-RateLimit-* headers of one response. ok is
+// false when the response carries no X-RateLimit-Remaining (non-GitHub
+// responses from intermediaries, for example).
+func parseRateLimit(h http.Header) (forge.RateLimit, bool) {
+	remaining, err := strconv.Atoi(h.Get("X-RateLimit-Remaining"))
+	if err != nil {
+		return forge.RateLimit{}, false
+	}
+	limit, _ := strconv.Atoi(h.Get("X-RateLimit-Limit"))
+	var reset time.Time
+	if secs, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64); err == nil && secs > 0 {
+		reset = time.Unix(secs, 0)
+	}
+	return forge.RateLimit{
+		Limit:     limit,
+		Remaining: remaining,
+		Reset:     reset,
+		Resource:  h.Get("X-RateLimit-Resource"),
+		Observed:  time.Now(),
+	}, true
+}
+
+// observeRateLimit records the X-RateLimit-* headers of a response as
+// the client-wide last observation. Responses without the headers leave
+// the previous observation in place.
+func (c *LiveClient) observeRateLimit(h http.Header) {
+	rl, ok := parseRateLimit(h)
+	if !ok {
+		return
+	}
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	c.rate = rl
+	c.rateSeen = true
+}
 
 // New creates a new GitHub client with the given personal access token.
 func New(token string) *LiveClient {
@@ -50,6 +106,11 @@ func New(token string) *LiveClient {
 func (c *LiveClient) WithBaseURL(url string) *LiveClient {
 	c.baseURL = strings.TrimRight(url, "/")
 	return c
+}
+
+// BaseURL returns the configured GitHub API base URL.
+func (c *LiveClient) BaseURL() string {
+	return c.baseURL
 }
 
 // WithAfterFunc sets a custom delay function (for testing without real sleeps).
@@ -86,6 +147,15 @@ func (e *APIError) Error() string {
 		}
 	}
 	return s
+}
+
+// IsTransient reports whether the API error represents a transient
+// failure that may succeed on retry: server errors (500–504) and
+// rate limits (429). This method satisfies the transientReporter
+// interface used by forge.IsTransient.
+func (e *APIError) IsTransient() bool {
+	return e.StatusCode == http.StatusTooManyRequests ||
+		(e.StatusCode >= 500 && e.StatusCode <= 504)
 }
 
 // Unwrap returns sentinel errors for well-known API responses.
@@ -182,6 +252,9 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body any) (*ht
 		}
 
 		resp, err := c.http.Do(req)
+		if err == nil {
+			c.observeRateLimit(resp.Header)
+		}
 		if err != nil {
 			// If the caller's context is done, propagate immediately
 			// — retrying is pointless when the parent has cancelled.
@@ -198,7 +271,7 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body any) (*ht
 				half := base / 2
 				delay := half + time.Duration(rand.Int64N(int64(half)+1))
 				select {
-				case <-time.After(delay):
+				case <-c.afterFunc(delay):
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				}
@@ -230,6 +303,26 @@ func (c *LiveClient) do(ctx context.Context, method, path string, body any) (*ht
 				msg += fmt.Sprintf(", Retry-After: %s", retryAfter)
 			}
 			msg += ")"
+			// 429 and retryable 403 are rate limits by construction
+			// (isRetryable). Name the cause so IsRateLimitError matches
+			// and carry the budget the headers reported, so a caller
+			// that only has the error can still tell "rate limited"
+			// from a generic 403.
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+				msg = "rate limit: " + msg
+				// Report the budget from the response that failed —
+				// the client-wide observation may belong to another
+				// goroutine's request. A response without the headers
+				// (secondary limits may omit them) says so, and names
+				// the last observation with its age.
+				if rl, ok := parseRateLimit(resp.Header); ok {
+					msg += " [" + rl.String() + "]"
+				} else if last, seen := c.RateLimit(); seen {
+					msg += fmt.Sprintf(" [rate-limit headers absent; last seen %s, %s ago]", last, time.Since(last.Observed).Round(time.Second))
+				} else {
+					msg += " [rate-limit headers absent; no prior observation]"
+				}
+			}
 			return nil, &APIError{StatusCode: resp.StatusCode, Message: msg}
 		}
 		select {
@@ -2793,6 +2886,89 @@ func (c *LiveClient) MinimizeComment(ctx context.Context, nodeID, reason string)
 	return nil
 }
 
+// validReactionContent lists the emoji reaction values accepted by the
+// GitHub reactions API.
+var validReactionContent = []string{"+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"}
+
+// AddIssueReaction adds an emoji reaction to an issue or pull request.
+func (c *LiveClient) AddIssueReaction(ctx context.Context, owner, repo string, number int, content string) (int64, error) {
+	if !slices.Contains(validReactionContent, content) {
+		return 0, fmt.Errorf("add issue reaction: invalid content %q", content)
+	}
+	resp, err := c.post(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/reactions", owner, repo, number), map[string]string{"content": content})
+	if err != nil {
+		return 0, fmt.Errorf("add issue reaction on #%d: %w", number, err)
+	}
+	var result struct {
+		ID int64 `json:"id"`
+	}
+	if err := decodeJSON(resp, &result); err != nil {
+		return 0, fmt.Errorf("decode issue reaction: %w", err)
+	}
+	return result.ID, nil
+}
+
+// DeleteIssueReaction removes a previously added reaction by ID.
+func (c *LiveClient) DeleteIssueReaction(ctx context.Context, owner, repo string, number int, reactionID int64) error {
+	return c.delete_(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/reactions/%d", owner, repo, number, reactionID))
+}
+
+// AddIssueCommentReaction adds an emoji reaction to an issue/PR comment.
+func (c *LiveClient) AddIssueCommentReaction(ctx context.Context, owner, repo string, commentID int, content string) (int64, error) {
+	if !slices.Contains(validReactionContent, content) {
+		return 0, fmt.Errorf("add issue comment reaction: invalid content %q", content)
+	}
+	resp, err := c.post(ctx, fmt.Sprintf("/repos/%s/%s/issues/comments/%d/reactions", owner, repo, commentID), map[string]string{"content": content})
+	if err != nil {
+		return 0, fmt.Errorf("add issue comment reaction on comment %d: %w", commentID, err)
+	}
+	var result struct {
+		ID int64 `json:"id"`
+	}
+	if err := decodeJSON(resp, &result); err != nil {
+		return 0, fmt.Errorf("decode issue comment reaction: %w", err)
+	}
+	return result.ID, nil
+}
+
+// DeleteIssueCommentReaction removes a previously added comment reaction by ID.
+func (c *LiveClient) DeleteIssueCommentReaction(ctx context.Context, owner, repo string, commentID int, reactionID int64) error {
+	return c.delete_(ctx, fmt.Sprintf("/repos/%s/%s/issues/comments/%d/reactions/%d", owner, repo, commentID, reactionID))
+}
+
+// ListIssueReactions returns the emoji reactions on an issue or pull request.
+func (c *LiveClient) ListIssueReactions(ctx context.Context, owner, repo string, number int) ([]forge.Reaction, error) {
+	var result []forge.Reaction
+
+	for page := 1; page <= 100; page++ {
+		resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d/reactions?per_page=100&page=%d", owner, repo, number, page))
+		if err != nil {
+			return nil, fmt.Errorf("list issue reactions on #%d page %d: %w", number, page, err)
+		}
+		var items []struct {
+			ID      int64  `json:"id"`
+			Content string `json:"content"`
+			User    struct {
+				Login string `json:"login"`
+			} `json:"user"`
+		}
+		if err := decodeJSON(resp, &items); err != nil {
+			return nil, fmt.Errorf("decode issue reactions page %d: %w", page, err)
+		}
+		for _, item := range items {
+			result = append(result, forge.Reaction{
+				ID:      item.ID,
+				Content: item.Content,
+				User:    item.User.Login,
+			})
+		}
+		if len(items) < 100 {
+			break
+		}
+	}
+	return result, nil
+}
+
 // GetPullRequestInfo returns branch/repo context for a pull request.
 func (c *LiveClient) GetPullRequestInfo(ctx context.Context, owner, repo string, number int) (*forge.PullRequestInfo, error) {
 	resp, err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number))
@@ -3087,14 +3263,14 @@ func (c *LiveClient) UpdatePullRequestBranch(ctx context.Context, owner, repo st
 // through so the caller can retry the merge (which will get another 409 if
 // the update still hasn't landed).
 func (c *LiveClient) awaitBranchUpdate(ctx context.Context, owner, repo string, number int, oldSHA string) error {
-	deadline := time.After(mergeRetryPollTimeout)
+	deadline := c.afterFunc(mergeRetryPollTimeout)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
 			return nil // timed out; let the caller retry the merge
-		case <-time.After(mergeRetryPollInterval):
+		case <-c.afterFunc(mergeRetryPollInterval):
 			newSHA, err := c.GetPullRequestHeadSHA(ctx, owner, repo, number)
 			if err != nil {
 				continue // transient error; keep polling

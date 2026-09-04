@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/fullsend-ai/fullsend/internal/appsetup"
 	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/dispatch/gcf"
 	"github.com/fullsend-ai/fullsend/internal/forge"
@@ -127,7 +128,7 @@ func runReposMigrate(cmd *cobra.Command, org string, cfg *reposMigrateConfig) er
 
 	upstreamRef, upstreamTag := resolveUpstreamRef()
 
-	scaffoldCommitFn := func(ctx context.Context, owner, repo string, files []forge.TreeFile, direct bool) error {
+	scaffoldCommitFn := func(ctx context.Context, owner, repo string, files []forge.TreeFile, direct bool, installed bool) error {
 		fc, fcErr := clients.ConfigFor(repos.ForgeGitHub)
 		if fcErr != nil {
 			return fcErr
@@ -136,7 +137,8 @@ func runReposMigrate(cmd *cobra.Command, org string, cfg *reposMigrateConfig) er
 		if repoErr != nil {
 			return fmt.Errorf("getting repo info: %w", repoErr)
 		}
-		meta := repos.BuildScaffoldPRMetadata(ctx, fc.Client, owner, repo, upstreamTag)
+		meta := repos.BuildScaffoldPRMetadata(ctx, fc.Client, owner, repo, upstreamTag,
+			repos.ScaffoldMetadataOpts{GuardInstalled: &installed})
 		_, commitErr := layers.CommitScaffoldFiles(ctx, fc.Client, printer, owner, repo,
 			targetRepo.DefaultBranch, meta, files, direct, nil)
 		return commitErr
@@ -158,17 +160,24 @@ func runReposMigrate(cmd *cobra.Command, org string, cfg *reposMigrateConfig) er
 		printer.StepStart(fmt.Sprintf("Migrating %s from per-org to per-repo install", org))
 	}
 
+	// Resolve the review app client ID for provenance validation.
+	var reviewAppClientID string
+	if fc, fcErr := clients.ConfigFor(repos.ForgeGitHub); fcErr == nil {
+		reviewAppClientID = resolveReviewAppClientID(ctx, fc.Client, appsetup.DefaultAppSet)
+	}
+
 	migrateCfg := repos.MigrateConfig{
-		Org:            org,
-		Project:        cfg.project,
-		RepoFilter:     cfg.repoFilter,
-		DryRun:         cfg.dryRun,
-		Direct:         cfg.direct,
-		MaxConcurrency: cfg.concurrency,
-		ManifestPath:   cfg.manifest,
-		UpstreamRef:    upstreamRef,
-		UpstreamTag:    upstreamTag,
-		CLIVersion:     version,
+		Org:               org,
+		Project:           cfg.project,
+		RepoFilter:        cfg.repoFilter,
+		DryRun:            cfg.dryRun,
+		Direct:            cfg.direct,
+		MaxConcurrency:    cfg.concurrency,
+		ManifestPath:      cfg.manifest,
+		UpstreamRef:       upstreamRef,
+		UpstreamTag:       upstreamTag,
+		CLIVersion:        version,
+		ReviewAppClientID: reviewAppClientID,
 	}
 
 	result, err := repos.Migrate(ctx, migrateCfg, clients, provisioner, scaffoldCommitFn, progressFn)
@@ -315,7 +324,7 @@ func renderStatusResult(cmd *cobra.Command, result *repos.StatusResult, jsonOutp
 //
 // SHA detection reuses commitSHAPattern (defined in agent.go) which matches
 // exactly 40 lowercase hex characters. This intentionally differs from
-// isSHARef in internal/repos/upgrade.go, which accepts 7–40 hex chars
+// isSHARef in internal/repos/ref_ops.go, which accepts 7–40 hex chars
 // case-insensitively; the stricter check here is appropriate because Git
 // stores full SHAs as lowercase and status output always receives full refs.
 func formatRef(currentRef, expectedRef string) string {
@@ -414,7 +423,8 @@ type reposInstallConfig struct {
 
 	// GCP credentials (install-time only)
 	inferenceProject       string
-	inferenceProjectNumber string
+	inferenceWIFProvider   string
+	inferenceProjectNumber string // auto-derived from --inference-project; not a CLI flag
 	inferenceRegion        string
 
 	// GitLab-specific
@@ -424,6 +434,11 @@ type reposInstallConfig struct {
 	fullsendRef            string
 	mintURL                string
 	allowedRemoteResources []string
+	runtime                string
+
+	// Vendor flags
+	vendor        bool
+	vendorChanged bool
 
 	// Test overrides
 	testClient          forge.Client
@@ -454,8 +469,9 @@ GCP infrastructure (WIF, mint) must be provisioned separately via
 			opts.repoFilter = args
 			opts.gitlabToken = getGitLabToken(cmd)
 			if opts.gitlabBotToken == "" {
-				opts.gitlabBotToken = os.Getenv("FULLSEND_GITLAB_BOT_TOKEN")
+				opts.gitlabBotToken = os.Getenv(forge.VarGitLabBotToken)
 			}
+			opts.vendorChanged = cmd.Flags().Changed("vendor")
 			return runReposInstall(cmd.Context(), opts)
 		},
 	}
@@ -468,12 +484,14 @@ GCP infrastructure (WIF, mint) must be provisioned separately via
 	cmd.Flags().BoolVar(&opts.force, "force", false, "allow scaffold ref downgrades")
 	cmd.Flags().StringVar(&opts.forge, "forge", "", "forge type for repos not yet in the manifest (github or gitlab)")
 	cmd.Flags().StringVar(&opts.inferenceProject, "inference-project", "", "GCP project ID for inference")
-	cmd.Flags().StringVar(&opts.inferenceProjectNumber, "inference-project-number", "", "numeric GCP project number (auto-derived from --inference-project when omitted)")
+	cmd.Flags().StringVar(&opts.inferenceWIFProvider, "inference-wif-provider", "", "full WIF provider resource name (projects/{number}/locations/global/workloadIdentityPools/{pool}/providers/{id}); uses this provider for all repos instead of deriving per-repo providers")
 	cmd.Flags().StringVar(&opts.inferenceRegion, "inference-region", "", "GCP region for inference (default: global)")
 	cmd.Flags().StringVar(&opts.fullsendRef, "fullsend-ref", "", "per-repo fullsend workflow ref override")
 	cmd.Flags().StringVar(&opts.mintURL, "mint-url", "", "per-repo mint URL override")
 	cmd.Flags().StringSliceVar(&opts.allowedRemoteResources, "allowed-remote-resources", nil, "per-repo allowed remote resources override")
+	cmd.Flags().StringVar(&opts.runtime, "runtime", "", "agent runtime written to the per-repo config for repos added by this command (claude, pi, codex); repos already in the manifest keep their entry/defaults.runtime")
 	cmd.Flags().StringVar(&opts.gitlabBotToken, "gitlab-bot-token", "", "GitLab bot PAT for free-tier instances that don't support project access tokens")
+	cmd.Flags().BoolVar(&opts.vendor, "vendor", false, "vendor binary, reusable workflows, actions, and agent content into each repo for offline CI")
 
 	return cmd
 }
@@ -485,8 +503,10 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 	if opts.inferenceProject != "" && !repos.IsValidGCPProjectID(opts.inferenceProject) {
 		return fmt.Errorf("--inference-project %q is not a valid GCP project ID (must be 6-30 lowercase letters, digits, hyphens; start with a letter, no trailing hyphen)", opts.inferenceProject)
 	}
-	if opts.inferenceProjectNumber != "" && !repos.IsNumeric(opts.inferenceProjectNumber) {
-		return fmt.Errorf("--inference-project-number must be numeric, got %q", opts.inferenceProjectNumber)
+	if opts.inferenceWIFProvider != "" {
+		if err := validateWIFProvider(opts.inferenceWIFProvider); err != nil {
+			return err
+		}
 	}
 	if opts.forge != "" && !repos.IsValidForge(opts.forge) {
 		return fmt.Errorf("--forge: %q is not a valid forge platform (valid: %s, %s)", opts.forge, repos.ForgeGitHub, repos.ForgeGitLab)
@@ -509,9 +529,11 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		opts.inferenceRegion = "global"
 	}
 
-	// Derive --inference-project-number from --inference-project via
-	// the GCP Resource Manager API when not explicitly provided.
-	if opts.inferenceProject != "" && opts.inferenceProjectNumber == "" {
+	// When --inference-wif-provider is not set, derive the project number
+	// from --inference-project via the GCP Resource Manager API so that
+	// per-repo WIF provider paths can be constructed in converge.go.
+	// Skip when the project number is already populated (internal use).
+	if opts.inferenceProject != "" && opts.inferenceWIFProvider == "" && opts.inferenceProjectNumber == "" {
 		var projectNumber string
 		var lookupErr error
 		if opts.testProjectNumberFn != nil {
@@ -521,7 +543,7 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 			projectNumber, lookupErr = gcpClient.GetProjectNumber(ctx, opts.inferenceProject)
 		}
 		if lookupErr != nil {
-			return fmt.Errorf("deriving project number from %q: %w (use --inference-project-number to specify it manually)", opts.inferenceProject, lookupErr)
+			return fmt.Errorf("deriving project number from %q: %w (use --inference-wif-provider to specify the full WIF provider path)", opts.inferenceProject, lookupErr)
 		}
 		opts.inferenceProjectNumber = projectNumber
 		printer.StepDone(fmt.Sprintf("Derived project number %s from project %s", projectNumber, opts.inferenceProject))
@@ -599,6 +621,14 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 			if forgeName != repos.ForgeGitHub && opts.mintURL != "" {
 				printer.StepWarn(fmt.Sprintf("--mint-url is only used with GitHub repos; ignored for %s", forgeName))
 			}
+			if forgeName != repos.ForgeGitHub && opts.vendorChanged && opts.vendor {
+				printer.StepWarn("--vendor only fully supported for GitHub repos; GitLab CI templates do not yet reference the vendored binary")
+			}
+			if opts.runtime != "" {
+				if err := validateRuntimeName(opts.runtime); err != nil {
+					return fmt.Errorf("--runtime: %w", err)
+				}
+			}
 
 			entries := make([]repos.RepoEntry, len(notInManifest))
 			for i, r := range notInManifest {
@@ -614,6 +644,19 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 				}
 				if len(opts.allowedRemoteResources) > 0 {
 					entry.AllowedRemoteResources = opts.allowedRemoteResources
+				}
+				if opts.runtime != "" && opts.runtime != manifest.Defaults.Runtime {
+					entry.Runtime = opts.runtime
+				}
+				if opts.vendorChanged {
+					defaultVendor := manifest.Defaults.Vendor != nil && *manifest.Defaults.Vendor
+					if opts.vendor && !defaultVendor {
+						v := true
+						entry.Vendor = &v
+					} else if !opts.vendor && defaultVendor {
+						v := false
+						entry.Vendor = &v
+					}
 				}
 				entries[i] = entry
 			}
@@ -662,9 +705,18 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		return err
 	}
 
+	// When --vendor is explicitly set on the CLI, override the manifest
+	// vendor setting for all repos in this run. Both --vendor and
+	// --vendor=false are honored so the CLI can enable or disable
+	// vendoring for a one-off run.
+	var vendorOverride *bool
+	if opts.vendorChanged {
+		vendorOverride = &opts.vendor
+	}
+
 	upstreamRef, upstreamTag := resolveUpstreamRef()
 
-	scaffoldCommitFn := func(ctx context.Context, owner, repo string, files []forge.TreeFile, direct bool) error {
+	scaffoldCommitFn := func(ctx context.Context, owner, repo string, files []forge.TreeFile, direct bool, installed bool) error {
 		rc, ok := manifest.ResolveConfigWithGlobs(owner, repo)
 		if !ok {
 			return fmt.Errorf("repo %s/%s not found in manifest", owner, repo)
@@ -673,21 +725,45 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		if fcErr != nil {
 			return fcErr
 		}
+
+		// When vendor is enabled (CLI flag or manifest), append vendored
+		// binary and content files to the scaffold commit so they are
+		// delivered atomically.
+		repoVendor := rc.Vendor
+		if vendorOverride != nil {
+			repoVendor = *vendorOverride
+		}
+		if repoVendor {
+			var vendorErr error
+			files, _, vendorErr = appendVendorTreeFiles(ctx, fc.Client, printer, owner, repo, files, true, "", "")
+			if vendorErr != nil {
+				return fmt.Errorf("collecting vendored assets: %w", vendorErr)
+			}
+		}
+
 		targetRepo, repoErr := fc.Client.GetRepo(ctx, owner, repo)
 		if repoErr != nil {
 			return fmt.Errorf("getting repo info: %w", repoErr)
 		}
-		meta := repos.BuildScaffoldPRMetadata(ctx, fc.Client, owner, repo, upstreamTag)
+		meta := repos.BuildScaffoldPRMetadata(ctx, fc.Client, owner, repo, upstreamTag,
+			repos.ScaffoldMetadataOpts{GuardInstalled: &installed})
 		if rc.Forge == repos.ForgeGitLab {
 			meta.CommitMsg += " [skip ci]"
+			meta.PRTitle += " [skip ci]"
 		}
 		_, commitErr := layers.CommitScaffoldFiles(ctx, fc.Client, printer, owner, repo,
 			targetRepo.DefaultBranch, meta, files, direct, nil)
 		return commitErr
 	}
 
-	// Phase 1: provision repos not yet installed.
-	cfg := repos.BatchInstallConfig{
+	// Resolve the review app client ID for provenance validation.
+	// Best-effort: a missing client ID does not block installation.
+	var reviewAppClientID string
+	if fc, fcErr := clients.ConfigFor(repos.ForgeGitHub); fcErr == nil {
+		reviewAppClientID = resolveReviewAppClientID(ctx, fc.Client, appsetup.DefaultAppSet)
+	}
+
+	convergeCfg := repos.ConvergeConfig{
 		Manifest:               manifest,
 		DryRun:                 opts.dryRun,
 		RepoFilter:             opts.repoFilter,
@@ -696,9 +772,13 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		UpstreamRef:            upstreamRef,
 		UpstreamTag:            upstreamTag,
 		Direct:                 opts.direct,
+		Force:                  opts.force,
 		InferenceProject:       opts.inferenceProject,
 		InferenceProjectNumber: opts.inferenceProjectNumber,
 		InferenceRegion:        opts.inferenceRegion,
+		WIFProvider:            opts.inferenceWIFProvider,
+		ReviewAppClientID:      reviewAppClientID,
+		VendorOverride:         vendorOverride,
 	}
 
 	progressFn := func(repo, phase, msg string) {
@@ -717,16 +797,21 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 		printer.StepStart("Converging repos to desired state")
 	}
 
-	result, err := repos.BatchInstall(ctx, cfg, clients, scaffoldCommitFn, progressFn)
+	result, err := repos.Converge(ctx, convergeCfg, clients, scaffoldCommitFn, progressFn)
 	if err != nil {
 		return err
 	}
+
+	installed := result.Installed()
+	converged := result.Converged()
+	alreadyCurrent := result.AlreadyCurrent()
+	failed := result.Failed()
 
 	// Writeback: when platform-level fullsend_ref was empty and repos
 	// were installed, write the binary's version back to repos.yaml
 	// so future installs and status checks have a baseline.
 	// Exception to ADR-0057 manual-maintenance: authorized by #6190.
-	if !opts.dryRun && len(result.Installed) > 0 {
+	if !opts.dryRun && len(installed) > 0 {
 		writebackRef := upstreamTag
 		if writebackRef == "" {
 			writebackRef = upstreamRef
@@ -736,7 +821,7 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 			glEmpty := manifest.GitLab == nil || manifest.GitLab.FullsendRef == ""
 			if ghEmpty || glEmpty {
 				var hasGH, hasGL bool
-				for _, r := range result.Installed {
+				for _, r := range installed {
 					rc, ok := manifest.ResolveConfigWithGlobs(r.Owner, r.Repo)
 					if !ok {
 						continue
@@ -768,11 +853,13 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 	}
 
 	// GitLab post-install: set up bot token and pipeline schedules for
-	// newly installed GitLab repos. Bot token failures are treated as install
-	// failures because the repo is non-functional without FULLSEND_FORGE_TOKEN.
+	// newly installed GitLab repos. Only fresh installs need this —
+	// converged repos already have working bot tokens and schedules.
+	// Running on converged repos would revoke live bot PATs, breaking
+	// in-flight pipelines.
 	var postInstallFailed int
-	if !opts.dryRun && len(result.Installed) > 0 {
-		for _, r := range result.Installed {
+	if !opts.dryRun && len(installed) > 0 {
+		for _, r := range installed {
 			rc, ok := manifest.ResolveConfigWithGlobs(r.Owner, r.Repo)
 			if !ok || rc.Forge != repos.ForgeGitLab {
 				continue
@@ -812,151 +899,23 @@ func runReposInstall(ctx context.Context, opts *reposInstallConfig) error {
 				printer.StepWarn(fmt.Sprintf("[%s] Pipeline schedule setup failed: %v", repoFullName, schedErr))
 			}
 
-			// Break stale resource group locks that may have been left by
-			// cancelled or deleted pipelines during a previous install.
 			healGitLabResourceGroups(ctx, glClient, printer, r.Owner, r.Repo)
 		}
 	}
 
-	// Phase 2: converge already-installed repos (variable reconciliation + ref upgrade).
-	var alreadyInstalled []repos.InstallResult
-	for _, r := range result.Skipped {
-		if r.AlreadyInstalled {
-			alreadyInstalled = append(alreadyInstalled, r)
-		}
-	}
-
-	var converged, alreadyCurrent int
-	failedRepos := make(map[string]bool)
-	convergedRepos := make(map[string]bool)
-
-	if len(alreadyInstalled) > 0 {
-		printer.Blank()
-		if opts.dryRun {
-			printer.StepStart("Checking installed repos for drift")
-		} else {
-			printer.StepStart("Reconciling installed repos")
-		}
-
-		repoNames := make([]string, len(alreadyInstalled))
-		for i, r := range alreadyInstalled {
-			repoNames[i] = r.Owner + "/" + r.Repo
-		}
-
-		if opts.dryRun {
-			driftResult, driftErr := repos.Diff(ctx, manifest, clients, opts.concurrency, repoNames)
-			if driftErr != nil {
-				return driftErr
-			}
-			if len(driftResult.Changes) > 0 {
-				for _, c := range driftResult.Changes {
-					convergedRepos[c.Owner+"/"+c.Repo] = true
-				}
-				printer.StepInfo(fmt.Sprintf("  %d repos have %d variable changes", len(convergedRepos), len(driftResult.Changes)))
-				converged = len(convergedRepos)
-			}
-		} else {
-			reconcileResult, reconcileErr := repos.Sync(ctx, manifest, clients, opts.concurrency, repoNames, progressFn)
-			if reconcileErr != nil && reconcileResult == nil {
-				return reconcileErr
-			}
-			if reconcileErr != nil && reconcileResult != nil {
-				printer.StepWarn(fmt.Sprintf("Variable reconciliation had errors: %v", reconcileErr))
-			}
-			if reconcileResult != nil {
-				for _, c := range reconcileResult.Applied {
-					convergedRepos[c.Owner+"/"+c.Repo] = true
-				}
-				converged += len(convergedRepos)
-				for _, fr := range reconcileResult.FailedRepos {
-					repoKey := fr.Owner + "/" + fr.Repo
-					failedRepos[repoKey] = true
-					printer.StepInfo(fmt.Sprintf("  FAILED: %s — variable reconciliation failed", repoKey))
-				}
-			}
-		}
-
-		upgradeCommitFn := func(ctx context.Context, owner, repo string, files []forge.TreeFile, isDirect bool) error {
-			rc, ok := manifest.ResolveConfigWithGlobs(owner, repo)
-			if !ok {
-				return fmt.Errorf("repo %s/%s not found in manifest", owner, repo)
-			}
-			fc, fcErr := clients.ConfigFor(rc.Forge)
-			if fcErr != nil {
-				return fcErr
-			}
-			targetRepo, repoErr := fc.Client.GetRepo(ctx, owner, repo)
-			if repoErr != nil {
-				return fmt.Errorf("getting repo info: %w", repoErr)
-			}
-			// Repos in the upgrade path are already known to be installed
-			// (they come from alreadyInstalled), so skip the redundant
-			// guard-variable API call.
-			guardInstalled := true
-			meta := repos.BuildScaffoldPRMetadata(ctx, fc.Client, owner, repo, upstreamTag,
-				repos.ScaffoldMetadataOpts{GuardInstalled: &guardInstalled})
-			_, commitErr := layers.CommitScaffoldFiles(ctx, fc.Client, printer, owner, repo,
-				targetRepo.DefaultBranch, meta, files, isDirect, nil)
-			return commitErr
-		}
-
-		upgradeRepoNames := repoNames
-		if len(failedRepos) > 0 {
-			upgradeRepoNames = make([]string, 0, len(repoNames))
-			for _, name := range repoNames {
-				if !failedRepos[name] {
-					upgradeRepoNames = append(upgradeRepoNames, name)
-				}
-			}
-		}
-
-		if len(upgradeRepoNames) > 0 {
-			upgradeCfg := repos.UpgradeConfig{
-				Manifest:       manifest,
-				RepoFilter:     upgradeRepoNames,
-				DryRun:         opts.dryRun,
-				Force:          opts.force,
-				Direct:         opts.direct,
-				MaxConcurrency: opts.concurrency,
-			}
-
-			upgradeResults, upgradeErr := repos.Upgrade(ctx, upgradeCfg, clients, upgradeCommitFn, progressFn)
-			if upgradeErr != nil {
-				return upgradeErr
-			}
-			for _, r := range upgradeResults {
-				repoKey := r.Owner + "/" + r.Repo
-				switch {
-				case r.Error != nil:
-					failedRepos[repoKey] = true
-					printer.StepInfo(fmt.Sprintf("  FAILED: %s — %v", repoKey, r.Error))
-				case r.Upgraded:
-					if !convergedRepos[repoKey] {
-						converged++
-					}
-					convergedRepos[repoKey] = true
-				case r.Skipped:
-					if !convergedRepos[repoKey] {
-						alreadyCurrent++
-					}
-				}
-			}
-		}
-	}
-
 	printer.Blank()
-	installed := len(result.Installed) - postInstallFailed
-	failed := len(result.Failed) + len(failedRepos) + postInstallFailed
+	installedCount := len(installed) - postInstallFailed
+	failedCount := len(failed) + postInstallFailed
 
-	for _, r := range result.Failed {
+	for _, r := range failed {
 		printer.StepInfo(fmt.Sprintf("  FAILED: %s/%s — %v", r.Owner, r.Repo, r.Error))
 	}
 
 	printer.StepDone(fmt.Sprintf("Install complete: %d installed, %d converged, %d already current, %d failed",
-		installed, converged, alreadyCurrent, failed))
+		installedCount, len(converged), len(alreadyCurrent), failedCount))
 
-	if failed > 0 {
-		return fmt.Errorf("%d repos failed", failed)
+	if failedCount > 0 {
+		return fmt.Errorf("%d repos failed", failedCount)
 	}
 	return nil
 }

@@ -26,7 +26,7 @@ help:
 	@echo "  go-vet               - Run go vet"
 	@echo "  go-tidy              - Run go mod tidy"
 	@echo "  lint-md-links        - Check markdown files for broken in-repo links and anchors"
-	@echo "  script-test          - Run shell script tests (reconcile-repos, topissues, gitlint-rules, artifact redaction)"
+	@echo "  script-test          - Run shell script tests (reconcile-repos, topissues, gitlint-rules, artifact redaction, kill_stray_processes)"
 	@echo "  test                 - Run all checks: lint-all, go-test, script-test, lint-eval-cases"
 	@echo "  e2e-test             - Run admin e2e tests (CI: OIDC mint; local: gh auth login or GH_TOKEN)"
 	@echo "  behaviour-test       - Run Gherkin behaviour tests (installs fullsend per-repo; CI: OIDC mint)"
@@ -108,7 +108,17 @@ go-build:
 go-test:
 	GH_TOKEN= GITHUB_TOKEN= \
 	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false \
-	go test -race -cover ./...
+	go test -race -coverprofile=cover-default.out ./...
+	cd internal/mintcore && \
+	GH_TOKEN= GITHUB_TOKEN= \
+	GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false \
+	go test -race -tags github -coverprofile=../../cover-github.out ./...
+	@# Merge coverage profiles from both test runs into coverage.out.
+	@head -1 cover-default.out > coverage.out
+	@tail -n +2 cover-default.out >> coverage.out
+	@tail -n +2 cover-github.out >> coverage.out
+	@go tool cover -func=coverage.out | tail -1
+	@rm -f cover-default.out cover-github.out
 
 go-lint:
 	golangci-lint run ./...
@@ -179,22 +189,44 @@ endef
 
 script-test:
 	$(call run-timed,bash scripts/check-e2e-authorization-test.sh)
-	$(call run-timed,bash .github/scripts/redact-behaviour-artifacts-test.sh)
+	$(call run-timed,bash scripts/redact-behaviour-artifacts-test.sh)
 	$(call run-timed,bash .github/scripts/check-fix-eligibility-test.sh)
+	$(call run-timed,bash scripts/check-agents-gate-pin-test.sh)
 	$(call run-timed,bash internal/scaffold/fullsend-repo/scripts/reconcile-repos-test.sh)
 	$(call run-timed,bash internal/scaffold/fullsend-repo/scripts/pre-fetch-prior-review-test.sh)
+	$(call run-timed,bash internal/scaffold/fullsend-repo/.github/scripts/setup-agent-env-test.sh)
 	$(call run-timed,bash hack/gitlab-runner-vm/executor/prepare_validation_test.sh)
+	$(call run-timed,bash internal/runtime/kill_stray_processes_test.sh)
 	$(call run-timed,python3 skills/topissues/scripts/topissues_test.py)
 	$(call run-timed,python3 skills/nextwork/scripts/nextwork_test.py)
+	$(call run-timed,python3 skills/analyze-transcript/analyze_transcript_test.py)
 	$(call run-timed,python3 -m pytest gitlint_rules_test.py -v)
+	$(call run-timed,node --test internal/runtime/pi_extension/*.test.mjs)
 
 test: lint-all go-test script-test lint-eval-cases
 
 e2e-test:
 	go test -tags e2e -v -count=1 -timeout 30m ./e2e/admin/
 
+# Capabilities the runner declares for @requires:capability:<name> scenarios.
+# Declared here rather than in the e2e workflow so a PR that adds a gated
+# scenario exercises it on its own CI run (E2E Tests runs on
+# pull_request_target, whose workflow file comes from main). runtime-pi:
+# fullsend-sandbox:latest ships pi since v0.37.0; each pi scenario costs one
+# small haiku run on the pool repo's Vertex WIF. Override to skip them:
+#   BEHAVIOUR_CAPABILITIES= make behaviour-test
+# runtime-pi-openai (features/runtime/pi-openai.feature) is deliberately not
+# declared: it needs an OpenAI organization mapped to the pool repositories
+# (docs/guides/infrastructure/openai-workload-identity.md). Add it here once
+# that exists: BEHAVIOUR_CAPABILITIES=runtime-pi,runtime-pi-openai
+# runtime-codex-openai (features/runtime/codex-openai.feature) is undeclared
+# for the same reason, and codex has no Vertex path — so unlike pi it has no
+# default behaviour coverage at all until that organization exists:
+# BEHAVIOUR_CAPABILITIES=runtime-pi,runtime-codex-openai
+BEHAVIOUR_CAPABILITIES ?= runtime-pi
+
 behaviour-test:
-	go test -tags behaviour -race -v -count=1 -timeout 45m ./e2e/behaviour/
+	BEHAVIOUR_CAPABILITIES="$(BEHAVIOUR_CAPABILITIES)" go test -tags behaviour -race -v -count=1 -timeout 45m ./e2e/behaviour/
 
 # Functional agent evals — run agents against ephemeral GitHub repos and judge results.
 # Required env: EVAL_ORG (GitHub org for ephemeral repos), plus GCP creds for Vertex AI.

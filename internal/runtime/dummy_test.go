@@ -748,3 +748,37 @@ func TestExecuteBehaviourOp_CheckoutBranchExecError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "checkout_branch exec")
 }
+
+// ClearIterationArtifacts sweeps stray processes before removing files, so
+// nothing from iteration N keeps writing into what iteration N+1 reads.
+func TestDummyRuntime_ClearIterationArtifacts_SweepsStraysBeforeFiles(t *testing.T) {
+	t.Parallel()
+
+	var cmds []string
+	rt := DummyRuntime{ExecFn: func(_ string, cmd string, _ time.Duration) (string, string, int, error) {
+		cmds = append(cmds, cmd)
+		return "stray processes killed: 0\n", "", 0, nil
+	}}
+	require.NoError(t, rt.ClearIterationArtifacts("sb"))
+	require.Len(t, cmds, 2)
+	assert.Equal(t, killStrayProcessesScript(), cmds[0])
+	assert.Contains(t, cmds[1], "rm -rf")
+}
+
+// A failed sweep (exit 124 is the only exec failure sandbox.Exec reports)
+// is warning-only: the file cleanup still runs and the result is nil.
+func TestDummyRuntime_ClearIterationArtifacts_SweepFailureIsNotAnError(t *testing.T) {
+	t.Parallel()
+
+	var cmds []string
+	rt := DummyRuntime{ExecFn: func(_ string, cmd string, _ time.Duration) (string, string, int, error) {
+		cmds = append(cmds, cmd)
+		if len(cmds) == 1 {
+			return "", "boom", 124, errors.New("command timed out after 15s")
+		}
+		return "", "", 0, nil
+	}}
+	require.NoError(t, rt.ClearIterationArtifacts("sb"))
+	require.Len(t, cmds, 2)
+	assert.Contains(t, cmds[1], "rm -rf")
+}

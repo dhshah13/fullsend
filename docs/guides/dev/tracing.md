@@ -105,12 +105,12 @@ Created by `resolveTraceIdentity()`. When an inbound `TRACEPARENT` env var
 is present, the W3C propagator extracts a remote span context and the root
 span is `SpanKindConsumer`. Otherwise it is `SpanKindInternal`.
 
-Start attributes: `fullsend.agent`, `fullsend.work_item_id`,
+Start attributes include: `fullsend.agent`, `fullsend.work_item_id`,
 `gen_ai.operation.name`, `gen_ai.agent.name`.
 
-End attributes (set in a deferred cleanup): `exit_code`, aggregated token
-usage (`gen_ai.usage.*`), `fullsend.cost_usd`, `fullsend.num_turns`,
-`fullsend.tool_calls`, `fullsend.iterations`, `gen_ai.request.model`.
+End attributes (set in a deferred cleanup): `exit_code`,
+`fullsend.cost_usd`, `fullsend.num_turns`, `fullsend.tool_calls`,
+`fullsend.iterations`.
 
 For the full attribute list (including `fullsend.security_trace_id` and
 `fullsend.prescript.*`), see the
@@ -131,6 +131,43 @@ build the attribute slices. Start attributes: `iteration`,
 `gen_ai.operation.name`, `gen_ai.agent.name`. End attributes: `iteration`,
 `exit_code`, `gen_ai.system`, model, token counts, `fullsend.cost_usd`,
 `fullsend.tool_calls`.
+
+### Level 3 content on agent spans
+
+When the content-capture gate is on
+(`telemetry.ContentCaptureEnabled()`), `runAgent` constructs one
+`contentCollector` per iteration — iteration and agent span are 1:1, so a
+run-scoped collector would repeat earlier iterations' content on later
+spans — and tees the runtime's normalized event stream to it through
+`RunParams.OnEvent`.
+
+**The tee trap:** supplying any `OnEvent` replaces the runtime's default
+console renderer (`internal/runtime/claude.go`), so the handler built by
+`contentEventHandler` always calls the renderer first and the collector
+second. With the gate off the collector is nil and `contentEventHandler`
+returns nil, leaving the default renderer path byte-identical to before
+Level 3 existed.
+
+The collector (`internal/cli/content_collector.go`) coalesces contiguous
+text/reasoning deltas, maps tool use to `tool_call` parts, redacts every
+part through `security.OutputPipeline()` at assembly (redaction runs
+before the size budget — truncating first could split a secret past
+recognition), enforces a 256 KiB ordered-suffix budget (the ending survives — the
+final answer is what consumers judge) with exact dropped-byte accounting
+across content, tool names, and summaries, and emits
+`gen_ai.output.messages` JSON following the GenAI output-messages schema,
+including the schema-required `finish_reason` from the iteration outcome. `attachContent` records the
+content and its marker attributes on the span before either
+`finalizeAgentSpan` path can end it, so failed iterations keep their
+content.
+
+**Consumer contract** (for eval scorers and other readers of
+`run-telemetry.jsonl`): parse the `gen_ai.output.messages` attribute as
+JSON; check `fullsend.content.truncated` / `fullsend.content.dropped_bytes`
+before treating content as complete; masked secrets appear as the
+redactor's mask tokens and are counted in `fullsend.content.redactions`.
+The attribute names and shapes above are the consumption contract — see the
+[Tracing reference](../infrastructure/distributed-tracing.md#content-capture-level-3).
 
 ## Trace identity and TRACEPARENT propagation
 

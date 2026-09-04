@@ -16,16 +16,21 @@ var scaffoldGitLabPaths = []struct {
 	repoPath string
 	outPath  string
 }{
+	{"internal/scaffold/fullsend-repo-gitlab/.gitlab/ci/fullsend-pipeline.yml", ".gitlab/ci/fullsend-pipeline.yml"},
 	{"internal/scaffold/fullsend-repo-gitlab/.gitlab/ci/fullsend-dispatch.yml", ".gitlab/ci/fullsend-dispatch.yml"},
 	{"internal/scaffold/fullsend-repo-gitlab/.gitlab/ci/fullsend-agent.yml", ".gitlab/ci/fullsend-agent.yml"},
 	{"internal/scaffold/fullsend-repo-gitlab/.gitlab/ci/fullsend-poll.yml", ".gitlab/ci/fullsend-poll.yml"},
-	{"internal/scaffold/fullsend-repo-gitlab/.gitlab-ci.yml", ".gitlab-ci.yml"},
 }
 
 // FetchRemoteScaffold fetches scaffold templates from fullsend-ai/fullsend
 // at the given ref and renders them for the specified forge. This is used
 // when fullsend_ref pins to a version that differs from the running
 // binary, so embedded templates would be incorrect.
+//
+// Callers should skip this function when vendored is true: the running
+// binary's embedded templates already match the binary being committed to
+// the repo, so there is no version-skew concern and the remote fetch
+// would add unnecessary API latency.
 //
 // Template paths (scaffoldGitHubShimPath, scaffoldGitLabPaths) are pinned
 // to the current binary's layout. If the remote ref reorganises these
@@ -34,10 +39,11 @@ var scaffoldGitLabPaths = []struct {
 func FetchRemoteScaffold(ctx context.Context, ghClient forge.Client,
 	manifestRef, resolvedSHA, forgeName string,
 	runnerTags []string,
+	vendored bool,
 ) (scaffold.InstallFiles, error) {
 	switch forgeName {
 	case ForgeGitHub:
-		return fetchRemoteGitHubScaffold(ctx, ghClient, manifestRef, resolvedSHA)
+		return fetchRemoteGitHubScaffold(ctx, ghClient, manifestRef, resolvedSHA, vendored)
 	case ForgeGitLab:
 		return fetchRemoteGitLabScaffold(ctx, ghClient, manifestRef, resolvedSHA, runnerTags)
 	default:
@@ -46,24 +52,46 @@ func FetchRemoteScaffold(ctx context.Context, ghClient forge.Client,
 }
 
 func fetchRemoteGitHubScaffold(ctx context.Context, client forge.Client,
-	manifestRef, resolvedSHA string,
+	manifestRef, resolvedSHA string, vendored bool,
 ) (scaffold.InstallFiles, error) {
 	content, err := client.GetFileContentAtRef(ctx, shimOwner, shimRepo, scaffoldGitHubShimPath, manifestRef)
 	if err != nil {
 		return nil, fmt.Errorf("fetching GitHub shim template at %s: %w", manifestRef, err)
 	}
 
-	opts := scaffold.RenderOptionsForInstall(false, true, resolvedSHA, manifestRef)
+	opts := scaffold.RenderOptionsForInstall(vendored, true, resolvedSHA, manifestRef)
 	rendered, err := scaffold.RenderTemplate("templates/shim-per-repo.yaml", content, opts)
 	if err != nil {
 		return nil, fmt.Errorf("rendering remote GitHub shim: %w", err)
 	}
 
-	return scaffold.InstallFiles{{
+	files := scaffold.InstallFiles{{
 		Path:    ".github/workflows/fullsend.yaml",
 		Content: scaffold.PrependManagedHeader(".github/workflows/fullsend.yaml", rendered),
 		Mode:    "100644",
-	}}, nil
+	}}
+
+	for _, path := range scaffold.PerRepoThinCallerPaths() {
+		remotePath := "internal/scaffold/fullsend-repo/" + path
+		raw, fetchErr := client.GetFileContentAtRef(ctx, shimOwner, shimRepo, remotePath, manifestRef)
+		if fetchErr != nil {
+			if forge.IsNotFound(fetchErr) {
+				continue
+			}
+			return nil, fmt.Errorf("fetching remote thin caller %s at %s: %w", path, manifestRef, fetchErr)
+		}
+		tcRendered, renderErr := scaffold.RenderTemplate(path, raw, opts)
+		if renderErr != nil {
+			return nil, fmt.Errorf("rendering remote thin caller %s: %w", path, renderErr)
+		}
+		files = append(files, scaffold.InstallFile{
+			Path:    path,
+			Content: scaffold.PrependManagedHeader(path, tcRendered),
+			Mode:    "100644",
+		})
+	}
+
+	return files, nil
 }
 
 func fetchRemoteGitLabScaffold(ctx context.Context, client forge.Client,
@@ -71,6 +99,7 @@ func fetchRemoteGitLabScaffold(ctx context.Context, client forge.Client,
 ) (scaffold.InstallFiles, error) {
 	tagYAML := scaffold.FormatRunnerTags(runnerTags)
 	versionMarker := scaffold.FormatVersionMarker(resolvedSHA, manifestRef)
+	fullsendVersion := scaffold.ResolveFullsendVersion(resolvedSHA, manifestRef)
 
 	var files scaffold.InstallFiles
 	for _, sp := range scaffoldGitLabPaths {
@@ -80,6 +109,7 @@ func fetchRemoteGitLabScaffold(ctx context.Context, client forge.Client,
 		}
 
 		rendered := strings.ReplaceAll(string(content), "__RUNNER_TAGS__", tagYAML)
+		rendered = strings.ReplaceAll(rendered, "__FULLSEND_VERSION__", fullsendVersion)
 		if sp.outPath == ".gitlab/ci/fullsend-dispatch.yml" && versionMarker != "" {
 			rendered = scaffold.InsertAfterDocStart(rendered, versionMarker)
 		}

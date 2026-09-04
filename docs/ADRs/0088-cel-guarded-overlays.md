@@ -20,6 +20,17 @@ Date: 2026-08-14
 
 Accepted
 
+> **Living reference:** The overlay resolution pipeline, CEL environment,
+> and merge rules described here are maintained in
+> [Harness Field Reference](../contributing/harness-fields.md). Update
+> that document (not this ADR) when overlay behavior evolves.
+
+> **Note (2026-08-27):** The matching semantics have been revised from
+> first-match-wins to merge-all-matching (later entries take precedence).
+> See [Harness Field Reference — Overlay resolution](../contributing/harness-fields.md#overlay-resolution-adr-0088)
+> and [#6686](https://github.com/fullsend-ai/fullsend/issues/6686) for
+> the current behavior.
+
 ## Context
 
 [ADR 0045](0045-forge-portable-harness-schema.md) added a `forge:` block to
@@ -121,6 +132,11 @@ warning when `forge:` is present, recommending migration to
 
 ### Resolution pipeline
 
+> **Update (2026-08-21):** The empty-event semantics described below have
+> evolved since this ADR was written. See
+> [Harness Field Reference](../contributing/harness-fields.md) for the
+> current behavior (nil event → empty map substitution).
+
 `LoadWithOpts` and `LoadWithBase` gain `Event normevent.Event` and
 `Config map[string]any` fields in their options structs. The pipeline
 becomes:
@@ -134,8 +150,6 @@ ResolveForge(platform) → ResolveOverlays(event, config) → Validate
 against the CEL environment (see below). The first entry whose
 `when` returns true is merged; remaining entries are skipped. Like
 `ResolveForge`, it nils out the field after resolution (consumed).
-When `Event` is nil, `ResolveOverlays` is a no-op (no entries
-match), paralleling `ResolveForge` when `ForgePlatform` is empty.
 
 ### CEL environment
 

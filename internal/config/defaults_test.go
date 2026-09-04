@@ -35,6 +35,7 @@ func TestPerRepoDefaults_CodeDefaults(t *testing.T) {
 	assert.Equal(t, "", d.ConfigInferenceProject(), "project has no code default")
 	assert.Equal(t, DefaultPerRepoInferenceRegion, d.ConfigInferenceRegion())
 	assert.Equal(t, "", d.ConfigInferenceWIFProvider(), "WIF provider has no code default")
+	assert.Nil(t, d.ConfigModelAliases(), "model aliases have no code default (fleet table is compiled into the runtimes)")
 }
 
 // --- Unset fields resolve through parent to code defaults ---
@@ -652,6 +653,42 @@ roles:
 	pcr, ok := cfg.(PerRepoConfigReader)
 	require.True(t, ok)
 	assert.Equal(t, "claude", pcr.ConfigRuntime())
+}
+
+func TestParsePerRepoConfigWriterLayered_MergesBase(t *testing.T) {
+	baseYAML := `version: "1"
+agents:
+  - name: lint
+    source: https://raw.githubusercontent.com/acme/agents/main/harness/lint.yaml#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+allowed_remote_resources:
+  - https://raw.githubusercontent.com/acme/agents/
+`
+	overlayYAML := `version: "1"
+agents:
+  - name: lint
+    effort: medium
+`
+	cfg, err := ParsePerRepoConfigWriterLayered([]byte(overlayYAML), []byte(baseYAML))
+	require.NoError(t, err)
+	agents := cfg.AgentEntries()
+	require.Len(t, agents, 1)
+	assert.Equal(t, "lint", agents[0].Name)
+	assert.Contains(t, agents[0].Source, "lint.yaml")
+	assert.Equal(t, "medium", agents[0].Effort)
+	// Validation must pass on the merged set.
+	require.NoError(t, cfg.Validate())
+}
+
+func TestParsePerRepoConfigWriterLayered_NilBase(t *testing.T) {
+	overlayYAML := `version: "1"
+roles:
+  - triage
+`
+	cfg, err := ParsePerRepoConfigWriterLayered([]byte(overlayYAML), nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"triage"}, cfg.ConfigRoles())
+	// Code defaults surface as the parent.
+	assert.Equal(t, "claude", cfg.ConfigRuntime())
 }
 
 // --- Existing single-file behavior unchanged ---

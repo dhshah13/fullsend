@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,8 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/resolve"
@@ -25,6 +29,37 @@ const (
 	SandboxWorkspace = "/sandbox/workspace" //nolint:gosec // not a credential
 	// SandboxClaudeConfig is the Claude config directory inside the sandbox.
 	SandboxClaudeConfig = "/sandbox/claude-config" //nolint:gosec // not a credential
+	// SandboxCodexConfig is the codex config directory inside the sandbox.
+	// Exported as CODEX_HOME. Outside the cloned repo tree, like
+	// SandboxClaudeConfig and SandboxPiConfig, so repo contents cannot
+	// pre-seed it and workspace resets do not clear it. It is not a
+	// permission boundary: the agent process runs as the same user, so the
+	// runner-written files under it (config.toml, hooks, the auth helper)
+	// have to be checksum-guarded before every launch rather than trusted.
+	// codex refuses to start when CODEX_HOME does not exist; the sandbox
+	// image creates it (images/sandbox/Containerfile).
+	SandboxCodexConfig = "/sandbox/codex-config" //nolint:gosec // not a credential
+	// SandboxPiConfig is the pi config directory inside the sandbox.
+	// Exported as PI_CODING_AGENT_DIR. Outside the cloned repo tree, like
+	// SandboxClaudeConfig, so repo contents cannot pre-seed it and workspace
+	// resets do not clear it. It is not a permission boundary: the agent
+	// process runs as the same user, and pi loads extensions from
+	// <dir>/extensions/, so Bootstrap must pass --no-extensions plus the
+	// runner-supplied adapter explicitly.
+	SandboxPiConfig = "/sandbox/pi-config" //nolint:gosec // not a credential
+	// SandboxPiExtensionsDir holds runner-vetted pi extensions baked into the
+	// sandbox image (images/sandbox/Containerfile), root-owned and outside
+	// PI_CODING_AGENT_DIR so pi never auto-loads them; PiRuntime.Run passes
+	// each one explicitly with -e.
+	SandboxPiExtensionsDir = "/usr/local/share/pi-extensions"
+
+	// KeepAliveCommand is the sandbox's canonical main process, started by
+	// createOnce so the sandbox stays Ready between `sandbox exec` calls
+	// (OpenShell 0.0.111+ makes a sandbox terminal once its main process
+	// exits). It runs as the sandbox user, so anything that sweeps the
+	// sandbox user's processes (runtime.killStrayProcesses) must spare
+	// exactly this argv — keep the two in sync through this constant.
+	KeepAliveCommand = "sleep infinity"
 
 	readyTimeout    = 120 * time.Second
 	readyPoll       = 2 * time.Second
@@ -36,6 +71,15 @@ const (
 	DefaultMaxCreateAttempts = 3
 	retryInitialBackoff      = 5 * time.Second
 	retryMaxBackoff          = 15 * time.Second
+
+	// providerRetries is the number of times EnsureProvider retries on
+	// transient errors caused by concurrent fullsend runs sharing a
+	// gateway: "unsupported provider type or profile" (a concurrent
+	// ImportProfile deleting and reimporting a changed profile) and the
+	// gateway's optimistic-concurrency rejection of a provider update
+	// ("provider was modified concurrently").
+	providerRetries      = 3
+	providerRetryBackoff = 500 * time.Millisecond
 )
 
 // RetrySleepFn is the function called between retry attempts in
@@ -149,9 +193,65 @@ func inGitDir(path, root string) bool {
 
 // ImportProfile imports a single openshell provider profile from a YAML
 // file. The profile defines a provider type schema (credentials, endpoints).
-// To ensure content changes propagate on persistent gateways, the profile
-// is deleted by id before re-importing (mirroring the ImportProfiles flow).
+//
+// Idempotency is hash-based: the function computes a SHA-256 digest of the
+// profile file and compares it against a cached value in a temp file keyed
+// by the profile id. When the hash matches (content unchanged), the import
+// is skipped entirely. This makes parallel fullsend run invocations safe —
+// only the first process imports, and subsequent processes see the cache hit.
+//
+// Concurrency safety: the delete+reimport critical section is protected by
+// a cross-process file lock (flock) keyed by profile id. This prevents the
+// race where a concurrent process deletes a profile between another
+// process's import and provider creation. Processes that block on the lock
+// re-check the cache after acquiring it (double-check pattern) and skip
+// the import if the winner already wrote the cache.
+//
+// When content has changed (hash mismatch or no cache), the existing profile
+// is deleted and reimported. If the reimport fails because a parallel process
+// already imported it, the error is treated as success.
 func ImportProfile(ctx context.Context, id, profilePath string) error {
+	currentHash, err := hashProfileFile(profilePath)
+	if err != nil {
+		return fmt.Errorf("hashing profile %q: %w", filepath.Base(profilePath), err)
+	}
+
+	// Fast path: check cache before acquiring the lock.
+	cachePath := profileFileCachePath(id)
+	if cached, readErr := os.ReadFile(cachePath); readErr == nil {
+		if strings.TrimSpace(string(cached)) == currentHash {
+			return nil
+		}
+	}
+
+	// Acquire a cross-process file lock so only one process at a time
+	// performs the non-atomic delete+reimport sequence for this profile.
+	lockPath := profileFileLockPath(id)
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening profile lock for %q: %w", id, err)
+	}
+	defer lockFile.Close()
+
+	// NOTE: LOCK_EX blocks without respecting ctx cancellation. This is
+	// acceptable because the lock holder's critical section is short: just
+	// a delete + reimport, each bounded by providerTimeout (30 s), so the
+	// worst-case wait is ~60 s. If stricter context-awareness is ever
+	// needed, switch to LOCK_NB in a poll loop that checks ctx.Done()
+	// between attempts.
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("acquiring profile lock for %q: %w", id, err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	// Double-check: the process that held the lock before us may have
+	// already imported this profile and written the cache.
+	if cached, readErr := os.ReadFile(cachePath); readErr == nil {
+		if strings.TrimSpace(string(cached)) == currentHash {
+			return nil
+		}
+	}
+
 	// Best-effort delete so content changes propagate (same pattern as ImportProfiles).
 	delCtx, delCancel := context.WithTimeout(ctx, providerTimeout)
 	exec.CommandContext(delCtx, "openshell", "provider", "profile", "delete", id).CombinedOutput() //nolint:errcheck
@@ -164,11 +264,94 @@ func ImportProfile(ctx context.Context, id, profilePath string) error {
 	if err != nil {
 		outStr := strings.ToLower(string(out))
 		if strings.Contains(outStr, "already exists") {
+			// A parallel process imported the profile — safe to continue.
+			os.WriteFile(cachePath, []byte(currentHash), 0o600) //nolint:errcheck
 			return nil
 		}
 		return fmt.Errorf("profile import %q failed: openshell: %w\noutput: %s", filepath.Base(profilePath), err, bytes.TrimSpace(out))
 	}
+	os.WriteFile(cachePath, []byte(currentHash), 0o600) //nolint:errcheck
 	return nil
+}
+
+// ProfileExists reports whether the gateway lists a provider profile with
+// the given id (`openshell provider list-profiles`). ImportProfile trusts a
+// local content cache, which goes stale when the gateway is recreated or
+// the cache was written against another gateway; callers that must have
+// the profile present check here and ForgetProfileCache before importing
+// again.
+func ProfileExists(ctx context.Context, id string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "openshell", "provider", "list-profiles", "-o", "json").CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("listing provider profiles: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return profileListed(out, id), nil
+}
+
+// profileListed matches id against `provider list-profiles -o json` (an
+// array of objects with an "id" field at OpenShell 0.0.115). Output that is
+// not JSON is read as the human table, whose first column is the id.
+func profileListed(out []byte, id string) bool {
+	var profiles []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &profiles); err == nil {
+		for _, p := range profiles {
+			if p.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == id {
+			return true
+		}
+	}
+	return false
+}
+
+// EffectivePolicy returns the policy the sandbox is enforcing, as YAML, from
+// `openshell policy get <name> --full` (the composed policy, including the
+// gateway's provider entries). The CLI's metadata header is removed.
+func EffectivePolicy(ctx context.Context, name string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+	defer cancel()
+	// stdout only: the CLI prints the header and the YAML there, and a
+	// stray stderr line (an update notice, a gateway warning) must not end
+	// up inside the document.
+	cmd := exec.CommandContext(ctx, "openshell", "policy", "get", name, "--full")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("reading the effective policy of sandbox %q: %w (stderr: %s)", name, err, strings.TrimSpace(stderr.String()))
+	}
+	return StripPolicyHeader(out), nil
+}
+
+// StripPolicyHeader removes the `Version:/Hash:/Status:` metadata block that
+// `openshell policy get` prints before the first `---` document marker. Output
+// without a marker is returned unchanged.
+func StripPolicyHeader(out []byte) []byte {
+	for _, marker := range []string{"\n---\n", "\n---\r\n"} {
+		if i := bytes.Index(out, []byte(marker)); i >= 0 {
+			return out[i+len(marker):]
+		}
+	}
+	if bytes.HasPrefix(out, []byte("---\n")) {
+		return out[4:]
+	}
+	return out
+}
+
+// ForgetProfileCache drops ImportProfile's content cache for a profile id so
+// the next ImportProfile re-sends it.
+func ForgetProfileCache(id string) {
+	os.Remove(profileFileCachePath(id)) //nolint:errcheck
 }
 
 // reservedCredentialKeys are env var names that must not be used as provider
@@ -229,6 +412,13 @@ var reservedCredentialKeys = map[string]bool{
 // never appear on the process command line. The expanded values are injected
 // into the child process environment, where openshell reads them directly.
 // See https://docs.nvidia.com/openshell/latest/sandboxes/manage-providers#bare-key-form
+//
+// Transient errors from concurrent runs on the same gateway are retried with
+// short backoff: "unsupported provider type or profile" occurs when a
+// concurrent ImportProfile process temporarily removes a profile during its
+// delete+reimport cycle, and "provider was modified concurrently" when two
+// runs update the same provider at once (the gateway rejects the stale
+// resource_version; the update is idempotent, so retrying is safe).
 func EnsureProvider(ctx context.Context, name, providerType string, credentials, config map[string]string, fromURL bool) error {
 	if fromURL {
 		for k := range credentials {
@@ -239,7 +429,103 @@ func EnsureProvider(ctx context.Context, name, providerType string, credentials,
 	}
 
 	args, extraEnv, secrets := buildProviderArgs(name, providerType, credentials, config, fromURL)
+	updateArgs := buildProviderUpdateArgs(name, credentials, config, fromURL)
+	return ensureProviderArgs(ctx, name, args, updateArgs, extraEnv, secrets)
+}
 
+// EnsureProviderLiteral creates or updates a provider whose credential
+// values were resolved in process — a token the runner exchanged or read
+// from its own environment — and must be passed to openshell verbatim.
+// Unlike EnsureProvider, values are never run through os.ExpandEnv: an
+// opaque access token may legitimately contain `$`, and expanding it would
+// mangle the credential silently (#6689). Values still travel by bare-key
+// form in the child process environment, never on the command line.
+func EnsureProviderLiteral(ctx context.Context, name, providerType string, credentials map[string]string) error {
+	for k := range credentials {
+		if reservedCredentialKeys[strings.ToUpper(k)] {
+			return fmt.Errorf("provider %q: credential key %q is a reserved environment variable name", name, k)
+		}
+	}
+	args, extraEnv, secrets := buildProviderArgsLiteral(name, providerType, credentials)
+	updateArgs := buildProviderUpdateArgsLiteral(name, credentials)
+	return ensureProviderArgs(ctx, name, args, updateArgs, extraEnv, secrets)
+}
+
+// UpdateProviderLiteral replaces the credential values of an existing
+// provider with in-process values (no expansion), the refresh counterpart
+// of EnsureProviderLiteral. OpenShell propagates the new generation to
+// running sandboxes within seconds; old placeholders keep resolving by
+// credential key.
+func UpdateProviderLiteral(ctx context.Context, name string, credentials map[string]string) error {
+	_, extraEnv, secrets := literalCredentialArgs(credentials)
+	return updateProvider(ctx, name, buildProviderUpdateArgsLiteral(name, credentials), extraEnv, secrets)
+}
+
+// UpdateProviderLiteralWithExpiry replaces credential values and records
+// their expiry in one `provider update`, so the new value never carries the
+// old expiry between two calls.
+func UpdateProviderLiteralWithExpiry(ctx context.Context, name string, credentials map[string]string, expiresAt time.Time) error {
+	args := buildProviderUpdateArgsLiteral(name, credentials)
+	_, extraEnv, secrets := literalCredentialArgs(credentials)
+	for _, k := range sortedKeys(credentials) {
+		args = append(args, "--credential-expires-at", k+"="+expiresAt.UTC().Format(time.RFC3339))
+	}
+	return updateProvider(ctx, name, args, extraEnv, secrets)
+}
+
+// ensureProviderArgs runs the create-with-retry loop shared by
+// EnsureProvider and EnsureProviderLiteral. updateArgs is used when the
+// provider already exists.
+func ensureProviderArgs(ctx context.Context, name string, args, updateArgs, extraEnv, secrets []string) error {
+	var lastErr error
+	for attempt := range providerRetries {
+		lastErr = tryCreateProvider(ctx, name, args, updateArgs, extraEnv, secrets)
+		if lastErr == nil {
+			return nil
+		}
+		// Retry only on the transient concurrency errors.
+		if !isTransientProviderErr(lastErr) {
+			return lastErr
+		}
+		if attempt < providerRetries-1 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(providerRetryBackoff):
+			}
+		}
+	}
+	return fmt.Errorf("retries exhausted after %d attempts: %w", providerRetries, lastErr)
+}
+
+// isTransientProviderErr reports whether err is one of the openshell
+// errors produced by concurrent runs racing on the same gateway: a missing
+// or not-yet-reimported profile, or an optimistic-concurrency rejection of
+// a provider update ("provider was modified concurrently (current
+// resource_version: N)").
+//
+// NOTE: This matches literal text from the openshell CLI's stderr output.
+// If openshell changes its error wording in a future version, this check
+// will silently stop matching and retries will no longer trigger. Update
+// the substrings if the upstream messages change.
+func isTransientProviderErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unsupported provider type or profile") ||
+		providerModifiedConcurrentlyRe.MatchString(msg)
+}
+
+// providerModifiedConcurrentlyRe matches openshell's optimistic-concurrency
+// error. The CLI wraps the message across lines with a box-drawing gutter
+// (`"provider was modified` / `│ concurrently (current resource_version: 2)"`),
+// so the two words are matched across any non-word characters.
+var providerModifiedConcurrentlyRe = regexp.MustCompile(`provider was modified\W+concurrently`)
+
+// tryCreateProvider performs a single attempt to create (or update) a
+// provider via openshell. Extracted from EnsureProvider to support retry.
+func tryCreateProvider(ctx context.Context, name string, args, updateArgs, extraEnv, secrets []string) error {
 	createCtx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(createCtx, "openshell", args...)
@@ -251,7 +537,7 @@ func EnsureProvider(ctx context.Context, name, providerType string, credentials,
 		if strings.Contains(strings.ToLower(outStr), "provider already exists") {
 			// Provider exists from a prior run — update it with current credentials.
 			// Pass original ctx (not createCtx) so updateProvider gets a fresh timeout.
-			return updateProvider(ctx, name, credentials, config, extraEnv, secrets, fromURL)
+			return updateProvider(ctx, name, updateArgs, extraEnv, secrets)
 		}
 		// Redact known credential values from error output.
 		for _, s := range secrets {
@@ -262,9 +548,10 @@ func EnsureProvider(ctx context.Context, name, providerType string, credentials,
 	return nil
 }
 
-// updateProvider runs openshell provider update for an already-existing provider.
-func updateProvider(ctx context.Context, name string, credentials, config map[string]string, extraEnv, secrets []string, fromURL bool) error {
-	args := buildProviderUpdateArgs(name, credentials, config, fromURL)
+// updateProvider runs openshell provider update for an already-existing
+// provider with pre-built args (see buildProviderUpdateArgs and
+// buildProviderUpdateArgsLiteral).
+func updateProvider(ctx context.Context, name string, args, extraEnv, secrets []string) error {
 	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "openshell", args...)
@@ -286,7 +573,7 @@ func buildProviderUpdateArgs(name string, credentials, config map[string]string,
 	args := []string{"provider", "update", name}
 	credKeys := sortedKeys(credentials)
 	for _, k := range credKeys {
-		expanded := os.ExpandEnv(credentials[k])
+		expanded := expandProviderValue(credentials[k])
 		if expanded != "" {
 			args = append(args, "--credential", k)
 		} else {
@@ -299,7 +586,7 @@ func buildProviderUpdateArgs(name string, credentials, config map[string]string,
 	for _, k := range cfgKeys {
 		v := config[k]
 		if !fromURL {
-			v = os.ExpandEnv(v)
+			v = expandProviderValue(v)
 		}
 		args = append(args, "--config", k+"="+v)
 	}
@@ -319,7 +606,7 @@ func buildProviderArgs(name, providerType string, credentials, config map[string
 
 	credKeys := sortedKeys(credentials)
 	for _, k := range credKeys {
-		expanded := os.ExpandEnv(credentials[k])
+		expanded := expandProviderValue(credentials[k])
 		if expanded != "" {
 			secrets = append(secrets, expanded)
 			extraEnv = append(extraEnv, fmt.Sprintf("%s=%s", k, expanded))
@@ -334,12 +621,95 @@ func buildProviderArgs(name, providerType string, credentials, config map[string
 	for _, k := range cfgKeys {
 		v := config[k]
 		if !fromURL {
-			v = os.ExpandEnv(v)
+			v = expandProviderValue(v)
 		}
 		args = append(args, "--config", k+"="+v)
 	}
 
 	return args, extraEnv, secrets
+}
+
+// buildProviderArgsLiteral is buildProviderArgs for in-process credential
+// values: no os.ExpandEnv, no config, bare-key form with the value in the
+// child environment only. An empty value uses the inline KEY= form.
+func buildProviderArgsLiteral(name, providerType string, credentials map[string]string) (args, extraEnv, secrets []string) {
+	args = []string{"provider", "create",
+		"--name", name,
+		"--type", providerType,
+	}
+	credArgs, extraEnv, secrets := literalCredentialArgs(credentials)
+	return append(args, credArgs...), extraEnv, secrets
+}
+
+// buildProviderUpdateArgsLiteral is buildProviderUpdateArgs for in-process
+// credential values (no expansion).
+func buildProviderUpdateArgsLiteral(name string, credentials map[string]string) []string {
+	args := []string{"provider", "update", name}
+	credArgs, _, _ := literalCredentialArgs(credentials)
+	return append(args, credArgs...)
+}
+
+func literalCredentialArgs(credentials map[string]string) (args, extraEnv, secrets []string) {
+	for _, k := range sortedKeys(credentials) {
+		v := credentials[k]
+		if v == "" {
+			args = append(args, "--credential", k+"=")
+			continue
+		}
+		secrets = append(secrets, v)
+		extraEnv = append(extraEnv, k+"="+v)
+		args = append(args, "--credential", k)
+	}
+	return args, extraEnv, secrets
+}
+
+// SetProviderCredentialExpiry records when a provider credential stops
+// being valid (`openshell provider update --credential-expires-at`). The
+// gateway then fails placeholder resolution closed after that instant, which
+// is the backstop for a run-scoped provider whose runner died before the
+// deferred DeleteProvider ran (#6689).
+func SetProviderCredentialExpiry(ctx context.Context, name, key string, expiresAt time.Time) error {
+	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+	defer cancel()
+	args := []string{"provider", "update", name,
+		"--credential-expires-at", key + "=" + expiresAt.UTC().Format(time.RFC3339),
+	}
+	out, err := exec.CommandContext(ctx, "openshell", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("provider %q: setting credential expiry for %s failed: %w (output: %s)", name, key, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// deniedExpansionKeys are runner environment variables that a provider
+// definition's ${VAR} syntax must never expand — the runner's own
+// credentials (the CLI registers its oidcDenyKeys at start-up). Expansion
+// yields an empty string for them, the same outcome as an unset variable.
+var (
+	deniedExpansionMu   sync.RWMutex
+	deniedExpansionKeys = map[string]bool{}
+)
+
+// DenyExpansionKeys marks environment variable names that provider
+// definitions may not expand.
+func DenyExpansionKeys(keys ...string) {
+	deniedExpansionMu.Lock()
+	defer deniedExpansionMu.Unlock()
+	for _, k := range keys {
+		deniedExpansionKeys[k] = true
+	}
+}
+
+// expandProviderValue is os.ExpandEnv minus the denied keys.
+func expandProviderValue(v string) string {
+	deniedExpansionMu.RLock()
+	defer deniedExpansionMu.RUnlock()
+	return os.Expand(v, func(k string) string {
+		if deniedExpansionKeys[k] {
+			return ""
+		}
+		return os.Getenv(k)
+	})
 }
 
 func sortedKeys(m map[string]string) []string {
@@ -396,6 +766,13 @@ func CheckGateway() error {
 // entirely. This makes parallel fullsend run invocations safe — only the
 // first process imports, and subsequent processes see the cache hit.
 //
+// Concurrency safety: the delete+reimport critical section is protected by
+// a cross-process file lock (flock) keyed by directory path. This prevents the
+// race where a concurrent process deletes profiles between another process's
+// import and provider creation. Processes that block on the lock re-check the
+// cache after acquiring it (double-check pattern) and skip the import if the
+// winner already wrote the cache.
+//
 // When profiles have changed (hash mismatch or no cache), existing profiles
 // are deleted and reimported. If the reimport fails because a parallel process
 // already imported them, the error is treated as success.
@@ -412,7 +789,30 @@ func ImportProfiles(dir string) error {
 		return fmt.Errorf("hashing profiles directory %s: %w", dir, err)
 	}
 
+	// Fast path: check cache before acquiring the lock.
 	cachePath := profileCachePath(dir)
+	if cached, readErr := os.ReadFile(cachePath); readErr == nil {
+		if strings.TrimSpace(string(cached)) == currentHash {
+			return nil
+		}
+	}
+
+	// Acquire a cross-process file lock so only one process at a time
+	// performs the non-atomic delete+reimport sequence for this directory.
+	lockPath := profileDirLockPath(dir)
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening profiles lock for %q: %w", dir, err)
+	}
+	defer lockFile.Close()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("acquiring profiles lock for %q: %w", dir, err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	// Double-check: the process that held the lock before us may have
+	// already imported these profiles and written the cache.
 	if cached, readErr := os.ReadFile(cachePath); readErr == nil {
 		if strings.TrimSpace(string(cached)) == currentHash {
 			return nil
@@ -468,16 +868,66 @@ func hashProfileDir(dir string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// profileCachePath returns a temp file path for caching the profile directory
-// hash. The path is keyed to the absolute directory path so that different
-// fullsend-dir values get separate caches.
-func profileCachePath(dir string) string {
+// profileDirTempPath returns a temp file path keyed by the absolute directory
+// path with the given extension. Used by profileCachePath and profileDirLockPath
+// to derive deterministic, per-directory paths without duplicating the hashing
+// logic. This mirrors profileTempPath for single-profile paths.
+func profileDirTempPath(dir, ext string) string {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		absDir = dir
 	}
 	dirHash := sha256.Sum256([]byte(absDir))
-	return filepath.Join(os.TempDir(), "fullsend-profiles-"+hex.EncodeToString(dirHash[:8])+".sha256")
+	return filepath.Join(os.TempDir(), "fullsend-profiles-"+hex.EncodeToString(dirHash[:8])+"."+ext)
+}
+
+// profileCachePath returns a temp file path for caching the profile directory
+// hash. The path is keyed to the absolute directory path so that different
+// fullsend-dir values get separate caches.
+func profileCachePath(dir string) string {
+	return profileDirTempPath(dir, "sha256")
+}
+
+// profileDirLockPath returns a temp file path used as a cross-process flock
+// for serializing the delete+reimport critical section in ImportProfiles.
+// Keyed by directory path so different profile directories lock independently.
+func profileDirLockPath(dir string) string {
+	return profileDirTempPath(dir, "lock")
+}
+
+// hashProfileFile computes a SHA-256 digest of a single profile file's
+// contents. This is the single-file analog of hashProfileDir.
+func hashProfileFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// profileTempPath returns a temp file path keyed by profile id with the
+// given extension. Used by profileFileCachePath and profileFileLockPath to
+// derive deterministic, per-profile paths without duplicating the hashing
+// logic.
+func profileTempPath(id, ext string) string {
+	idHash := sha256.Sum256([]byte(id))
+	return filepath.Join(os.TempDir(), "fullsend-profile-"+hex.EncodeToString(idHash[:8])+"."+ext)
+}
+
+// profileFileCachePath returns a temp file path for caching the hash of a
+// single profile file. The path is keyed to the profile id so that
+// different profiles get separate caches.
+func profileFileCachePath(id string) string {
+	return profileTempPath(id, "sha256")
+}
+
+// profileFileLockPath returns a temp file path used as a cross-process
+// flock for serializing the delete+reimport critical section in
+// ImportProfile. Keyed by profile id so different profiles lock
+// independently.
+func profileFileLockPath(id string) string {
+	return profileTempPath(id, "lock")
 }
 
 // EnableProvidersV2 enables the providers_v2_enabled setting globally in the
@@ -535,6 +985,17 @@ func CreateWithRetry(name string, providers []string, image, policy string, maxA
 			return nil
 		}
 
+		// A global policy source is a stable mismatch — retrying with a
+		// new sandbox will not change the gateway-level policy. Clean up
+		// the running sandbox (it reached Ready before verifyPolicy
+		// detected the mismatch) and return immediately.
+		if errors.Is(lastErr, errPolicyGlobal) {
+			if delErr := Delete(name); delErr != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: cleanup of sandbox %s failed: %v\n", name, delErr)
+			}
+			return lastErr
+		}
+
 		if delErr := Delete(name); delErr != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: cleanup of sandbox %s failed: %v\n", name, delErr)
 		}
@@ -553,6 +1014,48 @@ func CreateWithRetry(name string, providers []string, image, policy string, maxA
 		}
 	}
 	return fmt.Errorf("sandbox creation failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// terminalSandboxPhases lists sandbox phases that will never transition to
+// Ready on their own. When one is detected during polling, createOnce returns
+// immediately instead of burning the full timeout. "Error" is the phase
+// OpenShell 0.0.111+ reports once the main process exits; "Completed" is
+// reserved for the pending upstream exit-zero mapping (NVIDIA/OpenShell#2884)
+// and is inert until that lands.
+var terminalSandboxPhases = []string{"Error", "Completed"}
+
+// readySandboxPhase is the phase createOnce waits for.
+const readySandboxPhase = "Ready"
+
+// sandboxPhaseRe matches the "Phase:" field of `openshell sandbox get` output.
+// The escape sequences cover the case where OpenShell is forced to colorize
+// despite writing to a pipe; they are interleaved with the separating
+// whitespace because either the label or the value (or both) may be wrapped.
+var sandboxPhaseRe = regexp.MustCompile(`(?m)^[ \t]*(?:\x1b\[[0-9;]*m)*Phase:(?:[ \t]|\x1b\[[0-9;]*m)*([A-Za-z]+)`)
+
+// sandboxPhase extracts the reported phase from `openshell sandbox get`
+// output, or "" when no phase field is present.
+func sandboxPhase(output string) string {
+	m := sandboxPhaseRe.FindStringSubmatch(output)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// terminalSandboxPhase returns the sandbox phase when it is terminal, or ""
+// otherwise. Matching is anchored to the "Phase:" field rather than searching
+// the whole output, so an unrelated occurrence of a phase name elsewhere in
+// the get output (the sandbox name, labels, annotations, or the printed
+// policy YAML) cannot be mistaken for a terminal phase.
+func terminalSandboxPhase(output string) string {
+	phase := sandboxPhase(output)
+	for _, terminal := range terminalSandboxPhases {
+		if phase == terminal {
+			return phase
+		}
+	}
+	return ""
 }
 
 // createOnce creates a persistent OpenShell sandbox and waits for it to be
@@ -579,24 +1082,56 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 	for _, p := range providers {
 		args = append(args, "--provider", p)
 	}
-	// Without a command, sandbox create starts an interactive shell and
-	// blocks until it exits. Pass `true` so it returns immediately.
-	args = append(args, "--", "true")
+	// Keep a long-running process inside the sandbox so it stays alive
+	// for subsequent sandbox exec calls. Prior to OpenShell 0.0.111 the
+	// `true` command worked because an exited main process left the
+	// sandbox Ready; starting with 0.0.111 an exited process makes the
+	// sandbox terminal. --detach returns immediately while the keep-alive
+	// command continues running in the background.
+	args = append(args, "--detach", "--")
+	args = append(args, strings.Fields(KeepAliveCommand)...)
 
 	cmd := exec.CommandContext(ctx, "openshell", args...)
 	cmd.Stdin = nil
 	out, err := cmd.CombinedOutput()
+	createOutput := strings.TrimSpace(string(out))
 
 	if err != nil {
 		check := exec.CommandContext(ctx, "openshell", "sandbox", "get", name)
 		if checkErr := check.Run(); checkErr != nil {
-			return fmt.Errorf("sandbox create failed: %s", string(out))
+			// Wrap err too: when openshell cannot execute at all the
+			// combined output is empty and it is the only diagnostic.
+			return fmt.Errorf("sandbox create failed: %w (output: %s)", err, createOutput)
 		}
+		// Sandbox exists despite the create error — continue to the
+		// polling loop, but preserve createOutput for diagnostics.
 	}
 
 	// Wait for sandbox to be fully ready (image pull can take a while).
 	deadline := time.Now().Add(timeout)
 	var lastOutput, lastStderr string
+	var lastPolicyErr error
+
+	// checkPolicy runs verifyPolicy against the latest output. It returns:
+	//   - (true, nil)  when the policy is verified — createOnce should return nil.
+	//   - (true, err)  when the mismatch is stable — createOnce should return err.
+	//   - (false, nil) when policy fields may not yet be populated — continue polling.
+	checkPolicy := func() (done bool, err error) {
+		policyErr := verifyPolicy(name, lastOutput, policy)
+		if policyErr == nil {
+			return true, nil
+		}
+		// A global policy source is a stable mismatch that re-polling
+		// cannot fix — return immediately.
+		if errors.Is(policyErr, errPolicyGlobal) {
+			return true, policyErr
+		}
+		// Policy fields may not yet be populated; record the error and
+		// continue polling until the deadline.
+		lastPolicyErr = policyErr
+		return false, nil
+	}
+
 	for time.Now().Before(deadline) {
 		check := exec.CommandContext(ctx, "openshell", "sandbox", "get", name)
 		var stdoutBuf, stderrBuf strings.Builder
@@ -605,8 +1140,34 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 		checkErr := check.Run()
 		lastOutput = stdoutBuf.String()
 		lastStderr = stderrBuf.String()
-		if checkErr == nil && strings.Contains(lastOutput, "Ready") {
-			return nil
+		// Both checks read the anchored "Phase:" field rather than
+		// searching the whole output, which also carries the sandbox
+		// name, labels, annotations and the printed policy YAML — an
+		// unanchored search there could abort a healthy creation or
+		// report a provisioning sandbox as ready.
+		//
+		// When no phase field parses at all the output shape has
+		// changed, and anchoring alone would time out every healthy
+		// creation. Fall back to the historical substring check in that
+		// case only: it cannot reintroduce the decoy problem, because a
+		// decoy requires a phase field to be present and say otherwise.
+		if checkErr == nil {
+			switch phase := sandboxPhase(lastOutput); {
+			case phase == readySandboxPhase:
+				if done, err := checkPolicy(); done {
+					return err
+				}
+			case phase == "" && strings.Contains(lastOutput, readySandboxPhase):
+				if done, err := checkPolicy(); done {
+					return err
+				}
+			}
+			// Detect terminal phases and fail immediately instead of
+			// polling through the full timeout.
+			if phase := terminalSandboxPhase(lastOutput); phase != "" {
+				return fmt.Errorf("sandbox %q entered terminal phase %q (will not become Ready)\ncreate output: %s\nstdout: %s\nstderr: %s",
+					name, phase, createOutput, lastOutput, lastStderr)
+			}
 		}
 		time.Sleep(readyPoll)
 	}
@@ -617,8 +1178,131 @@ func createOnce(name string, providers []string, image, policy string, timeout t
 
 	containerLogs := collectPodmanLogs(name)
 
-	return fmt.Errorf("sandbox %q not ready after %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
-		name, timeout, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
+	if lastPolicyErr != nil {
+		return fmt.Errorf("sandbox %q policy verification failed after %s: %w\ncreate output: %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
+			name, timeout, lastPolicyErr, createOutput, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
+	}
+
+	return fmt.Errorf("sandbox %q not ready after %s\ncreate output: %s\nstdout: %s\nstderr: %s\nsupervisor logs: %s\ngateway logs: %s\ncontainer logs: %s",
+		name, timeout, createOutput, lastOutput, lastStderr, supervisorLogs, gatewayLogs, containerLogs)
+}
+
+// errPolicyGlobal is returned by verifyPolicy when the sandbox's policy
+// source is "global" instead of "sandbox". This is a stable mismatch that
+// re-polling and re-creation cannot fix — the global policy is a
+// gateway-level setting, not a per-sandbox override. CreateWithRetry
+// classifies it as non-retryable and returns immediately.
+var errPolicyGlobal = errors.New("sandbox policy source is global, not sandbox-level")
+
+// ErrProviderNotFound is returned by DeleteProvider when the gateway has no
+// provider of that name — already gone, which callers treat as done.
+var ErrProviderNotFound = errors.New("provider not found")
+
+// DeleteProvider deletes a named provider from the gateway. Run-scoped
+// providers (e.g. openai-<suffix>) must be cleaned up regardless of
+// --keep-sandbox so a live-token provider does not outlive the run (#6689).
+// The 0.0.115 CLI reports a missing provider as "! Provider <name> not
+// found" with exit 0; that and any non-zero "not found" variant surface as
+// ErrProviderNotFound. A provider a sandbox still references cannot be
+// deleted (FAILED_PRECONDITION) and is reported as an error.
+func DeleteProvider(name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), providerTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "openshell", "provider", "delete", name).CombinedOutput()
+	lower := strings.ToLower(string(out))
+	lname := strings.ToLower(name)
+	for _, form := range []string{
+		"provider " + lname + " not found",
+		"provider '" + lname + "' not found",
+		"provider " + lname + " does not exist",
+		"provider '" + lname + "' does not exist",
+	} {
+		if strings.Contains(lower, form) {
+			return ErrProviderNotFound
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("provider delete %q failed: %w (output: %s)", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// verifyPolicy checks that the sandbox has an active policy applied at the
+// sandbox level when one was requested at creation time. The openshell CLI
+// wraps field labels in ANSI escape sequences (even when stdout is not a
+// terminal), so the output is stripped via stripANSI (defined in
+// gateway_endpoint.go) before text parsing. The output format reports
+// policy metadata as:
+//
+//	Policy source: sandbox|global
+//	Policy:
+//	  <yaml>
+//
+// When no policy was requested (empty string), the check is skipped.
+//
+// Returns errPolicyGlobal when the source is "global" — a stable mismatch
+// that re-polling and re-creation cannot fix. Other errors indicate
+// conditions where the policy fields may not yet be populated.
+func verifyPolicy(name, output, requestedPolicy string) error {
+	if requestedPolicy == "" {
+		return nil
+	}
+	// The openshell CLI emits ANSI colour codes unconditionally (even
+	// when stdout is not a terminal), so strip them before parsing.
+	output = stripANSI(output)
+	truncated := truncatePolicyOutput(output, 512)
+	source := parsePolicySource(output)
+	if source == "" {
+		return fmt.Errorf("sandbox %q is ready but no policy source reported (expected policy %q); output: %s", name, requestedPolicy, truncated)
+	}
+	if source == "global" {
+		return fmt.Errorf("%w: sandbox %q policy source is %q, expected %q (requested policy %q); output: %s", errPolicyGlobal, name, source, "sandbox", requestedPolicy, truncated)
+	}
+	if source != "sandbox" {
+		return fmt.Errorf("sandbox %q policy source is %q, expected %q (requested policy %q); output: %s", name, source, "sandbox", requestedPolicy, truncated)
+	}
+	if !hasPolicySection(output) {
+		return fmt.Errorf("sandbox %q reports policy source %q but no policy content found (expected policy %q); output: %s", name, source, requestedPolicy, truncated)
+	}
+	return nil
+}
+
+// truncatePolicyOutput limits output to maxLen bytes for inclusion in error
+// messages, appending an ellipsis if truncated.
+func truncatePolicyOutput(output string, maxLen int) string {
+	if len(output) <= maxLen {
+		return output
+	}
+	return output[:maxLen] + "..."
+}
+
+// parsePolicySource extracts the "Policy source:" field value from
+// openshell sandbox get output. Returns "sandbox", "global", or ""
+// if the field is not present.
+func parsePolicySource(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if val, ok := strings.CutPrefix(line, "Policy source:"); ok {
+			return strings.TrimSpace(val)
+		}
+	}
+	return ""
+}
+
+// hasPolicySection checks whether the output contains a standalone
+// "Policy:" section header, indicating that a policy is active.
+// This is intentionally a presence-only check — it does not compare the
+// policy content against the requested policy YAML. The goal is to
+// detect the case where no policy was applied at all (missing section),
+// not to verify byte-for-byte content equality. This distinguishes the
+// section header from the "Policy source:" metadata field.
+func hasPolicySection(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) == "Policy:" {
+			return true
+		}
+	}
+	return false
 }
 
 // Delete deletes a sandbox, returning any error for the caller to log.
@@ -824,7 +1508,7 @@ func UploadFile(sandboxName, localPath, remotePath string) error {
 	}
 
 	if exitCode != 0 {
-		wrongPath := fmt.Sprintf("%s/%s", remotePath, filepath.Base(localPath))
+		wrongPath := fmt.Sprintf("%s/%s", remotePath, resolvedBasename(localPath))
 		_, _, exitCode, err := Exec(sandboxName, fmt.Sprintf("test -f %s", shellQuote(wrongPath)), 1*time.Second)
 		if err != nil {
 			return err
@@ -862,6 +1546,16 @@ func UploadFile(sandboxName, localPath, remotePath string) error {
 	return nil
 }
 
+// resolvedBasename returns filepath.Base of the symlink-resolved path.
+// Upload resolves symlinks before handing the path to openshell, so the
+// file inside the sandbox has the resolved basename, not the symlink name.
+func resolvedBasename(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Base(resolved)
+	}
+	return filepath.Base(path)
+}
+
 // UploadDir uploads the contents of a local directory into a sandbox,
 // preserving symlinks. It builds a local tar archive (tar preserves symlinks
 // by default), uploads it, and extracts it in the sandbox at remotePath.
@@ -875,7 +1569,7 @@ func UploadFile(sandboxName, localPath, remotePath string) error {
 // same remotePath overwrite deterministically rather than merging files
 // from both. Do not point two different, unrelated sources at the same
 // remotePath expecting their content to coexist.
-func UploadDir(sandboxName, localPath, remotePath string) error {
+func UploadDir(sandboxName, localPath, remotePath string, excludes ...string) error {
 	tmp, err := os.CreateTemp("", "openshell-upload-*.tar.gz")
 	if err != nil {
 		return fmt.Errorf("creating temp tarball: %w", err)
@@ -884,7 +1578,21 @@ func UploadDir(sandboxName, localPath, remotePath string) error {
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	tarCmd := exec.Command("tar", "-czf", tmpPath, "-C", localPath, ".")
+	members, err := tarRootMembers(localPath, excludes...)
+	if err != nil {
+		return fmt.Errorf("listing %q for upload: %w", localPath, err)
+	}
+	tarArgs := []string{"-czf", tmpPath, "-C", localPath}
+	if len(members) == 0 {
+		// Everything at the root was excluded (or the dir is empty). An
+		// empty --files-from list yields an empty archive on GNU tar and
+		// bsdtar alike; do not fall back to "." (that would re-include
+		// excluded names).
+		tarArgs = append(tarArgs, "--files-from", os.DevNull)
+	} else {
+		tarArgs = append(tarArgs, members...)
+	}
+	tarCmd := exec.Command("tar", tarArgs...)
 	// Suppress macOS AppleDouble (._*) files in the tarball. On macOS,
 	// bsdtar generates ._* companion files for any file with extended
 	// attributes. These corrupt .git after a sandbox round-trip.
@@ -919,6 +1627,39 @@ func UploadDir(sandboxName, localPath, remotePath string) error {
 		return fmt.Errorf("extracting tarball in sandbox %q: exit %d: %s", sandboxName, exitCode, stderr)
 	}
 	return nil
+}
+
+// tarRootMembers lists top-level archive members under localPath, omitting
+// excludes. Matching is by top-level entry name only (nested path components
+// in an exclude are ignored beyond the first segment), so nested directories
+// like sub/output/ are never dropped — unlike tar --exclude on bsdtar,
+// which matches the basename at any depth.
+func tarRootMembers(localPath string, excludes ...string) ([]string, error) {
+	skip := make(map[string]struct{}, len(excludes))
+	for _, ex := range excludes {
+		name := strings.Trim(ex, `/\`)
+		if name == "" {
+			continue
+		}
+		// Top-level basenames only. Rejecting nested paths avoids silently
+		// truncating "build/output" to "build" and dropping an entire tree.
+		if strings.ContainsAny(name, `/\`) {
+			return nil, fmt.Errorf("upload exclude %q must be a top-level name", ex)
+		}
+		skip[name] = struct{}{}
+	}
+	entries, err := os.ReadDir(localPath)
+	if err != nil {
+		return nil, err
+	}
+	members := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if _, ok := skip[e.Name()]; ok {
+			continue
+		}
+		members = append(members, "./"+e.Name())
+	}
+	return members, nil
 }
 
 // Download copies a file or directory from a sandbox to the local machine.

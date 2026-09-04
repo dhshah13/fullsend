@@ -821,6 +821,8 @@ func TestComputeDispatchHMAC_MatchesPython3(t *testing.T) {
 		"FULLSEND_POLL_JOB_URL": "https://gitlab.example.com/-/jobs/12345",
 		"IS_FORK":               "false",
 		"MR_AUTHOR_ID":          "42",
+		"ORIGINATING_URL":       "https://gitlab.example.com/testgroup/testrepo/-/merge_requests/10",
+		"REPO_FULL_NAME":        "testgroup/testrepo",
 		"RESOURCE_KEY":          "mr-10",
 		"STAGE":                 "review",
 		"STATUS_IID":            "10",
@@ -849,6 +851,94 @@ func TestComputeDispatchHMAC_MatchesPython3(t *testing.T) {
 
 	if goHMAC != pythonHMAC {
 		t.Errorf("HMAC mismatch:\n  Go:     %s\n  python: %s", goHMAC, pythonHMAC)
+	}
+}
+
+func TestDispatch_IncludesOriginatingURLForIssueEvent(t *testing.T) {
+	mc := newMockClient()
+	p := newTestPoller(mc, Options{})
+
+	event := RoutableEvent{
+		Type:         "issue_note",
+		IID:          42,
+		UpdatedAt:    time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC),
+		NoteBody:     "/fs-retro",
+		NoteID:       100,
+		NoteAuthorID: 88,
+	}
+
+	err := p.dispatch(context.Background(), "owner", "repo", "retro", event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	vars := mc.pipelineCalls[0].Variables
+	wantURL := "https://gitlab.example.com/testgroup/testrepo/-/issues/42"
+	if vars["ORIGINATING_URL"] != wantURL {
+		t.Errorf("ORIGINATING_URL: got %q, want %q", vars["ORIGINATING_URL"], wantURL)
+	}
+	if vars["REPO_FULL_NAME"] != "testgroup/testrepo" {
+		t.Errorf("REPO_FULL_NAME: got %q, want %q", vars["REPO_FULL_NAME"], "testgroup/testrepo")
+	}
+}
+
+func TestDispatch_IncludesOriginatingURLForMREvent(t *testing.T) {
+	mc := newMockClient()
+	p := newTestPoller(mc, Options{})
+
+	event := RoutableEvent{
+		Type:      "mr_event",
+		IID:       10,
+		UpdatedAt: time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC),
+		MRSource:  100,
+		MRTarget:  100,
+	}
+
+	err := p.dispatch(context.Background(), "owner", "repo", "retro", event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	vars := mc.pipelineCalls[0].Variables
+	wantURL := "https://gitlab.example.com/testgroup/testrepo/-/merge_requests/10"
+	if vars["ORIGINATING_URL"] != wantURL {
+		t.Errorf("ORIGINATING_URL: got %q, want %q", vars["ORIGINATING_URL"], wantURL)
+	}
+	if vars["REPO_FULL_NAME"] != "testgroup/testrepo" {
+		t.Errorf("REPO_FULL_NAME: got %q, want %q", vars["REPO_FULL_NAME"], "testgroup/testrepo")
+	}
+}
+
+func TestDispatch_OriginatingURLWithSubgroup(t *testing.T) {
+	mc := newMockClient()
+	p := newTestPoller(mc, Options{})
+	p.projectPath = "group/sub/project"
+	p.gitlabURL = "https://gitlab.cee.redhat.com"
+
+	event := RoutableEvent{
+		Type:         "mr_note",
+		IID:          7,
+		UpdatedAt:    time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC),
+		NoteBody:     "/fs-retro",
+		NoteID:       200,
+		NoteAuthorID: 55,
+		MRAuthorID:   42,
+		MRSource:     100,
+		MRTarget:     100,
+	}
+
+	err := p.dispatch(context.Background(), "owner", "repo", "retro", event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	vars := mc.pipelineCalls[0].Variables
+	wantURL := "https://gitlab.cee.redhat.com/group/sub/project/-/merge_requests/7"
+	if vars["ORIGINATING_URL"] != wantURL {
+		t.Errorf("ORIGINATING_URL: got %q, want %q", vars["ORIGINATING_URL"], wantURL)
+	}
+	if vars["REPO_FULL_NAME"] != "group/sub/project" {
+		t.Errorf("REPO_FULL_NAME: got %q, want %q", vars["REPO_FULL_NAME"], "group/sub/project")
 	}
 }
 

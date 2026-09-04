@@ -1,0 +1,39 @@
+---
+sidebar_label: Choose a Runtime
+---
+
+# Choose an agent runtime
+
+> **Claude Code is the stable default.** The fleet agents have run on Claude Code in production for a long time; it is what a new installation gets unless you ask for something else. **pi and codex are experimental** — pi works end to end for `triage`, `prioritize`, `code` and `fix`, and codex runs OpenAI models through the same secretless credential path. Neither builds a sub-agent roster, so `review` and `retro` are best left on Claude Code — nothing stops a repo-wide `runtime:` applying to them, it is just not recommended. Neither has completed a fleet pilot. Unless you are taking part in one, keep the default.
+
+This page explains what the choice means and where it is made. **You do not select anything on this page** — the selection happens in the next step, [Configuring GitHub](configuring-github.md), when `fullsend github setup` prompts for the runtime (press Enter for `claude`) or when you pass `--runtime`.
+
+Fullsend supports multiple agent runtimes. A runtime is the program that runs inside the sandbox and drives the model — it owns the tool-use loop, hook wiring, and transcript format. The runner (fullsend) owns everything outside: sandbox lifecycle, credentials, metrics, and the verdict.
+
+## Available runtimes
+
+| Runtime | Status | Description | When to use |
+|---------|--------|-------------|-------------|
+| `claude` | **Stable (default)** | Claude Code on Vertex AI | Every production deployment — mature, full sub-agent support for `review`/`retro` |
+| `pi` | Experimental (enablement phase) | [Pi](https://github.com/earendil-works/pi) — Claude on Vertex by default; any provider pi supports by model name (e.g. Gemini on Vertex with the same credentials) | Opt-in pilots only; no sub-agent tool yet, so `review`/`retro` run single-context; see [Runtimes](../../runtimes.md) for known constraints |
+| `codex` | Experimental | [Codex](https://github.com/openai/codex) — OpenAI models only, through the same secretless credential path | Opt-in pilots only, when you want GPT specifically. No sub-agent roster, so keeping `review`/`retro` on Claude Code is recommended; needs an OpenAI model named (`FULLSEND_CODEX_MODEL`) because the fleet harnesses ask for `opus`; see [Codex](../../runtimes/codex.md) |
+
+## When and how the runtime is selected
+
+1. **Next step — Configuring GitHub.** `fullsend github setup <owner/repo>` asks which runtime to use when run from a terminal; press Enter to keep `claude`. Passing `--runtime` skips the prompt. The setup PR it opens records the choice in `.fullsend/config.yaml` and describes how to change it. Nothing runs on this page — continue with [Configuring GitHub](configuring-github.md).
+2. **Later — changing it.** Edit `runtime:` in the repo's `.fullsend/config.yaml` (the setup PR shows the key), or re-run `fullsend github setup <owner/repo> --runtime <claude|pi|codex>`. To put one agent on a different runtime or model than the rest — say `code` on Claude Code while `triage` runs Grok on pi — set `runtime:` on that agent's `agents:` entry in the same file (`fullsend agent set code --runtime claude`); see [Runtimes — per-agent settings](../../runtimes.md#per-agent-runtime-model-and-effort). Fleets managed through `repos.yaml` set `defaults.runtime` (or a per-entry `runtime`) — `fullsend repos set-default defaults.runtime pi` — and run `fullsend repos install`; see [fullsend repos](../../cli/repos.md).
+3. **Per run — trying without changing the repo.** `fullsend run --runtime pi --model google-vertex/gemini-2.5-flash`, or the `FULLSEND_RUNTIME` / `FULLSEND_MODEL` / `FULLSEND_EFFORT` environment variables (flag beats environment beats the agent's `agents:` entry beats repo-wide config). In CI the same names work as repository variables. Reference: [fullsend run](../../cli/run.md) and [Runtimes — selecting and overriding](../../runtimes.md#selecting-a-runtime-and-model).
+
+## Where to see what ran
+
+After a run completes, the selected runtime and model appear in several places:
+
+- **Run plan block** — `Runtime: <name> (from <source>)` printed at the start of every `fullsend run`
+- **Status comment** — the terminal status comment on the issue/PR includes a footer with runtime, model, effort, and cost (see [Cost data contract](../infrastructure/distributed-tracing.md#cost-data-contract) for how cost is sourced and aggregated)
+- **metrics.json** — `runtime`, `requested_runtime`, `runtime_source`, `requested_model`, and `override_source` fields record what was selected and why
+- **stderr** — `runtime: selected "<name>" from <source>` for script consumers
+
+## Next steps
+
+- [Configuring GitHub](configuring-github.md) to set up your repo
+- [Runtimes](../../runtimes.md) for the full runtime reference, including model override precedence and the capability table

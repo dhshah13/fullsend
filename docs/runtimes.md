@@ -1,150 +1,240 @@
 # Agent runtimes
 
-Fullsend's `fullsend run` command delegates in-sandbox agent execution to a pluggable **runtime**. Recognized values in org `config.yaml` `defaults.runtime` are **`claude`** (production default) and **`dummy`** (behaviour tests only). Install with `fullsend admin install --runtime dummy` on dedicated test orgs. The runner resolves the backend via `runtime.ResolveFromConfig()` after loading the org config.
+A **runtime** is the agent program fullsend runs inside the sandbox — the thing that talks to the
+model and executes tool calls. `fullsend run` delegates to it and owns everything around it: the
+sandbox, the credentials, and the verdict.
 
-When adding a runtime, fill in the security matrix below and register it in `runtime.Resolve()`.
+| Runtime | Use it for | Status |
+|---|---|---|
+| **[`claude`](runtimes/claude.md)** | Production agent runs (Claude Code) | Default |
+| **[`pi`](runtimes/pi.md)** | Second runtime, opt-in per repo — Claude, Grok and Gemini on Vertex; GPT via OpenAI WIF (wired, not yet exercised live) | Supported for `triage`, `prioritize`, `code`, `fix` |
+| **[`codex`](runtimes/codex.md)** | Third runtime, opt-in per repo or agent — OpenAI models only, via the same secretless credential path (wired, not yet exercised live) | Opt-in |
+| `dummy` | Behaviour tests — scripted ops, no inference | Internal |
+| `dummy-playback` | Behaviour tests — replays canned agent results from a playlist, no inference | Internal |
+| `opencode` | Not yet functional | Stub |
 
-## Registered runtimes
+Pick one with `runtime:` in `.fullsend/config.yaml`, or per run with `--runtime`.
 
-| Runtime | Purpose | Inference |
-|---------|---------|-----------|
-| `claude` | Production agent runs via Claude Code | Required |
-| `opencode` | OpenCode agent runs (stub — not yet functional; resolved by `runtime.Resolve()` but not in `ValidRuntimes()` until implemented) | Required |
-| `dummy` | Behaviour tests — scripted ops in real sandbox | None |
-
-## Security feature matrix
-
-| Feature | Where it runs | Claude Code | OpenCode (stub) | Notes for future runtimes |
-|---------|---------------|-------------|-----------------|---------------------------|
-| **Host-side context injection scan** (DeBERTa / LLM Guard, unicode, SSRF patterns on repo context files) | Host + sandbox `scan context` | ✓ | N/A — stub | Requires sandbox image with ML models; harness `security.host_scanners` |
-| **Host-side runtime content scan** (agent def, SKILL.md, plugin JSON before upload) | Host (`scanRuntimeContent`) | ✓ | N/A — stub | Uses `security.InputPipeline()`; not part of `Runtime` interface — runner responsibility |
-| **Tirith** (Bash command scanning) | Sandbox PreToolUse hook | ✓ | N/A — stub | `tirith_check.py`; harness `security.sandbox_hooks.tirith` |
-| **SSRF pre-tool** | Sandbox PreToolUse hook | ✓ | N/A — stub | `ssrf_pretool.py`; default on |
-| **Canary token detection** | Sandbox Pre/PostToolUse hooks | ✓ | N/A — stub | `canary_pretool.py` / `canary_posttool.py` |
-| **Secret redaction** | Sandbox PostToolUse hook | ✓ | N/A — stub | `secret_redact_posttool.py` |
-| **Unicode normalization** | Sandbox PostToolUse hook | ✓ | N/A — stub | `unicode_posttool.py` |
-| **Context suppression** | Sandbox PostToolUse hook | ✓ | N/A — stub | `context_suppress_posttool.py` |
-| **Tool allowlist** | Sandbox PreToolUse hook | opt-in | N/A — stub | `tool_allowlist_pretool.py`; requires `FULLSEND_TOOL_ALLOWLIST` |
-| **Prompt injection (DeBERTa)** | Host Path A + sandbox Path B | ✓ | N/A — stub | Same scanner stack as context files when enabled in harness |
-| **Optional Claude sandbox hooks** | `ClaudeHooksBootstrap` type assert | ✓ only | ✗ — does not implement `ClaudeHooksBootstrap` | Other runtimes must define their own hook/bootstrap extension; absence means **no** sandbox tool hooks installed |
-| **Transcript / debug artifacts** | `TranscriptHandler` | ✓ (stream-json, `claude-debug.log`) | No-op — see #1935 | Format-specific; not shared across runtimes |
-
-### Fail modes
-
-Harness `security.fail_mode` controls whether critical findings **block** the run (`closed`, default) or **warn** and continue (`open`). This applies to host scans, sandbox `scan context`, and host-side runtime content scan alike.
-
-### Runtime interface contract
-
-| Interface | Responsibility |
-|-----------|----------------|
-| `runtime.Runtime` | Name, config dir, env exports, bootstrap, run loop, per-iteration artifact cleanup |
-| `runtime.BootstrapInput` | Portable agent name/path, skill dirs, and plugin dirs to upload |
-| `runtime.ClaudeHooksBootstrap` | Optional — Claude-only sandbox security hooks |
-| `runtime.TranscriptHandler` | Extract transcripts/debug logs; parse errors for CI annotations |
-
-A runtime that implements `Runtime` but not `ClaudeHooksBootstrap` (or an equivalent future extension) will **not** install Tirith, SSRF, canary, or other Claude hook scripts. Document what your runtime provides instead.
-
-## Sandbox workspace layout
-
-The sandbox has two key directories that map to Claude Code's config levels:
-
-```
-/sandbox/
-├── claude-config/                   ← CLAUDE_CONFIG_DIR (personal level)
-│   ├── agents/
-│   │   └── <name>.md                   Agent definition (filename derived from the agent name)
-│   ├── skills/
-│   │   ├── code-review/SKILL.md        Built-in skills (personal level — wins on collision)
-│   │   ├── pr-review/SKILL.md
-│   │   └── ...
-│   └── plugins/
-│       └── ...                         Plugin state (simplified; see bootstrapPlugins())
-│
-└── workspace/                       ← SandboxWorkspace
-    ├── .env                            Environment variables (sourced before claude)
-    ├── .env.d/                         Additional env files (host_files expand)
-    ├── .claude/
-    │   ├── hooks/                      Security hooks (PreToolUse, PostToolUse)
-    │   └── settings.json               Hook wiring (separate from plugin config)
-    │
-    └── <repo-name>/                 ← Claude Code's working directory (cd target)
-        ├── CLAUDE.md                   Project instructions (repo's own or injected bridge)
-        ├── AGENTS.md                   Project rules (repo's own or org default injected)
-        ├── .claude/skills/             Repo skills (project level — shadowed on collision)
-        │   └── custom-lint/SKILL.md
-        └── src/...                     Target repo source code
+```bash
+fullsend run triage --runtime pi --model xai-vertex/xai/grok-4.6
 ```
 
-## Agent rule layering
+## How a run uses the runtime
 
-When `fullsend run` executes an agent, Claude Code loads instructions from
-multiple sources. These compose — they occupy different layers, not competing
-slots:
+The runner owns the sandbox, credentials and verdict; the runtime owns what happens between "start"
+and "event stream".
 
-```
-┌────────────────────────────────────────────────────────┐
-│  Layer 1: Agent Definition (system prompt)             │
-│  Source: /sandbox/claude-config/agents/<name>.md       │
-│  Loaded via: --agent flag                              │
-│  Controls: role, task, tools, disallowedTools, model,  │
-│            built-in skills list                        │
-│  Authority: highest — repo cannot modify               │
-├────────────────────────────────────────────────────────┤
-│  Layer 2: Project Instructions (advisory)              │
-│  Source: /sandbox/workspace/<repo>/CLAUDE.md           │
-│         /sandbox/workspace/<repo>/AGENTS.md            │
-│  Loaded via: Claude Code auto-loads from working dir   │
-│  Controls: conventions, architecture, domain context   │
-│  Authority: advisory — cannot override layer 1         │
-├────────────────────────────────────────────────────────┤
-│  Layer 3: Skills                                       │
-│  Personal: /sandbox/claude-config/skills/ (fullsend)   │
-│  Project:  <repo>/.claude/skills/ (repo)               │
-│  Precedence: personal > project (name collision →      │
-│              fullsend wins, repo version shadowed)     │
-│  Repo skills extend the agent; use config-driven       │
-│  agent registration for org-level skill overrides      │
-└────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+  autonumber
+  participant R as Runner
+  participant S as Sandbox
+  participant A as Runtime
+  participant M as Model
+  R->>R: pick runtime (config.yaml)
+  R->>S: .env, host files
+  R->>S: Bootstrap
+  R->>S: OIDC token (4-min refresh)
+  R->>S: clean up stray processes (between iterations)
+  R->>S: Run (per iteration)
+  S->>A: start + hook wiring
+  loop tool-use loop
+    A->>M: request (WIF)
+    M-->>A: response
+    A->>A: Pre → tool → Post hooks
+  end
+  A-->>R: event stream
+  R->>S: extract artifacts
+  R->>R: verdict, metrics.json
 ```
 
-### AGENTS.md injection logic
+## Choosing a runtime
 
-`run.go` step 8a (`hasAgentsMD()` / `injectClaudeMDPointer()`):
+<a id="choosing-between-claude-and-pi"></a>
 
-1. If target repo has no AGENTS.md → inject org-level default from config repo,
-   add to `.git/info/exclude`
-2. If runtime is Claude Code, target repo has AGENTS.md but no CLAUDE.md →
-   inject bridge CLAUDE.md pointing to AGENTS.md, add to `.git/info/exclude`
-3. If target repo has both → use as-is
+| | Claude Code | pi | codex |
+|---|---|---|---|
+| Models | Anthropic on Vertex | Claude, **Grok** and **Gemini** on Vertex; **GPT** via OpenAI WIF (opt-in, [not yet exercised live](runtimes/pi.md#models-and-providers)) | **GPT only**, via OpenAI WIF ([not yet exercised live](runtimes/codex.md#not-yet-exercised)) |
+| Sub-agents | Native (`Agent` tool) | Not wired — agents execute sub-agent definitions inline ([#6527](https://github.com/fullsend-ai/fullsend/issues/6527)) | Not available |
+| Fallback model chain | `FULLSEND_FALLBACK_MODELS`, tried in order | Ignored with a warning | Ignored with a warning |
+| Roles | All | `review`/`retro` stay on Claude Code — they rely on sub-agent rosters | Same recommendation — no sub-agent roster on codex either |
+| Effort | `--effort low..max` | `--thinking`, same levels (`high` when unset) | `model_reasoning_effort`, same levels |
+| Tools | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | Shell + `apply_patch` only; `tools:` is recorded, not enforced (the allowlist hook is opt-in) |
+| Security controls | Full matrix | Full matrix; stricter on failed-call sanitizing | Full matrix; post-tool hooks detect and block but cannot rewrite output |
+| Cost in `metrics.json` | Reported | Reported | Not reported — codex sends none |
 
-### Context file security scanning
+All three run unattended in the same sandbox, behind the same egress allowlist. Stay on `claude`
+when you need sub-agents or a fallback chain. Choose `pi` when you want a non-Anthropic model, or
+several vendors from one runtime. Choose `codex` when you want OpenAI models specifically and
+codex's shell-centric way of working.
 
-`run.go` steps 8c and 9b:
+## Selecting a runtime and model
 
-Repo context files (CLAUDE.md, AGENTS.md, SKILL.md) are scanned in two
-defense-in-depth passes before the agent starts:
+First non-empty wins — the usual **flag > env var > config > default**. `fullsend run` resolves this
+once, validates it, prints the source, and records it in `metrics.json`; runtimes never read the
+override variables themselves.
 
-1. **Host-side (Path A, step 8c):** `scanRepoContextFiles()` runs the
-   `InputPipeline` (unicode normalizer, context injection scanner) on the
-   host before files enter the sandbox.
-2. **Sandbox-side (Path B, step 9b):** `buildScanContextCommand()` runs
-   `fullsend scan context` inside the sandbox after all files are assembled.
+```mermaid
+flowchart LR
+  F["--runtime / --model<br/>(flag)"] --> E["FULLSEND_RUNTIME<br/>FULLSEND_MODEL"]
+  E --> R["config.yaml<br/>agents: entry for the agent"]
+  R --> C["config.yaml runtime:<br/>harness model:"]
+  C --> A["agent frontmatter<br/>model:"]
+  A --> D["default<br/>claude · opus"]
+  classDef s fill:#e3e9fb,stroke:#2d5be3,color:#1b2230;
+  classDef d fill:#eceee8,stroke:#a9afa4,color:#1b2230;
+  class F,E,R,C,A s;
+  class D d;
+```
 
-Critical findings block the run in `fail_mode: closed`.
+| Setting | Flag | Env | Config (per-agent) | Config (repo-wide) |
+|---|---|---|---|---|
+| Runtime | `--runtime` | `FULLSEND_RUNTIME` | `runtime:` on the agent's `agents:` entry | `runtime:` in `.fullsend/config.yaml` (repo default) |
+| Model | `--model` | `FULLSEND_MODEL` (`FULLSEND_PI_MODEL` on pi and `FULLSEND_CODEX_MODEL` on codex are lower-precedence aliases) | `model:` on the agent's `agents:` entry | harness `model:`, then agent frontmatter `model:`; `models.aliases` in `.fullsend/config.yaml` remaps the alias any of these resolve to |
+| Effort | `--effort` | `FULLSEND_EFFORT` | `effort:` on the agent's `agents:` entry | harness `effort:` |
 
-## Dummy runtime operations
+In CI these are repository variables of the same name, plain or role-prefixed
+(`TRIAGE_FULLSEND_MODEL`), so a repo can switch one role's model without a pull request. For
+**durable** per-agent configuration that lives in the repository and is reviewable, use
+the agent's `agents:` entry in `.fullsend/config.yaml` instead. Harness `env.runner` does **not** reach the
+`fullsend` process.
 
-The `dummy` runtime executes a YAML script of operations inside the real sandbox (behaviour tests only). Besides `write_fixture` and `fail`, dispatch behaviour tests use:
+### Per-agent runtime, model and effort
 
-| Op | Args | Purpose |
-|----|------|---------|
-| `assert_env` | `VAR_NAME` | Assert env var is set and non-empty in the sandbox |
-| `assert_file` | `path` | Assert file exists and is readable under the workspace |
-| `assert_json` | `path,json_path` | Assert JSON file exists and dot-path field is present and non-null (uses `jq`) |
+The `agents:` list is the per-agent place in `config.yaml`: an entry names an agent and can set
+its `runtime`, `model` and `effort`. A built-in agent (`triage`, `code`, `review`, `fix`, `retro`,
+`prioritize`) is tuned with a name-only entry; a custom agent carries the settings on its
+`source:` entry.
+
+```yaml
+runtime: pi                    # repo default for agents that set none
+agents:
+  - name: triage
+    model: xai-vertex/xai/grok-4.6
+  - name: code
+    runtime: claude
+    model: sonnet
+    effort: high
+  - source: https://raw.githubusercontent.com/acme/agents/<sha>/harness/lint.yaml#sha256=…
+    model: haiku
+```
+
+Or from the CLI, which validates the entry before writing it:
+
+1. `fullsend agent set code --fullsend-dir .fullsend --runtime claude --model sonnet --effort high`
+2. `fullsend agent list --fullsend-dir .fullsend` shows the settings next to each agent —
+   `code  (built-in)  [runtime=claude model=sonnet effort=high]`, or the `source:` path for a custom
+   agent.
+3. The next `fullsend run code` names the entry as the source —
+   `Runtime: claude (from <config path> agents.code)` — and a `--runtime`/`--model` flag on that
+   run still wins.
+
+An invalid value is refused before the write — `invalid effort "turbo": must be one of low, medium,
+high, xhigh, max` — and the same check runs on every `fullsend run`, so a hand-edited entry fails the
+run before a sandbox starts rather than being skipped.
+
+A `source:` entry needs no `name:` — the agent's name is derived from the source file
+(`harness/lint.yaml` → `lint`, ADR 0058), and that is the name the settings, `fullsend run lint`
+and `fullsend agent set lint` all use; add `name:` only to override it.
+
+Names are agent names as passed to `fullsend run <agent>` — **not** harness `role:` values (`code`
+and `fix` both carry `role: coder`) — matched case-insensitively. A name-only entry for anything
+that is not a built-in agent fails validation (`coder` gets a "did you mean `code`" hint); a custom
+agent gets its settings on its own entry.
+
+Precedence: flag > env var > the agent's `agents:` entry > repo-wide `runtime:` / harness
+`model:` `effort:` > default. Entries merge per field across the layered config (`config.yaml`
+over `config.base.yaml`), so a preset base can tune agents too. `fullsend run` validates the
+whole `agents:` list in every layer (names, runtime, model syntax, effort) and fails the run with
+an error naming the file and entry rather than silently skipping a mistyped entry or handing a
+bad value to the runtime.
+
+A value that came from here shows up as `<config path> agents.<name>` wherever the selection is
+surfaced (plan block, stderr, `metrics.json` — see below); the path is the effective config file.
+
+`provider/id` is pi's model form. The syntax is accepted for every runtime (model ids are not a
+closed set), but an entry that pairs `runtime: claude` with a `provider/id` model gets a warning
+in the plan block — Claude Code expects an alias (`opus`, `sonnet`, …) or an Anthropic model id.
+
+**Migrating from repository variables.** A repo that carries `<ROLE>_FULLSEND_MODEL` /
+`<ROLE>_FULLSEND_RUNTIME` variables can move them onto `agents:` entries one-to-one: the variable
+prefix is the agent name (`CODE_FULLSEND_RUNTIME=claude` → `- name: code` / `runtime: claude`).
+Delete the variable afterwards — while it exists it still wins, so the config entry would be
+silently shadowed. Bump the workflow's fullsend pin to a version that carries per-agent settings
+*before* adding them: an older pinned CLI rejects an enabled `agents:` entry without a `source`,
+whereas a current CLI validates the settings on every run.
+
+Set the runtime per repo with `fullsend github setup <owner/repo> --runtime pi`. Repos on pi need a
+sandbox image that carries `PI_VERSION`; repos on codex need one that carries `CODEX_VERSION`.
+
+## Models
+
+On Claude Code, pass an alias (`opus`, `sonnet`, `haiku`, `fable`) or a model id.
+
+On pi, a model is `provider/id` — aliases and bare ids still work, and the provider comes from
+`FULLSEND_PI_PROVIDER` (default `anthropic-vertex`). pi reaches Claude, Gemini **and** Grok, each
+through its own provider; see [Pi › Models and providers](runtimes/pi.md#models-and-providers).
+
+On codex, a model is an OpenAI id — `openai/<id>` or the bare id. The Claude aliases above do
+**not** apply: codex serves the OpenAI Responses API only, so `opus` and friends are refused rather
+than remapped to a GPT model. Because the fleet harnesses say `model: opus`, a repo moving to codex
+names its model either once on the runner with `FULLSEND_CODEX_MODEL=openai/gpt-5.6-luna` or per
+agent with `model: openai/<id>` on the `agents:` entry — no harness needs editing either way. See
+[Codex › Models](runtimes/codex.md#models).
+
+Harness `model:` and `agents:` entry `model:` values accept provider-qualified `provider/id` syntax
+(e.g. `google-vertex/gemini-3.7-flash`). On pi, a harness can also select a provider with a bare
+`model:` plus `FULLSEND_PI_PROVIDER`.
+
+### Per-repo alias overrides
+
+Point an alias at a different model for one repo with `models.aliases` in `.fullsend/config.yaml`
+— `sonnet: claude-sonnet-5` changes `sonnet` and leaves the other aliases alone. Works on both
+runtimes; see [Pi › Per-repo alias overrides](runtimes/pi.md#per-repo-alias-overrides) for the
+syntax and what the plan block shows, and [Claude Code › Models](runtimes/claude.md#models) for
+the one limit there (sub-agent `model:` frontmatter is not remapped).
+
+## Where the selection appears
+
+| Surface | What it shows |
+|---|---|
+| Run plan block | `Runtime: <name> (from <source>)` next to Model and Effort; `<source>` is the flag, the variable, or `<config path>` (suffixed ` agents.<name>` when the agent's entry decided) |
+| stderr | `runtime: selected "<name>" from <source>` |
+| Status comment / `::notice::` | `Runtime · Model: <requested → reported> · Effort · Cost` |
+| OTel span | `fullsend.runtime`, next to `gen_ai.request.model` |
+| `metrics.json` | `runtime`, `requested_runtime`, `runtime_source`, `requested_model`, `override_source` |
+
+`requested_model` is the model after the per-run overrides (an alias stays the alias name) and
+`override_source` says where it came from, with `, remapped by <config path> models.aliases`
+appended when a per-repo alias override applied — so a silent override is visible after the fact.
+The reported model is the
+provider-stripped id (`claude-opus-4-6`); for a provider whose ids are publisher-qualified it keeps
+that segment (`xai/grok-4.6`), since that is the wire id.
+
+## Harness config keys per runtime
+
+Harness keys are runtime-neutral in YAML; each runtime owns the translation.
+Test-only runtimes (`dummy`, `dummy-playback`) ignore all harness config keys
+and are omitted from this table.
+
+| Harness key | Claude Code | pi | codex |
+|---|---|---|---|
+| `model` | `--model` | alias table (merged with `models.aliases`), then `provider/id`; see [Models](#models) | `--model <id>`; OpenAI ids only |
+| `effort` | `--effort` | `--thinking` (superset of the harness levels; `high` when unset) | `model_reasoning_effort` (same levels) |
+| `tools:` | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | No native allowlist. `Bash(...)` lists are recorded but not enforced, entries with no codex tool are dropped with a warning, and the tool-allowlist hook is opt-in (`FULLSEND_TOOL_ALLOWLIST`) |
+| `skills` | `CLAUDE_CONFIG_DIR/skills/` | `PI_CODING_AGENT_DIR/skills/`, discovered natively | `CODEX_HOME/skills/`, discovered natively |
+| `plugins` | Marketplace layout | Unsupported — warned and skipped | Unsupported — warned and skipped |
+| `security.sandbox_hooks` | `hooks.json` via `--settings` | Hook scripts + manifest + adapter extension | `hooks.json` + adapter script under `CODEX_HOME` |
+| `validation_loop.feedback_mode` | Replaces the prompt on retry | Same | Same |
+
+Full per-key detail, including the exact `--tools` mapping and allowlist parsing rules, is in
+[Implementing an agent runtime](contributing/runtime-implementation.md).
 
 ## Related docs
 
-- [cli-internals.md](guides/dev/cli-internals.md) — sandbox constants, key sandbox operations
-- [architecture.md](architecture.md) — Agent Runtime layer
-- [problems/security-threat-model.md](problems/security-threat-model.md) — threat model and scanner paths
-- [problems/agent-architecture.md](problems/agent-architecture.md) — pluggable runtimes (#1260, #579, #70)
+- [Claude Code](runtimes/claude.md) — models, fallback chains, behaviour notes
+- [Pi](runtimes/pi.md) — models and providers, behaviour differences, troubleshooting
+- [Codex](runtimes/codex.md) — OpenAI models, behaviour differences, troubleshooting
+- [Implementing an agent runtime](contributing/runtime-implementation.md) — security matrix, interfaces, hook contract, sandbox layout
+- [Running agents locally](guides/user/running-agents-locally.md) — step-by-step local runs
+- [architecture.md](architecture.md) — where the runtime sits

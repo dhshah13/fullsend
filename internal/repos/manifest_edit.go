@@ -82,7 +82,7 @@ func AddToManifest(ctx context.Context, cfg ManifestEditConfig, forgeName string
 				progress(entries[i].Name, "discover", fmt.Sprintf("forge client error: %v", fcErr))
 				continue
 			}
-			state, err := ProbeRepoState(ctx, fc.Client, parts[0], parts[1], fc)
+			state, err := ProbeRepoState(ctx, fc.Client, parts[0], parts[1], forgeName, fc)
 			if err != nil && !state.Installed {
 				progress(entries[i].Name, "discover", fmt.Sprintf("probe failed: %v", err))
 				continue
@@ -303,6 +303,8 @@ func writeManifest(path string, m *Manifest) error {
 // `repos set-default`. Order matches the help text.
 var ValidDefaultKeys = []string{
 	"defaults.allowed_remote_resources",
+	"defaults.runtime",
+	"defaults.vendor",
 	"github.url",
 	"github.mint_url",
 	"github.mint_mode",
@@ -355,6 +357,15 @@ func SetDefault(manifestPath, key, value string) error {
 
 	// Apply.
 	switch key {
+	case "defaults.runtime":
+		m.Defaults.Runtime = value
+	case "defaults.vendor":
+		if value == "" {
+			m.Defaults.Vendor = nil
+		} else {
+			v := value == "true"
+			m.Defaults.Vendor = &v
+		}
 	case "defaults.allowed_remote_resources":
 		if value == "" {
 			m.Defaults.AllowedRemoteResources = nil
@@ -438,6 +449,14 @@ func validateDefaultValue(key, value string) error {
 	case "github.fullsend_ref", "gitlab.fullsend_ref":
 		if !IsValidRef(value) {
 			return fmt.Errorf("%s %q contains invalid characters; only alphanumeric, dot, underscore, and hyphen are allowed", key, value)
+		}
+	case "defaults.runtime":
+		if err := validateRuntimeValue(key, value); err != nil {
+			return err
+		}
+	case "defaults.vendor":
+		if value != "true" && value != "false" {
+			return fmt.Errorf("defaults.vendor must be \"true\" or \"false\", got %q", value)
 		}
 	case "defaults.allowed_remote_resources":
 		for _, raw := range strings.Split(value, ",") {

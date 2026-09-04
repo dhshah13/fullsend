@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fullsend.ai/normative/normalized-event/v1/normalized-event.schema.json",
   "title": "NormalizedEvent",
-  "description": "Forge-neutral routing input for fullsend dispatch and harness CEL trigger evaluation (ADR 0061). v1 targets GitHub Actions webhooks, GitLab cron-poll input (ADR 0067), and Jira poll input (ADR 0063).",
+  "description": "Forge-neutral routing input for fullsend dispatch and harness CEL trigger evaluation (ADR 0061). v1 targets GitHub Actions webhooks (including Discussions via entity.kind conversation and transition.comment id/parent_id per ADR 0086), GitLab cron-poll input (ADR 0067), and Jira poll input (ADR 0063).",
   "type": "object",
   "additionalProperties": false,
   "required": ["repo", "entity", "transition", "actor", "state", "source"],
@@ -83,6 +83,32 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "entity": {
+            "properties": { "kind": { "const": "conversation" } },
+            "required": ["kind"]
+          }
+        },
+        "required": ["entity"]
+      },
+      "then": {
+        "properties": {
+          "state": {
+            "required": ["conversation"]
+          }
+        },
+        "required": ["state"]
+      },
+      "else": {
+        "properties": {
+          "state": {
+            "properties": { "conversation": false }
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -100,8 +126,8 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["work_item", "change_proposal"],
-          "description": "Forge-neutral entity kind (issue vs PR/MR)."
+          "enum": ["work_item", "change_proposal", "conversation"],
+          "description": "Forge-neutral entity kind (issue vs PR/MR vs conversation/Discussion/channel). Threads are not a separate entity.kind; reply association uses transition.comment.parent_id. See ADR 0086."
         },
         "id": {
           "type": "integer",
@@ -185,6 +211,18 @@
           "additionalProperties": false,
           "required": ["body"],
           "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "description": "Backend message id for this comment. Required when entity.kind is conversation on comment_* transitions (ADR 0086). GitHub: comment id or node_id; Slack: message ts."
+            },
+            "parent_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "description": "Thread-root message id — always the safe reply target for this comment's thread (ADR 0086). Required when entity.kind is conversation on comment_* transitions. Equal to comment.id for top-level / thread-root messages; for replies, the root id (normalize GitHub discussion_comment null parent to id; Slack thread_ts, or ts when the message starts the thread)."
+            },
             "command": {
               "type": "string",
               "maxLength": 64,
@@ -282,7 +320,7 @@
         },
         "is_entity_author": {
           "type": "boolean",
-          "description": "True when actor.id is the author of the work item or change proposal."
+          "description": "True when actor.id is the author of the work item, change proposal, or conversation."
         }
       }
     },
@@ -298,7 +336,52 @@
             "minLength": 1,
             "maxLength": 255
           },
-          "description": "Snapshot of label names on the entity at event time."
+          "description": "Snapshot of label names on the entity at event time. See state.conversation for conversation-specific label semantics."
+        },
+        "conversation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["category"],
+          "properties": {
+            "category": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name"],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255,
+                  "description": "Backend-stable category id when available (e.g. GitHub GraphQL node id)."
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255,
+                  "description": "Human-readable category name (GitHub Discussion category; Slack channel section when mapped)."
+                },
+                "slug": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255,
+                  "description": "Backend slug when available. On GitHub, present in webhook REST payloads (discussion.category.slug) but not on GraphQL DiscussionCategory; GITHUB_EVENT_PATH adapters can populate it, GraphQL-only enrichment cannot. Treat as untrusted input even after schema validation — no structural pattern is enforced so Slack/Discord/Matrix adapters can pass through backend identifiers."
+                },
+                "format": {
+                  "type": "string",
+                  "enum": [
+                    "discussion",
+                    "question_answer",
+                    "announcement",
+                    "poll",
+                    "other"
+                  ],
+                  "description": "Optional portable category format for routing. Not a permission authority (ADR 0054). GitHub GraphQL DiscussionCategory exposes isAnswerable but no announcement/poll/discussion format field: adapters MUST set question_answer when isAnswerable is true, and SHOULD omit format otherwise unless they document an explicit heuristic (e.g. name/slug matching). UI-only GitHub create restrictions (e.g. announcement maintain/admin) are not queryable via the public API and MUST NOT be inferred solely from this field."
+                }
+              },
+              "description": "Exclusive category of the conversation (1:M category→conversation). Distinct from state.labels (M:M tags on the conversation, not on threads or messages)."
+            }
+          },
+          "description": "Required when entity.kind is conversation and forbidden otherwise (ADR 0086). Snapshot of conversation metadata at event time. Threading is on transition.comment (id / parent_id), not here. state.labels are labels on the conversation; category is not a label; threads and messages are not labeled independently."
         },
         "change_proposal": {
           "type": "object",

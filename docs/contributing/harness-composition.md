@@ -30,11 +30,28 @@ and update the others as needed.
 | Function | File | Purpose |
 |----------|------|---------|
 | `mergeBaseIntoChild` | `internal/harness/compose.go` | Merges base harness fields into child during `base:` composition |
-| `mergeForgeConfig` | `internal/harness/forge.go` | Applies `forge.<platform>` overrides onto top-level harness fields |
+| `mergeForgeConfig` | `internal/harness/forge.go` | Applies `forge.<platform>` or overlay overrides onto top-level harness fields |
 | `mergeForgeConfigInto` | `internal/harness/compose.go` | Merges base `ForgeConfig` fields into child `ForgeConfig` during `base:` composition |
 | `mergeSkills` | `internal/harness/compose.go` | Deduplicates skills by basename (base + child); merges file-level override maps when both define the same basename (child keys win) |
 | `mergeHostFiles` | `internal/harness/compose.go` | Deduplicates host files by dest path (base + child) |
 | `mergeForgeBlocks` | `internal/harness/compose.go` | Merges `forge:` maps key-by-key across base and child |
+
+> **Note — overlay precedence during base composition.** When `overlays` are
+> concatenated during base composition, base entries are placed first and
+> child entries are appended. Because overlay resolution merges **all**
+> matching entries in order (later matches take precedence),
+> child overlay entries override base overlay entries with the same
+> condition. This follows the child-overrides-base convention used by
+> scalar and map merges.
+
+### Validation and resolution side
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `validateForge` | `internal/harness/forge.go` | Validates `forge:` block keys and `ForgeConfig` field values |
+| `validateOverlays` | `internal/harness/forge.go` | Validates `overlays:` entries — CEL `when` expressions and `ForgeConfig` field values; enforces mutual exclusion with `forge:` |
+| `ResolveForge` | `internal/harness/forge.go` | Merges the selected forge platform's config into the harness and nils the forge map |
+| `ResolveOverlays` | `internal/harness/forge.go` | Evaluates overlay `when` expressions against event/runtime/config CEL environment; merges all matching entries in order (later matches take precedence) and nils the overlays list. When event is nil (CLI flows without event context), an empty map is substituted so overlays conditioned on `runtime.forge` or `config` can still match. Use `has(event.source)` to guard event field access in `when` expressions. |
 
 ### How they correspond
 
@@ -60,8 +77,8 @@ When adding or modifying a field in the `Harness` or `ForgeConfig`
 structs:
 
 1. **Determine the field type.** Is it a scalar, list, map, or pointer
-   struct? This determines the merge behavior (see ADR-0045 inheritance
-   rules).
+   struct? This determines the merge behavior (see
+   [Harness Field Reference](harness-fields.md) merge rules).
 2. **Update `mergeBaseIntoChild`** if the field participates in `base:`
    composition.
 3. **Update `mergeForgeConfig`** if the field can appear under
@@ -71,6 +88,14 @@ structs:
    blocks.
 5. **Update tests** in `compose_test.go` and `forge_test.go` to cover
    the new field in all affected functions.
+6. **Update the [Harness Field Reference](harness-fields.md)** — If the
+   change adds a new field to `ForgeConfig`, moves a field between
+   classification tiers (top-level-only → forge-overridable or vice
+   versa), or changes merge semantics, update the relevant tables:
+   - Field classification tables ("Fields that can appear at both
+     levels" vs "Fields that stay at top level only")
+   - Merge and inheritance rules table
+   - `ForgeConfig` struct definition
 
 ## When reviewing PRs
 
@@ -83,9 +108,15 @@ matching `_test.go` file.
 
 ## Related
 
+- [Harness Field Reference](harness-fields.md): Living reference for field
+  classifications, merge rules, and `ForgeConfig` struct — updated in step 6
 - [ADR-0045](../ADRs/0045-forge-portable-harness-schema.md): Forge-portable
-  harness schema — defines the merge/inheritance rules
+  harness schema — original architectural decision (Superseded by ADR-0088)
+- [ADR-0088](../ADRs/0088-cel-guarded-overlays.md): CEL-guarded overlays —
+  current overlay mechanism
 - [ADR-0064](../ADRs/0064-deprecate-customized-directory-overlay.md):
   Deprecate customized directory overlay
+- [ADR-0088](../ADRs/0088-cel-guarded-overlays.md): CEL-guarded overlays —
+  generalizes forge-specific config with CEL expressions
 - Issue #5579: Harness field integration pipeline (complementary
   checklist covering the broader field addition workflow)

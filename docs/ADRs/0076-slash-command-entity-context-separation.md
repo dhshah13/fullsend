@@ -17,6 +17,9 @@ Date: 2026-07-28
 
 Accepted
 
+Extends entity-context rules for conversation surfaces in
+[ADR 0086](0086-conversation-surface-for-agent-participation.md).
+
 Refines [ADR 0002](0002-initial-fullsend-design.md) (initial design) and
 reinforces [ADR 0020](0020-composable-single-responsibility-agents-with-individual-sandboxes.md)
 (single-responsibility agents).
