@@ -335,7 +335,10 @@ func ExpectedScaffoldContent(ctx context.Context, resolved ResolvedConfig, dcfg 
 	// rather than the running binary's embedded templates. This is the
 	// same logic the converge path uses in convergeContentDriftFiles.
 	manifestRef := resolved.FullsendRef
-	if manifestRef != "" && refResolver != nil {
+	// When vendored, the running binary's embedded templates match the
+	// binary being committed to the repo — no version-skew concern, so
+	// skip the remote fetch to avoid unnecessary API calls.
+	if manifestRef != "" && refResolver != nil && !installCfg.VendorBinary {
 		ref := manifestRef
 		if isSemver(manifestRef) {
 			if sha := refResolver.Resolve(ctx, manifestRef); sha != manifestRef {
@@ -347,6 +350,7 @@ func ExpectedScaffoldContent(ctx context.Context, resolved ResolvedConfig, dcfg 
 			ctx, refResolver.client,
 			manifestRef, ref, resolved.Forge,
 			dcfg.RunnerTags,
+			installCfg.VendorBinary,
 		)
 		if fetchErr == nil {
 			installCfg.PrebuiltScaffoldFiles = scaffoldFiles
