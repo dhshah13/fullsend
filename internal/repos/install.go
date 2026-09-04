@@ -347,6 +347,7 @@ func ExpectedScaffoldContent(ctx context.Context, resolved ResolvedConfig, dcfg 
 			ctx, refResolver.client,
 			manifestRef, ref, resolved.Forge,
 			dcfg.RunnerTags,
+			installCfg.VendorBinary,
 		)
 		if fetchErr == nil {
 			installCfg.PrebuiltScaffoldFiles = scaffoldFiles

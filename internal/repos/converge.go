@@ -544,6 +544,7 @@ func convergeRepo(ctx context.Context,
 				ctx, refResolver.client,
 				manifestRef, ref, resolved.Forge,
 				gitlabRunnerTags(cfg.Manifest),
+				vendor,
 			)
 			if fetchErr == nil {
 				installCfg.PrebuiltScaffoldFiles = scaffoldFiles
@@ -1312,6 +1313,7 @@ func convergeScaffoldFiles(ctx context.Context,
 			ctx, refResolver.client,
 			manifestRef, ref, resolved.Forge,
 			gitlabRunnerTags(cfg.Manifest),
+			repairVendor,
 		)
 		if fetchErr == nil {
 			installCfg.PrebuiltScaffoldFiles = scaffoldFiles
@@ -1434,6 +1436,7 @@ func convergeContentDriftFiles(ctx context.Context,
 			ctx, refResolver.client,
 			manifestRef, ref, resolved.Forge,
 			gitlabRunnerTags(cfg.Manifest),
+			installCfg.VendorBinary,
 		)
 		if fetchErr == nil {
 			installCfg.PrebuiltScaffoldFiles = scaffoldFiles
