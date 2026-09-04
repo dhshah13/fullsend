@@ -539,7 +539,10 @@ func convergeRepo(ctx context.Context,
 			VendorBinary:      vendor,
 		}
 
-		if manifestRef != "" && refResolver != nil {
+		// When vendored, the running binary's embedded templates match the
+		// binary being committed to the repo — no version-skew concern, so
+		// skip the remote fetch to avoid unnecessary API calls.
+		if manifestRef != "" && refResolver != nil && !vendor {
 			scaffoldFiles, fetchErr := FetchRemoteScaffold(
 				ctx, refResolver.client,
 				manifestRef, ref, resolved.Forge,
@@ -1308,7 +1311,10 @@ func convergeScaffoldFiles(ctx context.Context,
 		VendorBinary: repairVendor,
 	}
 
-	if manifestRef != "" && refResolver != nil {
+	// When vendored, the running binary's embedded templates match the
+	// binary being committed to the repo — no version-skew concern, so
+	// skip the remote fetch to avoid unnecessary API calls.
+	if manifestRef != "" && refResolver != nil && !repairVendor {
 		scaffoldFiles, fetchErr := FetchRemoteScaffold(
 			ctx, refResolver.client,
 			manifestRef, ref, resolved.Forge,
@@ -1431,7 +1437,10 @@ func convergeContentDriftFiles(ctx context.Context,
 		installCfg.VendorBinary = *cfg.VendorOverride
 	}
 
-	if manifestRef != "" && refResolver != nil {
+	// When vendored, the running binary's embedded templates match the
+	// binary being committed to the repo — no version-skew concern, so
+	// skip the remote fetch to avoid unnecessary API calls.
+	if manifestRef != "" && refResolver != nil && !installCfg.VendorBinary {
 		scaffoldFiles, fetchErr := FetchRemoteScaffold(
 			ctx, refResolver.client,
 			manifestRef, ref, resolved.Forge,

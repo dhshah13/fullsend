@@ -27,6 +27,11 @@ var scaffoldGitLabPaths = []struct {
 // when fullsend_ref pins to a version that differs from the running
 // binary, so embedded templates would be incorrect.
 //
+// Callers should skip this function when vendored is true: the running
+// binary's embedded templates already match the binary being committed to
+// the repo, so there is no version-skew concern and the remote fetch
+// would add unnecessary API latency.
+//
 // Template paths (scaffoldGitHubShimPath, scaffoldGitLabPaths) are pinned
 // to the current binary's layout. If the remote ref reorganises these
 // paths, the fetch fails gracefully and the caller falls back to embedded

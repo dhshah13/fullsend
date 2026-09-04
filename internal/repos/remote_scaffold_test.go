@@ -108,7 +108,7 @@ func TestFetchRemoteScaffold_GitHub_ThinCallerNotFound(t *testing.T) {
 	}
 }
 
-func TestFetchRemoteScaffold_GitHub_VendoredTrue(t *testing.T) {
+func TestFetchRemoteScaffold_GitHub_VendoredRendersLocalRefs(t *testing.T) {
 	fc := forge.NewFakeClient()
 	ref := "v0.42.0"
 	sha := "abcdef1234567890abcdef1234567890abcdef12"
@@ -146,7 +146,7 @@ func TestFetchRemoteScaffold_GitHub_VendoredTrue(t *testing.T) {
 	}
 }
 
-func TestFetchRemoteScaffold_GitHub_VendoredFalse(t *testing.T) {
+func TestFetchRemoteScaffold_GitHub_NonVendoredRendersCrossRepoRefs(t *testing.T) {
 	fc := forge.NewFakeClient()
 	ref := "v0.42.0"
 	sha := "abcdef1234567890abcdef1234567890abcdef12"
