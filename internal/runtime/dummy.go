@@ -108,7 +108,7 @@ func (r DummyRuntime) Bootstrap(input BootstrapInput) error {
 	mkdirCmd := fmt.Sprintf("mkdir -p %s/output %s/.dummy", sandbox.SandboxWorkspace, sandbox.SandboxWorkspace)
 	_, stderr, exitCode, err := r.execFn()(sandboxName, mkdirCmd, 10*time.Second)
 	if err != nil {
-		return err
+		return fmt.Errorf("bootstrap exec: %w", err)
 	}
 	if exitCode != 0 {
 		return fmt.Errorf("bootstrap: exited %d: %s", exitCode, strings.TrimSpace(stderr))
@@ -152,7 +152,7 @@ func (r DummyRuntime) ClearIterationArtifacts(sandboxName string) error {
 	clearCmd := fmt.Sprintf("rm -rf %s/output/*", r.WorkspaceDir())
 	_, stderr, exitCode, err := r.execFn()(sandboxName, clearCmd, 10*time.Second)
 	if err != nil {
-		return err
+		return fmt.Errorf("clear iteration artifacts exec: %w", err)
 	}
 	if exitCode != 0 {
 		return fmt.Errorf("clear iteration artifacts: exited %d: %s", exitCode, strings.TrimSpace(stderr))
