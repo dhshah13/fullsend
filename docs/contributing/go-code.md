@@ -192,6 +192,60 @@ This applies to all `require` functions (`require.NoError`, `require.Equal`, `re
 
 Stubs that implement an interface with no-ops or stateless pass-throughs hold no mutable state, so the race detector has nothing to detect. Even stubs that use `atomic.Int64` counters are invisible to `-race` because atomics are correctly synchronized by definition. The point of a race test is to exercise the **real type's fields** — only a real constructor backed by a thread-safe fake can trigger the detector on unsynchronized production code.
 
+## Concurrent error handling
+
+When goroutines fan out to perform **independent** operations that can each
+fail on their own (e.g., a `sync.WaitGroup` + `go func` loop creating
+providers), collect **every** failure and surface them together with
+`errors.Join`. Do not keep a single error variable (e.g., `firstErr`) that
+discards all failures after the first — that forces the user into
+fix-and-rerun cycles: they fix the one error shown, rerun, and only then
+discover the next.
+
+The canonical pattern — a mutex-guarded `[]error` accumulated across
+goroutines and joined after `wg.Wait()` — is in `internal/cli/run.go`
+(provider fan-out):
+
+```go
+var (
+    mu   sync.Mutex
+    wg   sync.WaitGroup
+    errs []error
+)
+for _, pd := range allDefs {
+    wg.Add(1)
+    go func(pd harness.ProviderDef) {
+        defer wg.Done()
+        if err := sandbox.EnsureProvider(ctx, /* … */); err != nil {
+            mu.Lock()
+            errs = append(errs, fmt.Errorf("ensuring provider %q: %w", pd.Name, err))
+            mu.Unlock()
+            return
+        }
+    }(pd)
+}
+wg.Wait()
+if err := errors.Join(errs...); err != nil {
+    return err
+}
+```
+
+The `sync.Mutex` is the idiom used here; writing each goroutine's result into
+its own pre-sized slice slot (one index per goroutine, no lock) is equally
+acceptable. The requirement is that no failure is dropped — not the specific
+synchronization mechanism.
+
+**This applies only to independent fan-out.** When goroutines are *not*
+independent — you deliberately want the first failure to cancel the rest
+(e.g., an `errgroup.Group` sharing a `context.Context`) — fail-fast is
+correct and must not be forced into error collection.
+
+**When reviewing PRs:** Flag a fan-out that captures only the first error (a
+single `firstErr`/`err` variable, or break-on-first) across independent
+goroutines as a **medium-severity** finding, and recommend collecting a
+`[]error` and returning `errors.Join`. Do not flag intentional fail-fast
+cancellation patterns.
+
 ## Context-aware blocking
 
 Functions that accept `context.Context` must not use `time.Sleep` or other
