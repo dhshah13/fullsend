@@ -937,6 +937,9 @@ func TestParseClaudeStreamToolResultNonTextContent(t *testing.T) {
 	if results[0].Result != "" {
 		t.Errorf("expected empty result for non-text content, got %q", results[0].Result)
 	}
+	if !results[0].Partial {
+		t.Errorf("undecodable content was skipped; Partial must be true")
+	}
 }
 
 func TestParseClaudeStreamToolResultIsError(t *testing.T) {
@@ -1568,6 +1571,21 @@ func TestParseClaudeStreamMalformedResultFallsBackToTokensEvent(t *testing.T) {
 	}
 	if last.CacheWrite != 50 {
 		t.Errorf("expected 50 cache write tokens, got %d", last.CacheWrite)
+	}
+}
+
+func TestParseClaudeStream_AssistantLineServerToolUseProducesNoEvent(t *testing.T) {
+	// The live path (no --include-partial-messages): a server_tool_use block
+	// on an assistant line is not a client tool call — no event, no part,
+	// not counted — while the tool_use beside it is reported with its id.
+	input := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"server_tool_use","id":"srvtoolu_01","name":"web_search","input":{"query":"otel"}},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"/x"}}]}}`
+	events := collectEvents(t, input)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly one event (the client tool_use), got %d: %+v", len(events), events)
+	}
+	use, ok := events[0].(ToolUseEvent)
+	if !ok || use.ID != "toolu_01" || use.Name != "Read" {
+		t.Fatalf("expected the client tool_use with its id, got %+v", events[0])
 	}
 }
 
