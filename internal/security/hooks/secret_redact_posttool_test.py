@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import re
+import string
 import subprocess
 import sys
 import unittest
@@ -400,6 +401,205 @@ class TestVerifyRound(unittest.TestCase):
         page = f'{{"NextToken": "{next_token}", "ContinuationToken": "{continuation}"}}'
         _, stdout, _ = run_hook(page)
         self.assertEqual(stdout, "")
+
+
+class TestRepeatedPrefixInput(unittest.TestCase):
+    """The bare-JWT pattern must scan hostile output in linear time. Under
+    Claude Code the hook has 30 s and fails open: a stall passes the tool
+    output through unredacted. pi (60 s) and codex (25 s) fail closed and
+    withhold the result instead. Unanchored, every ``eyJ`` in a dot-free
+    run was a match start and the greedy segment backtracked each time —
+    quadratic, ~4 s at 120 KB and minutes at 1 MB. Anchored, a token must
+    start within five characters of a non-token character or of the
+    output's start, so each alternative fires at one fixed offset from the
+    start of a token run and a run is scanned at most twice, however long
+    it is."""
+
+    TOKEN_CHARS = string.ascii_letters + string.digits + "_-"
+    # Every printable character outside the alphabet, then a dozen that are
+    # not printable or not ASCII: NUL, ESC, DEL, NEL, NBSP, a zero-width, an
+    # em and an ideographic space, a BOM, and accented, sharp-s and CJK
+    # letters — the boundaries a Unicode class would swallow.
+    NON_TOKEN_CHARS = [c for c in string.printable if not re.fullmatch("[A-Za-z0-9_-]", c)] + list(
+        "\x00\x1b\x7f\x85\xa0\u200b\u2003\u3000\ufeff\u00e9\u00df\u4ee4"
+    )
+
+    # Segments concatenated so the fixtures do not trip gitleaks.
+    JWT = (
+        "eyJhbGciOiJSUzI1NiJ9"
+        + "."
+        + "eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        + "."
+        + "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    )
+    # A realistic token: a kid of `??` puts a `_` in the header, a name
+    # with ` ?~` in it puts one in the payload, and the signature carries
+    # both `-` and `_`.
+    LONG_JWT = (
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6Ij8_In0"
+        + "."
+        + "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IueUsOS4reWkqumDjiA_fiIsImlhdCI6"
+        + "MTUxNjIzOTAyMiwic2NvcGUiOiJvcGVuaWQgZW1haWwifQ"
+        + "."
+        + "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    )
+    # The runner's own OIDC token is an order of magnitude longer than the
+    # fixtures above (a GitHub Actions one: 136 / 1452 / 342), with `-` and
+    # `_` possible in every segment.
+    OIDC_SIZED = "eyJ" + "h-_" * 44 + "h" + "." + "eyJ" + "p_-" * 483 + "." + "s-_" * 114
+    # The shortest shape the pattern accepts: `eyJ` plus ten characters,
+    # then ten per segment. And every token character in every segment.
+    MIN_JWT = "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10
+    FULL_ALPHABET_JWT = "eyJ" + TOKEN_CHARS + "." + TOKEN_CHARS + "." + TOKEN_CHARS
+
+    def test_jwt_pattern_scans_repeated_prefix_runs_linearly(self):
+        import time
+
+        import secret_redact_posttool as sr
+
+        masked = sr.mask_token(self.JWT)
+        # ~200 KB per run, ~10 s unanchored and ~30 ms anchored: a bare run,
+        # one behind every character of the token alphabet (a character
+        # dropped from it turns that flood quadratic), a run of five (the
+        # anchor's reach), one behind every character outside the alphabet
+        # that the class lists (a first-segment class widened by any of them
+        # turns that flood quadratic, or swallows it), and the delimiters
+        # that end in a token character — a
+        # diff's removed line, the same inside a JSON string, JSON escapes,
+        # a percent-encoded byte once and twice. Then 1.2 MB, the size the
+        # review cited. The trailing token pins that the run was scanned,
+        # not skipped; the exact text, that the mask is whole. The time
+        # bound is outside the subtest so one stall ends the test instead
+        # of every run after it.
+        heads = ["", "aaaaa", *self.TOKEN_CHARS, *self.NON_TOKEN_CHARS]
+        heads += ["\n-", "\\n-", "\\n", "\\u0022", "%3D", "%253D"]
+        runs = [(head + "eyJ") * (200_000 // (len(head) + 3)) for head in heads]
+        runs.append("eyJ" * 400_000)
+        for run in runs:
+            start = time.perf_counter()
+            text, findings = sr.redact_text(f"{run} {self.JWT}\n")
+            elapsed = time.perf_counter() - start
+            self.assertLess(
+                elapsed, 2.0, f"{elapsed:.1f}s for a {len(run) // 1024} KB run of {run[:8]!r}"
+            )
+            with self.subTest(head=run[:8], kb=len(run) // 1024):
+                self.assertEqual(text, f"{run} {masked}\n")
+                self.assertEqual([f["pattern"] for f in findings], ["jwt"])
+
+    def test_jwt_masks_after_any_boundary_within_reach(self):
+        import secret_redact_posttool as sr
+
+        masked = sr.mask_token(self.JWT)
+        # Every character outside the token alphabet that the class lists,
+        # five token characters before it so a widened alphabet shows, and
+        # again with one token character after it so it is pinned as a
+        # boundary; every offset from one to five after the output's start
+        # and after a boundary; then shapes seen in tool output — plain
+        # boundaries in context (a header word, an assignment, a dotted
+        # prefix, a tab, a comma) and the delimiters that are token
+        # characters or end in one: a diff's removed line (LF, CRLF,
+        # combined `--` and `+-`,
+        # word-diff `[-`, mail-quoted `>-`, and `\n-` inside a JSON string),
+        # JSON escapes including `\u0022`, a percent-encoded byte (upper,
+        # lower, double), a glued short flag, a non-ASCII character or a
+        # dash after one, mid-line. The whole token masks, and no finding
+        # carries it.
+        prefixes = ["abcde" + c for c in self.NON_TOKEN_CHARS]
+        prefixes += ["x" + c + "a" for c in self.NON_TOKEN_CHARS]
+        prefixes += ["a" * n for n in range(1, 6)]
+        prefixes += ["x!" + "a" * n for n in range(1, 6)]
+        prefixes += [
+            "Bearer ",
+            "token=",
+            "a.",
+            "x\n-",
+            "x\r\n-",
+            " --",
+            "+-",
+            "[-",
+            ">-",
+            '{"patch":"@@\\n-',
+            '"a\\t',
+            '"a\\r',
+            '{"a":"\\u0022',
+            "id_token%3D",
+            "%3d",
+            "id_token%253D",
+            " -p",
+            "abcdeé",
+            "abcde令牌",
+            "xé-",
+            "alice\t",
+            "alice,",
+        ]
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                text, findings = sr.redact_text(f"{prefix}{self.JWT}\n")
+                self.assertEqual(text, f"{prefix}{masked}\n")
+                self.assertEqual([f["pattern"] for f in findings], ["jwt"])
+                self.assertNotIn(self.JWT, json.dumps(findings))
+        # Beyond the reach there is no boundary to anchor on: the stated
+        # drop. A ghs_…_eyJ wrap among those masks whole as
+        # github_server_token (test_ghs_wrapped_jwt_fully_redacted).
+        for prefix in ("a" * 6, "x!" + "a" * 6, " prefix_"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    sr.redact_text(f"{prefix}{self.JWT}\n"), (f"{prefix}{self.JWT}\n", [])
+                )
+
+    def test_jwt_segments_stop_at_every_non_token_character(self):
+        import secret_redact_posttool as sr
+
+        # Each segment's class is the token alphabet exactly: a character
+        # outside it inside the header or the payload breaks the token
+        # (nothing masks), and after the signature ends it (the mask stops
+        # there). A widened class would match, or swallow, the rest.
+        header, payload, signature = self.JWT.split(".")
+        masked = sr.mask_token(self.JWT)
+        for c in self.NON_TOKEN_CHARS:
+            with self.subTest(c=c):
+                split_header = f"{header[:8]}{c}{header[8:]}.{payload}.{signature}\n"
+                self.assertEqual(sr.redact_text(split_header), (split_header, []))
+                split_payload = f"{header}.{payload[:5]}{c}{payload[5:]}.{signature}\n"
+                self.assertEqual(sr.redact_text(split_payload), (split_payload, []))
+                text, findings = sr.redact_text(f"{self.JWT}{c}{'x' * 10}.{'y' * 10}\n")
+                self.assertEqual(text, f"{masked}{c}{'x' * 10}.{'y' * 10}\n")
+                self.assertEqual([f["pattern"] for f in findings], ["jwt"])
+
+    def test_jwt_of_realistic_shape_and_size_masks_whole(self):
+        import secret_redact_posttool as sr
+
+        for token in (self.MIN_JWT, self.FULL_ALPHABET_JWT, self.LONG_JWT, self.OIDC_SIZED):
+            with self.subTest(length=len(token)):
+                text, findings = sr.redact_text(f"curl output: {token}\n")
+                self.assertEqual(text, f"curl output: {sr.mask_token(token)}\n")
+                self.assertEqual([f["pattern"] for f in findings], ["jwt"])
+
+    def test_jwt_masks_every_copy_and_every_distinct_token(self):
+        import secret_redact_posttool as sr
+
+        # A glued copy of a token that also appears anchored masks with it,
+        # and a second, distinct token in the same output is its own
+        # finding — the replace pass must keep both when it is reworked.
+        text, findings = sr.redact_text(
+            f"curl: {self.JWT}\nprefix_{self.JWT}\nid {self.LONG_JWT}\n"
+        )
+        self.assertEqual(
+            text,
+            f"curl: {sr.mask_token(self.JWT)}\nprefix_{sr.mask_token(self.JWT)}\n"
+            f"id {sr.mask_token(self.LONG_JWT)}\n",
+        )
+        self.assertEqual([f["pattern"] for f in findings], ["jwt", "jwt"])
+
+    def test_skip_leaves_later_patterns_running(self):
+        import secret_redact_posttool as sr
+
+        # The skip is per pattern: a Read inside the checkout skips the
+        # bare-JWT shape and nothing after it in the list.
+        token = "hf_" + "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+        text, findings = sr.redact_text(f"{token} {self.JWT}\n", skip=frozenset({"jwt"}))
+        self.assertEqual([f["pattern"] for f in findings], ["hf_token"])
+        self.assertIn(self.JWT, text)
 
 
 class TestBareJwtToolScope(unittest.TestCase):

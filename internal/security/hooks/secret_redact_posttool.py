@@ -27,6 +27,15 @@ FINDINGS_PATH = "/sandbox/workspace/.security/findings.jsonl"
 
 # --- Known secret prefix patterns ---
 
+# The bare-JWT pattern's start anchor: within five characters of a
+# non-token character or of the output's start — see the "jwt" entry.
+_TOKEN_CHAR = "[A-Za-z0-9_-]"
+_NOT_TOKEN_CHAR = f"[^{_TOKEN_CHAR[1:-1]}]"
+_JWT_START = "|".join(
+    [f"(?<!{_TOKEN_CHAR})"]
+    + [f"(?<={edge}{_TOKEN_CHAR}{{{n}}})" for n in range(1, 6) for edge in ("^", _NOT_TOKEN_CHAR)]
+)
+
 _PREFIX_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("openai_key", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}")),
     # Before github_pat: dots in the class cover the 2026 JWT-wrapped
@@ -55,8 +64,31 @@ _PREFIX_PATTERNS: list[tuple[str, re.Pattern]] = [
     # Bare three-segment JWTs (and OIDC/WIF STS tokens) carry no
     # surrounding context for the structural patterns to anchor on; the
     # Go side of this shape is likewise in #6603, not on main. Skipped for
-    # file content inside the checkout — see content_skips.
-    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+    # file content inside the checkout — see content_skips. The start
+    # anchor keeps the scan linear: unanchored, every `eyJ` in a dot-free
+    # run was a match start and the greedy segment backtracked each time —
+    # quadratic, ~4 s at 120 KB and minutes at 1 MB. Under Claude Code the
+    # hook has 30 s and fails open, so a stall passes the output through
+    # unredacted; pi (60 s) and codex (25 s) fail closed and withhold the
+    # result. Anchored, a token must start within five characters of a
+    # non-token character or of the output's start, which reaches the
+    # delimiters that are themselves token characters or end in one: a
+    # diff's removed line (`-`, `--`, and `\n-` inside a JSON string), a
+    # JSON escape (`\n`, `\u0022`), a percent-encoded byte (`%3D`, `%253D`),
+    # a glued short flag (` -p`). Each alternative fires at one fixed
+    # offset from the start of a token run, so a run is scanned at most
+    # twice however long it is. What drops is a token glued to six or more
+    # token characters mid-line (` prefix_eyJ…`); the ghs_…_eyJ wrap among
+    # those masks whole as github_server_token above. Go's RE2 is linear
+    # without any of this (and has no lookbehind), so #6603's pattern
+    # stays unanchored.
+    (
+        "jwt",
+        re.compile(
+            f"(?:{_JWT_START})"
+            r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+        ),
+    ),
     ("aws_sts_key", re.compile(r"ASIA[A-Z0-9]{16}")),
     ("hf_token", re.compile(r"hf_[A-Za-z0-9]{20,}")),
     ("npm_token", re.compile(r"npm_[A-Za-z0-9]{36}")),
