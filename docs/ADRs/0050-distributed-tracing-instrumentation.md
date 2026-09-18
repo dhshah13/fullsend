@@ -178,3 +178,14 @@ codex emit no call ids — becomes an `execute_tool` child of its iteration's
 `agent` span, up to 1,024 per iteration, metadata only; the message record
 on the `agent` span stays the content carrier. Sub-agent nesting (deferred item 1 above)
 remains deferred.
+
+**2026-09-18 — Level 3 input message and tool arguments ([ADR 0108](0108-tool-call-span-topology.md)):**
+under the content gate, a retry iteration that carries validation feedback
+records the prompt the runner composed as `gen_ai.input.messages`, and
+`tool_call` parts on the message record carry the call's arguments — Claude
+Code today ([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)).
+The rest of the model's input is not recorded. The fixed default prompt
+that all other iterations send is a constant that carries no task and is left
+out by choice; the requests the runtime builds from the agent definition and
+the conversation are not visible to fullsend, which reads the runtime's
+stream, not its API requests. The gate and the carrier are unchanged.
