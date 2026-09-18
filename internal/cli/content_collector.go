@@ -38,7 +38,11 @@ import (
 const maxContentBytes = 256 * 1024
 
 // maxEncodedContentBytes bounds gen_ai.output.messages as exported — the
-// JSON string the backend receives, syntax and escaping included. It sits
+// JSON string the backend receives, syntax and escaping included. On a
+// retry that records gen_ai.input.messages, attachInput charges that
+// attribute's encoded size against it first, so the output gets what the
+// input left and the two together stay under it; the input itself is cut
+// upstream (maxFeedbackBytes), not here. It sits
 // just under the one size the pilot backend is proven to accept (see
 // maxContentBytes), so no record is ever larger than the proof. The raw
 // budget runs first; on live streams a budget-binding record encodes 9 to
@@ -123,6 +127,50 @@ func attachContent(span trace.Span, res contentResult) {
 	if len(attrs) > 0 {
 		span.SetAttributes(attrs...)
 	}
+}
+
+// attachInput records the prompt the runner composed for this iteration
+// as gen_ai.input.messages: one user message with one text part. Only a
+// retry under feedback_mode: append composes a prompt; otherwise prompt
+// is empty and nothing is recorded, as with a nil collector (gate off).
+//
+// The recorded copy goes through the same redaction as output content.
+// redactFeedback already scanned the feedback, before it was sanitized,
+// cut and framed; when neither sanitizing nor the pipeline's folding
+// changes the text, the pattern scan here repeats that one. Sanitizing can
+// join a token that scan saw split by a zero-width character, and folding
+// can spell out one it saw in fullwidth; then this scan is the first to
+// see it whole.
+// It masks the recorded copy only — the agent is sent the prompt as
+// composed — and it does not repeat redactFeedback's literal pass over
+// runner-env values. The mask that first scan leaves for a
+// connection-string password of ten or more bytes ("abcd...") matches its
+// own pattern again, so such a prompt counts a finding here; a shorter
+// password is masked "***", which does not.
+// The pipeline also folds compatibility characters the agent received
+// unfolded. Findings join the iteration's and surface through Result.
+//
+// The prompt is cut upstream (maxFeedbackBytes), not here. Folding can
+// grow the copy about elevenfold, so its encoded size is charged to
+// maxEncoded: the two content attributes of one span together stay
+// within the size maxEncodedContentBytes is proven for.
+func (c *contentCollector) attachInput(span trace.Span, prompt string) {
+	if c == nil {
+		return
+	}
+	text := c.redact(prompt, &c.findings)
+	if text == "" {
+		return
+	}
+	raw, err := json.Marshal([]struct {
+		Role  string        `json:"role"`
+		Parts []contentPart `json:"parts"`
+	}{{"user", []contentPart{{Type: "text", Content: text}}}})
+	if err != nil {
+		return // strings marshal unconditionally
+	}
+	c.maxEncoded -= len(raw)
+	span.SetAttributes(stringAttr("gen_ai.input.messages", string(raw)))
 }
 
 // contentPart is one part of the assembled assistant output message,
@@ -442,7 +490,7 @@ func bulkField(p *contentPart) *string {
 // failed. Redaction runs before the size budget: truncating first could
 // split a secret so the redactor no longer recognizes it.
 func (c *contentCollector) Result(finishReason string) contentResult {
-	if c == nil || len(c.parts) == 0 {
+	if c == nil {
 		return contentResult{}
 	}
 

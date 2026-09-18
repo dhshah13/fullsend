@@ -2319,6 +2319,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		// tool-span tracker is per iteration for the same reason and is not
 		// gated: execute_tool spans are metadata.
 		collector := newContentCollectorIfEnabled()
+		collector.attachInput(agentSpan, agentPrompt)
 		toolSpans := newToolSpanTracker(tracer, agentCtx)
 		var metrics agentruntime.RunMetrics
 		hooksSettings := ""

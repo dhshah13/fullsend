@@ -1396,7 +1396,10 @@ func TestContentCapture_EndToEndFileSink(t *testing.T) {
 	big := strings.Repeat("all work and no play makes claude a dull agent. ", 400) // ~19KB > 8192
 	c.Handle(agentruntime.TextEvent{Text: big})
 
+	prompt, _ := buildFeedbackPrompt(strings.Repeat("the validator said no. ", 500)) // cut at 10 KiB > 8192
+
 	_, span := tracer.Start(context.Background(), "agent")
+	c.attachInput(span, prompt)
 	res := c.Result("stop")
 	attachContent(span, res)
 	span.End()
@@ -1406,6 +1409,14 @@ func TestContentCapture_EndToEndFileSink(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, raw)
 	content := string(raw)
+	require.Greater(t, len(prompt), telemetry.MaxSpanAttrValueLen)
+	promptJSON, err := json.Marshal(prompt)
+	require.NoError(t, err)
+	escapedInput, err := json.Marshal(`[{"role":"user","parts":[{"type":"text","content":` + string(promptJSON) + `}]}]`)
+	require.NoError(t, err)
+	require.Contains(t, content, "gen_ai.input.messages")
+	assert.Contains(t, content, string(escapedInput[1:len(escapedInput)-1]),
+		"the input record must appear byte-intact in the file sink")
 	require.Contains(t, content, "gen_ai.output.messages")
 	assert.Contains(t, content, "dull agent",
 		"content must reach the file sink")
@@ -1440,12 +1451,15 @@ func TestContentCapture_GateOffProducesNoContent(t *testing.T) {
 	c.Handle(agentruntime.TextEvent{Text: "would-be content"}) // nil-safe no-op
 
 	_, span := tracer.Start(context.Background(), "agent")
+	c.attachInput(span, "would-be prompt") // nil-safe no-op
 	attachContent(span, c.Result("stop"))
 	span.End()
 	cleanup(context.Background())
 
 	raw, err := os.ReadFile(filepath.Join(dir, telemetry.TelemetryFile))
 	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "gen_ai.input.messages")
+	assert.NotContains(t, string(raw), "would-be prompt")
 	assert.NotContains(t, string(raw), "gen_ai.output.messages")
 	assert.NotContains(t, string(raw), "would-be content")
 	assert.NotContains(t, string(raw), "fullsend.content.")

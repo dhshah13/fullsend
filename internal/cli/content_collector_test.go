@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	agentruntime "github.com/fullsend-ai/fullsend/internal/runtime"
 )
@@ -1093,4 +1095,66 @@ func TestTailToRuneBoundary(t *testing.T) {
 		"cut landing on a rune start keeps the full tail")
 	assert.Equal(t, "fgh", tailToRuneBoundary("abcdéfgh", 4),
 		"cut landing mid-rune walks forward, never splitting the rune")
+}
+
+// recordedInput runs attachInput on a recorded agent span and returns the
+// attributes the span ended with.
+func recordedInput(t *testing.T, c *contentCollector, prompt string) map[attribute.Key]attribute.Value {
+	t.Helper()
+	_, rec, span := toolSpanFixture(t)
+	c.attachInput(span, prompt)
+	span.End()
+	ended := rec.Ended()
+	require.Len(t, ended, 1)
+	return toolSpanAttrs(tracetest.SpanStubFromReadOnlySpan(ended[0]))
+}
+
+func TestAttachInput_RecordsTheRetryPromptAsOneUserMessage(t *testing.T) {
+	prompt, _ := buildFeedbackPrompt("lint: main.go:3 unused variable <x>")
+	attrs := recordedInput(t, newContentCollector(maxContentBytes), prompt)
+
+	var msgs []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(attrs["gen_ai.input.messages"].AsString()), &msgs))
+	require.Len(t, msgs, 1)
+	assert.Equal(t, map[string]any{
+		"role":  "user",
+		"parts": []any{map[string]any{"type": "text", "content": prompt}},
+	}, msgs[0], "an input message carries role and parts; finish_reason belongs to output messages")
+	assert.Len(t, attrs, 1)
+}
+
+func TestAttachInput_NoPromptOrNoCollectorAddsNothing(t *testing.T) {
+	assert.Empty(t, recordedInput(t, newContentCollector(maxContentBytes), ""),
+		"no composed prompt (the first iteration, or feedback_mode off)")
+	assert.Empty(t, recordedInput(t, nil, "would-be prompt"), "gate off")
+}
+
+func TestAttachInput_RedactsAndCountsFindings(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("k", 36)
+	c := newContentCollector(maxContentBytes)
+	in := recordedInput(t, c, "token "+secret+" leaked")["gen_ai.input.messages"].AsString()
+
+	assert.NotContains(t, in, secret)
+	assert.Contains(t, in, "leaked")
+	// A retry can fail before the agent emits anything; the input's
+	// findings still have to reach the span.
+	assert.NotEmpty(t, c.Result("error").Findings)
+}
+
+func TestAttachInput_WorstCaseFeedbackSharesTheEncodedCeiling(t *testing.T) {
+	// U+FDFA has the largest NFKC expansion in Unicode (3 bytes to 33) and
+	// redaction folds it, so the recorded copy of a 10 KiB feedback is an
+	// order of magnitude larger than the prompt the agent was sent.
+	prompt, _ := buildFeedbackPrompt(strings.Repeat("\uFDFA", maxFeedbackBytes))
+	c := newContentCollector(maxContentBytes)
+	in := recordedInput(t, c, prompt)["gen_ai.input.messages"].AsString()
+	require.Greater(t, len(in), 10*maxFeedbackBytes, "fixture must expand for this test to prove anything")
+
+	c.Handle(agentruntime.TextEvent{Text: strings.Repeat("<", maxContentBytes)}) // encodes sixfold
+	out := c.Result("stop").OutputMessages
+	require.NotEmpty(t, out)
+	assert.LessOrEqual(t, len(in)+len(out), maxEncodedContentBytes,
+		"both attributes ride one span; together they stay within the proven size")
+	assert.Greater(t, len(in)+len(out), maxEncodedContentBytes-100,
+		"the output keeps everything the input left")
 }
