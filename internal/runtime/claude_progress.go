@@ -293,9 +293,10 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 			case "content_block_stop":
 				if currentToolName != "" {
 					onEvent(ToolUseEvent{
-						ID:      currentToolID,
-						Name:    currentToolName,
-						Summary: extractSafeContext(currentToolName, json.RawMessage(toolInputJSON.String())),
+						ID:        currentToolID,
+						Name:      currentToolName,
+						Summary:   extractSafeContext(currentToolName, json.RawMessage(toolInputJSON.String())),
+						Arguments: toolInputJSON.String(),
 					})
 					currentToolName = ""
 					currentToolID = ""
@@ -424,9 +425,10 @@ func parseClaudeStream(r io.Reader, onEvent func(AgentEvent)) error {
 					}
 				case "tool_use":
 					onEvent(ToolUseEvent{
-						ID:      item.ID,
-						Name:    item.Name,
-						Summary: extractSafeContext(item.Name, item.Input),
+						ID:        item.ID,
+						Name:      item.Name,
+						Summary:   extractSafeContext(item.Name, item.Input),
+						Arguments: string(item.Input),
 					})
 				}
 			}

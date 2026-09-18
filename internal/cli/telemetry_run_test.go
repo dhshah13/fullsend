@@ -1394,6 +1394,7 @@ func TestContentCapture_EndToEndFileSink(t *testing.T) {
 	c := newContentCollectorIfEnabled()
 	require.NotNil(t, c)
 	big := strings.Repeat("all work and no play makes claude a dull agent. ", 400) // ~19KB > 8192
+	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "Bash", Arguments: `{"command":"make lint"}`})
 	c.Handle(agentruntime.TextEvent{Text: big})
 
 	prompt, _ := buildFeedbackPrompt(strings.Repeat("the validator said no. ", 500)) // cut at 10 KiB > 8192
@@ -1420,6 +1421,7 @@ func TestContentCapture_EndToEndFileSink(t *testing.T) {
 	require.Contains(t, content, "gen_ai.output.messages")
 	assert.Contains(t, content, "dull agent",
 		"content must reach the file sink")
+	assert.Contains(t, res.OutputMessages, `"arguments":{"command":"make lint"}`)
 	// The whole redacted content must survive — no SDK truncation at 8192.
 	var decoded []map[string]any
 	require.NoError(t, json.Unmarshal([]byte(res.OutputMessages), &decoded),
@@ -1450,14 +1452,20 @@ func TestContentCapture_GateOffProducesNoContent(t *testing.T) {
 	require.Nil(t, c, "gate off must mean no collector")
 	c.Handle(agentruntime.TextEvent{Text: "would-be content"}) // nil-safe no-op
 
-	_, span := tracer.Start(context.Background(), "agent")
+	ctx, span := tracer.Start(context.Background(), "agent")
 	c.attachInput(span, "would-be prompt") // nil-safe no-op
+	handle := iterationEventHandler(func(agentruntime.AgentEvent) {}, c, newToolSpanTracker(tracer, ctx))
+	handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "Bash", Arguments: `{"command":"would-be arguments"}`})
+	handle(agentruntime.ToolResultEvent{ID: "toolu_01", Result: "would-be result"})
 	attachContent(span, c.Result("stop"))
 	span.End()
 	cleanup(context.Background())
 
 	raw, err := os.ReadFile(filepath.Join(dir, telemetry.TelemetryFile))
 	require.NoError(t, err)
+	assert.Contains(t, string(raw), "execute_tool Bash", "the tool span is metadata")
+	assert.NotContains(t, string(raw), "would-be arguments")
+	assert.NotContains(t, string(raw), "would-be result")
 	assert.NotContains(t, string(raw), "gen_ai.input.messages")
 	assert.NotContains(t, string(raw), "would-be prompt")
 	assert.NotContains(t, string(raw), "gen_ai.output.messages")
