@@ -3439,8 +3439,9 @@ func redactFeedback(feedback string, runnerEnv map[string]string) string {
 	return feedback
 }
 
-// replaceEnvSecrets is the literal pass: every value of a sensitive runner
-// env key that occurs in text becomes [REDACTED:<key>]. It returns the keys
+// replaceEnvSecrets is the literal pass: the value of each sensitive runner
+// env key, when it holds minRedactableSecretLen bytes or more and occurs in
+// text, becomes [REDACTED:<key>]. It returns the keys
 // it replaced. Longer values go first, then key order: a value that
 // contains another is replaced whole, and the text is the same on every run.
 func replaceEnvSecrets(text string, runnerEnv map[string]string) (string, []string) {

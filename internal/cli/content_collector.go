@@ -82,7 +82,9 @@ const maxToolResultBytes = 8 * 1024
 
 // maxToolArgumentsBytes bounds one tool call's arguments, measured on
 // their redacted encoding. Arguments over it are dropped whole, not cut:
-// a cut object is not JSON, and the part keeps its id, name and summary.
+// a cut object is not JSON, and the part keeps its id, name and summary
+// (not the summary when redaction found a secret in the arguments; see
+// Handle).
 // Like maxToolResultBytes it exists because the total above is small;
 // what blocks raising it is the same unproven backend ceiling named on
 // maxContentBytes.
@@ -166,8 +168,9 @@ func attachContent(span trace.Span, res contentResult) {
 // can spell out one it saw in fullwidth; then this scan is the first to
 // see it whole.
 // It masks the recorded copy only — the agent is sent the prompt as
-// composed — and it does not repeat redactFeedback's literal pass over
-// runner-env values. The mask that first scan leaves for a
+// composed. redact repeats redactFeedback's literal pass over runner env
+// values, once more after the fold, which can spell out a value that pass
+// saw in compatibility forms. The mask that first scan leaves for a
 // connection-string password of ten or more bytes ("abcd...") matches its
 // own pattern again, so such a prompt counts a finding here; a shorter
 // password is masked "***", which does not.
@@ -334,10 +337,10 @@ type contentResult struct {
 	// replaced), or as
 	// redacted text when they were not one JSON value.
 	DroppedBytes int
-	// Truncated reports whether the budget cut or dropped anything, a kept
-	// tool call's arguments were dropped (toolArguments; its part is
-	// marked), or a kept tool result was a parser-side fragment (its part
-	// is marked).
+	// Truncated reports whether the budget cut or dropped anything, a tool
+	// call's arguments were dropped (toolArguments, or Result when the name
+	// redacted away; a kept part is marked), or a kept tool result was a
+	// parser-side fragment (its part is marked).
 	Truncated bool
 	// Findings are the security findings raised during redaction.
 	Findings []security.Finding
@@ -404,7 +407,15 @@ func (c *contentCollector) Handle(evt agentruntime.AgentEvent) {
 			// The schema requires a name on a tool_call part. Arguments
 			// alone must not keep a nameless call, nor charge for one that
 			// appendPart then refuses.
+			scanned := len(c.findings)
 			p.Arguments, p.Truncated = c.toolArguments(e.Arguments)
+			if slices.ContainsFunc(c.findings[scanned:], func(f security.Finding) bool { return f.Scanner != "unicode_normalizer" }) {
+				// The parser cut the summary out of these arguments
+				// before anything scanned it, so a secret found in them
+				// can be in the summary as a beginning that neither the
+				// literal pass nor a pattern matches.
+				p.Summary = ""
+			}
 		}
 		c.appendPart(p)
 	case agentruntime.ToolResultEvent:
@@ -707,8 +718,8 @@ func encodedTail(s string, allow int) string {
 	return tailToRuneBoundary(s, len(s)-start)
 }
 
-// redact runs text through the output pipeline, returning the sanitized
-// form and accumulating findings. ScanResult.Sanitized is empty when
+// redact runs text through the runner env literal pass and the output
+// pipeline, returning the sanitized form and accumulating findings. ScanResult.Sanitized is empty when
 // nothing changed — but also when sanitization removed everything (an
 // all-invisible-bytes input), so an empty Sanitized WITH findings means
 // fully redacted, not unchanged.
@@ -716,14 +727,20 @@ func (c *contentCollector) redact(text string, findings *[]security.Finding) str
 	if text == "" {
 		return text
 	}
-	text, keys := replaceEnvSecrets(text, c.runnerEnv)
-	for _, key := range keys {
-		*findings = append(*findings, security.Finding{Scanner: "runner_env", Name: key, Severity: "critical", Position: -1})
-	}
+	// The literal pass runs on both sides of the pipeline. Ahead of it, on
+	// the text as the stream wrote it, so a pattern does not mask part of
+	// a value and keep its first bytes. After it, because the normalizer
+	// joins a value the stream split with an invisible character or
+	// spelled in compatibility forms. Not covered: a value written that way
+	// which a pattern also recognises — in an assignment, an auth header, a
+	// secret-named field or a connection string, or by its own prefix — is
+	// masked by that pattern, which shows what its mask shows; and a value
+	// the normalizer itself rewrites is matched only as the env has it.
+	text = c.replaceEnv(text, findings)
 	scanned := c.pipeline.Scan(text)
 	*findings = append(*findings, scanned.Findings...)
 	if scanned.Sanitized != "" {
-		return scanned.Sanitized
+		return c.replaceEnv(scanned.Sanitized, findings)
 	}
 	if len(scanned.Findings) > 0 {
 		return ""
@@ -739,8 +756,8 @@ func (c *contentCollector) redact(text string, findings *[]security.Finding) str
 // JSON they miss an assignment that opens a string or follows an escaped
 // newline, a value behind escaped quotes, and JSON nested in a string, and
 // Unicode folding can turn a fullwidth quotation mark into one that closes
-// the string. So the value is decoded, each string and object key is
-// redacted on its own (redactValue), and the result is encoded again —
+// the string. So the value is decoded, each string, number and object key
+// is redacted on its own (redactValue), and the result is encoded again —
 // key order, spacing and escapes are the encoder's, not the wire's.
 //
 // Text that is not one JSON value (see ToolUseEvent.Arguments) cannot be
@@ -777,7 +794,8 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 	return out, false
 }
 
-// redactValue redacts every string and object key under v. A pattern
+// redactValue redacts every string, number and object key under v; a
+// number that redacts becomes the redacted string. A pattern
 // keyed on a member name ("password": "...") cannot see the pair that
 // way, so each string member is scanned once more, already redacted,
 // beside its redacted key (secretNamed) and masked whole on a match.
@@ -789,6 +807,12 @@ func (c *contentCollector) redactValue(v any, collided *bool) any {
 	switch t := v.(type) {
 	case string:
 		return c.redact(t, &c.findings)
+	case json.Number:
+		// Digits can be a credential too; a number that redacts is
+		// recorded as the redacted string.
+		if s := c.redact(t.String(), &c.findings); s != t.String() {
+			return s
+		}
 	case []any:
 		for i := range t {
 			t[i] = c.redactValue(t[i], collided)
@@ -833,6 +857,16 @@ func (c *contentCollector) secretNamed(key, value string) bool {
 		}
 	}
 	return false
+}
+
+// replaceEnv is redact's literal pass (replaceEnvSecrets over runnerEnv),
+// with one finding for each key it replaced.
+func (c *contentCollector) replaceEnv(text string, findings *[]security.Finding) string {
+	text, keys := replaceEnvSecrets(text, c.runnerEnv)
+	for _, key := range keys {
+		*findings = append(*findings, security.Finding{Scanner: "runner_env", Name: key, Severity: "critical", Position: -1})
+	}
+	return text
 }
 
 // redactID scans a part id like every other stream-derived string; on
