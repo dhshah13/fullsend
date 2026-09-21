@@ -184,8 +184,6 @@ under the content gate, a retry iteration that carries validation feedback
 records the prompt the runner composed as `gen_ai.input.messages`, and
 `tool_call` parts on the message record carry the call's arguments — Claude
 Code today ([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)).
-The rest of the model's input is not recorded. The fixed default prompt
-that all other iterations send is a constant that carries no task and is left
-out by choice; the requests the runtime builds from the agent definition and
-the conversation are not visible to fullsend, which reads the runtime's
-stream, not its API requests. The gate and the carrier are unchanged.
+The rest of the model's input is not recorded
+([reference](../guides/infrastructure/distributed-tracing.md#content-capture-level-3)).
+The gate and the carrier are unchanged.

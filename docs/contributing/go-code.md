@@ -471,7 +471,9 @@ function in `internal/cli/run.go` is the canonical implementation.
    `_SECRET`, `_PASSWORD`, `_KEY`, `_CREDENTIALS`) with
    `[REDACTED:<key>]`. Skip values shorter than
    `minRedactableSecretLen` (currently 8) — short values like `"main"`
-   or `"true"` cause false-positive mangling.
+   or `"true"` cause false-positive mangling. `replaceEnvSecrets` is that
+   pass: it takes longer values first, so a value that contains another
+   is replaced whole.
 
 2. **Apply `security.SecretRedactor` as a second-pass fallback.**
    The `RunnerEnv` scan only catches credentials the harness declared.

@@ -126,11 +126,8 @@ convention bump.
 
 **2026-09-18 — Tool arguments on the message record:** the Decision's "full
 arguments next" is in place up to a per-call bound: `tool_call` parts on the
-`agent` span's `gen_ai.output.messages` record carry the call's arguments —
-decoded, redacted and re-encoded, not the wire text — where the runtime's
-stream provides them, Claude Code today. Arguments over 8 KiB re-encoded, not
-a complete JSON value, or with two keys of one object that redact to the same
-string, are dropped whole and the part marked `fullsend.truncated`; kept
-arguments count toward the record's total bound
-([reference](../guides/infrastructure/distributed-tracing.md#content-capture-level-3)).
+`agent` span's `gen_ai.output.messages` record carry the call's redacted
+arguments where the runtime's stream provides them, Claude Code today. The
+bound and the drop rules are in the
+[reference](../guides/infrastructure/distributed-tracing.md#content-capture-level-3).
 `execute_tool` spans still carry metadata only.

@@ -169,8 +169,8 @@ an id — pi and codex emit none — produce no span, so the child count can be
 below `fullsend.tool_calls`, which counts every reported call, id or not; a
 `server_tool_use` block on an `assistant` line produces no event at all (its
 result never arrives as a `tool_result`), so it appears in neither count. The name passes through `security.OutputPipeline()`
-— Unicode normalization, then secret redaction, the same pipeline as span
-content — and is bounded to 256 bytes before it becomes the attribute; the
+— Unicode normalization, then secret redaction, the pipeline span content
+gets, without the collector's runner env literal pass — and is bounded to 256 bytes before it becomes the attribute; the
 span name keeps at most 128 bytes of it. The call id is scanned through the
 same pipeline and dropped from the span on any finding — never substituted,
 since a masked id could collide with another call's — while the raw bounded
@@ -208,8 +208,8 @@ results to `tool_call_response` parts (only the Claude parser emits
 codex emit none of them,
 [#7414](https://github.com/fullsend-ai/fullsend/issues/7414); the schema's
 required result field is `response`), redacts every
-part — `replaceEnvSecrets` for the values of sensitive `runner_env` keys,
-then `security.OutputPipeline()` — at assembly (redaction runs
+part — `security.OutputPipeline()`, with `replaceEnvSecrets` for the values
+of sensitive runner env keys on both sides of it — at assembly (redaction runs
 before the size budget — truncating first could split a secret past
 recognition), enforces a 256 KiB ordered-suffix budget (the ending survives — the
 final answer is what consumers judge) plus an 8 KiB per-tool-result
@@ -241,15 +241,17 @@ assignment that opens a string or follows an escaped newline, a value
 behind escaped quotes, and JSON nested in a string; Unicode folding can
 also turn a fullwidth quotation mark into one that closes the string.
 `toolArguments` decodes the value, redacts each string and object key on
-its own, and encodes the result again. Each string member is also scanned
+its own (a number as its digits; one that redacts becomes the redacted
+string), and encodes the result again. Each string member is also scanned
 once more, already redacted, beside its key, and masked whole when the
 member-name pattern (`json_field`) matches — a pattern keyed on a member
 name has no other way to see the pair; that scan's other findings are
 discarded, since both strings were already scanned. It runs the pattern
 stage alone: the normalizer is not idempotent over escape sequences, and a
 second pass over the pair could strip the value or the key's keyword. It reaches string
-members only: a secret-named member holding an array, object or number is
-redacted string by string, as it would be in text. Arguments that are not
+members only — a number that redacted is one by then: a
+secret-named member holding an array, an object or any other number is
+redacted leaf by leaf, as it would be in text. Arguments that are not
 one JSON value cannot be walked that way: they are scanned as text — with
 the misses above — so their findings count, then dropped and charged. So
 are arguments in which two keys of one object redact to the same string,
@@ -278,10 +280,12 @@ stay within the proven size.
 `run-telemetry.jsonl`): parse the `gen_ai.output.messages` attribute as
 JSON; check `fullsend.content.truncated` / `fullsend.content.dropped_bytes`
 before treating content as complete; masked secrets appear as the
-redactor's mask tokens and are counted in `fullsend.content.redactions`.
+redactor's mask tokens, or as `[REDACTED:<key>]` for a runner env value,
+and are counted in `fullsend.content.redactions`.
 A `tool_call` part's `arguments`, when present, is a JSON value (an object
 for the tools seen so far); a `tool_call` part marked `fullsend.truncated`
-had arguments that were dropped. `gen_ai.input.messages` is absent unless
+had arguments that were dropped whole — on that part type the marker
+never means a partial value, as it does on a tool result. `gen_ai.input.messages` is absent unless
 the iteration is a retry that carried validation feedback — absence is
 the normal case, not a gap. Masks `redactFeedback` left in the feedback
 (`abcd...`, `***`, `[REDACTED:<ENV_KEY>]`) are in `gen_ai.input.messages`
