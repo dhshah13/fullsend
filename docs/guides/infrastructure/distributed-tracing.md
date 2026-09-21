@@ -77,7 +77,10 @@ console renders, redacts it through the security output pipeline, and
 attaches it to the per-iteration `agent` span. The one input it records,
 a retry's validation-feedback prompt, is composed by the runner — fixed
 framing around the previous iteration's validation output — rather than
-read from the stream, and goes through the same redaction. The agent runtime's own
+read from the stream, and goes through the same redaction. Before the
+pipeline runs, the value of every sensitive `runner_env` key (8 bytes or
+longer) is replaced with `[REDACTED:<key>]`, as it is in validation
+feedback; each replacement counts as a redaction. The agent runtime's own
 content-logging variables (`OTEL_LOG_USER_PROMPTS`,
 `OTEL_LOG_ASSISTANT_RESPONSES`, etc.) are never set.
 

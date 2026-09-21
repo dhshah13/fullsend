@@ -97,9 +97,15 @@ const maxToolArgumentsBytes = 8 * 1024
 // newContentCollectorIfEnabled returns a live collector when the Level 3
 // gate is on and nil otherwise — nil is the off state and is inert at
 // every call site, so the gate needs no second check.
-func newContentCollectorIfEnabled() *contentCollector {
+//
+// runnerEnv is the harness runner environment. The sandbox is not meant to
+// hold its credentials, but the record leaves the runner, so their values
+// get the same literal pass redactFeedback gives script output.
+func newContentCollectorIfEnabled(runnerEnv map[string]string) *contentCollector {
 	if telemetry.ContentCaptureEnabled() {
-		return newContentCollector(maxContentBytes)
+		c := newContentCollector(maxContentBytes)
+		c.runnerEnv = runnerEnv
+		return c
 	}
 	return nil
 }
@@ -353,8 +359,10 @@ type contentCollector struct {
 	pipeline   *security.Pipeline
 	// secrets is the pipeline's pattern stage alone, for secretNamed.
 	secrets *security.SecretRedactor
-	parts   []contentPart
-	total   int
+	// runnerEnv feeds redact's literal pass; see newContentCollectorIfEnabled.
+	runnerEnv map[string]string
+	parts     []contentPart
+	total     int
 	// evicted counts bytes discarded before Result's budget runs: old
 	// parts and a lone oversized part's head (evictOverflow), the head a
 	// tool result loses to maxToolResultBytes, and dropped tool arguments
@@ -708,6 +716,10 @@ func (c *contentCollector) redact(text string, findings *[]security.Finding) str
 	if text == "" {
 		return text
 	}
+	text, keys := replaceEnvSecrets(text, c.runnerEnv)
+	for _, key := range keys {
+		*findings = append(*findings, security.Finding{Scanner: "runner_env", Name: key, Severity: "critical", Position: -1})
+	}
 	scanned := c.pipeline.Scan(text)
 	*findings = append(*findings, scanned.Findings...)
 	if scanned.Sanitized != "" {
@@ -827,12 +839,9 @@ func (c *contentCollector) secretNamed(key, value string) bool {
 // any finding the id is dropped entirely — a substituted id could
 // falsely collide with another call's.
 func (c *contentCollector) redactID(id string, findings *[]security.Finding) string {
-	if id == "" {
-		return id
-	}
-	scanned := c.pipeline.Scan(id)
-	*findings = append(*findings, scanned.Findings...)
-	if len(scanned.Findings) > 0 {
+	before := len(*findings)
+	c.redact(id, findings)
+	if len(*findings) > before {
 		return ""
 	}
 	return id

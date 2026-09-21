@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2318,7 +2321,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		// later spans. Nil when the Level 3 gate is off; nil is inert. The
 		// tool-span tracker is per iteration for the same reason and is not
 		// gated: execute_tool spans are metadata.
-		collector := newContentCollectorIfEnabled()
+		collector := newContentCollectorIfEnabled(h.RunnerEnv)
 		collector.attachInput(agentSpan, agentPrompt)
 		toolSpans := newToolSpanTracker(tracer, agentCtx)
 		var metrics agentruntime.RunMetrics
@@ -3427,18 +3430,32 @@ const minRedactableSecretLen = 8
 // never passed through our env (a key baked into a fixture, a hook printing
 // its own).
 func redactFeedback(feedback string, runnerEnv map[string]string) string {
-	for key, value := range runnerEnv {
-		if len(value) < minRedactableSecretLen || !sensitiveEnvKey(key) {
-			continue
-		}
-		feedback = strings.ReplaceAll(feedback, value, "[REDACTED:"+key+"]")
-	}
+	feedback, _ = replaceEnvSecrets(feedback, runnerEnv)
 	// ScanResult.Sanitized is empty when the scanner changed nothing, so the
 	// original text is the fallback — not an empty prompt.
 	if res := security.NewSecretRedactor().Scan(feedback); res.Sanitized != "" {
 		return res.Sanitized
 	}
 	return feedback
+}
+
+// replaceEnvSecrets is the literal pass: every value of a sensitive runner
+// env key that occurs in text becomes [REDACTED:<key>]. It returns the keys
+// it replaced. Longer values go first, then key order: a value that
+// contains another is replaced whole, and the text is the same on every run.
+func replaceEnvSecrets(text string, runnerEnv map[string]string) (string, []string) {
+	var replaced []string
+	for _, key := range slices.SortedFunc(maps.Keys(runnerEnv), func(a, b string) int {
+		return cmp.Or(cmp.Compare(len(runnerEnv[b]), len(runnerEnv[a])), cmp.Compare(a, b))
+	}) {
+		value := runnerEnv[key]
+		if len(value) < minRedactableSecretLen || !sensitiveEnvKey(key) || !strings.Contains(text, value) {
+			continue
+		}
+		text = strings.ReplaceAll(text, value, "[REDACTED:"+key+"]")
+		replaced = append(replaced, key)
+	}
+	return text, replaced
 }
 
 // writeValidationFeedback writes the validation failure output to a file in

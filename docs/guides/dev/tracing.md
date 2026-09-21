@@ -208,7 +208,8 @@ results to `tool_call_response` parts (only the Claude parser emits
 codex emit none of them,
 [#7414](https://github.com/fullsend-ai/fullsend/issues/7414); the schema's
 required result field is `response`), redacts every
-part through `security.OutputPipeline()` at assembly (redaction runs
+part — `replaceEnvSecrets` for the values of sensitive `runner_env` keys,
+then `security.OutputPipeline()` — at assembly (redaction runs
 before the size budget — truncating first could split a secret past
 recognition), enforces a 256 KiB ordered-suffix budget (the ending survives — the
 final answer is what consumers judge) plus an 8 KiB per-tool-result

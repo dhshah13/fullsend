@@ -1368,10 +1368,10 @@ func TestIterationEventHandler_TeesToRendererAndCollector(t *testing.T) {
 
 func TestNewContentCollectorIfEnabled_FollowsGate(t *testing.T) {
 	t.Setenv(telemetry.ContentCaptureEnvVar, "")
-	assert.Nil(t, newContentCollectorIfEnabled(), "gate off => nil collector")
+	assert.Nil(t, newContentCollectorIfEnabled(nil), "gate off => nil collector")
 
 	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
-	assert.NotNil(t, newContentCollectorIfEnabled(), "gate on => live collector")
+	assert.NotNil(t, newContentCollectorIfEnabled(nil), "gate on => live collector")
 }
 
 // TestContentCapture_EndToEndFileSink drives the REAL telemetry.Setup —
@@ -1391,7 +1391,7 @@ func TestContentCapture_EndToEndFileSink(t *testing.T) {
 	dir := t.TempDir()
 	tracer, cleanup := telemetry.Setup(dir, "test")
 
-	c := newContentCollectorIfEnabled()
+	c := newContentCollectorIfEnabled(nil)
 	require.NotNil(t, c)
 	big := strings.Repeat("all work and no play makes claude a dull agent. ", 400) // ~19KB > 8192
 	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "Bash", Arguments: `{"command":"make lint"}`})
@@ -1448,7 +1448,7 @@ func TestContentCapture_GateOffProducesNoContent(t *testing.T) {
 	dir := t.TempDir()
 	tracer, cleanup := telemetry.Setup(dir, "test")
 
-	c := newContentCollectorIfEnabled()
+	c := newContentCollectorIfEnabled(nil)
 	require.Nil(t, c, "gate off must mean no collector")
 	c.Handle(agentruntime.TextEvent{Text: "would-be content"}) // nil-safe no-op
 

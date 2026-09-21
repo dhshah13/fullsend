@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	agentruntime "github.com/fullsend-ai/fullsend/internal/runtime"
+	"github.com/fullsend-ai/fullsend/internal/telemetry"
 )
 
 // decodeOutputMessages unmarshals a collector's OutputMessages JSON and
@@ -207,6 +208,26 @@ func TestContentCollector_NamelessCallCarriesNoArgumentsAndNoCharge(t *testing.T
 			assert.Equal(t, contentResult{}, c.Result("stop"))
 		})
 	}
+}
+
+func TestContentCollector_ReplacesRunnerEnvSecretValues(t *testing.T) {
+	// No prefix and no shape a pattern knows: only the literal pass sees it.
+	const secret = "runner-only-opaque-value"
+	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
+	c := newContentCollectorIfEnabled(map[string]string{
+		"PUSH_TOKEN": secret,
+		"BRANCH":     "feature-branch-name", // not a sensitive key
+		"API_KEY":    "short",               // under minRedactableSecretLen
+	})
+	c.Handle(agentruntime.TextEvent{Text: "pushing " + secret + " to feature-branch-name, short"})
+	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "Bash", Arguments: `{"command":"git push https://x:` + secret + `@host/repo"}`})
+	c.Handle(agentruntime.ToolResultEvent{ID: "toolu_" + secret, Result: "remote: " + secret})
+
+	res := c.Result("stop")
+	assert.NotContains(t, res.OutputMessages, secret)
+	assert.Equal(t, 3, strings.Count(res.OutputMessages, "[REDACTED:PUSH_TOKEN]"), "an id is dropped, not rewritten")
+	assert.Contains(t, res.OutputMessages, "to feature-branch-name, short")
+	assert.Len(t, res.Findings, 4, "one finding per replaced key per scanned string")
 }
 
 func TestContentCollector_ANameRedactedAwayTakesItsArgumentsAlong(t *testing.T) {
