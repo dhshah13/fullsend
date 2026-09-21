@@ -557,10 +557,13 @@ func (c *contentCollector) Result(finishReason string) contentResult {
 			p.Response = c.redact(p.Response, &res.Findings)
 		}
 		p.Name = c.redact(p.Name, &res.Findings)
-		if p.Name == "" {
-			// As in Handle, for a name that redacts to nothing. Arguments
-			// Handle had already dropped stay charged and marked.
-			p.Arguments = nil
+		if p.Name == "" && p.Arguments != nil {
+			// As in Handle, for a name that redacts to nothing — but these
+			// arguments were accepted, so losing them is charged and
+			// marked. Ones Handle had already dropped stay as they were.
+			res.DroppedBytes += len(p.Arguments)
+			res.Truncated = true
+			p.Arguments, p.Truncated = nil, true
 		}
 		p.Summary = c.redact(p.Summary, &res.Findings)
 		p.ID = c.redactID(p.ID, &res.Findings)

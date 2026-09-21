@@ -210,12 +210,27 @@ func TestContentCollector_NamelessCallCarriesNoArgumentsAndNoCharge(t *testing.T
 }
 
 func TestContentCollector_ANameRedactedAwayTakesItsArgumentsAlong(t *testing.T) {
+	const args = `{"a":1}`
 	c := newContentCollector(4096)
-	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "\u200B", Arguments: `{"a":1}`})
+	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "\u200B", Arguments: args})
 
 	res := c.Result("stop")
 	assert.Empty(t, res.OutputMessages, "a tool_call part needs a name")
 	assert.Len(t, res.Findings, 1)
+	assert.True(t, res.Truncated)
+	assert.Equal(t, len(args), res.DroppedBytes)
+}
+
+func TestContentCollector_ANameRedactedAwayMarksTheCallItsSummaryKeeps(t *testing.T) {
+	const args = `{"command":"ls"}`
+	c := newContentCollector(4096)
+	c.Handle(agentruntime.ToolUseEvent{Name: "\u200B", Summary: "ls", Arguments: args})
+
+	res := c.Result("stop")
+	assert.Contains(t, res.OutputMessages, `"summary":"ls","fullsend.truncated":true`)
+	assert.NotContains(t, res.OutputMessages, "arguments")
+	assert.True(t, res.Truncated)
+	assert.Equal(t, len(args), res.DroppedBytes)
 }
 
 func TestContentCollector_DroppedBytesCountArgumentsOnEveryDropPath(t *testing.T) {

@@ -254,7 +254,10 @@ the misses above — so their findings count, then dropped and charged. So
 are arguments in which two keys of one object redact to the same string,
 where keeping either member would misreport the call. A call the stream
 reports without a name carries no arguments. This happens once, when the
-event is handled; eviction and `Result` do not rescan it.
+event is handled; eviction and `Result` do not rescan it. A name that
+redacts to nothing at `Result` takes the arguments with it: they are
+charged to the dropped bytes, and the part — kept only when it has a
+summary — is marked.
 
 The input message does not come from the stream. When `runAgent` composes
 a retry prompt (`buildFeedbackPrompt`, under `feedback_mode: append`),
