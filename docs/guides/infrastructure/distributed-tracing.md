@@ -158,7 +158,9 @@ whole — a cut object is not JSON — and the marked `tool_call` part keeps
 its `id`, name and summary — not the summary when redaction found a
 secret in the arguments. Arguments also go, charged and marked, when
 the call's name redacts to nothing; that part survives only if it has a
-summary. The input message is not cut at this stage:
+summary. So `fullsend.truncated` means different things by part type: on a
+tool result, part of the response is kept; on a tool call, none of the
+arguments is. Read it together with the part's `type`. The input message is not cut at this stage:
 the validation output inside it is cut at 10 KiB when the prompt is
 composed (the prompt then says `[truncated]`), and the two markers above
 do not describe it. The recorded copy is the redacted one, so it can
