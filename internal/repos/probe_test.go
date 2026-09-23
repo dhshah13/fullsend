@@ -191,7 +191,13 @@ func TestProbeComponents_SecretCheckError(t *testing.T) {
 
 func TestProbeComponents_GitLab_SkipsThinCallers(t *testing.T) {
 	fc := forge.NewFakeClient()
+	fc.VariableValues["acme/api/"+forge.VarGitLabRoleMigration] = "enforced"
 	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("include:")
+	trustScript, err := scaffold.GitLabPerRepoFile(gitlabTrustScriptPath)
+	if err != nil {
+		t.Fatalf("GitLabPerRepoFile() error = %v", err)
+	}
+	fc.FileContents["acme/api/"+gitlabTrustScriptPath] = trustScript
 	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
 	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
 	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
@@ -216,6 +222,9 @@ func TestProbeComponents_GitLab_SkipsThinCallers(t *testing.T) {
 		if c.Name == "thin-caller:"+scaffold.PerRepoThinCallerPaths()[0] {
 			t.Error("GitLab should not check thin callers")
 		}
+		if c.Name == "secret:"+forge.SecretForgeToken {
+			t.Error("enforced GitLab role migration must not require the shared credential")
+		}
 	}
 
 	if !AllMatch(components) {
@@ -225,6 +234,25 @@ func TestProbeComponents_GitLab_SkipsThinCallers(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestProbeComponents_GitLab_MissingTrustScript(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("include:")
+
+	components, err := ProbeComponents(context.Background(), fc, "acme", "api", ForgeGitLab, GitLabForgeConfig(), nil)
+	if err != nil {
+		t.Fatalf("ProbeComponents() error = %v", err)
+	}
+	for _, c := range components {
+		if c.Name == "scaffold:"+gitlabTrustScriptPath {
+			if c.Present || c.Match {
+				t.Fatalf("missing trust script component = %+v", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing trust script component not found: %+v", components)
 }
 
 func TestProbeComponents_GitLab_MissingSchedules(t *testing.T) {

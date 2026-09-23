@@ -781,6 +781,11 @@ func TestCheckInstallComponents_GitLab_MissingSecrets(t *testing.T) {
 func TestCheckInstallComponents_GitLab_FullyInstalled(t *testing.T) {
 	fc := forge.NewFakeClient()
 	fc.FileContents["acme/api/.gitlab/ci/fullsend-dispatch.yml"] = []byte("include:")
+	trustScript, err := scaffold.GitLabPerRepoFile(gitlabTrustScriptPath)
+	if err != nil {
+		t.Fatalf("GitLabPerRepoFile() error = %v", err)
+	}
+	fc.FileContents["acme/api/"+gitlabTrustScriptPath] = trustScript
 	fc.VariableValues["acme/api/"+forge.VarLastPollAtFast] = "2026-01-01T00:00:00Z"
 	fc.VariableValues["acme/api/"+forge.VarLastPollAtFull] = "2026-01-01T00:00:00Z"
 	fc.VariableValues["acme/api/"+forge.VarLabelState] = "{}"
@@ -1007,6 +1012,18 @@ func TestRequiredSecretsForForge(t *testing.T) {
 	secrets := requiredSecretsForForge(ForgeGitHub)
 	if len(secrets) == 0 {
 		t.Fatal("expected non-empty required secrets")
+	}
+	if got := requiredSecretsForForgeMode(ForgeGitLab, "enforced", true); len(got) != len(requiredSecrets) {
+		t.Errorf("enforced GitLab mode should omit the shared credential, got %v", got)
+	}
+	if got := requiredSecretsForForgeMode(ForgeGitLab, "migrating", true); len(got) != len(requiredSecrets)+1 {
+		t.Errorf("migrating GitLab mode should require the shared credential, got %v", got)
+	}
+	if got := requiredSecretsForForgeMode(ForgeGitLab, " EnFoRcEd ", true); len(got) != len(requiredSecrets) {
+		t.Errorf("normalized enforced GitLab mode should omit the shared credential, got %v", got)
+	}
+	if got := requiredSecretsForForgeMode(ForgeGitLab, "unknown", true); len(got) != len(requiredSecrets) {
+		t.Errorf("unknown GitLab mode should not require the shared credential, got %v", got)
 	}
 }
 
