@@ -59,11 +59,11 @@ const (
 	SecretForgeToken = "FULLSEND_FORGE_TOKEN"
 
 	// Optional GitLab role credentials (docs/contributing/gitlab-role-credentials.md).
-	// These are not required on existing installations. Probe/converge must
-	// not treat their absence as health drift while migration mode is
-	// disabled. Built-in names are fixed; custom roles derive
-	// FULLSEND_GITLAB_ROLE_<NAME>_TOKEN. Provisioning is #7498; job
-	// routing is #7499 (`internal/gitlabroles.Select`).
+	// These are not required on leftover shared-token installations.
+	// Probe/converge must not treat their absence as health drift while
+	// the gate is leftover disabled or rollback. Built-in names are fixed;
+	// custom roles derive FULLSEND_GITLAB_ROLE_<NAME>_TOKEN. Provisioning
+	// is #7498; job routing is #7499 (`internal/gitlabroles.Select`).
 	SecretGitLabPollerToken  = "FULLSEND_GITLAB_POLLER_TOKEN"
 	SecretGitLabAnalystToken = "FULLSEND_GITLAB_ANALYST_TOKEN"
 	SecretGitLabCoderToken   = "FULLSEND_GITLAB_CODER_TOKEN"
@@ -100,10 +100,12 @@ const (
 	VarPollMode       = "FULLSEND_POLL_MODE"
 	VarGitLabBotToken = "FULLSEND_GITLAB_BOT_TOKEN"
 
-	// VarGitLabRoleMigration is the explicit role-credential migration
-	// and rollback gate. Absent or empty means disabled: jobs use only
-	// FULLSEND_FORGE_TOKEN. Valid values: disabled, migrating, rollback,
-	// enforced. See internal/gitlabroles.
+	// VarGitLabRoleMigration is the GitLab role-identity gate. Absent or
+	// empty means disabled: leftover shared-token jobs use only
+	// FULLSEND_FORGE_TOKEN until ordinary repos install converges them.
+	// Operator-settable values are enforced and rollback. Leftover
+	// disabled and migrating values remain parseable. See
+	// internal/gitlabroles.
 	VarGitLabRoleMigration = "FULLSEND_GITLAB_ROLE_MIGRATION"
 
 	// VarGitLabRoleRegistry is the administrator-controlled GitLab role
@@ -859,6 +861,19 @@ type Client interface {
 	// expose branch-protection queries.
 	IsProtectedBranch(ctx context.Context, owner, repo, branch string) (bool, error)
 
+	// GetProtectedBranch returns who may push or merge the given branch.
+	// A nil rule with a nil error means the branch is not protected.
+	// GitLab uses these access levels to decide who may create pipelines
+	// for the ref. GitHub returns ErrNotSupported.
+	GetProtectedBranch(ctx context.Context, owner, repo, branch string) (*ProtectedBranchRule, error)
+
+	// GrantProtectedBranchMergeUser grants userID merge access on a
+	// protected branch. Idempotent if the user already has merge or push
+	// access. Used on GitLab so a Developer-level poller can create
+	// pipelines without widening Developer-class merge policy. GitHub
+	// returns ErrNotSupported.
+	GrantProtectedBranchMergeUser(ctx context.Context, owner, repo, branch string, userID int) error
+
 	// Pipeline schedules and branch-restricted CI variables live on
 	// the base Client because both GitHub Actions and GitLab CI support
 	// timed triggers. However, the branch-restricted/protected variable
@@ -879,6 +894,10 @@ type Client interface {
 	CreatePipelineSchedule(ctx context.Context, owner, repo, ref, description, cron string, variables map[string]string) (int64, error)
 	DeletePipelineSchedule(ctx context.Context, owner, repo string, scheduleID int64) error
 	ListPipelineSchedules(ctx context.Context, owner, repo string) ([]PipelineSchedule, error)
+	// UpdatePipelineSchedule sets whether an existing pipeline schedule is
+	// active. Used to reactivate required GitLab schedules that exist but
+	// were disabled. GitHub returns ErrNotSupported.
+	UpdatePipelineSchedule(ctx context.Context, owner, repo string, scheduleID int64, active bool) error
 
 	// CI/CD branch-restricted variables (distinct from RepoVariable methods).
 	// UpdateCIVariable upserts a CI/CD variable (update if exists, create if not).
@@ -901,6 +920,25 @@ type Pipeline struct {
 	WebURL string
 }
 
+// ProtectedBranchAccess is one grant on a protected branch.
+// A role-based grant has AccessLevel set and UserID/GroupID zero.
+// A user or group grant has the corresponding ID set.
+// GitLab access levels: 0 (No one), 30 (Developer), 40 (Maintainer),
+// 60 (Admin). A role-based grant of N allows identities at N or above.
+type ProtectedBranchAccess struct {
+	AccessLevel int
+	UserID      int
+	GroupID     int
+}
+
+// ProtectedBranchRule is the protection configuration for a branch.
+// A nil value from GetProtectedBranch means the branch is not protected.
+type ProtectedBranchRule struct {
+	Name              string
+	PushAccessLevels  []ProtectedBranchAccess
+	MergeAccessLevels []ProtectedBranchAccess
+}
+
 // PipelineSchedule represents a scheduled pipeline trigger.
 type PipelineSchedule struct {
 	ID           int64
@@ -910,6 +948,12 @@ type PipelineSchedule struct {
 	CronTimezone string
 	Active       bool
 	Variables    map[string]string // schedule-level pipeline variables
+}
+
+// OrgMembership is a user's membership in a GitHub organization.
+type OrgMembership struct {
+	State string // "active" or "pending"
+	Role  string // "admin" or "member"
 }
 
 // GitHubExtensions provides GitHub-specific operations that are not
@@ -931,4 +975,9 @@ type GitHubExtensions interface {
 	// error when GitHub only sends an invitation (the user is not an org
 	// member), because access does not start until it is accepted.
 	AddCollaborator(ctx context.Context, owner, repo, username, permission string) error
+
+	// GetOrgMembership returns username's membership in org.
+	// Returns forge.ErrNotFound when the user is not a member and has
+	// no pending invitation.
+	GetOrgMembership(ctx context.Context, org, username string) (OrgMembership, error)
 }

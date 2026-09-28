@@ -146,7 +146,14 @@ Accepted
 > cron-polling), originally rejected for sub-second MR review latency
 > that #7293 already gave up. `fullsend-dispatch.yml` is retained as a
 > version-marker carrier and is no longer included by the pipeline
-> wrapper. Superseded sections: the two-path Decision, the native-CI
+> wrapper.
+>
+> **Update (2026-09, #7707):** The leftover `fullsend-dispatch.yml` stub
+> is no longer scaffolded. The `# fullsend-ref:` version marker now lives
+> in `fullsend-pipeline.yml`. Status, probe, and upgrade still read a
+> leftover dispatch stub so already-enrolled repos keep reporting a ref;
+> converge deletes the stub and writes the marker onto the pipeline
+> wrapper. Uninstall still removes the file when it is present. Superseded sections: the two-path Decision, the native-CI
 > architecture-diagram line, and the #5556 auto_cancel note's "MR
 > pipelines / MR dispatch jobs are fast (<30s)" claim above — no MR
 > pipelines or dispatch jobs exist anymore. ("MR review latency is
@@ -301,10 +308,11 @@ Credentials:
 > roles) is specified in
 > [gitlab-role-credentials.md](../contributing/gitlab-role-credentials.md).
 > `repos install` can provision those credentials additively without
-> revoking `FULLSEND_FORGE_TOKEN`. Job routing (#7499) selects the
-> registered role credential when the migration gate is `migrating` or
-> `enforced`; this ADR's single-bot identity remains the default while
-> the gate is unset, `disabled`, or `rollback`.
+> revoking `FULLSEND_FORGE_TOKEN`. Job routing (#7499, #7559) selects the
+> registered role credential when the gate is `migrating` or `enforced`
+> and fails closed if that secret is missing; this ADR's single-bot
+> identity remains the leftover/`rollback` path while the gate is unset,
+> leftover `disabled`, or explicit `rollback`.
 
 ### Credential model
 
@@ -375,6 +383,17 @@ protected, masked CI/CD variable (`FULLSEND_FORGE_TOKEN`).
 > configuration must grant Developers merge (or push) access to the
 > default branch, or keep the bot PAT at Maintainer (40), for dispatch
 > to keep working.
+>
+> **Update (#7665):** `repos install` now grants the poller
+> project-access-token user merge access (not push) on the protected
+> default branch when Developer-class merge/push is absent, and fails
+> closed if that grant is not possible. `repos status` reports
+> `protected-ref-pipeline` drift if the access is later removed.
+>
+> **Update (#7667):** a failed `CreatePipeline` (including that 403) now
+> fails the poll cycle after persisting retry state. The permission gap
+> is unchanged; the poll job no longer reports success when no agent
+> pipeline was created.
 
 Key properties:
 
@@ -636,7 +655,7 @@ injection > insider > drift > supply chain):
 
 - `IsProtectedBranch` — maps to GitHub branch protection API and GitLab
   protected branches API
-- `CreatePipelineSchedule` / `DeletePipelineSchedule` — GitLab-native; GitHub
+- `CreatePipelineSchedule` / `DeletePipelineSchedule` / `UpdatePipelineSchedule` — GitLab-native; GitHub
   returns `ErrNotSupported`
 - `UpdateCIVariable` — for poll watermark management
   > **Update (2026-09, #7343):** Poll watermarks are no longer CI/CD

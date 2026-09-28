@@ -539,14 +539,15 @@ Modified packages (minimized via forge.Client abstraction):
 > (one PAT per agent). The current registered-role contract — built-in
 > Poller, Analyst, and Coder plus administrator-registered custom roles,
 > with `FULLSEND_GITLAB_*_TOKEN` identifiers, a trusted install-state
-> registry, and an explicit migration gate — is defined in
+> registry, and an explicit role-identity gate — is defined in
 > [gitlab-role-credentials.md](../contributing/gitlab-role-credentials.md).
 > `repos install` provisions built-in and custom role credentials on
 > fresh and existing shared-token installs and, when every registered
 > role is ready, cuts over to `enforced` mode and retires
-> `FULLSEND_FORGE_TOKEN` automatically. When the migration gate is
-> `migrating` or `enforced`, `fullsend poll` and `fullsend run` select
-> the registered role credential; disabled and rollback keep
+> `FULLSEND_FORGE_TOKEN` automatically. When the role-identity gate is
+> `migrating` or `enforced`, GitLab CI poll/agent jobs and `fullsend poll`
+> / `fullsend run` select the registered role credential and fail closed
+> if it is missing; leftover `disabled` and explicit `rollback` keep
 > `FULLSEND_FORGE_TOKEN`. Role registration is not accepted from
 > repository or merge-request content.
 
