@@ -102,7 +102,11 @@ func (r *EventRenderer) Handle(evt AgentEvent) {
 		}
 		r.printer.Header(label)
 		r.printer.KeyValue("Turns", fmt.Sprintf("%d", e.NumTurns))
-		r.printer.KeyValue("Cost", fmt.Sprintf("$%.4f", e.TotalCostUSD))
+		if e.CostUnavailable {
+			r.printer.KeyValue("Cost", "unavailable")
+		} else {
+			r.printer.KeyValue("Cost", fmt.Sprintf("$%.4f", e.TotalCostUSD))
+		}
 		if e.ReasoningTokens > 0 {
 			r.printer.KeyValue("Tokens", fmt.Sprintf(
 				"in=%d out=%d reasoning=%d cache_create=%d cache_read=%d",

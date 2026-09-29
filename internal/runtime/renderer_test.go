@@ -157,6 +157,15 @@ func TestRendererResultEvent(t *testing.T) {
 	}
 }
 
+func TestRendererResultEventCostUnavailable(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+	r.Handle(ResultEvent{CostUnavailable: true})
+	if output := buf.String(); !strings.Contains(output, "unavailable") || strings.Contains(output, "$0.0000") {
+		t.Errorf("unreported cost must not render as zero dollars: %s", output)
+	}
+}
+
 func TestRendererResultEventWithError(t *testing.T) {
 	var buf bytes.Buffer
 	r := newTestRenderer(&buf)

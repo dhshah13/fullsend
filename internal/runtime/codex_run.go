@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,6 +27,10 @@ const codexHooksMissingExit = 97
 // model call or replace the credential. Distinct from codexHooksMissingExit so
 // Run can name the actual cause.
 const codexConfigTamperedExit = 98
+
+// codexWriteProtectionExit is the Landlock launcher's sys.exit(78): no Landlock
+// ABI 3+, or a runner-held file changed before launch.
+const codexWriteProtectionExit = 78
 
 // codexBinaryVar holds the absolute path of the codex binary, resolved before
 // .env is sourced and marked read-only.
@@ -167,8 +172,8 @@ func codexBinaryPin() string {
 // codexAssetGuard is the POSIX sh fragment run before codex: the runner-owned
 // files must exist, and the two whose contents are fixed at compile time — the
 // hook adapter and the provider auth script — must be byte-identical to the
-// copies embedded in this binary. The config directory is agent-writable
-// between iterations, exactly as Claude Code's hooks.json and its scripts are.
+// copies embedded in this binary. Landlock protects the launched hierarchy;
+// these runner-held checks also detect external or pre-launch changes.
 //
 // `command -p` bypasses shell functions and uses the system default PATH, so
 // nothing left in the environment can stand in for sha256sum or cut; test, [
@@ -185,21 +190,8 @@ func codexAssetGuard(r CodexRuntime, hooksEnabled bool, digests codexRunnerHeldD
 			"test -f "+shellQuote(r.codexManifestPath()),
 			"test -f "+shellQuote(r.codexAdapterPath()),
 			codexSHACheck(r.codexAdapterPath(), codexAssetSHA256(codexHookAdapterPy)),
-			// The wiring is rendered per run, so it cannot be pinned by a
-			// compile-time hash. Instead every handler line must carry both the
-			// "command" key and this adapter's path, so the two counts are
-			// equal: replacing one handler's command with something else, or
-			// adding a handler of the agent's own, breaks the equality.
-			//
-			// What it does not catch is deletion — removing whole handlers
-			// keeps the counts equal and narrows the wiring. That residue is
-			// the same one Claude Code has with its own hooks.json, which is
-			// likewise written once at Bootstrap and agent-writable after.
-			codexHooksAdapterCheck(r.codexHooksPath(), r.codexAdapterPath()),
-			// Every script in the hooks directory must be one this binary
-			// installed: the scripts are agent-writable between iterations,
-			// and a tirith_check.py rewritten to exit 0 would disable a
-			// control while every other check still passed.
+			// Bind every installed script to its name, including against
+			// external changes before the protected native hierarchy starts.
 			codexHookScriptsGuard(r.codexHooksDir(), digests.HookScripts),
 		)
 	}
@@ -208,36 +200,8 @@ func codexAssetGuard(r CodexRuntime, hooksEnabled bool, digests codexRunnerHeldD
 		strings.Join(checks, " && "), codexHooksMissingExit)
 }
 
-// codexHooksAdapterCheck asserts that every command handler in hooks.json
-// still invokes adapter.
-//
-// This is **defense in depth, not the boundary**. On its own the count
-// comparison is bypassable — swap one handler's command and pad the adapter's
-// path into the free-form `description` field to restore parity. What actually
-// makes hooks.json tamper-evident is codexConfigGuard's whole-file digest,
-// a runner-held digest; this check survives as a cheap, readable
-// assertion that fails first and names the wiring rather than the file.
-//
-// The grouping braces are load-bearing: `&&` and `||` are left-associative in
-// sh, so an ungrouped alternation inside the guard's chain would rescue every
-// earlier failure and make the whole guard fail open.
-func codexHooksAdapterCheck(hooksPath, adapter string) string {
-	// `grep -o | wc -l` counts occurrences rather than matching lines: the
-	// runner writes one handler per line, but an agent rewriting the file is
-	// under no such obligation, and a compacted single-line hooks.json would
-	// make a line count collapse to 1 = 1 and pass.
-	count := func(pattern string) string {
-		return fmt.Sprintf(`$(command -p grep -o %s %s | command -p wc -l)`,
-			shellQuote(pattern), shellQuote(hooksPath))
-	}
-	// The key, with its colon: a bare `"command"` would also match the value
-	// in `"type": "command"` and double every handler's count.
-	return fmt.Sprintf(`[ "%s" = "%s" ]`, count(`"command":`), count(adapter))
-}
-
-func codexSHACheck(path, sum string) string {
-	return fmt.Sprintf(`[ "$(command -p sha256sum %s | command -p cut -d' ' -f1)" = %s ]`,
-		shellQuote(path), shellQuote(sum))
+func codexSHACheck(path, expected string) string {
+	return `[ "$(command -p sha256sum ` + shellQuote(path) + ` | command -p cut -d' ' -f1)" = ` + shellQuote(expected) + ` ]`
 }
 
 // codexConfigGuard is the POSIX sh fragment that fails closed when a
@@ -305,15 +269,13 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		"&& readonly "+codexPathVar+`="$PATH"`,
 		"&& "+codexAssetGuard(r, hooksEnabled, digests),
 		"&& "+codexConfigGuard(r, digests),
-		"&& "+r.OpenAIAuthSeed(),
 		"&& . "+shellQuote(envFile),
 		// .env is agent-writable; re-pin the runner-owned config location
 		// after it so a rewritten .env cannot move codex's home out from
 		// under the guards.
 		"&& "+strings.Join(r.EnvExports(), " && "),
-		// Restored for codex itself, and exported so the hook adapter can set
-		// it for its children from a value that never passed through .env —
-		// rather than trusting whatever PATH it happens to inherit.
+		// Keep the npm launcher's env-node interpreter, provider auth and hooks
+		// on the trusted base PATH. Writable helpers belong only in tool shells.
 		"&& export PATH=\"$"+codexPathVar+"\" && export "+codexPathVar,
 		"&& export "+codexRuntimeEnv+"=codex",
 		// NODE_* would load code into npm's codex launcher; PYTHON* would do
@@ -323,7 +285,10 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		// LD_* would load code into any dynamically linked binary the run
 		// starts — codex's own native binary, tirith, git — before its main
 		// runs, which no digest of ours would see.
-		"&& unset OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY NODE_OPTIONS NODE_PATH PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT",
+		// Native hooks invoke the image's shell non-interactively. Bash still
+		// sources BASH_ENV in that mode, so a planted startup script could exit
+		// before the mandatory guard even with allow_login_shell=false.
+		"&& unset OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY NODE_OPTIONS NODE_PATH PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT BASH_ENV ENV ZDOTDIR SHELL",
 		// `unset -f` is a special builtin, which a function .env defined
 		// cannot shadow, so it restores the real utilities before the second
 		// pass; `command -p` inside the guard defeats a PATH swap.
@@ -369,19 +334,21 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		"--skip-git-repo-check",
 		"--dangerously-bypass-approvals-and-sandbox",
 	)
-	if hooksEnabled {
-		// Unmanaged hooks otherwise run only when their recorded trusted_hash
-		// matches. fullsend's own SHA-256 guard above already vets the adapter
-		// the handlers invoke, and the alternative — baking a managed hook
-		// layer into /etc/codex at image build — would tie hook wiring to
-		// image releases (ADR 0099).
-		parts = append(parts, "--dangerously-bypass-hook-trust")
-	}
+	// Unmanaged hooks otherwise run only when their recorded trusted_hash
+	// matches. fullsend's own SHA-256 guard above already vets the adapter
+	// the handlers invoke, and the alternative — baking a managed hook
+	// layer into /etc/codex at image build — would tie hook wiring to
+	// image releases (ADR 0099).
+	parts = append(parts, "--dangerously-bypass-hook-trust")
 	parts = append(parts,
 		"-C "+shellQuote(params.RepoDir),
 		"--model "+shellQuote(model),
 		"-c "+shellQuote("model_provider="+codexProviderID),
 		"-c "+shellQuote("approval_policy=never"),
+		"-c "+shellQuote("allow_login_shell=false"),
+		// Codex applies this policy only to model tool subprocesses; native
+		// children inherit it. It does not alter launcher/auth/hook resolution.
+		`-c "shell_environment_policy.set.PATH=\"/sandbox/workspace/bin:/usr/local/go/bin:/sandbox/go/bin:$`+codexPathVar+`\""`,
 		"-c "+shellQuote("sandbox_mode=danger-full-access"),
 		// The endpoint and the credential command as SessionFlags too, so
 		// even an edit that somehow satisfied the digest guard could not move
@@ -411,6 +378,7 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 // into AgentEvents. codex exits 0 on a failed turn and on an interrupted one,
 // so the stream's verdict overrides the exit code, as it does for pi.
 func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printer, start time.Time, metrics *RunMetrics) (int, error) {
+	clearCodexTranscriptIdentities(params.SandboxName)
 	m, err := readCodexManifest(params.SandboxName, r.codexManifestPath())
 	if err != nil {
 		return -1, err
@@ -441,15 +409,10 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 	// legal on pi too, whose check distinguishes a nil groups array from an
 	// empty one for the same reason. A nil map means Bootstrap never ran the
 	// hooks path at all, which contradicts the runner's signal.
-	if hooksEnabled && digests.HookScripts == nil {
+	if hooksEnabled != (digests.HookScripts != nil) || digests.HooksJSON == "" {
 		return -1, fmt.Errorf(
-			"codex hook wiring is inconsistent: the runner expects hooks but Bootstrap recorded no hook-script digests; refusing to run rather than fall back to the weaker checks")
-	}
-	if hooksEnabled != (digests.HooksJSON != "") {
-		return -1, fmt.Errorf(
-			"codex hook wiring is inconsistent: the runner %s hooks but Bootstrap %s a hooks.json digest; refusing to run rather than fall back to the weaker checks",
-			map[bool]string{true: "expects", false: "does not expect"}[hooksEnabled],
-			map[bool]string{true: "recorded", false: "recorded no"}[digests.HooksJSON != ""])
+			"codex hook wiring is inconsistent: shared hooks enabled=%t, shared scripts recorded=%t, mandatory hooks.json recorded=%t; refusing to run",
+			hooksEnabled, digests.HookScripts != nil, digests.HooksJSON != "")
 	}
 	// The same fallback chain NeedsOpenAIProvider decides from, so the launch
 	// and the provider decision cannot disagree about which model this run
@@ -478,7 +441,7 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			sanitizeOutput(strings.Join(params.FallbackModels, ","))))
 	}
 
-	cmd := buildCodexRunCommand(params, modelID, effort, hooksEnabled, digests)
+	cmd := r.OpenAIAuthSeed() + " && " + codexProtectedCommand(buildCodexRunCommand(params, modelID, effort, hooksEnabled, digests), digests)
 
 	stdout, execCmd, cancel, err := sandbox.ExecStreamReader(ctx, params.SandboxName, cmd, params.Timeout, os.Stderr)
 	if err != nil {
@@ -522,14 +485,50 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 	var lastResult *ResultEvent
 	innerHandler := handler
 	handler = func(evt AgentEvent) {
+		applyCodexMetrics(metrics, evt)
 		if e, ok := evt.(ResultEvent); ok {
 			lastResult = &e
+			// The terminal summary must include children. Retain the parent
+			// result until the bounded rollout collection below is finished.
+			return
 		}
-		applyCodexMetrics(metrics, evt)
 		innerHandler(evt)
 	}
 
-	if _, parseErr := parseCodexStream(reader, handler); parseErr != nil {
+	children := map[string]bool{} // successful spawns, with observed completion
+	closedChildren := map[string]bool{}
+	rootID, parseErr := parseCodexStream(reader, handler, func(item codexCollabToolCallItem) {
+		if (item.Tool == "spawn_agent" || item.Tool == "send_input") && item.Status == "completed" {
+			for _, id := range item.ReceiverThreadIDs {
+				children[id] = false
+				closedChildren[id] = false
+			}
+		}
+		for id, state := range item.AgentStates {
+			// close_agent removes the thread, so waiting on or closing a closed
+			// child again reports it not_found.
+			if closedChildren[id] && state.Status == "not_found" {
+				continue
+			}
+			if _, exists := children[id]; exists {
+				switch state.Status {
+				case "completed":
+					children[id] = state.Message != ""
+				case "pending_init", "running", "interrupted", "errored", "not_found":
+					children[id] = false
+				}
+			}
+		}
+		if item.Tool == "close_agent" && item.Status == "completed" {
+			for _, id := range item.ReceiverThreadIDs {
+				if children[id] {
+					closedChildren[id] = true
+				}
+			}
+		}
+	})
+	rememberCodexTranscriptIdentities(params.SandboxName, rootID, children)
+	if parseErr != nil {
 		fmt.Fprintf(os.Stderr, "  progress parser: %v\n", sanitizeOutput(parseErr.Error()))
 		cancel()
 		io.Copy(io.Discard, reader)
@@ -543,6 +542,41 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 	if waitErr != nil && execCmd.ProcessState == nil {
 		return exitCode, fmt.Errorf("openshell exec failed: %w", waitErr)
 	}
+	// The exec stream reports root usage only. Collect persisted child records
+	// even after cancellation, with a bounded cleanup context and no inference.
+	usageCtx, usageCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	usageErr := r.collectCodexUsage(usageCtx, params.SandboxName, rootID, metrics, children, lastResult != nil && !lastResult.IsError)
+	usageErr = errors.Join(usageErr, parseErr)
+	usageCancel()
+	if lastResult == nil || lastResult.Subtype == codexSubtypeIncomplete {
+		// A killed exec leaves Codex writing until the runner terminates it:
+		// drop the pinned digests so extraction publishes the final bytes.
+		rememberCodexTranscriptIdentities(params.SandboxName, rootID, children)
+	}
+	for id := range children {
+		if !closedChildren[id] {
+			usageErr = errors.Join(usageErr, fmt.Errorf("child lifecycle: child %s was not closed after completion", id))
+		}
+	}
+	if usageErr != nil {
+		printer.StepWarn("Codex runtime evidence is incomplete: " + sanitizeOutput(usageErr.Error()))
+		if exitCode == 0 {
+			exitCode = 1
+		}
+	}
+	if lastResult != nil {
+		lastResult.InputTokens = metrics.InputTokens
+		lastResult.OutputTokens = metrics.OutputTokens
+		lastResult.ReasoningTokens = metrics.ReasoningTokens
+		lastResult.CacheCreationInputTokens = metrics.CacheCreationInputTokens
+		lastResult.CacheReadInputTokens = metrics.CacheReadInputTokens
+		if usageErr != nil {
+			lastResult.IsError = true
+			lastResult.Subtype = codexSubtypeIncomplete
+			lastResult.ErrorMessage = strings.TrimSpace(lastResult.ErrorMessage + "\nCodex runtime evidence is incomplete: " + usageErr.Error())
+		}
+		innerHandler(*lastResult)
+	}
 	if exitCode == codexHooksMissingExit {
 		return exitCode, fmt.Errorf(
 			"codex config, hook adapter or auth script missing or modified in %s; refusing to run (was Bootstrap run, or did the agent change it?)",
@@ -553,6 +587,11 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			"codex config.toml in %s no longer pins the run-scoped provider endpoint, its auth command, or leaves the project untrusted; refusing to run because any of those can redirect or replace the runner's credential (did the agent write there between iterations?)",
 			r.ConfigDir())
 	}
+	if exitCode == codexWriteProtectionExit {
+		return exitCode, fmt.Errorf(
+			"codex write protection failed in %s: Codex runs require Linux Landlock ABI 3+ (kernel 6.2+), and the runner-held config, role and hook files must match what Bootstrap wrote; refusing to run (see the sandbox stderr)",
+			r.ConfigDir())
+	}
 
 	if exitCode == 0 && lastResult != nil && lastResult.IsError {
 		msg := lastResult.ErrorMessage
@@ -560,9 +599,110 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 			msg = "stream ended without a completed turn (" + lastResult.Subtype + ")"
 		}
 		printer.StepWarn("codex exited 0 but the stream reports an error: " + sanitizeOutput(msg))
-		return 1, nil
+		exitCode = 1
+	}
+	if usageErr != nil {
+		return exitCode, fmt.Errorf("%w: %w", ErrIncompleteEvidence, usageErr)
 	}
 	return exitCode, nil
+}
+
+func (r CodexRuntime) collectCodexUsage(ctx context.Context, sandboxName, rootID string, metrics *RunMetrics, expectedChildren map[string]bool, requireRootEvidence bool) error {
+	if metrics == nil {
+		return fmt.Errorf("codex usage requires run metrics")
+	}
+	// Keep the stream contribution until complete native evidence can replace
+	// it. A failed start with no response usage keeps its original provider
+	// error; successful runs and runs with incurred usage require a root.
+	requireRootEvidence = requireRootEvidence || len(expectedChildren) != 0 ||
+		metrics.InputTokens != 0 || metrics.OutputTokens != 0 || metrics.ReasoningTokens != 0 ||
+		metrics.CacheReadInputTokens != 0 || metrics.CacheCreationInputTokens != 0
+	metrics.CostUnavailable = true
+	metrics.PerModelUsage = map[string]ModelUsage{metrics.Model: {
+		CostUnavailable: true,
+		InputTokens:     metrics.InputTokens, OutputTokens: metrics.OutputTokens,
+		ReasoningTokens: metrics.ReasoningTokens, CacheReadInputTokens: metrics.CacheReadInputTokens,
+		CacheCreationInputTokens: metrics.CacheCreationInputTokens, Requests: 1,
+	}}
+	if rootID == "" {
+		if requireRootEvidence {
+			return fmt.Errorf("codex usage is missing the root thread identity")
+		}
+		return nil
+	}
+	dir, err := os.MkdirTemp("", "fullsend-codex-usage-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	paths, collectionErr := r.downloadCodexRollouts(ctx, sandboxName, dir)
+	var rollouts []codexRolloutUsage
+	var failures []error
+	failures = append(failures, collectionErr)
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		rollout, err := parseCodexRolloutUsage(f)
+		f.Close()
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		failures = append(failures, rememberCodexTranscriptFile(sandboxName, rollout.Meta, path))
+		rollouts = append(rollouts, rollout)
+	}
+	observedChildren := map[string]bool{}
+	for _, rollout := range rollouts {
+		if rollout.Meta.ParentThreadID == rootID && rollout.Meta.SessionID == rootID {
+			if _, dispatched := expectedChildren[rollout.Meta.ThreadID]; !dispatched {
+				failures = append(failures, fmt.Errorf("child %s has no observed dispatch", rollout.Meta.ThreadID))
+			}
+			// A child without response usage still exists and must be accounted
+			// for, even if its spawn record was absent from the live stream.
+			observedChildren[rollout.Meta.ThreadID] = false
+			for _, response := range rollout.Responses {
+				if response.Record.ThreadID == rollout.Meta.ThreadID {
+					observedChildren[rollout.Meta.ThreadID] = true
+				}
+			}
+		}
+	}
+	for id, complete := range expectedChildren {
+		if !complete {
+			failures = append(failures, fmt.Errorf("child %s did not deliver a completed result", id))
+		}
+		if !observedChildren[id] {
+			failures = append(failures, fmt.Errorf("child %s has no collected response usage", id))
+		}
+	}
+	requireRootEvidence = requireRootEvidence || len(observedChildren) != 0
+	// A later interrupted turn can incur usage after an earlier completed
+	// stream snapshot. Persisted response deltas cover all observed turns;
+	// replace the root contribution, never add the snapshot again.
+	rootUsage, rootErr := foldCodexRootUsage(rootID, rollouts)
+	failures = append(failures, rootErr)
+	if rootErr == nil && len(rootUsage) == 0 && requireRootEvidence {
+		failures = append(failures, fmt.Errorf("codex root has no collected response usage for thread %s", rootID))
+	}
+	if rootErr == nil && len(rootUsage) != 0 {
+		rootMetrics := &RunMetrics{CostUnavailable: true}
+		if err := addCodexUsage(rootMetrics, rootUsage); err != nil {
+			failures = append(failures, err)
+		} else {
+			metrics.InputTokens, metrics.OutputTokens, metrics.ReasoningTokens = rootMetrics.InputTokens, rootMetrics.OutputTokens, rootMetrics.ReasoningTokens
+			metrics.CacheReadInputTokens, metrics.CacheCreationInputTokens = rootMetrics.CacheReadInputTokens, rootMetrics.CacheCreationInputTokens
+			metrics.PerModelUsage = rootMetrics.PerModelUsage
+		}
+	}
+	children, err := foldCodexChildUsage(rootID, rollouts)
+	failures = append(failures, err)
+	if err == nil {
+		failures = append(failures, addCodexUsage(metrics, children))
+	}
+	return errors.Join(failures...)
 }
 
 // ClearIterationArtifacts terminates processes the previous iteration left
@@ -570,12 +710,16 @@ func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Pri
 // sessions and the debug log so transcripts and output files are
 // per-iteration.
 func (r CodexRuntime) ClearIterationArtifacts(sandboxName string) error {
+	clearCodexTranscriptIdentities(sandboxName)
 	clearStrayProcesses(sandbox.Exec, sandboxName, os.Stderr, "the previous iteration")
 	clearCmd := fmt.Sprintf("rm -rf %s/output/* %s/* %s %s",
 		shellQuote(r.WorkspaceDir()),
 		shellQuote(r.codexSessionsDir()),
 		shellQuote(r.WorkspaceDir()+"/"+codexDebugLogFile),
 		shellQuote(r.ConfigDir()+"/"+codexLastMessageFile))
+	// The frozen CODEX_HOME directory cannot create a new top-level file.
+	// Re-provision this writable state file before the next launch.
+	clearCmd += " && touch " + shellQuote(r.ConfigDir()+"/"+codexLastMessageFile)
 	_, _, _, err := sandbox.Exec(sandboxName, clearCmd, 10*time.Second)
 	return err
 }

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,9 +34,9 @@ func TestCodexExtractTranscripts_DownloadsRollouts(t *testing.T) {
 	// Only plain .jsonl, and only regular files: the sessions directory is
 	// agent-writable, and a plaintext file named x.jsonl.zst used to ship as
 	// an artifact codexRedactFile then declined to rewrite.
-	assert.Contains(t, log, "-type f -name '*.jsonl'")
+	assert.Contains(t, log, "fullsend-codex-list")
 	assert.NotContains(t, log, "*.jsonl.zst")
-	assert.Contains(t, log, "download")
+	assert.Contains(t, log, "fullsend-codex-rollout")
 	// The local name is prefixed with the agent label, as for pi and Claude,
 	// so several agents' transcripts can share one directory.
 	_, err := os.Stat(filepath.Join(outDir, "triage-rollout-2026-09-02T10-00-00-abc123.jsonl"))
@@ -48,6 +50,141 @@ func TestCodexExtractTranscripts_NoSessionsIsNotAnError(t *testing.T) {
 	outDir := filepath.Join(t.TempDir(), "transcripts")
 	require.NoError(t, CodexRuntime{}.ExtractTranscripts("sb", "triage", outDir))
 	assert.NotContains(t, readFileString(t, logPath), "download")
+}
+
+func TestCodexExtractTranscripts_RequiresEveryObservedThreadAfterCollection(t *testing.T) {
+	child, err := os.ReadFile("testdata/codex/native-subagents/0158/probe-alpha.jsonl")
+	require.NoError(t, err)
+	root := testCodexRootUsage(recordedRoot0158, "gpt-5.6-luna", 20, 10, 2)
+	stream := fmt.Sprintf(`{"type":"thread.started","thread_id":%q}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"spawn","type":"collab_tool_call","tool":"spawn_agent","status":"completed","receiver_thread_ids":[%q],"agents_states":{}}}
+{"type":"item.completed","item":{"id":"close","type":"collab_tool_call","tool":"close_agent","status":"completed","receiver_thread_ids":[%q],"agents_states":{%q:{"status":"completed","message":"Verified the result."}}}}
+{"type":"turn.completed","usage":{"input_tokens":20,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":2}}
+`, recordedRoot0158, recordedAlpha0158, recordedAlpha0158, recordedAlpha0158)
+	for _, tc := range []struct {
+		name, removed, missing, reset string
+		wantFiles                     int
+	}{
+		{name: "complete", wantFiles: 2},
+		{name: "root disappears", removed: "root.jsonl", missing: recordedRoot0158, wantFiles: 1},
+		{name: "child disappears", removed: "child.jsonl", missing: recordedAlpha0158, wantFiles: 1},
+		{name: "all disappear", removed: "all", missing: recordedRoot0158},
+		{name: "child replaced with metadata only", removed: "child-metadata", missing: recordedAlpha0158, wantFiles: 1},
+		{name: "next iteration has no session yet", removed: "all", reset: "iteration"},
+		{name: "bootstrap has no session yet", removed: "all", reset: "bootstrap"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := filepath.Join(t.TempDir(), "stream.ndjson")
+			require.NoError(t, os.WriteFile(fixture, []byte(stream), 0o600))
+			store := t.TempDir()
+			seedCodexManifest(t, store, CodexRuntime{}, nil)
+			bodies := map[string]string{"root.jsonl": root, "child.jsonl": string(child)}
+			fakeOpenshellCodexWithRollouts(t, filepath.Join(t.TempDir(), "run.log"), store, fixture, bodies)
+			exit, runErr := (CodexRuntime{}).Run(t.Context(), RunParams{
+				SandboxName: "sb", RepoDir: "/sandbox/workspace/repo", Model: "gpt-5.6-luna", Timeout: time.Minute,
+			}, ui.New(&bytes.Buffer{}), time.Now(), &RunMetrics{})
+			require.NoError(t, runErr)
+			require.Zero(t, exit, "usage collection must succeed before files disappear")
+			switch tc.removed {
+			case "all":
+				clear(bodies)
+			case "child-metadata":
+				bodies["child.jsonl"] = strings.SplitN(string(child), "\n", 2)[0] + "\n"
+			default:
+				delete(bodies, tc.removed)
+			}
+			fakeOpenshellCodexWithRollouts(t, filepath.Join(t.TempDir(), "extract.log"), store, "", bodies)
+			switch tc.reset {
+			case "iteration":
+				require.NoError(t, (CodexRuntime{}).ClearIterationArtifacts("sb"))
+			case "bootstrap":
+				require.NoError(t, (CodexRuntime{}).Bootstrap(bootstrapInput{
+					sandboxName: "sb", agentPath: writeAgentFile(t, codexTestAgentDef), agentName: "triage",
+				}))
+			}
+			out := t.TempDir()
+			err := (CodexRuntime{}).ExtractTranscripts("sb", "review", out)
+			if tc.missing == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, ErrIncompleteEvidence)
+				assert.Contains(t, err.Error(), tc.missing)
+				if tc.removed == "child-metadata" {
+					assert.Contains(t, err.Error(), "transcript changed after usage collection")
+				}
+			}
+			files, err := os.ReadDir(out)
+			require.NoError(t, err)
+			assert.Len(t, files, tc.wantFiles, "preserve the remaining redacted transcripts")
+		})
+	}
+}
+
+func TestCodexExtractTranscripts_TimedOutRunPublishesFinalBytes(t *testing.T) {
+	// No terminal event: the exec was killed while Codex kept writing.
+	stream := fmt.Sprintf("{\"type\":\"thread.started\",\"thread_id\":%q}\n{\"type\":\"turn.started\"}\n", recordedRoot0158)
+	fixture := filepath.Join(t.TempDir(), "stream.ndjson")
+	require.NoError(t, os.WriteFile(fixture, []byte(stream), 0o600))
+	store := t.TempDir()
+	seedCodexManifest(t, store, CodexRuntime{}, nil)
+	root := testCodexRootUsage(recordedRoot0158, "gpt-5.6-luna", 20, 10, 2)
+	fakeOpenshellCodexWithRollouts(t, filepath.Join(t.TempDir(), "run.log"), store, fixture, map[string]string{"root.jsonl": root})
+	_, err := (CodexRuntime{}).Run(t.Context(), RunParams{
+		SandboxName: "sb", RepoDir: "/sandbox/workspace/repo", Model: "gpt-5.6-luna", Timeout: time.Minute,
+	}, ui.New(&bytes.Buffer{}), time.Now(), &RunMetrics{})
+	require.NoError(t, err)
+	final := root + `{"type":"turn_context","payload":{"turn_id":"after-collection","model":"gpt-5.6-luna"}}` + "\n"
+	fakeOpenshellCodexWithRollouts(t, filepath.Join(t.TempDir(), "extract.log"), store, "", map[string]string{"root.jsonl": final})
+	out := t.TempDir()
+	require.NoError(t, (CodexRuntime{}).ExtractTranscripts("sb", "review", out))
+	assert.Contains(t, readFileString(t, filepath.Join(out, "review-"+recordedRoot0158+".jsonl")), "after-collection")
+}
+
+func TestCodexDownloadRolloutBoundAndFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, failure string
+		limit               int64
+		wantError           bool
+	}{
+		{"complete", "complete bytes", "", 64, false},
+		{"exact limit", strings.Repeat("x", 63), "", 64, false},
+		{"one byte over", strings.Repeat("x", 64), "", 64, true},
+		{"process failure", "", "fullsend-codex-rollout", 64, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.157.0")
+			t.Setenv("FULLSEND_TEST_DOWNLOAD_BODY", tc.body)
+			t.Setenv("FULLSEND_TEST_FAIL_MATCH", tc.failure)
+			local := filepath.Join(t.TempDir(), "private.jsonl")
+			n, err := codexDownloadRollout(t.Context(), "download-test", "/sessions", "/sessions/rollout.jsonl", local, tc.limit)
+			if tc.wantError {
+				require.Error(t, err)
+				_, statErr := os.Stat(local)
+				assert.ErrorIs(t, statErr, os.ErrNotExist, "partial raw bytes must be removed")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.body+"\n", readFileString(t, local))
+				assert.EqualValues(t, len(tc.body)+1, n)
+				info, err := os.Stat(local)
+				require.NoError(t, err)
+				assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+			}
+		})
+	}
+}
+
+func TestCodexExtractTranscriptsChildIdentity(t *testing.T) {
+	role := "../../untrusted"
+	body := `{"type":"session_meta","payload":{"id":"01a0e868-1019-74d0-a11f-2ad529629759","parent_thread_id":"root","agent_role":"` + role + `"}}`
+	fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.157.0", "", CodexRuntime{}.codexSessionsDir()+"/child.jsonl")
+	t.Setenv("FULLSEND_TEST_DOWNLOAD_BODY", body)
+	out := t.TempDir()
+	require.NoError(t, CodexRuntime{}.ExtractTranscripts("child-identity", "review", out))
+	entries, err := os.ReadDir(out)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "review-child-generic-01a0e868-1019-74d0-a11f-2ad529629759.jsonl", entries[0].Name())
 }
 
 func TestCodexExtractDebugLog_OnlyWhenDebugIsOn(t *testing.T) {
@@ -143,7 +280,7 @@ func TestCodexRun_SuccessfulRunReportsMetrics(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.ndjson"))
+	fakeOpenshellCodexWithRollouts(t, logPath, storeDir, filepath.Join("testdata", "codex", "basic_run.ndjson"), map[string]string{"root.jsonl": testBasicCodexRootUsage()})
 
 	metrics := &RunMetrics{}
 	exit, err := r.Run(context.Background(), RunParams{
@@ -210,7 +347,7 @@ func TestCodexRun_AcceptsManifestHookPlan(t *testing.T) {
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r,
 		codexHooksManifestFor(r.codexHooksDir(), security.SandboxHookConfigFromHarness(&harness.Harness{})))
-	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.ndjson"))
+	fakeOpenshellCodexWithRollouts(t, logPath, storeDir, filepath.Join("testdata", "codex", "basic_run.ndjson"), map[string]string{"root.jsonl": testBasicCodexRootUsage()})
 
 	exit, err := r.Run(context.Background(), RunParams{
 		SandboxName:       "sb",
@@ -231,6 +368,8 @@ func TestCodexRun_AcceptsManifestHookPlan(t *testing.T) {
 func seedCodexManifest(t *testing.T, storeDir string, r CodexRuntime, hooks *codexHooksManifest) {
 	t.Helper()
 	hashes := codexRunnerHeldDigestSet{
+		Python:     "/usr/bin/python3",
+		HooksJSON:  "hooks00000000000000000000000000000000000000000000000000000000000",
 		ConfigTOML: "config0000000000000000000000000000000000000000000000000000000000",
 		AgentModel: "openai/gpt-5.6-luna",
 	}
@@ -239,7 +378,10 @@ func seedCodexManifest(t *testing.T, storeDir string, r CodexRuntime, hooks *cod
 		hashes.HookScripts = testCodexHookScripts()
 	}
 	recordRunnerHeldDigests("sb", hashes)
-	t.Cleanup(func() { forgetRunnerHeldDigests("sb") })
+	t.Cleanup(func() {
+		forgetRunnerHeldDigests("sb")
+		clearCodexTranscriptIdentities("sb")
+	})
 	data, err := json.MarshalIndent(codexManifest{
 		AgentName: "triage",
 		// Deliberately different from the runner-held AgentModel: Run must
@@ -277,7 +419,7 @@ func TestCodexRun_FallsBackToTheAgentDefinitionModel(t *testing.T) {
 	// the run params name none. The manifest's own copy is deliberately not
 	// consulted, so it is left saying something else below.
 	seedCodexManifest(t, storeDir, r, nil)
-	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", filepath.Join("testdata", "codex", "basic_run.ndjson"))
+	fakeOpenshellCodexWithRollouts(t, logPath, storeDir, filepath.Join("testdata", "codex", "basic_run.ndjson"), map[string]string{"root.jsonl": testBasicCodexRootUsage()})
 
 	metrics := &RunMetrics{}
 	exit, err := r.Run(context.Background(), RunParams{
@@ -289,7 +431,7 @@ func TestCodexRun_FallsBackToTheAgentDefinitionModel(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, exit)
 	assert.Equal(t, "gpt-5.6-luna", metrics.Model, "the runner-held openai/ spec, prefix stripped")
-	assert.Contains(t, readFileString(t, logPath), "--model 'gpt-5.6-luna'")
+	assert.Contains(t, strings.ReplaceAll(readFileString(t, logPath), "'\\''", "'"), "--model 'gpt-5.6-luna'")
 }
 
 func TestCodexRun_RequiresAModelWhenNothingNamesOne(t *testing.T) {
@@ -376,7 +518,7 @@ func TestCodexExtractTranscripts_DiscardsSpoofedFiles(t *testing.T) {
 	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1", "", spoof)
 
 	outDir := filepath.Join(t.TempDir(), "transcripts")
-	require.NoError(t, r.ExtractTranscripts("sb", "smoke", outDir))
+	require.Error(t, r.ExtractTranscripts("sb", "smoke", outDir))
 
 	// The fake writes a non-rollout body for a path containing "planted", so
 	// nothing is kept.
@@ -499,7 +641,7 @@ func TestCodexExtractTranscripts_FailurePaths(t *testing.T) {
 
 		err := r.ExtractTranscripts("sb", "smoke", filepath.Join(t.TempDir(), "out"))
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "finding transcripts")
+		assert.Contains(t, err.Error(), "listing codex rollouts")
 	})
 
 	t.Run("a path outside the sessions dir is skipped, not downloaded", func(t *testing.T) {
@@ -510,7 +652,7 @@ func TestCodexExtractTranscripts_FailurePaths(t *testing.T) {
 			sandbox.SandboxWorkspace+"/.env")
 
 		outDir := filepath.Join(t.TempDir(), "out")
-		require.NoError(t, r.ExtractTranscripts("sb", "smoke", outDir))
+		require.Error(t, r.ExtractTranscripts("sb", "smoke", outDir))
 		assert.NotContains(t, readFileString(t, logPath), "download",
 			"a path outside the sessions directory must never reach a download")
 		entries, err := os.ReadDir(outDir)
@@ -522,11 +664,11 @@ func TestCodexExtractTranscripts_FailurePaths(t *testing.T) {
 		logPath := filepath.Join(t.TempDir(), "openshell.log")
 		rollout := r.codexSessionsDir() + "/rollout-x.jsonl"
 		fakeOpenshellCodex(t, logPath, t.TempDir(), "codex-cli 0.152.1", "", rollout)
-		t.Setenv("FULLSEND_TEST_FAIL_MATCH", "download")
+		t.Setenv("FULLSEND_TEST_FAIL_MATCH", "fullsend-codex-rollout")
 
 		outDir := filepath.Join(t.TempDir(), "out")
-		require.NoError(t, r.ExtractTranscripts("sb", "smoke", outDir),
-			"one failed transcript must not fail the run")
+		require.Error(t, r.ExtractTranscripts("sb", "smoke", outDir),
+			"missing transcripts must not be reported as complete")
 		entries, err := os.ReadDir(outDir)
 		require.NoError(t, err)
 		assert.Empty(t, entries)
@@ -538,7 +680,7 @@ func TestCodexExtractDebugLog_FailurePaths(t *testing.T) {
 
 	t.Run("a download that fails is reported", func(t *testing.T) {
 		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
-		t.Setenv("FULLSEND_TEST_FAIL_MATCH", "download")
+		t.Setenv("FULLSEND_TEST_FAIL_MATCH", "fullsend-codex-rollout")
 
 		err := r.ExtractDebugLog("sb", filepath.Join(t.TempDir(), "codex-debug.log"), "1")
 		require.Error(t, err)
@@ -571,8 +713,8 @@ func TestCodexRun_IgnoresATamperedManifestModel(t *testing.T) {
 	storeDir := t.TempDir()
 	r := CodexRuntime{}
 	seedCodexManifest(t, storeDir, r, nil) // manifest says gpt-9-tampered
-	fakeOpenshellCodex(t, logPath, storeDir, "codex-cli 0.152.1",
-		filepath.Join("testdata", "codex", "basic_run.ndjson"))
+	fakeOpenshellCodexWithRollouts(t, logPath, storeDir,
+		filepath.Join("testdata", "codex", "basic_run.ndjson"), map[string]string{"root.jsonl": testBasicCodexRootUsage()})
 
 	metrics := &RunMetrics{}
 	exit, err := r.Run(t.Context(), RunParams{
@@ -585,6 +727,6 @@ func TestCodexRun_IgnoresATamperedManifestModel(t *testing.T) {
 	assert.Equal(t, 0, exit)
 	assert.Equal(t, "gpt-5.6-luna", metrics.Model, "the runner-held model, not the manifest's")
 	log := readFileString(t, logPath)
-	assert.Contains(t, log, "--model 'gpt-5.6-luna'")
+	assert.Contains(t, strings.ReplaceAll(log, "'\\''", "'"), "--model 'gpt-5.6-luna'")
 	assert.NotContains(t, log, "gpt-9-tampered")
 }

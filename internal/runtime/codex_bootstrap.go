@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/fullsend-ai/fullsend/internal/sandbox"
 	"github.com/fullsend-ai/fullsend/internal/security"
 )
@@ -103,6 +105,7 @@ const codexLastMessageFile = "last-message.txt"
 // manifest Run reads. It also preflights the pinned codex binary so a broken
 // image fails here rather than as a silent zero-turn run.
 func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
+	clearCodexTranscriptIdentities(input.SandboxName())
 	agentPath := input.AgentPath()
 	if agentPath == "" {
 		return fmt.Errorf("agent path is required")
@@ -132,13 +135,32 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		agentName = strings.TrimSuffix(agentDestName("", agentPath), ".md")
 	}
 
+	// As on Claude and pi, only an agent with the Agent tool delegates. With
+	// no roster the dispatch guard denies every spawn, and codexPersonaConfig
+	// turns Codex's multi-agent tools off.
+	var roles []codexPersona
+	if piAgentToolEnabled(def) {
+		if roles, err = codexPersonas(input, agentName); err != nil {
+			return err
+		}
+	}
 	sandboxName := input.SandboxName()
 	cfg := r.ConfigDir()
+	version, err := codexPreflightVersion(sandboxName)
+	if err != nil {
+		return err
+	}
 
 	// codex refuses to start when CODEX_HOME is not a directory, and the
-	// sessions directory is where its rollout transcripts land.
-	mkdirCmd := fmt.Sprintf("mkdir -p %s %s %s",
-		shellQuote(cfg+"/skills"), shellQuote(r.codexSessionsDir()), shellQuote(r.codexHooksDir()))
+	// sessions directory is where its rollout transcripts land. /sandbox is
+	// $HOME and CODEX_HOME's parent, so the Landlock launcher grants only the
+	// entries it already has: pre-create the common tool homes. git --global
+	// writes the XDG file when ~/.gitconfig is absent.
+	// ponytail: fixed list; any other new top-level $HOME entry (~/.rustup,
+	// ~/.m2, ~/.gitconfig) still fails. Moving CODEX_HOME and codex-policy out
+	// of /sandbox lifts the limit.
+	mkdirCmd := fmt.Sprintf("mkdir -p %s %s %s %s /sandbox/.cache /sandbox/.cargo /sandbox/.config/git /sandbox/.local /sandbox/.npm && touch /sandbox/.config/git/config",
+		shellQuote(cfg+"/skills"), shellQuote(r.codexSessionsDir()), shellQuote(r.codexHooksDir()), shellQuote(codexRolesDir))
 	if err := codexExecOK(sandboxName, mkdirCmd, "creating codex config dirs"); err != nil {
 		return err
 	}
@@ -151,6 +173,12 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	if err != nil {
 		return err
 	}
+	configTOML = append(configTOML, []byte(codexPersonaConfig(roles, codexRolesDir))...)
+	for _, role := range roles {
+		if err := uploadBytes(sandboxName, codexRolesDir+"/"+role.Name+".toml", role.config()); err != nil {
+			return fmt.Errorf("writing codex role %s: %w", role.Name, err)
+		}
+	}
 	if err := uploadBytes(sandboxName, r.codexConfigPath(), configTOML); err != nil {
 		return fmt.Errorf("writing %s: %w", codexConfigFile, err)
 	}
@@ -159,6 +187,29 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 	digests := codexRunnerHeldDigestSet{
 		ConfigTOML: codexAssetSHA256(configTOML),
 		AgentModel: def.Model,
+		Roles:      map[string]string{},
+	}
+	for _, role := range roles {
+		digests.Roles[role.Name+".toml"] = codexAssetSHA256(role.config())
+	}
+	python, err := codexPreflightPython(sandboxName)
+	if err != nil {
+		return err
+	}
+	digests.Python = python
+	for _, dir := range codexStateDirs {
+		if err := codexExecOK(sandboxName, "mkdir -p "+shellQuote(cfg+"/"+dir), "creating codex state directory"); err != nil {
+			return err
+		}
+	}
+	for _, name := range codexStateFiles {
+		var content []byte
+		if name == "installation_id" {
+			content = []byte(uuid.NewString())
+		}
+		if err := uploadBytes(sandboxName, cfg+"/"+name, content); err != nil {
+			return fmt.Errorf("initializing codex state: %w", err)
+		}
 	}
 
 	// uploadBytes does not set a mode, and codex executes this one.
@@ -173,18 +224,8 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		return err
 	}
 
-	if err := duplicateDestinationNameError("skill", input.SkillDirs()); err != nil {
+	if err := codexUploadSkills(sandboxName, cfg, input.SkillDirs()); err != nil {
 		return err
-	}
-	for _, skillPath := range input.SkillDirs() {
-		if skillPath == "" {
-			continue
-		}
-		// codex discovers $CODEX_HOME/skills natively.
-		if err := sandbox.Upload(sandboxName, skillPath, cfg+"/skills/"); err != nil {
-			return fmt.Errorf("copying skill %q: %w", skillPath, err)
-		}
-		fmt.Fprintf(os.Stderr, "Skill %q: uploaded to sandbox\n", resolveSkillDisplayName(skillPath))
 	}
 
 	for _, e := range input.Plugins() {
@@ -211,6 +252,7 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		BashAllowlist: def.BashAllowlist,
 	}
 
+	hooksJSON := []byte(`{"hooks":{}}`)
 	if hooksInput, ok := input.(SandboxHooksBootstrap); ok {
 		hooks := hooksInput.SandboxHookConfig()
 		if err := installHookScripts(sandboxName, r.codexHooksDir(), hooks); err != nil {
@@ -241,28 +283,25 @@ func (r CodexRuntime) Bootstrap(input BootstrapInput) error {
 		if err := uploadBytes(sandboxName, r.codexAdapterPath(), codexHookAdapterPy); err != nil {
 			return fmt.Errorf("installing hook adapter: %w", err)
 		}
-		python, err := codexPreflightPython(sandboxName)
-		if err != nil {
-			return err
-		}
-		hooksJSON, notes, err := codexHooksJSON(cfg, python, hooks)
+		var notes []string
+		hooksJSON, notes, err = codexHooksJSON(cfg, python, hooks)
 		if err != nil {
 			return err
 		}
 		for _, note := range notes {
 			fmt.Fprintf(os.Stderr, "Sandbox hooks: %s\n", note)
 		}
-		if err := uploadBytes(sandboxName, r.codexHooksPath(), hooksJSON); err != nil {
-			return fmt.Errorf("writing %s: %w", codexHooksFile, err)
-		}
-		digests.HooksJSON = codexAssetSHA256(hooksJSON)
 		manifest.Hooks = codexHooksManifestFor(r.codexHooksDir(), hooks)
 	}
-
-	version, err := codexPreflightVersion(sandboxName)
+	hooksJSON, err = codexAddDispatchGuard(hooksJSON, python, roles)
 	if err != nil {
 		return err
 	}
+	if err := uploadBytes(sandboxName, r.codexHooksPath(), hooksJSON); err != nil {
+		return fmt.Errorf("writing %s: %w", codexHooksFile, err)
+	}
+	digests.HooksJSON = codexAssetSHA256(hooksJSON)
+
 	manifest.CodexVersion = version
 
 	manifestJSON, err := json.MarshalIndent(manifest, "", "  ")
@@ -308,15 +347,18 @@ func codexDeveloperInstructions(agentName string, def *piAgentDef) string {
 	}
 	b.WriteString(def.Body)
 	b.WriteString("\n")
-	b.WriteString(codexNoSubagentNote)
+	if piAgentToolEnabled(def) {
+		b.WriteString(codexSubagentNote)
+	} else {
+		b.WriteString(codexNoSubagentNote)
+	}
 	return b.String()
 }
 
 // codexNoSubagentNote makes the absence of a sub-agent tool explicit so skills
-// written for Claude Code's Agent tool (pr-review, retro) take their
-// single-context path deliberately instead of recording a failed dispatch.
-// codex does have a spawn_agent tool, but fullsend wires no sub-agent roster
-// for it in v1, the same position pi was in (#6527).
+// written for Claude Code's Agent tool take their single-context path
+// deliberately instead of recording a failed dispatch. Bootstrap registers no
+// roles for an agent whose tools: list omits Agent, as pi does (#6527).
 const codexNoSubagentNote = "\n## Runtime note\n\n" +
 	"This agent runs on the codex runtime (FULLSEND_RUNTIME=codex). No fullsend sub-agent " +
 	"roster is available. When a skill says to dispatch sub-agents, execute each sub-agent " +
@@ -456,9 +498,11 @@ func codexReadHarnessSecurityEnv(sandboxName string) ([]codexEnvPair, error) {
 // will name. It is resolved here, on a shell the agent has not touched, rather
 // than left as a bare `python3` in hooks.json: codex spawns hooks after the
 // agent-writable .env is sourced, so PATH resolution at that point is the
-// agent's to influence.
+// agent's to influence. The image's PATH is too: it leads with the
+// agent-writable /sandbox/.venv, whose .pth files -I still loads, so
+// `command -p` searches only the system path.
 func codexPreflightPython(sandboxName string) (string, error) {
-	stdout, _, exitCode, err := sandbox.Exec(sandboxName, "command -v python3", 10*time.Second)
+	stdout, _, exitCode, err := sandbox.Exec(sandboxName, "command -p -v python3", 10*time.Second)
 	if err != nil {
 		return "", fmt.Errorf("resolving python3 for the hook adapter: %w", err)
 	}
@@ -490,7 +534,7 @@ func codexPreflightPython(sandboxName string) (string, error) {
 const codexMinPythonMinor = 11
 
 func codexPreflightPythonVersion(sandboxName, python string) error {
-	cmd := shellQuote(python) + ` -c 'import sys; print("%d.%d" % sys.version_info[:2])'`
+	cmd := shellQuote(python) + ` -I -c 'import os, sys; print("%d.%d" % sys.version_info[:2], *map(os.path.realpath, (sys.executable, sys.prefix, sys.base_prefix)), sep="\t")'`
 	stdout, stderr, exitCode, err := sandbox.Exec(sandboxName, cmd, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("checking the hook interpreter version: %w", err)
@@ -499,10 +543,12 @@ func codexPreflightPythonVersion(sandboxName, python string) error {
 		return fmt.Errorf("checking the hook interpreter version: exited %d: %s",
 			exitCode, strings.TrimSpace(sanitizeOutput(stderr)))
 	}
-	version := strings.TrimSpace(stdout)
-	if i := strings.LastIndexByte(version, '\n'); i >= 0 {
-		version = strings.TrimSpace(version[i+1:])
+	line := strings.TrimSpace(stdout)
+	if i := strings.LastIndexByte(line, '\n'); i >= 0 {
+		line = strings.TrimSpace(line[i+1:])
 	}
+	fields := strings.Split(line, "\t")
+	version := fields[0]
 	major, minor, ok := strings.Cut(version, ".")
 	if !ok || major != "3" {
 		return fmt.Errorf("hook interpreter %s reports version %q, expected 3.x", python, sanitizeOutput(version))
@@ -515,6 +561,17 @@ func codexPreflightPythonVersion(sandboxName, python string) error {
 		return fmt.Errorf(
 			"hook interpreter %s is Python %s; the sandbox hook adapter needs at least 3.%d",
 			python, sanitizeOutput(version), codexMinPythonMinor)
+	}
+	// The launcher, dispatch guard and hooks all run on this interpreter, so
+	// neither it nor its site-packages or stdlib may be agent-writable.
+	if len(fields) != 4 {
+		return fmt.Errorf("hook interpreter %s did not report its location", python)
+	}
+	for _, path := range fields[1:] {
+		if !strings.HasPrefix(path, "/") || codexUnderWriteRoot(path) {
+			return fmt.Errorf("hook interpreter %s loads from %q, which the agent can write; Codex needs a system python3 outside %s",
+				python, sanitizeOutput(path), strings.Join(codexWriteRoots, ", "))
+		}
 	}
 	return nil
 }

@@ -41,6 +41,8 @@ import (
 type codexRunnerHeldDigestSet struct {
 	ConfigTOML string
 	HooksJSON  string
+	Python     string
+	Roles      map[string]string
 	// SecurityEnv is the hook configuration the runner knows at Bootstrap:
 	// what it derived from SandboxHookConfig, plus the harness-supplied
 	// variables read back from the workspace .env before any agent iteration

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -195,6 +196,10 @@ type codexCollabToolCallItem struct {
 	Tool              string   `json:"tool"`
 	ReceiverThreadIDs []string `json:"receiver_thread_ids"`
 	Status            string   `json:"status"`
+	AgentStates       map[string]struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	} `json:"agents_states"`
 }
 
 type codexWebSearchItem struct {
@@ -371,8 +376,11 @@ const (
 //   - A turn interrupted (Ctrl-C, kill) emits *neither* terminal event — the
 //     processor shuts down silently — so a stream with no terminal event is
 //     reported as an incomplete, failed run rather than a success.
-func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, err error) {
-	br := bufio.NewReaderSize(r, streamBufSize)
+func parseCodexStream(r io.Reader, onEvent func(AgentEvent), onCollab ...func(codexCollabToolCallItem)) (threadID string, err error) {
+	// Collaboration events include full prompts and child results, so they can
+	// exceed the shared 1 MiB progress buffer. Use the Codex stream artifact's
+	// bound and reject larger records rather than losing lifecycle evidence.
+	br := bufio.NewReaderSize(r, codexRedactMaxLine)
 
 	var (
 		numTurns int
@@ -484,6 +492,9 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 				summary += " (failed)"
 			}
 			onEvent(ToolUseEvent{Name: "Agent", Summary: piSummarize(summary)})
+			for _, observe := range onCollab {
+				observe(item)
+			}
 		case "web_search":
 			var item codexWebSearchItem
 			if json.Unmarshal(raw, &item) != nil {
@@ -516,6 +527,7 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 		result := ResultEvent{
 			NumTurns:                 numTurns,
 			TotalCostUSD:             0, // codex reports no cost
+			CostUnavailable:          true,
 			InputTokens:              counters.Input,
 			OutputTokens:             counters.Output,
 			ReasoningTokens:          counters.Reasoning,
@@ -549,12 +561,11 @@ func parseCodexStream(r io.Reader, onEvent func(AgentEvent)) (threadID string, e
 			finish()
 			return threadID, readErr
 		}
-		// Skip lines exceeding the buffer (same pattern as the other parsers).
 		if isPrefix {
-			for isPrefix && readErr == nil {
-				_, isPrefix, readErr = br.ReadLine()
-			}
-			continue
+			terminal = codexTerminalNone
+			criticalErrMsg = fmt.Sprintf("codex stream record exceeds %d-byte limit", codexRedactMaxLine)
+			finish()
+			return threadID, errors.New(criticalErrMsg)
 		}
 		if len(line) == 0 {
 			continue
@@ -672,6 +683,7 @@ func applyCodexMetrics(metrics *RunMetrics, evt AgentEvent) {
 	switch e := evt.(type) {
 	case ResultEvent:
 		metrics.NumTurns = e.NumTurns
+		metrics.CostUnavailable = metrics.CostUnavailable || e.CostUnavailable
 		metrics.InputTokens = e.InputTokens
 		metrics.OutputTokens = e.OutputTokens
 		metrics.ReasoningTokens = e.ReasoningTokens

@@ -92,6 +92,7 @@ func (TokensEvent) agentEvent() {}
 type ResultEvent struct {
 	NumTurns                 int
 	TotalCostUSD             float64
+	CostUnavailable          bool // The runtime does not report dollar cost.
 	IsError                  bool
 	ErrorMessage             string
 	Subtype                  string

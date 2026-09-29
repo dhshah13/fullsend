@@ -15,6 +15,8 @@ import (
 // optional model and optional tools restriction.
 type piPersona struct {
 	Name          string
+	Description   string
+	Body          string
 	Model         string   // frontmatter model (alias or id); empty = inherit parent
 	Tools         []string // Claude tool names; nil = parent's set
 	BashAllowlist []string // Bash(a,b) prefixes; nil = unrestricted
@@ -129,6 +131,8 @@ func discoverPersonas(skillDirs []string, agentName string) ([]piPersona, []piSk
 				seen[name] = skillName
 				personas = append(personas, piPersona{
 					Name:          name,
+					Description:   def.Description,
+					Body:          def.Body,
 					Model:         def.Model,
 					Tools:         def.Tools,
 					BashAllowlist: def.BashAllowlist,

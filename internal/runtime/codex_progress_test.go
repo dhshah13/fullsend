@@ -549,7 +549,7 @@ func TestParseCodexStream_ReadErrorStillEmitsResult(t *testing.T) {
 	assert.Equal(t, codexSubtypeIncomplete, result.Subtype)
 }
 
-func TestParseCodexStream_OverlongLineIsSkipped(t *testing.T) {
+func TestParseCodexStream_LargeMessageIsNotDropped(t *testing.T) {
 	t.Parallel()
 
 	huge := `{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"` +
@@ -568,9 +568,39 @@ func TestParseCodexStream_OverlongLineIsSkipped(t *testing.T) {
 	require.NoError(t, err)
 
 	texts := codexEventsOfType[TextEvent](events)
-	require.Len(t, texts, 1, "the oversized line is dropped, the stream continues")
-	assert.Equal(t, "after", texts[0].Text)
+	require.Len(t, texts, 2, "records larger than the shared parser buffer must be retained")
+	assert.Len(t, texts[0].Text, streamBufSize+1024)
+	assert.Equal(t, "after", texts[1].Text)
 	assert.False(t, codexOnlyResult(t, events).IsError)
+}
+
+func TestParseCodexStream_LargeCollaborationIsNotDropped(t *testing.T) {
+	large := strings.Repeat("e", streamBufSize+1024)
+	stream := fmt.Sprintf(`{"type":"thread.started","thread_id":"root"}
+{"type":"item.completed","item":{"id":"spawn","type":"collab_tool_call","tool":"spawn_agent","prompt":%q,"receiver_thread_ids":["child"],"status":"completed"}}
+{"type":"item.completed","item":{"id":"wait","type":"collab_tool_call","tool":"wait","receiver_thread_ids":["child"],"agents_states":{"child":{"status":"completed","message":%q}},"status":"completed"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}
+`, large, large)
+	var calls []codexCollabToolCallItem
+	_, err := parseCodexStream(strings.NewReader(stream), func(AgentEvent) {}, func(call codexCollabToolCallItem) { calls = append(calls, call) })
+	require.NoError(t, err)
+	require.Len(t, calls, 2, "losing either event loses child identity or completion")
+	assert.Equal(t, "spawn_agent", calls[0].Tool)
+	assert.Equal(t, []string{"child"}, calls[0].ReceiverThreadIDs)
+	assert.Equal(t, "completed", calls[1].AgentStates["child"].Status)
+	assert.Equal(t, large, calls[1].AgentStates["child"].Message)
+}
+
+func TestParseCodexStream_OverLimitCannotRetainEarlierSuccess(t *testing.T) {
+	stream := "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}\n" +
+		strings.Repeat("x", codexRedactMaxLine+1024) + "\n"
+	var events []AgentEvent
+	_, err := parseCodexStream(strings.NewReader(stream), func(event AgentEvent) { events = append(events, event) })
+	require.Error(t, err, "discarded records could include a child dispatch after the last completed turn")
+	result := codexOnlyResult(t, events)
+	assert.True(t, result.IsError)
+	assert.Equal(t, codexSubtypeIncomplete, result.Subtype)
+	assert.Equal(t, 10, result.InputTokens, "retain usage recorded before the incomplete evidence")
 }
 
 // --- redaction --------------------------------------------------------------

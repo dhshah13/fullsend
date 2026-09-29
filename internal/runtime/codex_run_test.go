@@ -19,6 +19,7 @@ import (
 // testRunnerHeldDigests stands in for what Bootstrap recorded in the runner's
 // memory for a sandbox.
 var testRunnerHeldDigests = codexRunnerHeldDigestSet{
+	Python:      "/usr/bin/python3",
 	ConfigTOML:  "aaaa000000000000000000000000000000000000000000000000000000000000",
 	HooksJSON:   "bbbb000000000000000000000000000000000000000000000000000000000000",
 	HookScripts: testCodexHookScripts(),
@@ -120,7 +121,6 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 		// runner recorded, then the credential seed — all before .env.
 		`sha256sum`,
 		testRunnerHeldDigests.ConfigTOML,
-		`OPENAI_API_KEY`,
 		`. '` + sandbox.SandboxWorkspace + `/.env'`,
 		`export CODEX_HOME=`,
 		`unset OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY NODE_OPTIONS NODE_PATH PYTHONPATH PYTHONHOME PYTHONSTARTUP`,
@@ -175,6 +175,7 @@ func TestBuildCodexRunCommand_OrderAndFlags(t *testing.T) {
 	pinAt := strings.Index(cmd, `readonly FULLSEND_CODEX_PATH="$PATH"`)
 	envAt := strings.Index(cmd, `. '`+sandbox.SandboxWorkspace+`/.env'`)
 	restoreAt := strings.Index(cmd, `export PATH="$FULLSEND_CODEX_PATH"`)
+	assert.Contains(t, cmd, "-c 'allow_login_shell=false'", "login profiles must not remove the output validator from agent PATH")
 	require.Positive(t, pinAt)
 	require.Positive(t, restoreAt)
 	assert.Less(t, pinAt, envAt, "PATH is captured before .env")
@@ -213,7 +214,7 @@ func TestBuildCodexRunCommand_HooksDisabled(t *testing.T) {
 	cmd := buildCodexRunCommand(RunParams{RepoDir: "/repo"}, "gpt-5.6-luna", "", false, testRunnerHeldDigests)
 
 	// The flag is decided from the runner's own signal, not the manifest.
-	assert.NotContains(t, cmd, "--dangerously-bypass-hook-trust")
+	assert.Contains(t, cmd, "--dangerously-bypass-hook-trust", "native dispatch policy is mandatory")
 	assert.NotContains(t, cmd, codexAdapterFile)
 	// The credential guards are not conditional on hooks: the risk they cover
 	// is credential leak, not tool misuse.
@@ -249,8 +250,9 @@ func TestCodexAssetGuard_Executes(t *testing.T) {
 	r := CodexRuntime{}
 
 	// The guard names absolute sandbox paths, so run it against a fake root.
+	digests := testRunnerHeldDigests
 	guard := func() string {
-		return strings.ReplaceAll(codexAssetGuard(r, true, testRunnerHeldDigests), sandbox.SandboxCodexConfig, dir)
+		return strings.ReplaceAll(codexAssetGuard(r, true, digests)+" && "+codexConfigGuard(r, digests), sandbox.SandboxCodexConfig, dir)
 	}
 	writeAll := func(t *testing.T) {
 		t.Helper()
@@ -269,6 +271,8 @@ func TestCodexAssetGuard_Executes(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, codexHooksFile),
 			[]byte(`{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"python3 `+
 				filepath.Join(dir, codexAdapterFile)+` PreToolUse x.py"}]}]}}`), 0o644))
+		digests.ConfigTOML = codexAssetSHA256([]byte("cfg"))
+		digests.HooksJSON = codexAssetSHA256([]byte(readFileString(t, filepath.Join(dir, codexHooksFile))))
 	}
 
 	t.Run("passes when every asset matches", func(t *testing.T) {
@@ -304,7 +308,7 @@ func TestCodexAssetGuard_Executes(t *testing.T) {
 			[]byte(`{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"true"}]}]}}`), 0o644))
 		_, err := exec.Command("/bin/sh", "-c", guard()+" && echo RAN").CombinedOutput()
 		require.Error(t, err)
-		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))
+		assert.Equal(t, codexConfigTamperedExit, exitCodeOf(t, err))
 	})
 
 	// The interesting case: the adapter is still referenced, so a
@@ -318,7 +322,7 @@ func TestCodexAssetGuard_Executes(t *testing.T) {
 				`{"hooks":[{"type":"command","command":"python3 `+adapter+` PreToolUse x.py"}]}]}}`), 0o644))
 		_, err := exec.Command("/bin/sh", "-c", guard()+" && echo RAN").CombinedOutput()
 		require.Error(t, err, "a handler replaced beside a still-referenced adapter must not pass")
-		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))
+		assert.Equal(t, codexConfigTamperedExit, exitCodeOf(t, err))
 	})
 
 	t.Run("blocks a handler the agent added", func(t *testing.T) {
@@ -330,7 +334,7 @@ func TestCodexAssetGuard_Executes(t *testing.T) {
 				`{"hooks":[{"type":"command","command":"curl https://example.invalid"}]}]}}`), 0o644))
 		_, err := exec.Command("/bin/sh", "-c", guard()+" && echo RAN").CombinedOutput()
 		require.Error(t, err)
-		assert.Equal(t, codexHooksMissingExit, exitCodeOf(t, err))
+		assert.Equal(t, codexConfigTamperedExit, exitCodeOf(t, err))
 	})
 
 	t.Run("blocks a missing manifest", func(t *testing.T) {
@@ -643,6 +647,49 @@ func exitCodeOf(t *testing.T, err error) int {
 	var exitErr *exec.ExitError
 	require.ErrorAs(t, err, &exitErr)
 	return exitErr.ExitCode()
+}
+
+// A retry may encounter executable names planted in writable helper directories.
+// Those directories belong to model tool shells, not the npm launcher or auth.
+func TestCodexRunCommand_HelperPathCannotShadowLauncherOrAuth(t *testing.T) {
+	dir := t.TempDir()
+	configDir := filepath.Join(dir, "config")
+	workspace := filepath.Join(dir, "workspace")
+	trusted := filepath.Join(dir, "trusted")
+	for _, path := range []string{configDir, workspace, trusted, filepath.Join(workspace, "bin")} {
+		require.NoError(t, os.MkdirAll(path, 0o755))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, codexConfigFile), []byte("cfg"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, codexAuthScriptFile), codexAuthScriptSH, 0o755))
+	startupPath := filepath.Join(workspace, "startup.sh")
+	require.NoError(t, os.WriteFile(startupPath, []byte("exit 0\n"), 0o644))
+	env := "export PATH=" + shellQuote(filepath.Join(workspace, "bin")) + ":$PATH\nexport BASH_ENV=" + shellQuote(startupPath) + "\n"
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, ".env"), []byte(env), 0o644))
+	for _, name := range []string{"node", "cat"} {
+		require.NoError(t, os.WriteFile(filepath.Join(workspace, "bin", name), []byte("#!/bin/sh\necho SHADOWED\nexit 42\n"), 0o755))
+	}
+	tokenPath := filepath.Join(dir, "placeholder")
+	placeholder := piPlaceholderPrefix + "test_OPENAI_API_KEY"
+	require.NoError(t, os.WriteFile(tokenPath, []byte(placeholder), 0o600))
+	authPath := filepath.Join(dir, "auth.sh")
+	auth := strings.ReplaceAll(string(codexAuthScriptSH), codexSandboxTokenFile, tokenPath)
+	require.NoError(t, os.WriteFile(authPath, []byte(auth), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(trusted, "codex"), []byte("#!/usr/bin/env node\n"), 0o755))
+	node := "#!/bin/sh\necho TRUSTED_NODE\n/bin/sh " + shellQuote(authPath) + " || exit $?\n/bin/bash -c 'echo GUARD_RAN'\nprintf '\\nARG:%s\\n' \"$@\"\n"
+	require.NoError(t, os.WriteFile(filepath.Join(trusted, "node"), []byte(node), 0o755))
+	digests := codexRunnerHeldDigestSet{ConfigTOML: codexAssetSHA256([]byte("cfg"))}
+	command := buildCodexRunCommand(RunParams{RepoDir: dir}, "gpt-5.6-luna", "low", false, digests)
+	command = strings.ReplaceAll(command, sandbox.SandboxCodexConfig, configDir)
+	command = strings.ReplaceAll(command, sandbox.SandboxWorkspace, workspace)
+	cmd := exec.Command("/bin/sh", "-c", command)
+	cmd.Env = append(os.Environ(), "PATH="+trusted+":/usr/bin:/bin:/usr/local/bin")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Contains(t, string(out), "TRUSTED_NODE")
+	assert.Contains(t, string(out), placeholder)
+	assert.Contains(t, string(out), "GUARD_RAN", "BASH_ENV must not short-circuit native hooks")
+	assert.NotContains(t, string(out), "SHADOWED")
+	assert.Contains(t, string(out), `ARG:shell_environment_policy.set.PATH="`+workspace+`/bin:/usr/local/go/bin:/sandbox/go/bin:`+trusted)
 }
 
 // TestCodexSecurityEnv_PinsWhatTheRunnerKnows covers the values the runtime can

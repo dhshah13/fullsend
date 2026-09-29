@@ -24,13 +24,15 @@ import (
 func fakeOpenshellCodex(t *testing.T, logPath, storeDir, versionOutput string, streamFixture ...string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(storeDir, 0o755))
-	streamCase := "exit 0"
+	streamCase := `exit "${FULLSEND_TEST_RUN_EXIT:-0}"`
 	if len(streamFixture) > 0 && streamFixture[0] != "" {
 		streamCase = "cat '" + streamFixture[0] + "'; exit 0"
 	}
-	findCase := "exit 0"
+	findCase := "echo '[]'; exit 0"
 	if len(streamFixture) > 1 && streamFixture[1] != "" {
-		findCase = "echo '" + streamFixture[1] + "'; exit 0"
+		listing, err := json.Marshal(strings.Split(streamFixture[1], "\n"))
+		require.NoError(t, err)
+		findCase = "printf '%s\\n' " + shellQuote(string(listing)) + "; exit 0"
 	}
 	binDir := t.TempDir()
 	script := `#!/bin/sh
@@ -61,12 +63,19 @@ if [ "$2" = "exec" ]; then
   for last; do :; done
   case "$last" in
     "codex --version") echo "` + versionOutput + `"; exit 0 ;;
-    "command -v python3") echo "/usr/bin/python3"; exit 0 ;;
-    *"sys.version_info"*) echo "${FULLSEND_TEST_PYVER:-3.12}"; exit 0 ;;
+    "command -p -v python3") echo "/usr/bin/python3"; exit 0 ;;
+    *"sys.version_info"*) printf '%s\t/usr/bin/python3.12\t%s\t/usr\n' "${FULLSEND_TEST_PYVER:-3.12}" "${FULLSEND_TEST_PYPREFIX:-/usr}"; exit 0 ;;
     *fullsend-env-sep*) printf '%s' "${FULLSEND_TEST_ENV_READ-|fullsend-env-sep|}"; exit 0 ;;
     cat\ *) f=$(printf '%s' "${last#cat }" | tr -d "'" | tr '/' '_'); cat '` + storeDir + `'/"$f"; exit $? ;;
+    *"fullsend-codex-rollout"*)
+      default_body='{"type":"session_meta","payload":{}}'
+      case "$last" in
+        *planted*) printf 'not a rollout\n' ;;
+        *) printf '%s\n' "${FULLSEND_TEST_DOWNLOAD_BODY:-$default_body}" ;;
+      esac
+      exit 0 ;;
     *"exec --json"*) ` + streamCase + ` ;;
-    find\ *) ` + findCase + ` ;;
+    *"fullsend-codex-list"*) ` + findCase + ` ;;
   esac
   exit 0
 fi
@@ -91,6 +100,10 @@ model: openai/gpt-5.6-luna
 ---
 You are the triage agent. Use gh.
 `
+
+// codexTestReviewAgentDef declares no tools: list, so it keeps the Agent tool
+// and delegates to native children.
+const codexTestReviewAgentDef = "---\nname: review\ndescription: Review a change.\n---\nYou are the review agent.\n"
 
 func TestCodexRuntimeBootstrap_WritesConfigAndManifest(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
@@ -117,6 +130,8 @@ func TestCodexRuntimeBootstrap_WritesConfigAndManifest(t *testing.T) {
 	// does not do on its own.
 	assert.Equal(t, codexAuthScriptSH, storedUpload(t, storeDir, r.codexAuthScriptPath()))
 	assert.Contains(t, readFileString(t, logPath), "chmod 755 '"+r.codexAuthScriptPath()+"'")
+	// Landlock grants only $HOME entries that exist at launch.
+	assert.Contains(t, readFileString(t, logPath), "/sandbox/.npm && touch /sandbox/.config/git/config")
 
 	var m codexManifest
 	require.NoError(t, json.Unmarshal(storedUpload(t, storeDir, r.codexManifestPath()), &m))
@@ -129,10 +144,16 @@ func TestCodexRuntimeBootstrap_WritesConfigAndManifest(t *testing.T) {
 	assert.Equal(t, []string{"gh", "jq"}, m.BashAllowlist)
 	assert.Nil(t, m.Hooks, "no hook plan when the input carries no sandbox hook config")
 
-	// Without SandboxHooksBootstrap nothing hook-related is installed.
+	// Native dispatch policy is always installed, independently of shared security hooks.
 	log := readFileString(t, logPath)
 	assert.NotContains(t, log, codexAdapterFile)
-	assert.NotContains(t, log, codexHooksFile)
+	assert.Contains(t, log, codexHooksFile)
+	// tools: omits Agent, so triage runs sub-agent definitions inline (#6970).
+	assert.Contains(t, cfg, "No fullsend sub-agent roster is available")
+	assert.NotContains(t, cfg, "Use native spawn_agent")
+	assert.Equal(t, map[string]any{"enabled": false}, codexParseTOML(t, []byte(cfg))["agents"], "no roles, and no native multi-agent tools")
+	assert.NotContains(t, log, codexRolesDir+"/")
+	assert.Contains(t, string(storedUpload(t, storeDir, r.codexHooksPath())), shellQuote("[]"), "the guard denies every spawn")
 }
 
 func TestCodexRuntimeBootstrap_RejectsAgentNameMismatch(t *testing.T) {
@@ -262,14 +283,23 @@ func TestCodexDeveloperInstructions(t *testing.T) {
 	def, err := parsePiAgent([]byte(codexTestAgentDef))
 	require.NoError(t, err)
 	got := codexDeveloperInstructions("triage", def)
-
 	assert.Contains(t, got, "# Agent: triage")
 	assert.Contains(t, got, "Inspect an issue.")
 	assert.Contains(t, got, "You are the triage agent. Use gh.")
-	// Skills written for Claude Code's Agent tool must take their
-	// single-context path deliberately rather than recording a failed
-	// dispatch (the same note pi carries, #6527).
-	assert.Contains(t, got, "No fullsend sub-agent roster is available")
+	assert.Contains(t, got, "execute each sub-agent definition yourself", "tools: omits Agent")
+	assert.NotContains(t, got, "spawn_agent")
+
+	def, err = parsePiAgent([]byte(codexTestReviewAgentDef))
+	require.NoError(t, err)
+	got = codexDeveloperInstructions("review", def)
+	assert.Contains(t, got, "Use native spawn_agent")
+	assert.Contains(t, got, "fork_context=false")
+	assert.Contains(t, got, "Delegation requires a V1 parent")
+	assert.Contains(t, got, "V2 arguments (fork_turns or task_name) are rejected")
+	assert.NotContains(t, got, "fork_turns=\"none\"")
+	assert.Contains(t, got, "only ONE child finishes")
+	assert.Contains(t, got, "close_agent")
+	assert.NotContains(t, got, "execute each sub-agent definition yourself")
 }
 
 func TestReadCodexManifest_RejectsGarbage(t *testing.T) {
@@ -326,18 +356,33 @@ func TestCodexRuntimeBootstrap_ReportsInfrastructureFailures(t *testing.T) {
 		"auth script": {codexAuthScriptFile, "writing " + codexAuthScriptFile},
 		"version":     {"codex --version", "codex preflight"},
 		"manifest":    {codexManifestFile, "writing " + codexManifestFile},
+		"native role": {codexRolesDir + "/default.toml", "writing codex role default"},
+		"python":      {"command -p -v python3", "resolving python3"},
+		"state dir":   {"mkdir -p " + shellQuote(r.ConfigDir()+"/archived_sessions"), "creating codex state directory"},
+		"state file":  {r.ConfigDir() + "/installation_id", "initializing codex state"},
+		"hooks.json":  {codexHooksFile, "writing " + codexHooksFile},
 	} {
 		t.Run(name, func(t *testing.T) {
-			fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+			storeDir := t.TempDir()
+			fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), storeDir, "codex-cli 0.157.0")
 			t.Setenv("FULLSEND_TEST_FAIL_MATCH", tc.match)
+			sandboxName := "bootstrap-infrastructure-failure"
+			t.Cleanup(func() { forgetRunnerHeldDigests(sandboxName) })
 
 			err := r.Bootstrap(bootstrapInput{
-				sandboxName: "sb",
-				agentPath:   writeAgentFile(t, codexTestAgentDef),
-				agentName:   "triage",
+				sandboxName: sandboxName,
+				agentPath:   writeAgentFile(t, codexTestReviewAgentDef),
+				agentName:   "review",
 			})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.want)
+			// A partially installed role/configuration must never become a
+			// trusted input for Run, even if earlier uploads succeeded.
+			_, trusted := lookupRunnerHeldDigests(sandboxName)
+			assert.False(t, trusted, "failed bootstrap must not publish integrity digests")
+			manifestPath := filepath.Join(storeDir, strings.ReplaceAll(r.codexManifestPath(), "/", "_"))
+			_, statErr := os.Stat(manifestPath)
+			assert.ErrorIs(t, statErr, os.ErrNotExist, "failed bootstrap must not publish its manifest")
 		})
 	}
 }
@@ -456,6 +501,25 @@ func TestCodexPreflightPythonVersion(t *testing.T) {
 		err := codexPreflightPythonVersion("sb", "/usr/bin/python3")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "needs at least 3.11")
+	})
+
+	// The image's PATH leads with the agent-writable /sandbox/.venv.
+	t.Run("refuses an agent-writable interpreter", func(t *testing.T) {
+		fakeOpenshellCodex(t, filepath.Join(t.TempDir(), "log"), t.TempDir(), "codex-cli 0.152.1")
+		t.Setenv("FULLSEND_TEST_PYPREFIX", "/sandbox/.venv")
+
+		err := codexPreflightPythonVersion("sb", "/usr/bin/python3")
+		require.ErrorContains(t, err, `loads from "/sandbox/.venv", which the agent can write`)
+	})
+
+	// Login-shell noise precedes the probe's own last line.
+	t.Run("refuses a probe that omits the interpreter's location", func(t *testing.T) {
+		binDir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(binDir, "openshell"), []byte("#!/bin/sh\nprintf 'motd\\n3.12\\n'\n"), 0o755))
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		err := codexPreflightPythonVersion("sb", "/usr/bin/python3")
+		require.ErrorContains(t, err, "did not report its location")
 	})
 
 	t.Run("refuses an unreadable version", func(t *testing.T) {

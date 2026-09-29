@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -9,11 +10,13 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
-// RunMetrics collects execution statistics from stream parsing.
+// RunMetrics collects execution statistics from stream parsing. CostUnavailable
+// means TotalCostUSD is incomplete because some usage has no reported cost.
 type RunMetrics struct {
 	ToolCalls                atomic.Int32
 	NumTurns                 int     `json:"num_turns"`
 	TotalCostUSD             float64 `json:"total_cost_usd"`
+	CostUnavailable          bool    `json:"cost_unavailable,omitempty"`
 	InputTokens              int     `json:"input_tokens"`
 	OutputTokens             int     `json:"output_tokens"`
 	ReasoningTokens          int     `json:"reasoning_tokens"`
@@ -21,7 +24,7 @@ type RunMetrics struct {
 	CacheReadInputTokens     int     `json:"cache_read_input_tokens"`
 	Model                    string  `json:"model"`
 	// PerModelUsage breaks the totals above down by the model spec that
-	// spent them. Runtimes that dispatch sub-agents (pi's Agent tool) fill
+	// spent them. Runtimes that dispatch sub-agents (pi and Codex) fill
 	// it with one entry per child model plus the parent's own, so a run
 	// whose cost is dominated by children is legible in metrics.json;
 	// runtimes without sub-agents leave it nil and the totals stand alone.
@@ -30,14 +33,18 @@ type RunMetrics struct {
 
 // ModelUsage is one model's token and cost contribution to a run. Requests
 // counts the agent invocations attributed to the model (one for the parent
-// iteration, one per sub-agent call).
+// iteration, one per sub-agent call). A Codex thread that changes model
+// contributes one invocation to each model it actually used. CostUnavailable
+// marks CostUSD as incomplete, including when its known contribution is zero.
 type ModelUsage struct {
 	Requests                 int     `json:"requests"`
 	InputTokens              int     `json:"input_tokens"`
 	OutputTokens             int     `json:"output_tokens"`
+	ReasoningTokens          int     `json:"reasoning_tokens,omitempty"`
 	CacheCreationInputTokens int     `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int     `json:"cache_read_input_tokens"`
 	CostUSD                  float64 `json:"cost_usd"`
+	CostUnavailable          bool    `json:"cost_unavailable,omitempty"`
 }
 
 // Add accumulates other into u.
@@ -45,10 +52,17 @@ func (u *ModelUsage) Add(other ModelUsage) {
 	u.Requests += other.Requests
 	u.InputTokens += other.InputTokens
 	u.OutputTokens += other.OutputTokens
+	u.ReasoningTokens += other.ReasoningTokens
 	u.CacheCreationInputTokens += other.CacheCreationInputTokens
 	u.CacheReadInputTokens += other.CacheReadInputTokens
 	u.CostUSD += other.CostUSD
+	u.CostUnavailable = u.CostUnavailable || other.CostUnavailable
 }
+
+// ErrIncompleteEvidence marks a run whose required runtime evidence could not
+// be collected or verified. Callers should preserve available artifacts, but
+// must not accept output validation as proof that the run completed safely.
+var ErrIncompleteEvidence = errors.New("incomplete runtime evidence")
 
 // DefaultAgentPrompt is the prompt handed to the agent CLI when RunParams
 // does not override it. It is deliberately content-free: the actual task

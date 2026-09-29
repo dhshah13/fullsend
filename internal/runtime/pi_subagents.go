@@ -18,11 +18,9 @@ import (
 // parent's entry is always in the breakdown (see foldPiSubagentUsage).
 //
 // The fold covers exactly the fields a per-model entry has: input,
-// output, cache-creation and cache-read tokens, and cost. Reasoning
-// tokens are not among them — RunMetrics carries a run-level
-// ReasoningTokens with no ModelUsage counterpart — so the
-// breakdown-sums-to-the-totals invariant is about those five and not
-// about every number in metrics.json.
+// output, cache-creation and cache-read tokens, and cost. Pi's child usage
+// records do not expose a separate reasoning count, so its breakdown invariant
+// covers those five fields. Codex records also populate ModelUsage.ReasoningTokens.
 
 // piSubagentUnknownModel keys a usage record that carries no model spec:
 // the line has a seq and a usage object but its "model" is empty or

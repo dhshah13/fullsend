@@ -208,7 +208,10 @@ var codexRolloutEnvelopes = map[string]bool{
 // codexMaxArtifactBytes bounds what the artifact filters will read. A codex
 // rollout for a long run is megabytes; the sessions directory is
 // agent-writable, so without a bound a planted multi-gigabyte file would be
-// read into the runner's memory to be "redacted".
+// read into the runner's memory to be "redacted". Native CommandExecution
+// records duplicate tool output in multiple fields and can exceed the shared
+// transcript line limit. Codex rollout scanners allow a line up to this whole
+// artifact bound, plus one byte to detect overflow or the final newline.
 const codexMaxArtifactBytes = 256 << 20
 
 // codexIsRolloutFile reports whether path is a codex rollout, by parsing
@@ -228,7 +231,7 @@ func codexIsRolloutFile(path string) error {
 	}
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxTranscriptLineSize)
+	scanner.Buffer(make([]byte, 0, 64*1024), codexMaxArtifactBytes+1)
 	seen := 0
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())

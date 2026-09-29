@@ -22,8 +22,8 @@ const (
 	// cannot move the provider, the approval policy or the sandbox mode.
 	codexConfigFile = "config.toml"
 	// codexHooksFile is codex's hook wiring, read from $CODEX_HOME/hooks.json
-	// (codex-rs/hooks/src/engine/discovery.rs). Written only when the harness
-	// enables security; its absence is how hooks stay off.
+	// (codex-rs/hooks/src/engine/discovery.rs). The mandatory native dispatch
+	// policy is always installed, plus the harness's optional security hooks.
 	codexHooksFile = "hooks.json"
 	// codexAdapterFile is the embedded adapter every hook handler invokes.
 	codexAdapterFile = "fullsend-codex-hook.py"
@@ -117,10 +117,12 @@ var codexConfigTemplate = template.Must(template.New("codex-config").Parse(
 # Integrity-checked before every iteration — see buildCodexRunCommand.
 model_provider = "{{ .ProviderID }}"
 approval_policy = "never"
+allow_login_shell = false
 sandbox_mode = "danger-full-access"
 web_search = "disabled"
 check_for_update_on_startup = false
 hide_agent_reasoning = false
+sqlite_home = {{ .StateDir }}
 developer_instructions = {{ .DeveloperInstructions }}
 
 [analytics]
@@ -167,6 +169,7 @@ type codexConfigData struct {
 	ProjectKey            string
 	RefreshIntervalMS     int
 	TimeoutMS             int
+	StateDir              string
 }
 
 // renderCodexConfig produces $CODEX_HOME/config.toml for one agent run.
@@ -186,6 +189,7 @@ func renderCodexConfig(configDir, repoDir, developerInstructions string) ([]byte
 		ProjectKey:            codexTOMLString(repoDir),
 		RefreshIntervalMS:     codexAuthRefreshIntervalMS,
 		TimeoutMS:             codexAuthTimeoutMS,
+		StateDir:              codexTOMLString(configDir + "/db"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("rendering codex %s: %w", codexConfigFile, err)

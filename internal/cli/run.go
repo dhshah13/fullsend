@@ -180,9 +180,10 @@ type statusOpts struct {
 
 // aggregateMetrics holds accumulated behavioral metrics across retry iterations.
 type aggregateMetrics struct {
-	NumTurns     int     `json:"num_turns"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
-	TokenUsage   struct {
+	NumTurns        int     `json:"num_turns"`
+	TotalCostUSD    float64 `json:"total_cost_usd"`
+	CostUnavailable bool    `json:"cost_unavailable,omitempty"`
+	TokenUsage      struct {
 		Input         int `json:"input"`
 		Output        int `json:"output"`
 		Reasoning     int `json:"reasoning"`
@@ -506,6 +507,13 @@ func newRunCmd() *cobra.Command {
 }
 
 func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRepo, fullsendBinary string, envFiles []string, noPostScript bool, debug string, forgeFlag string, eventFile string, rFlags resolveFlags, sOpts statusOpts, printer *ui.Printer, keepSandbox bool, oFlags runOverrideFlags) (runErr error) {
+	return runAgentWithRuntimeResolver(ctx, agentName, fullsendDir, outputBase, targetRepo, fullsendBinary, envFiles, noPostScript, debug, forgeFlag, eventFile, rFlags, sOpts, printer, keepSandbox, oFlags, resolveBackendFrom)
+}
+
+// runAgentWithRuntimeResolver scopes backend injection to one invocation. Tests
+// can exercise runner failure boundaries without replacing a package-global
+// resolver that another concurrent run could observe.
+func runAgentWithRuntimeResolver(ctx context.Context, agentName, fullsendDir, outputBase, targetRepo, fullsendBinary string, envFiles []string, noPostScript bool, debug string, forgeFlag string, eventFile string, rFlags resolveFlags, sOpts statusOpts, printer *ui.Printer, keepSandbox bool, oFlags runOverrideFlags, resolveRuntime func(runOverrides, runConfig, string) (agentruntime.Backend, string, error)) (runErr error) {
 	printer.Banner(Version())
 	printer.Blank()
 	printer.Header("Running agent: " + agentName)
@@ -1050,7 +1058,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			}
 		}
 	}
-	runtimeBackend, runtimeConfigSource, runtimeErr := resolveBackendFrom(overrides, runCfg, agentName)
+	runtimeBackend, runtimeConfigSource, runtimeErr := resolveRuntime(overrides, runCfg, agentName)
 	if runtimeErr != nil {
 		switch {
 		case errors.Is(runtimeErr, errParsingConfigRuntime):
@@ -1568,6 +1576,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// post-script defer must only run when validation has passed — running it
 	// on unvalidated output would violate ADR 0022's zero-trust model.
 	var validationPassed bool
+	var evidenceErr error
 
 	defer func() {
 		exitCode := telemetryExitCode(lastExitCode, runErr)
@@ -2239,7 +2248,8 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	// models and Claude's fallbacks stay on Anthropic (#7245).
 	genAISystem := agentruntime.GenAISystemFor(rt, h.Model, agentDefModel, configModelAliases)
 
-	for iteration := 1; iteration <= maxIterations; iteration++ {
+	// A retry cannot restore missing runtime evidence, so it stops inference.
+	for iteration := 1; iteration <= maxIterations && evidenceErr == nil; iteration++ {
 		runCount = iteration
 		transcriptErrorOverride = false
 
@@ -2375,7 +2385,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			return cancelledErr
 		}
 
-		if runErr != nil {
+		if runErr != nil && !errors.Is(runErr, agentruntime.ErrIncompleteEvidence) {
 			attachIterationContent("error")
 			finalizeAgentSpan(agentSpan, runErr, iteration, exitCode, genAISystem, rt.Name(), &metrics, "", toolSpans)
 			printer.StepFail("Agent execution failed")
@@ -2389,6 +2399,11 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 				printer.StepWarn("Failed to write metrics.json: " + err.Error())
 			}
 			return fmt.Errorf("running agent (iteration %d): %w", iteration, runErr)
+		}
+		if runErr != nil {
+			// Preserve partial output and transcripts below, but a schema
+			// pass cannot replace required runtime evidence.
+			evidenceErr = errors.Join(evidenceErr, fmt.Errorf("running agent (iteration %d): %w", iteration, runErr))
 		}
 		lastExitCode = exitCode
 
@@ -2420,11 +2435,11 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		// that enum value means a model-side length stop, and telemetry
 		// cuts are marked by fullsend.content.truncated instead.
 		contentFinishReason := "stop"
-		if exitCode != 0 || transcriptErrMsg != "" {
+		if runErr != nil || exitCode != 0 || transcriptErrMsg != "" {
 			contentFinishReason = "error"
 		}
 		attachIterationContent(contentFinishReason)
-		finalizeAgentSpan(agentSpan, nil, iteration, exitCode, genAISystem, rt.Name(), &metrics, transcriptErrMsg, toolSpans)
+		finalizeAgentSpan(agentSpan, runErr, iteration, exitCode, genAISystem, rt.Name(), &metrics, transcriptErrMsg, toolSpans)
 
 		printer.Blank()
 		// Non-zero exit is a warning, not a failure — the validation loop is the success gate.
@@ -2472,6 +2487,9 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		printer.StepStart("Extracting transcripts")
 		if err := tx.ExtractTranscripts(sandboxName, agentName, iterTranscriptDir); err != nil {
 			printer.StepWarn("Failed to extract transcripts: " + err.Error())
+			if errors.Is(err, agentruntime.ErrIncompleteEvidence) {
+				evidenceErr = errors.Join(evidenceErr, fmt.Errorf("extracting transcripts (iteration %d): %w", iteration, err))
+			}
 		} else {
 			printer.StepDone(fmt.Sprintf("Transcripts extracted (%.1fs)", time.Since(transcriptStart).Seconds()))
 		}
@@ -2591,7 +2609,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 			}
 			break
 		}
-		if iteration < maxIterations {
+		if iteration < maxIterations && evidenceErr == nil {
 			printer.StepInfo(fmt.Sprintf("Will retry (%d iterations remaining)", maxIterations-iteration))
 		}
 	}
@@ -2681,7 +2699,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 	}
 	printer.Blank()
 
-	return runTerminalError(h.ValidationLoop != nil, validationPassed, lastIterTimedOut, runCount, lastIterElapsed, timeout)
+	return errors.Join(evidenceErr, runTerminalError(h.ValidationLoop != nil, validationPassed, lastIterTimedOut, runCount, lastIterElapsed, timeout))
 }
 
 func bootstrapCommon(sandboxName, fullsendBinary string, h *harness.Harness) error {
@@ -3648,12 +3666,15 @@ func agentSpanStartAttrs(iteration int, agentName string) []attribute.KeyValue {
 }
 
 func rootSpanEndAttrs(agg aggregateMetrics, runCount int) []attribute.KeyValue {
-	return []attribute.KeyValue{
+	attrs := []attribute.KeyValue{
 		attribute.Int("fullsend.num_turns", agg.NumTurns),
 		attribute.Int("fullsend.tool_calls", agg.ToolCalls),
-		attribute.Float64("fullsend.cost_usd", roundUSD(agg.TotalCostUSD)),
 		attribute.Int("fullsend.iterations", runCount),
 	}
+	if agg.CostUnavailable {
+		return append(attrs, attribute.Bool("fullsend.cost_unavailable", true))
+	}
+	return append(attrs, attribute.Float64("fullsend.cost_usd", roundUSD(agg.TotalCostUSD)))
 }
 
 func agentSpanEndAttrs(iteration, exitCode int, system, runtimeName string, m *agentruntime.RunMetrics) []attribute.KeyValue {
@@ -3670,8 +3691,12 @@ func agentSpanEndAttrs(iteration, exitCode int, system, runtimeName string, m *a
 		attribute.Int("gen_ai.usage.output_tokens", m.OutputTokens),
 		attribute.Int("gen_ai.usage.cache_creation.input_tokens", m.CacheCreationInputTokens),
 		attribute.Int("gen_ai.usage.cache_read.input_tokens", m.CacheReadInputTokens),
-		attribute.Float64("fullsend.cost_usd", roundUSD(m.TotalCostUSD)),
 		attribute.Int("fullsend.tool_calls", int(m.ToolCalls.Load())),
+	}
+	if m.CostUnavailable {
+		attrs = append(attrs, attribute.Bool("fullsend.cost_unavailable", true))
+	} else {
+		attrs = append(attrs, attribute.Float64("fullsend.cost_usd", roundUSD(m.TotalCostUSD)))
 	}
 	if m.ReasoningTokens > 0 {
 		attrs = append(attrs, attribute.Int("gen_ai.usage.reasoning_tokens", m.ReasoningTokens))
@@ -3685,6 +3710,7 @@ func agentSpanEndAttrs(iteration, exitCode int, system, runtimeName string, m *a
 func aggregateRunMetrics(agg *aggregateMetrics, m *agentruntime.RunMetrics, iteration int) {
 	agg.NumTurns += m.NumTurns
 	agg.TotalCostUSD += m.TotalCostUSD
+	agg.CostUnavailable = agg.CostUnavailable || m.CostUnavailable
 	agg.TokenUsage.Input += m.InputTokens
 	agg.TokenUsage.Output += m.OutputTokens
 	agg.TokenUsage.Reasoning += m.ReasoningTokens
