@@ -239,6 +239,7 @@ The `agent` span's provider identity reflects only the parent run's serving endp
 | `fullsend.work_item_id` | `run` | Work item identity (e.g. `owner/repo#123`); primary cross-run correlation key |
 | `fullsend.agent` | `run` | Agent name |
 | `fullsend.cost_usd` | `run` (aggregated), `agent` | Cost in USD, rounded to cents (see [Cost data contract](#cost-data-contract)) |
+| `fullsend.cost_unavailable` | `run`, `agent` | Present (`true`) when dollar cost is unavailable; `fullsend.cost_usd` is then omitted |
 | `fullsend.tool_calls` | `run` (aggregated), `agent` | Number of tool invocations |
 | `fullsend.num_turns` | `run` | Total conversation turns across all iterations |
 | `fullsend.iterations` | `run` | Number of agent iterations (validation loop included) |
@@ -279,7 +280,7 @@ Additional resource attributes from `OTEL_RESOURCE_ATTRIBUTES` are merged in.
 ## Cost data contract
 
 Fullsend does not calculate inference cost from token counts or maintain a
-model-price table. Each runtime reports a USD cost value and fullsend
+model-price table. When a runtime reports a USD cost value, fullsend
 records it as-is. This section defines the source, aggregation, rounding,
 and display behavior of that value across every output surface.
 
@@ -292,6 +293,7 @@ Each runtime extracts cost differently from its agent process:
 | `claude` | Claude Code stream JSON | Reads `result.total_cost_usd` from the final result event — a single value covering the entire iteration |
 | `pi` | Pi assistant message stream | Sums `usage.cost.total` across all assistant messages in the iteration |
 | `opencode` | OpenCode step stream | Sums `step_finish.part.cost` across all step-finish events in the iteration |
+| `codex` | No dollar-cost field | Sets `cost_unavailable: true`; parent and child token usage remains available |
 
 The runtime-reported value includes whatever the provider prices — input
 tokens, output tokens, cache-creation tokens, cache-read tokens, and
@@ -311,13 +313,13 @@ sums raw costs:
 run_total_cost_usd = sum(iteration.total_cost_usd for each completed iteration)
 ```
 
-This sum is the single aggregate cost for the run, used by every
-downstream surface.
+If any iteration marks cost unavailable, the aggregate also marks it unavailable;
+any numeric partial sum is not a complete price for the run.
 
 ### Rounding and precision by surface
 
-The raw aggregate is a floating-point sum. Different output surfaces
-apply different precision:
+For available cost, the raw aggregate is a floating-point sum. Different output
+surfaces apply different precision:
 
 | Surface | Value | Precision | Example |
 |---------|-------|-----------|---------|
@@ -337,9 +339,12 @@ differently than the sum of parts.
 
 ### No pricing-table fallback
 
-If a runtime does not report cost (returns zero or the field is absent),
-fullsend records zero. There is no fallback cost calculation from token
-counts. A missing runtime cost propagates as `$0.00` on all surfaces.
+There is no fallback cost calculation from token counts. Codex explicitly marks
+cost unavailable in aggregate and per-model metrics; its terminal result displays
+unavailable, and run/agent spans omit `fullsend.cost_usd` and carry
+`fullsend.cost_unavailable: true`. Consumers must check the availability flag before
+interpreting a numeric zero. A zero without an availability signal from another
+runtime retains that runtime's existing reporting behavior.
 
 ### Distinction from backend-derived cost estimates
 

@@ -1051,9 +1051,9 @@ flowchart TB
   codex records a trust level for a git checkout it starts in when none is set, and only skips
   that when one already is. This is codex's equivalent of pi's `defaultProjectTrust: "never"`.
 - **Config layering.** The sandbox image bakes a root-owned managed `/etc/codex/config.toml`; the
-  runner's `$CODEX_HOME/config.toml` layers above it, and the `-c` SessionFlags above that. Only
-  the `-c` layer is beyond an agent's reach between iterations, which is why the security-relevant
-  keys are passed there as well as written to the file.
+  runner's `$CODEX_HOME/config.toml` layers above it, and the `-c` SessionFlags above that. The
+  native process hierarchy inherits a Landlock write restriction protecting the configuration and
+  child roles. Security-relevant keys are also passed in the `-c` layer.
 - **No `CLAUDE.md` pointer.** `CodexRuntime` does not implement `ContextBridger`; it gets the repo's
   `AGENTS.md` through `$CODEX_HOME/AGENTS.md` instead (see **AGENTS.md** below).
 - **Tool names**: the shell tool is already `Bash`; `apply_patch` covers Claude's `Write` and `Edit`
@@ -1102,9 +1102,11 @@ flowchart TB
 - **Exit code**: `codex exec` exits 0 on a failed turn *and* on an interrupted one, so the stream's
   verdict overrides it, exactly as for pi. Distinct guard exits: **97** (a runner-owned file is
   missing or no longer matches its embedded copy) and **98** (`config.toml` no longer pins the
-  provider endpoint or its auth command, or trusts the project).
-- **Cost is never reported** — the stream carries no cost field, so `total_cost_usd` stays 0. The
-  model id in `metrics.json` comes from the run parameters, not the wire.
+  provider endpoint or its auth command, or trusts the project), both behind the Landlock
+  launcher's **78**, which checks the same files first.
+- **Cost is unavailable** — Codex reports no dollar cost. Aggregate and per-model usage carry
+  `cost_unavailable: true`, the renderer says unavailable, and cost span attributes are omitted.
+  Root and child usage is folded from persisted response records as described below.
 
 ### Credential path
 
@@ -1139,7 +1141,7 @@ Matcher translation, per group:
 |---|---|---|
 | `Bash` | `Bash` | codex's shell tool has the same name |
 | `Write`, `Edit`, `MultiEdit` | `apply_patch` | the canonical name; `Write`/`Edit` would also match as aliases |
-| `Agent`, `Task` | `spawn_agent` | not reachable in v1 — no sub-agent roster is wired |
+| `Agent`, `Task` | `spawn_agent` | native child dispatch; the mandatory policy hook also covers `resume_agent` |
 | `Read`, `Glob`, `Grep`, `LS`, `WebFetch`, `WebSearch` | *dropped, with a note* | no codex tool; the `Bash` groups cover this work |
 | `*` (`security.AllTools`) | *matcher key omitted* | an absent matcher matches every tool |
 | `PostToolUseFailure` (any tools) | *not wired* | codex has no such event and does not need one — see below |
@@ -1195,16 +1197,21 @@ Consequences of those, recorded in the matrix and [ADR 0100](../ADRs/0100-codex-
 
 ### Where the guards' expected values come from
 
-Everything under `CODEX_HOME` is agent-writable between iterations, so a guard is worth only as much
-as the place its expected value comes from. There are two trustworthy places — this binary, and
+Authority files under `CODEX_HOME` and the separate role directory are protected throughout the
+launched hierarchy by Landlock. Digests still catch changes introduced outside that hierarchy;
+their expected values come from two trustworthy places — this binary, and
 **runner-held digests**, meaning digests the runner records outside the sandbox at Bootstrap and injects into the launch command at Run — and the manifest is not one of them:
 
 | File | Anchor | Guard |
 |---|---|---|
-| hook adapter, auth script | **compile-time** — `go:embed`ed, so the digest is a literal in the run command | SHA-256, exit 97 |
-| the shared hook scripts | **compile-time** for the bytes, **runner-held** for which names — Bootstrap records the name → digest map for the set the harness enabled | SHA-256 per filename, plus an exhaustive directory check, exit 97 |
-| `config.toml`, `hooks.json` | **runner-held** — rendered per run, so Bootstrap records what it uploaded outside the sandbox and Run injects it into the launch command (`codex_integrity.go`) | whole-file SHA-256, exit 98 |
-| `fullsend-manifest.json` | none — it is a file in the same agent-writable directory | information only; never authority |
+| hook adapter, auth script | **compile-time** — `go:embed`ed, so the digest is a literal in the run command | SHA-256; launcher exit 78, shell exit 97 |
+| the shared hook scripts | **compile-time** for the bytes, **runner-held** for which names — Bootstrap records the name → digest map for the set the harness enabled | SHA-256 per filename, plus an exhaustive directory check; launcher exit 78, shell exit 97 |
+| `config.toml`, `hooks.json` | **runner-held** — rendered per run, so Bootstrap records what it uploaded outside the sandbox and Run injects it into the launch command (`codex_integrity.go`) | whole-file SHA-256; launcher exit 78, shell exit 98 |
+| native role files and dispatch policy | **runner-held** — Bootstrap records exact paths and digests; the launcher restricts writes before checking them | exhaustive authority check, exit 78 |
+| `fullsend-manifest.json` | none | information only; never authority |
+
+The launcher checks these files before the shell starts, so the shell's 97 and 98 appear only for a
+missing manifest or a change made after the launcher's check.
 
 The hook-script check makes codex **stricter than Claude Code and pi**, where the scripts stay
 agent-writable between iterations with no integrity check at all. Each digest is bound to its
@@ -1223,26 +1230,30 @@ agent-writable between iterations with no integrity check at all. Each digest is
 All five were reproduced under `/bin/sh` before the guard was rewritten, and each has a case in
 `TestCodexHookScriptsGuard_Executes`.
 
-That guard runs once, before codex starts. The agent then has the whole iteration — with full
-sandbox access — to rewrite a script before the next tool call reaches it, a window Claude Code and
-pi leave open too. On codex it is cheap to close: the run command exports the name → digest map into
-the codex process's environment after `.env` and before launch, and a running process's environment
-is not something the agent can reach, so **the adapter re-reads and re-verifies each script
-immediately before spawning it** and blocks on a mismatch. A missing or malformed map is itself a
-block, since the adapter only ever runs when the runner enabled hooks.
+The launcher applies its kernel write restriction before sourcing `.env`, closes inherited file
+descriptors and then checks authority files. This closes the window in which a running parent could
+rewrite a role before a native child rereads it. The run command also exports the name → digest map
+after `.env`; **the adapter re-verifies each script immediately before spawning it** and blocks on
+a mismatch. A missing or malformed map is itself a block. The mandatory dispatch guard remains
+installed when optional security scanners are disabled.
 
 **PATH is pinned across `.env` for the same reason the interpreter is.** The hook scripts resolve
 their tools by name — `tirith_check.py` runs a bare `tirith` — so a `.env` that prepends a directory
 holding a fake `tirith` that exits 0 neuters the entire PreToolUse chain while every digest stays
-green. Reproduced before the pin existed. `Run` captures `PATH` into a readonly variable before
-sourcing `.env` and restores it afterwards, and unsets `LD_PRELOAD`, `LD_LIBRARY_PATH` and
+green. Reproduced before the pin existed. `Run` captures the base `PATH` into a readonly variable
+before sourcing `.env`; scanners use that base path. Agent shells get the workspace helper and Go
+directories plus the base path. `allow_login_shell=false` prevents startup files from discarding
+those helper paths. `Run` also unsets `LD_PRELOAD`, `LD_LIBRARY_PATH` and
 `LD_AUDIT`, which would otherwise load code into any dynamically linked program the run starts —
 codex's own binary, `tirith`, `git` — before its `main`. The adapter strips `LD_*` and `PYTHON*`
 from the children's environment too, while passing the scripts' own configuration through.
+The run command unsets `BASH_ENV`, `ENV`, `ZDOTDIR` and `SHELL` after `.env`: the image's non-interactive Bash hook
+shell still reads `BASH_ENV`, which could otherwise exit before the dispatch guard executes.
 
-**Why not record the config digest in the manifest.** It would be a digest in the same
-agent-writable directory as the file it describes, so an agent could rewrite both and the guard would pass. That is
-not theoretical: `projects."<repo>".trust_level = "trusted"` in `config.toml` makes codex load the
+**Why the manifest is not a trust anchor.** Before Landlock, an agent could rewrite both the config
+and a digest beside it. The inherited write restriction now prevents that within the launched
+hierarchy; runner-held digests still detect external or pre-launch changes. The original failure
+was reproducible: `projects."<repo>".trust_level = "trusted"` in `config.toml` makes codex load the
 target repo's own `.codex/config.toml`, which then supplies `developer_instructions`, `model`, and —
 under `--dangerously-bypass-hook-trust` — repo-authored hooks. Verified against 0.152.1: with the
 line the repo layer applied, without it it did not. An earlier grep-based guard here looked for a
@@ -1352,6 +1363,68 @@ Two artefacts of the run are worth knowing about:
   `turn.failed` carrying the 404, not as a startup error — which is why `Run` returns 1 from the
   stream verdict rather than trusting the exit code.
 
+### Native children (#6970)
+
+[ADR 0126](../ADRs/0126-runner-owned-codex-child-policy.md) describes the authority boundary.
+`codex_personas.go` discovers personas from selected skills and renders native role TOML files.
+The runner applies explicit persona model → `FULLSEND_CODEX_SUBAGENT_MODEL` → `subagents.default` →
+`gpt-5.6-luna` precedence. Claude model/tool frontmatter is not native configuration. Generic and
+Explore roles are explicit entries too; invalid mappings fail bootstrap. Only an agent with the
+Agent tool (pi's `piAgentToolEnabled`) gets roles; any other agent gets `[agents] enabled = false`.
+
+The native configuration allows four open child IDs, including completed-but-unclosed children,
+and depth one. A synchronous mandatory
+PreToolUse guard rejects nested dispatch, inherited context, per-call model/effort overrides,
+unknown roles and all resume calls. Native V1 cold resume can reconstruct a child with the root's
+configuration, so it cannot preserve the role/model contract. A fresh spawn is required instead.
+The runner requires a nonempty completed result and a close event for every successful spawn;
+waiting for one child or merely seeing a successful spawn is insufficient.
+
+`codex_landlock.go` and the embedded launcher require Linux Landlock ABI 3 or newer. Configuration,
+role and hook directories remain read-only, while native sessions, logs and SQLite state have
+explicit writable paths; the runner re-seeds the credential placeholder outside the restricted
+hierarchy. The launcher closes descriptors above stderr,
+checks for symlinks/hardlinks and verifies authority after restriction. These controls apply to
+the native hierarchy; shared tool hooks remain defense in depth, including their upstream
+failure/timeout semantics.
+
+`codex_usage.go` folds `token_usage_record.payload.usage` **deltas**, deduplicated by native thread
+and response ID. The corresponding turn context supplies the model. Persisted parent records
+replace the stream snapshot when present, including usage incurred before an interrupted final
+turn; completed and failed children's recorded usage is added once. Reasoning output is split from
+other output tokens. Per-model `requests` counts native thread/model invocations with recorded
+usage, not individual Responses API calls. Missing or inconsistent expected child evidence is an
+error, not zero usage.
+
+Rollout enumeration and transfer are bounded and use private host staging, with a 256 MiB
+aggregate transfer budget. A native JSONL record can exceed 1 MiB because command events retain
+multiple copies of tool output. Persisted rollout readers accept records within that artifact
+budget and validate the complete file. The live `exec --json` stream and its output redactor
+instead have an 8 MiB record limit; an oversized live record fails evidence collection rather
+than silently dropping child dispatch. Each complete JSONL file is redacted and atomically published;
+partial transfers and unreadable directories
+are errors. The runner retains expected thread IDs and raw file digests after usage collection;
+extraction must publish the same root and child evidence. A disappeared file or
+`codex transcript changed after usage collection for thread <id>` fails extraction; valid siblings
+are retained, but a changed file is withheld. A stream that ended without a terminal event (a
+timeout) keeps no digests, because Codex writes until the runner terminates it; extraction then
+publishes the final bytes. `runtime.ErrIncompleteEvidence` lets the CLI preserve output, transcripts and metrics
+while still failing the run, even if inline or sweep validation succeeds. It also stops further
+iterations, since a retry cannot restore the missing evidence. Post-scripts cannot run
+after that sentinel. Debug logs also use private staging before redaction and publication.
+
+### Native-child validation
+
+Validated locally at runtime `b668fee` with Codex CLI 0.157.0 and 0.158.0, `gpt-5.6-luna` as root
+and child (V1 collaboration API) and medium effort: representative review and retro runs with the
+[agents #1542](https://github.com/fullsend-ai/agents/pull/1542) instructions closed every child,
+produced schema-valid output and reconciled root/child transcripts and usage. That build still had
+the security collector and the image's venv Python, and predates the Agent-tool gate, the dispatch
+matcher change and the pre-created `$HOME` entries; later changes have unit and Linux Landlock
+tests but no live run. Not validated: lower effort, V2-selecting or mixed child models, other Codex
+agents (code and fix have the Agent tool, so they get roles), live forge posting, CI Workload
+Identity and the full fleet lifecycle. Reduced fixtures are in `internal/runtime/testdata/codex/native-subagents`.
+
 ### Not yet exercised
 
 `runtime: codex` is selectable per repo or per agent. Outstanding:
@@ -1362,13 +1435,16 @@ Two artefacts of the run are worth knowing about:
   and local smoke runs.
 - The rollout session files are archived as transcripts but not error-classified: only the tee'd
   `exec --json` capture yields a verdict, which is what the runner's exit-code override reads.
-- Sub-agent rosters are not wired, so `review`/`retro` are unsupported; `Bootstrap` appends a runtime
-  note telling the agent to execute sub-agent definitions itself, in order, as it does for pi.
+- General review/retro support requires the validated runtime and companion revisions together.
+  The local validation above does not establish the outstanding environments or close the
+  cross-repository merge dependency. Single-context execution is not an acceptable substitute.
 
 ### Re-check on a `CODEX_VERSION` bump
 
 | What | Why it matters | Where |
 |---|---|---|
+| Native role rereads, state paths, hook inheritance and model-selected V1/V2 lifecycle | role/model authority, Landlock compatibility, depth/concurrency and complete child closure must still hold | native child source plus the pinned/latest live workflow matrix |
+| `token_usage_record` response deltas and turn/model linkage | a cumulative snapshot or missing attribution can double-count or lose child usage | recorded native fixtures and parent/child reconciliation |
 | Hook exit-code semantics (0/2 blocking, everything else `Failed`) | the adapter's block translation is built on it; a change makes hooks fail open | `codex-rs/hooks/src/events/{pre,post}_tool_use.rs` |
 | `async` and `can_apply_control_effects` | a synchronous-only rule that changed would alter what the wiring must omit | `codex-rs/hooks/src/engine/mod.rs` |
 | `PostToolUse` output fields | if `updatedToolOutput` ever lands, the sanitizers can start redacting again | `codex-rs/hooks/src/schema.rs` |

@@ -17,6 +17,9 @@ Date: 2026-09-05
 
 Accepted
 
+Codex-specific model precedence and protected native role dispatch are defined
+in [ADR 0126](0126-runner-owned-codex-child-policy.md).
+
 ## Context
 
 Sub-agent skills (pr-review, retro-analysis) dispatch children by passing a

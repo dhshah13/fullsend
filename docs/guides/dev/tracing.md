@@ -110,8 +110,9 @@ Start attributes include: `fullsend.agent`, `fullsend.work_item_id`,
 `gen_ai.operation.name`, `gen_ai.agent.name`.
 
 End attributes (set in a deferred cleanup): `exit_code`,
-`fullsend.cost_usd`, `fullsend.num_turns`, `fullsend.tool_calls`,
-`fullsend.iterations`.
+`fullsend.num_turns`, `fullsend.tool_calls`, `fullsend.iterations`, and
+`fullsend.cost_usd` when dollar cost is available. Otherwise (including Codex),
+`fullsend.cost_unavailable: true` is emitted and `fullsend.cost_usd` is omitted.
 
 For the full attribute list (including `fullsend.security_trace_id` and
 `fullsend.prescript.*`), see the
@@ -131,8 +132,10 @@ The helper functions `agentSpanStartAttrs()` and `agentSpanEndAttrs()`
 build the attribute slices. Start attributes: `iteration`,
 `gen_ai.operation.name`, `gen_ai.agent.name`. End attributes: `iteration`,
 `exit_code`, `gen_ai.system` and `gen_ai.provider.name` (same serving-endpoint
-value), model, token counts, `fullsend.cost_usd`, `fullsend.runtime`,
-`fullsend.tool_calls`. Multi-provider runtimes resolve the provider from the
+value), model, token counts, `fullsend.runtime`, and `fullsend.tool_calls`.
+Cost follows the root span's rule: `fullsend.cost_usd` when available, otherwise
+`fullsend.cost_unavailable: true` with no `fullsend.cost_usd` attribute.
+Multi-provider runtimes resolve the provider from the
 effective model via `runtime.GenAISystemFor`; `System()` is only the fallback.
 
 ### execute_tool spans

@@ -48,9 +48,9 @@ The **Runtime** line shows which runtime was selected and the config source it w
 
 ## Runtime selection
 
-The runtime for a run is resolved once, in this order: `--runtime` flag, `FULLSEND_RUNTIME`, `runtime:` on the agent's `agents:` entry in `config.yaml` / `.fullsend/config.yaml`, the repo-wide `runtime:` there, then the built-in `claude`. The same order applies to the model (`--model`, `FULLSEND_MODEL`, `model:` on the agent's `agents:` entry, harness `model:`, agent frontmatter; `FULLSEND_PI_MODEL` on pi and `FULLSEND_CODEX_MODEL` on codex are lower-precedence aliases, each read only when that runtime is the one selected) and to effort (`--effort`, `FULLSEND_EFFORT`, `effort:` on the agent's `agents:` entry, harness `effort:`). `<agent>` is the name given to `fullsend run` (`triage`, `code`, …); see [Runtimes — per-agent settings](../runtimes.md#per-agent-runtime-model-and-effort). `FULLSEND_FALLBACK_MODELS=a,b` becomes Claude Code's `--fallback-model`; pi uses it for aliased models on the top-level run when Vertex does not serve the model (two specific 404/403 messages, same provider only; sub-agent children get none); codex ignores it with a warning.
+The runtime for a run is resolved once, in this order: `--runtime` flag, `FULLSEND_RUNTIME`, `runtime:` on the agent's `agents:` entry in `config.yaml` / `.fullsend/config.yaml`, the repo-wide `runtime:` there, then the built-in `claude`. The same order applies to the model (`--model`, `FULLSEND_MODEL`, `model:` on the agent's `agents:` entry, harness `model:`, agent frontmatter; `FULLSEND_PI_MODEL` on pi and `FULLSEND_CODEX_MODEL` on codex are lower-precedence aliases, each read only when that runtime is the one selected) and to effort (`--effort`, `FULLSEND_EFFORT`, `effort:` on the agent's `agents:` entry, harness `effort:`). `<agent>` is the name given to `fullsend run` (`triage`, `code`, …); see [Runtimes — per-agent settings](../runtimes.md#per-agent-runtime-model-and-effort). For Codex native children, `--effort` sets the root only; child roles retain their native model defaults (see [Codex native children](../runtimes/codex.md#native-children)). `FULLSEND_FALLBACK_MODELS=a,b` becomes Claude Code's `--fallback-model`; pi uses it for aliased models on the top-level run when Vertex does not serve the model (two specific 404/403 messages, same provider only; sub-agent children get none); codex ignores it with a warning.
 
-The plan block prints `Runtime: <name> (from <source>)` and, when an override applied, `Model: <value> (from <source>)`; stderr carries `runtime: selected "<name>" from <source>` (and `model: requested "<value>" from <source>`) for scripts. A value from the config file is labelled with the file path, suffixed ` agents.<name>` when the agent's entry decided. When `models.aliases` in `.fullsend/config.yaml` remaps the alias, the line keeps the alias and its source and adds the remap: `Model: sonnet (from <source>) → claude-sonnet-5 (from <config path> models.aliases)`, with `model: alias "sonnet" remapped to "claude-sonnet-5" from <config path> models.aliases` on stderr. Aliased entries in the `Fallback models` line show as `alias → id` (`sonnet → claude-sonnet-5, claude-opus-4-6 (from FULLSEND_FALLBACK_MODELS)`); literal ids print as written; pi uses the chain for aliased models when Vertex does not serve the model and ignores it for pinned ids. An invalid override — unknown runtime, unknown effort level, an `agents:` entry that names no agent, or a `models.aliases` key or value the block does not accept — fails before the sandbox is created.
+The plan block prints `Runtime: <name> (from <source>)` and, when an override applied, `Model: <value> (from <source>)`; stderr carries `runtime: selected "<name>" from <source>` (and `model: requested "<value>" from <source>`) for scripts. A value from the config file is labelled with the file path, suffixed ` agents.<name>` when the agent's entry decided. When `models.aliases` in `.fullsend/config.yaml` remaps the alias, the line keeps the alias and its source and adds the remap: `Model: sonnet (from <source>) → claude-sonnet-5 (from <config path> models.aliases)`, with `model: alias "sonnet" remapped to "claude-sonnet-5" from <config path> models.aliases` on stderr. Aliased entries in the `Fallback models` line show as `alias → id` (`sonnet → claude-sonnet-5, claude-opus-4-6 (from FULLSEND_FALLBACK_MODELS)`); literal ids print as written; pi uses the chain for aliased models when Vertex does not serve the model and ignores it for pinned ids. An invalid override — unknown runtime, unknown effort level, an `agents:` entry that names no agent, or a `models.aliases` key or value the block does not accept — fails before the sandbox is created. Codex still requires an explicit OpenAI model ID: `models.aliases` does not make Claude aliases valid for Codex, even if the shared plan display shows a remap.
 
 ```bash
 # try a repo's triage on pi with Gemini Flash, without touching its config
@@ -98,29 +98,28 @@ depend on the process cwd.
 | `override_source` | Where `requested_model` came from (`--model flag`, `FULLSEND_MODEL`, `FULLSEND_PI_MODEL`, `FULLSEND_CODEX_MODEL`, `<config path> agents.<name>`, `harness`, `default`), suffixed `, remapped by <config path> models.aliases` when a per-repo alias override applied to it |
 | `runtime_source` | Where `requested_runtime` came from (`--runtime flag`, `FULLSEND_RUNTIME`, the config file path — suffixed ` agents.<name>` when the agent's entry decided — or `default (config not found)`) |
 | `total_cost_usd` | Total inference cost in USD, as reported by the runtime (raw floating-point aggregate across all iterations; no fullsend-side pricing-table fallback). See [Cost data contract](../guides/infrastructure/distributed-tracing.md#cost-data-contract) |
+| `cost_unavailable` | When true, the runtime did not report complete dollar cost. Codex sets this; zero in `total_cost_usd` does not mean free inference. Omitted for runtimes with known cost |
 | `num_turns` | Number of conversation turns |
 | `iterations` | Number of agent iterations run; an iteration killed at the budget is not retried (see [Budget and deadline](#budget-and-deadline)) |
-| `per_model_usage` | Per-model-spec breakdown, present only when a runtime reports one (today: `pi` with the `Agent` tool enabled). See below |
+| `per_model_usage` | Per-model breakdown when supplied by the runtime (`pi` with the `Agent` tool enabled, and Codex). See below |
 
 #### Per-model usage
 
-A map from pi model spec (`anthropic-vertex/claude-opus-4-6`) to
-`{requests, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cost_usd}`.
-It exists because a pi sub-agent is a separate `pi` process whose tokens never appear in the
-parent's stream, so without it `total_cost_usd` would grow with no way to attribute it.
+A map from model spec (`anthropic-vertex/claude-opus-4-6` on pi, `gpt-5.6-luna` on Codex) to
+`{requests, input_tokens, output_tokens, reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens, cost_usd, cost_unavailable}`.
+Optional zero/false fields may be omitted. It attributes usage from both the parent and children;
+child usage does not appear in the parent's ordinary stream counters.
 
 - **What folds.** Tokens and cost, from both the parent and every child, summed across retry
-  iterations. Each iteration contributes one `requests` for the parent plus one per sub-agent call,
-  so `requests` counts inference *episodes*, not HTTP requests.
-- **The invariant.** The breakdown sums to the run totals for the five fields an entry has:
-  `sum(cost_usd) == total_cost_usd`, and likewise for `input_tokens`, `output_tokens`,
-  `cache_creation_input_tokens` and `cache_read_input_tokens`. `reasoning_tokens` is a run-level
-  total with no per-model counterpart, so it is outside the invariant. The parent's entry is
-  recorded on every iteration of an `Agent`-enabled run, including ones that dispatched no
-  sub-agent, which is what keeps the invariant true across a retry.
+  iterations. Pi counts one `requests` for the parent plus one per sub-agent call. Codex counts
+  unique native thread/model invocations with recorded usage. Neither counts HTTP requests.
+- **The invariant.** The breakdown sums to the run's input, output, cache-creation and cache-read
+  token totals. Codex also attributes reasoning tokens per model; pi child records do not yet
+  provide that split. Cost sums are meaningful only when cost is available. An incomplete Codex
+  collection preserves known usage and fails the run; it must not be read as complete accounting.
 - **What stays parent-only.** `num_turns` and `tool_calls` are read from the parent's stream and are
   not broken down or added to per model — a child's turns and tool calls are recorded in its own
-  session transcript (`transcripts/<agent>-sub<seq>-*.jsonl`) instead.
+  session transcript (pi's `<agent>-sub<seq>-*.jsonl`, Codex's native thread-ID filename) instead.
 - A model spec of `unknown` is a usage record that carries no model spec at all; its cost is
   bucketed there rather than dropped. A dispatch rejected *before* a model was resolved writes
   no record, so it never reaches the breakdown.

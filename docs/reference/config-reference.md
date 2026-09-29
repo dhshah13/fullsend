@@ -182,6 +182,15 @@ effort, and sub-agent models.
   value tombstones an inherited entry. Keys must be lowercase alphanumeric
   segments joined by hyphens (max 64 chars).
 
+For Codex, a named child uses its explicit `subagents.<name>` override (`<name>` other
+than `default`), then `FULLSEND_CODEX_SUBAGENT_MODEL`, then `subagents.default`, then
+`gpt-5.6-luna`. The generic `default` role starts with the environment variable;
+`subagents.default` does not outrank it.
+Use OpenAI model IDs; Claude aliases, `inherit`, unknown persona names and other
+provider prefixes are rejected. A persona's Claude frontmatter does not override
+this selection. See [Codex native children](../runtimes/codex.md#native-children)
+for the supported model lifecycle and companion instruction requirements.
+
 In the layered config system, agents use keyed merge by `DerivedName()` — see
 [Layered Config Reference](../guides/infrastructure/layered-config-reference.md).
 

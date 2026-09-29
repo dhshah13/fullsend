@@ -57,7 +57,7 @@ agents:
 
 Effort maps onto codex's own reasoning levels:
 
-| `--effort` | Codex `model_reasoning_effort` |
+| `--effort` | Root Codex `model_reasoning_effort`; native children retain their model defaults |
 |---|---|
 | `low` | `low` |
 | `medium` | `medium` |
@@ -75,11 +75,92 @@ warning.
 | Credentials | A runner-exchanged OpenAI WIF token in CI, or your `OPENAI_API_KEY` on the runner locally — never in the sandbox. Codex reads a placeholder from a runner-owned token file and re-reads it when the credential is refreshed ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)) |
 | Unattended | Approvals off; codex's own sandbox off, because OpenShell is the boundary. A missing credential exits before the agent starts |
 | Artifacts | `output.jsonl` (the `codex exec --json` stream), `transcripts/<agent>-<rollout>.jsonl`, `metrics.json` with `runtime: codex`, plus `codex-debug.log` with `--debug`. Only uncompressed rollouts are extracted — codex compresses older sessions, so a `.jsonl.zst` is never the run's own transcript. The agent's final message is in the stream; `--output-last-message` also drops it in the runner-owned config directory inside the sandbox, which is a convenience when inspecting a kept sandbox rather than a downloaded artifact |
-| Extra knobs | `FULLSEND_CODEX_MODEL` (the runner-side model default for codex runs; see [Models](#models)) |
-| Not supported | Sub-agents, `plugins:`, fallback chains, non-OpenAI providers |
+| Extra knobs | `FULLSEND_CODEX_MODEL` (root model) and `FULLSEND_CODEX_SUBAGENT_MODEL` (child model default) |
+| Sub-agents | Native named personas, generic and Explore children; see [Native children](#native-children) for model and lifecycle requirements |
+| Not supported | `plugins:`, fallback chains, non-OpenAI providers, resuming children |
 
-Cost is **not** in `metrics.json` on codex: the `codex exec --json` stream carries no cost field, so
-the value stays `0`. Token counts are recorded normally.
+Codex does not report dollar cost. The terminal displays **unavailable**, and aggregate and
+per-model metrics carry `cost_unavailable: true`; a numeric zero in a legacy cost field is not
+evidence of a free run. Token counts include the parent and children, including failed children
+with recorded usage. Reasoning tokens are reported separately from non-reasoning output tokens.
+
+## Native children
+
+Fullsend registers personas found in the selected harness skills as native Codex roles. The
+workflow selects the personas: review chooses its review dimensions and a separate challenger;
+retro chooses investigations relevant to the failure and dispatches each with `agent_type: "default"`,
+including read-only and duplicate checks. The generic `default` and `explore` roles
+are available even when a harness supplies no personas. As on Claude Code and pi, only an agent
+whose `tools:` frontmatter is absent or names `Agent` delegates. Any other agent gets no roles,
+Codex's multi-agent tools are turned off, and its runtime note says to run each sub-agent
+definition itself. Use the companion instructions tracked
+in [agents #1542](https://github.com/fullsend-ai/agents/pull/1542); runtime support alone does not
+teach an older workflow how to dispatch native children.
+
+For each child, model selection uses this precedence:
+
+1. Its explicit named override in `agents[].subagents.<name>`, where `<name>` is not `default`.
+2. The runner's `FULLSEND_CODEX_SUBAGENT_MODEL`.
+3. `agents[].subagents.default`.
+4. `gpt-5.6-luna`.
+
+For the generic `default` role, selection starts at step 2: `subagents.default` never
+outranks `FULLSEND_CODEX_SUBAGENT_MODEL`.
+
+```yaml
+agents:
+  - name: review
+    runtime: codex
+    model: openai/gpt-5.6-luna
+    subagents:
+      default: openai/gpt-5.6-luna
+      security: openai/gpt-5.5
+```
+
+Use an actual registered persona name for an explicit override. Unknown names, Claude aliases,
+`inherit`, and non-OpenAI model prefixes are rejected. An unavailable explicit model fails rather
+than falling back. Child models must be listed by the pinned CLI's `codex debug models --bundled`:
+Codex resolves the default child model against that catalog on every spawn, named personas
+included, so a missing default fails every spawn. Fullsend does not check this at Bootstrap. A null entry removes an inherited override. Claude `model:` and `tools:`
+frontmatter in a persona is reported but does not control the native child. Every persona needs a
+non-empty `description:`; Codex drops a role without one, so Bootstrap rejects it.
+
+`--effort` sets root reasoning effort. Generated child roles select the model but do not set
+reasoning effort; native model defaults apply. In the local Luna runs, children used medium
+even when the root used low. Compare recorded per-thread effort when interpreting usage.
+The verified local Fullsend review/retro profile uses `openai/gpt-5.6-luna` with
+`--effort medium`. Earlier low-effort runs missed required reads or child closure; the runner
+rejects incomplete child evidence even when the final output passes its schema.
+
+Children start with fresh context (`fork_context: false`), their role instructions and the task
+the parent explicitly supplies. The challenger therefore receives the review packet, without
+inheriting the parent's conversation. At most four child IDs can remain open, including completed
+children that have not been closed; children cannot
+spawn grandchildren. The parent must wait for a final result from **every** child and close every
+child before finishing, including the challenger. A wait that returns one completed child does
+not mean the other children finished. Resuming a child is blocked; start a fresh child instead.
+
+These requirements apply even when optional security scanning is disabled. The native hierarchy
+inherits a Linux Landlock write restriction protecting the runner's configuration, roles and
+hook files. Bootstrap requires a system `python3` 3.11+ outside `/sandbox` and `/tmp`; launch
+requires Landlock ABI 3 or newer. An incompatible sandbox fails before inference rather than
+silently dropping this protection. `$HOME` (`/sandbox`) is the configuration's parent, so
+processes cannot add new top-level entries to it. Bootstrap pre-creates `~/.cache`, `~/.cargo`,
+`~/.config/git` (git `--global` writes its `config`), `~/.local` and `~/.npm`; tools that need
+any other new `$HOME` entry (for example `~/.rustup` or `~/.m2`) fail with a permission error.
+
+Delegation requires Codex's V1 collaboration API. **The parent model's metadata selects that
+API, not the child model override or CLI version alone.** The mandatory dispatch guard requires
+`fork_context: false` and rejects V2 arguments; a V2 parent cannot delegate under this policy,
+and there is no automatic model fallback. A run without delegation can still use other OpenAI
+models. Local live workflow validation uses `gpt-5.6-luna` for both parent and children.
+In the inspected model catalogue, `gpt-5.5` falls back to V1 and GPT-6 entries select V2; that inspection
+is not live workflow validation of those models. Mixed-model children remain unverified.
+Revalidate on a model or CLI change.
+
+Each child has a separate transcript named with its native thread ID. Missing child usage,
+missing final results, unclosed children or transcript extraction failures fail the run even if
+the final output passes its JSON schema. Artifacts and known usage are retained for diagnosis.
 
 ## Running it locally
 
@@ -159,7 +240,8 @@ What a local codex run needs, beyond the guide:
 - **The repository's own `.codex/` config is never loaded.** fullsend pins the cloned repo's
   project trust to untrusted, so `.codex/config.toml` and `.codex/hooks.json` (model, instructions,
   MCP servers, hooks) never apply. A target repo cannot change how the agent runs.
-- **Two tools, not a menu.** Codex works through a shell and `apply_patch`, so a harness `tools:`
+- **Tool lists are not native permissions.** Codex works through a shell, `apply_patch` and native
+  collaboration tools, so a harness `tools:`
   list has no native allowlist to map onto. A `Bash(...)` allowlist is **recorded but not enforced**
   on codex, and the run says so:
 
@@ -188,8 +270,12 @@ What a local codex run needs, beyond the guide:
   content before the agent sees them. Codex 0.157.0 also picks up `.codex/skills` even though the
   project is untrusted; that is not documented upstream and may change, so keep repository skills
   in `.agents/skills`. Codex's bundled skills (`skill-installer`, `imagegen` and friends) are
-  switched off, so an agent sees only yours.
-- **No cost in metrics** — see [At a glance](#at-a-glance).
+  switched off, so an agent sees only yours. Harness skills are installed under their declared
+  frontmatter name (directory name when absent); duplicate names from different directories fail
+  bootstrap. Nested skills are retained when their parent directory is uploaded.
+- **Shells are non-login shells.** This preserves the runner's workspace helper and Go paths,
+  including `fullsend-check-output`. Security scanners use a separately pinned base `PATH`.
+- **Cost is unavailable** — see [At a glance](#at-a-glance).
 
 ## Not yet exercised
 
@@ -202,16 +288,19 @@ has no default behaviour-test coverage; its scenario is gated. What was run, and
 is recorded in [codex runtime
 internals](../contributing/runtime-implementation.md#codex-runtime-internals-6920).
 
-**Keep `review` and `retro` on Claude Code.** Codex has a `spawn_agent` tool, but fullsend does not
-build a persona roster for it yet, so those two agents run in a single context instead of with their
-reviewer personas. Nothing prevents a repo-wide `runtime: codex` from applying to them — they will
-run — so pin them with `runtime: claude` on their `agents:` entries if you want the roster:
+Native review and retro require both this runtime implementation and the companion instructions.
+The cross-repository completion gate remains [#6970](https://github.com/fullsend-ai/fullsend/issues/6970)
+and [agents #1500](https://github.com/fullsend-ai/agents/issues/1500). Local synthetic workflows
+exercise analysis, child lifecycle, schema output, transcripts and usage; they do not establish
+live forge retrieval/posting, CI Workload Identity, Fedora coverage or the full fleet lifecycle.
+See the [validation status](../contributing/runtime-implementation.md#native-child-validation)
+before treating the combination as generally available.
 
-```yaml
-agents:
-  - name: review
-    runtime: claude
-```
+Security hooks can add model turns when a blocked tool needs an alternative. Those turns are
+included in usage. Pre-tool denials and post-tool withholding were exercised in both parent and
+child contexts. They do not terminate the session: the existing runner does not enforce
+`security.escalation.on_critical: halt` on downloaded findings. Treat that as a remaining dependency,
+not a verified run-level halt guarantee.
 
 ## Troubleshooting
 
@@ -277,8 +366,12 @@ rewritten config can trust the target repo, which loads its .codex/ layer and it
 ```
 
 The first two exit 97 and mean the hook wiring cannot be trusted; the third exits 98 and is the
-credential-and-trust guard. All three are fail-closed by design. Between iterations the agent runs
-as the same user as those files, so "did the agent write there?" is the question to ask first.
+credential-and-trust guard. The Landlock launcher checks the same files first, so these appear
+only for a missing manifest or a change made after its check. A Landlock setup or authority
+failure, including a missing or changed file, exits 78 and fails the run with
+`codex write protection failed`: Codex runs require Linux Landlock ABI 3+ (kernel 6.2+). The
+launched Codex hierarchy cannot write these files; check the sandbox kernel and any external
+sandbox mutation when diagnosing a failure.
 
 **`--debug "..."` fails with `accepts 1 arg(s)`.** `--debug` takes an optional value: write
 `--debug='*'` (with `=`).

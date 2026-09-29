@@ -55,13 +55,13 @@ sequenceDiagram
 | | Claude Code | pi | codex |
 |---|---|---|---|
 | Models | Anthropic on Vertex | Claude, **Grok** and **Gemini** on Vertex; **GPT** via OpenAI WIF (opt-in, [not yet exercised live](runtimes/pi.md#models-and-providers)) | **GPT only**, via OpenAI WIF ([not yet exercised live](runtimes/codex.md#not-yet-exercised)) |
-| Sub-agents | Native (`Agent` tool) | `Agent`/`Task` via a fullsend extension | Not available |
+| Sub-agents | Native (`Agent` tool) | `Agent`/`Task` via a fullsend extension | Native personas, generic and Explore children; [model/lifecycle constraints](runtimes/codex.md#native-children) |
 | Fallback model chain | `FULLSEND_FALLBACK_MODELS`, tried in order | Top-level run only: alias requests tried in order when Vertex does not serve the model ([two 404/403 messages](runtimes/pi.md#per-repo-alias-overrides)), same provider only; pinned ids and sub-agent children fail loudly | Ignored with a warning |
-| Roles | All | All; `review`/`retro` at `--thinking medium` by default | Same recommendation as before — no sub-agent roster on codex |
+| Roles | All | All; `review`/`retro` at `--thinking medium` by default | `review`/`retro` require the companion native-child instructions; [validation status](contributing/runtime-implementation.md#native-child-validation) |
 | Effort | `--effort low..max` | `--thinking`, same levels (`high` when unset) | `model_reasoning_effort`, same levels |
-| Tools | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | Shell + `apply_patch` only; `tools:` is recorded, not enforced (the allowlist hook is opt-in) |
+| Tools | Native Claude permission syntax | `--tools` (strict) + a first-token Bash allowlist | Shell, `apply_patch`, native collaboration; `tools:` is recorded, not enforced (the allowlist hook is opt-in) |
 | Security controls | Full matrix | Full matrix; stricter on failed-call sanitizing | Full matrix; post-tool hooks detect and block but cannot rewrite output |
-| Cost in `metrics.json` | Reported | Reported | Not reported — codex sends none |
+| Cost in `metrics.json` | Reported | Reported | `cost_unavailable: true`; parent and child token usage reported |
 | Content capture (Level 3) | Text, reasoning, tool calls and tool results (correlating ids) | Text, reasoning, tool calls (no correlating ids) — pi's parser emits neither ids nor tool results yet ([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)) | Text, reasoning, tool calls (no correlating ids) — codex's parser emits neither ids nor tool results ([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)) |
 | Tool spans (`execute_tool`) | One per id-bearing tool call (server-side tools get none), up to 1,024 per iteration, a child of the iteration's `agent` span, timed at receipt | None — the parser emits no call ids ([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)) | None — the parser emits no call ids ([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)) |
 
@@ -196,8 +196,9 @@ Harness `model:` and `agents:` entry `model:` values accept provider-qualified `
 ### Per-repo alias overrides
 
 Point an alias at a different model for one repo with `models.aliases` in `.fullsend/config.yaml`
-— `sonnet: claude-sonnet-5` changes `sonnet` and leaves the other aliases alone. Works on both
-runtimes; the override applies to the parent run and to sub-agent dispatch on pi (children
+— `sonnet: claude-sonnet-5` changes `sonnet` and leaves the other aliases alone. Alias overrides
+apply to Claude Code and pi; Codex requires an explicit OpenAI model ID. The override applies to
+the parent run and to sub-agent dispatch on pi (children
 resolve aliases through the same merged table). See [Pi › Per-repo alias
 overrides](runtimes/pi.md#per-repo-alias-overrides) for the syntax and what the plan block shows,
 and [Claude Code › Models](runtimes/claude.md#models) for the one limit there (sub-agent `model:`

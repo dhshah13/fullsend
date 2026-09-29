@@ -229,6 +229,15 @@ fullsend run review \
   --forge github
 ```
 
+To exercise review with Codex, use the companion native-child instructions and add
+`--runtime codex --model openai/gpt-5.6-luna --effort medium --env-file fullsend-openai.env`
+to the review command above. Keep the key in the runner's env file. Use
+`--no-post-script` while validating so the run saves its output without posting a
+review. Read the [Codex requirements and validation status](../../runtimes/codex.md#native-children)
+first; the selected model must expose the verified native child lifecycle.
+The local retro validation uses the same model and medium effort; supply its own
+trigger inputs and retain `--no-post-script` while checking the generated proposals.
+
 ### Code agent
 
 Add to an env file:
