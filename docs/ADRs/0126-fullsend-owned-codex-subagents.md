@@ -132,10 +132,13 @@ Codex children run under a policy the runner provisions and enforces.
   V2 spawn, a spawn with a forbidden argument or of an unregistered role, or a spawn from
   a child goes through unpoliced, and the opt-in tool allowlist, off by default, is no
   backstop for it. Whether that outcome should also fail the run at the runner is an
-  implementation choice under #6970, not decided here; Codex's `exec` stream drops hook
-  outcomes and its rollout does not persist them, so an implementation that wants it
-  works from the findings log and the children's rollouts. Until the hook ships, #7829
-  keeps the multi-agent tools off. Bootstrap fails if it cannot install the hook.
+  implementation choice under #6970, not decided here. Codex's `exec` stream drops hook
+  outcomes and its rollout does not persist them, and the findings log and the children's
+  rollouts are agent-writable, so an implementation that wants it works from the stream's
+  `collab_tool_call` items (a spawn's sender and receiver thread ids and status), which
+  the host captures outside the sandbox; the stream carries no item for a resume. Until
+  the hook ships, #7829 keeps the multi-agent tools off. Bootstrap fails if it cannot
+  install the hook.
 
 ## Consequences
 
@@ -194,6 +197,6 @@ exact-or-regex matcher rule, the hook outcomes
 (exit 2 with a reason blocks; exit 2 without one, another exit, an `async` handler or a
 timeout does not), `codex debug models --bundled`, the catalog's V1 entries and the
 version Codex supplies to an entry that carries none (`multi_agent`, on by default), the
-`exec` usage stream carrying the primary thread only, and `exec --json` dropping hook
-outcomes with the rollout not persisting them. The checks ran on the 0.157.0, 0.159.0
-and 0.159.3 binaries.
+`exec` usage stream carrying the primary thread only, and `exec --json` carrying a
+`collab_tool_call` item per spawn but no hook outcome, with the rollout not persisting
+hook outcomes either. The checks ran on the 0.157.0, 0.159.0 and 0.159.3 binaries.
