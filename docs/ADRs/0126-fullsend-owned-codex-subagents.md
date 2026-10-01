@@ -131,14 +131,11 @@ Codex children run under a policy the runner provisions and enforces.
   it, as failed and lets the call proceed, as under ADR 0100, so on that path a resume, a
   V2 spawn, a spawn with a forbidden argument or of an unregistered role, or a spawn from
   a child goes through unpoliced, and the opt-in tool allowlist, off by default, is no
-  backstop for it. The runner closes that path for spawns after the fact: the hook
-  records each admission in the findings log with the spawn's `tool_use_id`, and after
-  the run the runner, which reads every child's rollout for usage, fails the run when a
-  child has no admission, as it fails a run whose audit log does not verify. Codex's
-  `exec` stream drops hook outcomes and its rollout does not persist them, so the
-  children themselves are the evidence. A resume on that path reopens an admitted child
-  and is the residual that remains. The switch that turns the tools on ships after the
-  cross-check. Bootstrap fails if it cannot install the hook.
+  backstop for it. Whether that outcome should also fail the run at the runner is an
+  implementation choice under #6970, not decided here; Codex's `exec` stream drops hook
+  outcomes and its rollout does not persist them, so an implementation that wants it
+  works from the findings log and the children's rollouts. Until the hook ships, #7829
+  keeps the multi-agent tools off. Bootstrap fails if it cannot install the hook.
 
 ## Consequences
 
@@ -174,8 +171,7 @@ Codex children run under a policy the runner provisions and enforces.
   timeout kills the handler without touching a protected file, so it is the fail-open
   path that remains under Option 4, and on it the whole admission policy is unenforced
   for one call: a resume, a V2 spawn, a spawn with a forbidden argument, of an
-  unregistered role or from a child. A spawn on that path fails the run after the fact
-  through the admission cross-check; a resume does not, and that is what remains.
+  unregistered role or from a child.
 - Token totals include children, which is runner work: `codex exec` forwards token
   updates for the primary thread and turn only and its JSONL total is that thread's, so
   the runner reads each child's rollout after the run and folds its last cumulative
