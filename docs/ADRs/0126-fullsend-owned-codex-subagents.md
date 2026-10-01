@@ -131,7 +131,14 @@ Codex children run under a policy the runner provisions and enforces.
   it, as failed and lets the call proceed, as under ADR 0100, so on that path a resume, a
   V2 spawn, a spawn with a forbidden argument or of an unregistered role, or a spawn from
   a child goes through unpoliced, and the opt-in tool allowlist, off by default, is no
-  backstop for it. Bootstrap fails if it cannot install the hook.
+  backstop for it. The runner closes that path for spawns after the fact: the hook
+  records each admission in the findings log with the spawn's `tool_use_id`, and after
+  the run the runner, which reads every child's rollout for usage, fails the run when a
+  child has no admission, as it fails a run whose audit log does not verify. Codex's
+  `exec` stream drops hook outcomes and its rollout does not persist them, so the
+  children themselves are the evidence. A resume on that path reopens an admitted child
+  and is the residual that remains. The switch that turns the tools on ships after the
+  cross-check. Bootstrap fails if it cannot install the hook.
 
 ## Consequences
 
@@ -167,7 +174,8 @@ Codex children run under a policy the runner provisions and enforces.
   timeout kills the handler without touching a protected file, so it is the fail-open
   path that remains under Option 4, and on it the whole admission policy is unenforced
   for one call: a resume, a V2 spawn, a spawn with a forbidden argument, of an
-  unregistered role or from a child.
+  unregistered role or from a child. A spawn on that path fails the run after the fact
+  through the admission cross-check; a resume does not, and that is what remains.
 - Token totals include children, which is runner work: `codex exec` forwards token
   updates for the primary thread and turn only and its JSONL total is that thread's, so
   the runner reads each child's rollout after the run and folds its last cumulative
@@ -177,8 +185,10 @@ Codex children run under a policy the runner provisions and enforces.
   marker in hook payloads (`agent_id` in a child's, absent from the parent's), depth one
   with no multi-agent tool for a child, four open children with overflow rejected, the
   catalog's V1 entries, the version Codex supplies to an entry that carries none and the
-  floor model are revalidated on each Codex CLI bump; a bump that changes the payload
-  shape ships with the hook updated, or the child-spawn rule fails open.
+  floor model, and the `exec` stream dropping hook outcomes with the rollout not
+  persisting them, are revalidated on each Codex CLI bump; a bump that changes the
+  payload shape ships with the hook updated, or the child-spawn rule fails open, and one
+  that exposes hook outcomes lets the runner read them directly.
 
 Verified against `rust-v0.159.3` (the sandbox image pin): role-file and `hooks.json`
 reload at child start, `config.toml` read once at launch, the spawn arguments, the child
@@ -187,6 +197,7 @@ children with overflow rejected, the V1 tool set and the hook-name rule, the
 exact-or-regex matcher rule, the hook outcomes
 (exit 2 with a reason blocks; exit 2 without one, another exit, an `async` handler or a
 timeout does not), `codex debug models --bundled`, the catalog's V1 entries and the
-version Codex supplies to an entry that carries none (`multi_agent`, on by default), and
-the `exec` usage stream carrying the primary thread only. The checks ran on the 0.157.0,
-0.159.0 and 0.159.3 binaries.
+version Codex supplies to an entry that carries none (`multi_agent`, on by default), the
+`exec` usage stream carrying the primary thread only, and `exec --json` dropping hook
+outcomes with the rollout not persisting them. The checks ran on the 0.157.0, 0.159.0
+and 0.159.3 binaries.
