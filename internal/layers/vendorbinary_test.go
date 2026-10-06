@@ -37,22 +37,6 @@ func TestVendorBinaryLayer_RequiredScopes(t *testing.T) {
 	assert.Nil(t, layer.RequiredScopes(OpAnalyze))
 }
 
-func TestVendorBinaryLayer_CombinedWithScaffold_SkipsVendorFn(t *testing.T) {
-	client := &forge.FakeClient{}
-	called := false
-	vendorFn := func(ctx context.Context, c forge.Client, p *ui.Printer, owner, repo string) error {
-		called = true
-		return nil
-	}
-
-	layer, _ := newVendorBinaryLayer(t, client, true, vendorFn)
-	layer.SetCombinedWithScaffold(true)
-
-	err := layer.Install(context.Background())
-	require.NoError(t, err)
-	assert.False(t, called, "vendor function should be skipped when combined with scaffold")
-}
-
 func TestVendorBinaryLayer_EnabledCallsVendorFn(t *testing.T) {
 	client := &forge.FakeClient{}
 	called := false
@@ -210,17 +194,17 @@ func TestVendorBinaryLayer_Analyze_DisabledAbsent(t *testing.T) {
 func TestVendorBinaryLayer_Analyze_ManifestAligned(t *testing.T) {
 	manifest := scaffold.NewVendorManifest("0.4.0", "", "bin/fullsend", []string{
 		".defaults/action.yml",
-		".github/workflows/reusable-triage.yml",
+		".github/workflows/reusable-prioritize.yml",
 	})
 	manifestYAML, err := manifest.MarshalYAML()
 	require.NoError(t, err)
 
 	client := &forge.FakeClient{
 		FileContents: map[string][]byte{
-			"test-org/.fullsend/bin/fullsend":                          []byte("binary-data"),
-			"test-org/.fullsend/.defaults/action.yml":                  []byte("marker"),
-			"test-org/.fullsend/.github/workflows/reusable-triage.yml": []byte("workflow"),
-			"test-org/.fullsend/vendor-manifest.yaml":                  manifestYAML,
+			"test-org/.fullsend/bin/fullsend":                              []byte("binary-data"),
+			"test-org/.fullsend/.defaults/action.yml":                      []byte("marker"),
+			"test-org/.fullsend/.github/workflows/reusable-prioritize.yml": []byte("workflow"),
+			"test-org/.fullsend/vendor-manifest.yaml":                      manifestYAML,
 		},
 	}
 	layer, _ := newVendorBinaryLayer(t, client, true, nil)
@@ -234,7 +218,7 @@ func TestVendorBinaryLayer_Analyze_ManifestAligned(t *testing.T) {
 func TestVendorBinaryLayer_Analyze_ManifestMissingPath(t *testing.T) {
 	manifest := scaffold.NewVendorManifest("0.4.0", "", "bin/fullsend", []string{
 		".defaults/action.yml",
-		".github/workflows/reusable-triage.yml",
+		".github/workflows/reusable-prioritize.yml",
 	})
 	manifestYAML, err := manifest.MarshalYAML()
 	require.NoError(t, err)

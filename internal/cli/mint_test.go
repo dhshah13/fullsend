@@ -3984,7 +3984,6 @@ func TestRunMintStatusAPI_Success(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"allowed_orgs":        []string{"acme", "bigcorp"},
 			"roles":               []string{"coder", "triage", "review"},
 			"workflow_host_repos": []string{"fullsend-ai/fullsend"},
 			"version":             "2.0.0",
@@ -4006,8 +4005,7 @@ func TestRunMintStatusAPI_Success(t *testing.T) {
 
 	output := out.String()
 	assert.Contains(t, output, "GitHub")
-	assert.Contains(t, output, "acme")
-	assert.Contains(t, output, "bigcorp")
+	assert.NotContains(t, output, "Allowed Organizations")
 	assert.Contains(t, output, "coder")
 	assert.Contains(t, output, "triage")
 	assert.Contains(t, output, "review")

@@ -57,8 +57,8 @@ content that must be updated whenever a runtime is added or renamed.
 **Tests:**
 
 - [ ] `internal/runtime/registry_test.go` — add a `Resolve("<name>")`
-  assertion block to `TestResolve` (and to `TestResolveFromConfig` /
-  `TestResolveFromPerRepoConfig` if the runtime is user-selectable).
+  assertion block to `TestResolve` (and to `TestResolveFromPerRepoConfig`
+  if the runtime is user-selectable).
 - [ ] `internal/config/config_test.go` — update any assertion on
   `ValidRuntimes()` to include the new name.
 
@@ -183,7 +183,7 @@ Harness `security.fail_mode` controls whether critical findings **block** the ru
 | Interface | Responsibility |
 |-----------|----------------|
 | `runtime.Runtime` | Name, config dir, env exports, bootstrap, run loop, per-iteration cleanup, user processes cleanup |
-| `runtime.BootstrapInput` | Portable agent name/path, skill dirs, declared plugins (`Plugins() []PluginInput` — name, host path, format kind, env, pi args; ADR 0094) to upload, and the per-repo model alias overrides (`ModelAliases() map[string]string`, from `models.aliases`; nil when the repo sets none). A runtime loads the entries whose `Kind` it reads and must warn and skip the rest, never drop them silently, and the agent's per-persona sub-agent model map (`AgentSubagents() map[string]*string`, from `agents[].subagents`; a nil value is a tombstone; ADR 0104) |
+| `runtime.BootstrapInput` | Portable agent name/path, skill dirs, declared plugins (`Plugins() []PluginInput` — name, host path, format kind, env, pi args; ADR 0094) to upload, and the per-repo model alias overrides (`ModelAliases() map[string]string`, from `models.aliases`; nil when the repo sets none). A runtime loads the entries whose `Kind` it reads and must warn and skip the rest, never drop them silently, and the agent's per-persona sub-agent model map (`AgentSubagents() map[string]*string`, from `agents[].subagents`; a nil value is a tombstone; ADR 0104), the parent's resolved model (`ParentModel() string`), and whether the run-scoped OpenAI provider was attached (`OpenAIProviderAttached() bool`). pi admits a configured child's `openai/` model only when that is true, because `OPENAI_API_KEY` is in the sandbox only then (#7981) |
 | `runtime.SandboxHooksBootstrap` | Optional `BootstrapInput` extension — runtime-neutral sandbox tool hook config (`security.SandboxHookConfig`); every runtime should honour it |
 | `runtime.TranscriptHandler` | Extract transcripts/debug logs; parse errors for CI annotations |
 | `runtime.DebugLogNamer` | Optional — names the per-iteration debug-log artifact (default `agent-debug.log`) |
@@ -354,6 +354,7 @@ Two traps when reproducing by hand:
 |----------|---------|-----------|
 | `TIRITH_FAIL_ON`, `TIRITH_REQUIRED` | `tirith_check.py` | written by `appendHookEnv`; `TIRITH_REQUIRED=1` turns the fail-open into fail-closed |
 | `FULLSEND_EGRESS_ALLOWLIST` | `ssrf_pretool.py` | comma-separated `host:port` entries; supports exact hostnames and leading-wildcard patterns (e.g. `*.example.com:443`) matched by domain-anchored suffix comparison — bare `*`, mid-string globs, and single-label TLD wildcards (e.g. `*.com`) are rejected with a warning on stderr; the rejection check requires >= 2 dots in the full pattern (e.g. `*.com` has 1 dot and is rejected, `*.example.com` has 2 and is accepted), so multi-label public suffixes (e.g. `*.co.uk`, `*.github.io`) also have 2 dots, pass the check, and are accepted — this is an accepted residual risk since the allowlist is operator-controlled config, not attacker input, and the L7 proxy remains the primary SSRF enforcement boundary; on DNS failure the hook defers to the L7 proxy for allowlisted hosts instead of failing closed; if DNS succeeds but resolves to a blocked IP, the allowlist is not consulted |
+| `OPENSHELL_SANDBOX` | `ssrf_pretool.py` | set by OpenShell, not `appendHookEnv`. When non-empty and `policy.local` resolves to `198.18.0.1` (policy DNS is answering), a host name whose every DNS answer is in `198.18.0.0/15` is allowed, and the supervisor enforces the real destination on connect. IP literals in any spelling, blocked hostnames, `policy.local` and the host-gateway names are still checked. Clearing the variable only turns this off |
 | `FULLSEND_TOOL_ALLOWLIST` | `tool_allowlist_pretool.py` | fail-closed when unset |
 | `FULLSEND_CANARY_TOKEN` | both canary hooks | no-ops when empty; supply it via harness `env.sandbox`/`host_files` |
 | `FULLSEND_TRACE_ID` | all scripts | correlates findings with the run |
@@ -541,7 +542,9 @@ The `dummy` runtime executes a YAML script of operations inside the real sandbox
 ## Dummy-playback runtime
 
 The `dummy-playback` runtime replays canned agent results from an ordered
-playlist without LLM inference (behaviour tests only). It reads
+playlist without LLM inference (behaviour tests only). The architectural
+decision is recorded in [ADR 0116](../ADRs/0116-dummy-playback-runtime.md).
+It reads
 `.fullsend/results/playlist.yaml`, serves the current entry's `result.json`
 to the sandbox output directory, copies companion files, and advances the
 playlist position.
@@ -568,18 +571,36 @@ treated as companion files:
 ### Playback comment tracking
 
 When a `.fullsend/playback-comment-url` file exists, the runtime reads the
-current playlist position from a forge comment (via `gh api` or `glab api`)
-instead of the local `playlist.yaml`. After serving a result, it updates the
-comment with the new position. The file format is `<cli>\n<api-path>` (e.g.
-`gh\n/repos/owner/repo/issues/comments/123`). Legacy single-line files
-default to `gh`.
+current playlist position from a forge comment through `RunParams.ForgeClient`
+instead of the local `playlist.yaml` — per the forge-abstraction rule, it
+never shells out to `gh`/`glab` itself. After serving a result, it updates
+the comment through the same client. The file format is `<cli>\n<api-path>`
+(e.g. `gh\n/repos/owner/repo/issues/comments/123` or
+`glab\n/projects/owner%2Frepo/merge_requests/7/notes/99`). Legacy
+single-line files default to `gh`.
+
+The API path is parsed into structured fields rather than replayed as a CLI
+argument: only the two known REST path shapes are accepted, and the owner
+and repository fields are restricted to the identifier charset GitHub/GitLab
+themselves allow. For GitLab, the noteable type (`issues` or
+`merge_requests`) and IID are also preserved and used to address the note
+directly through `forge.GitLabExtensions`, rather than through
+`GetIssueComment`/`UpdateIssueComment`'s bounded ID-only scan — a scan
+driven by the resolved client's own fixed noteable type, which cannot find
+a note whose actual parent differs from that type (e.g. an issue tracking
+reference during MR CI).
 
 ### Security
 
 - Path traversal: entry names are validated to stay within the results
   directory.
-- Argument injection: the `playback-comment-url` API path must start with `/`
-  to prevent flag injection into `gh`/`glab` CLI calls.
+- Request-target validation: the `playback-comment-url` API path must match
+  one of the two known REST path shapes exactly, and the owner/repository
+  fields may not contain URL delimiters, encoded separators, or control
+  characters — a looser pattern could redirect the request to a different
+  path or smuggle query data once interpolated back into a request path.
+  The GitHub client's comment-fetching and comment-updating methods also
+  percent-escape owner and repo as a second layer of defense.
 - Context propagation: forge API calls use `context.WithTimeout` to prevent
   indefinite blocking.
 
@@ -911,7 +932,7 @@ with `-e`, after the hook adapter — when the agent definition has no `tools:` 
 | `extensionDigests` | SHA-256 (hex) of each child `-e` entry `Bootstrap` itself wrote under the config dir — the hook adapter and the edit-repair extension, the same bytes their launch guards check. Re-hashed before every dispatch; a mismatch refuses the dispatch naming the file. The vendored provider extensions are absent on purpose: root-owned and read-only in the image, outside anything the agent can write. Omitted when neither applies (hooks off and no `edit` tool) |
 | `editRepairExtension` | The edit-repair extension's path, when the children's tool set has `edit`. Kept out of `extensions` because it registers the edit tool: the Agent extension adds it only for a child whose `--tools` names `edit`, since a persona declaring no tools runs under `--no-builtin-tools`, where pi would not filter it out |
 | `models` | `default` (the agent's model, translated) plus the Claude aliases on the Anthropic Vertex provider. The extension resolves a call's `model` through this table and **rejects** anything it cannot serve |
-| `providerModels` | Per provider a run can serve with no `models` entry, the model ids it can serve: `google-vertex` verbatim from the catalog the pinned pi bundles (`@earendil-works/pi-ai` `dist/providers/data/google-vertex.json`), and `xai-vertex` from the ids the vendored extension registers (`xai/grok-4.6`, the publisher-qualified wire form). A `provider/id` call is accepted only when the full spec is in `models`, is the parent's own spec, or is listed here — a provider prefix alone is not enough, or an invented id would reach the API. A Grok spec is normalized to `xai-vertex/xai/<id>` first, exactly as `normalizeXaiVertexModel` does for the parent, and then goes through this same set |
+| `providerModels` | Per provider a run can serve with no `models` entry, the model ids it can serve: `google-vertex` verbatim from the catalog the pinned pi bundles (`@earendil-works/pi-ai` `dist/providers/data/google-vertex.json`), and `xai-vertex` from the ids the vendored extension registers (`xai/grok-4.6`, the publisher-qualified wire form). `openai` is present only when the run-scoped OpenAI provider is attached, listing the ids that configured children resolve to (`subagents.<persona>`, `subagents.default`, a persona's frontmatter `model:`; `runtime.OpenAIChildren`), and its presence is what lets a non-openai parent dispatch to `openai` and turns on the OpenAI launch safeguards for the children (#7981). A `provider/id` call is accepted only when the full spec is in `models`, is the parent's own spec, or is listed here — a provider prefix alone is not enough, or an invented id would reach the API. A Grok spec is normalized to `xai-vertex/xai/<id>` first, exactly as `normalizeXaiVertexModel` does for the parent, and then goes through this same set |
 | `thinking` | Children's `--thinking`; `FULLSEND_PI_SUBAGENT_THINKING` (validated) else `medium` |
 | `tools` / `exploreTools` | The child `--tools` allowlist: the parent's built-ins minus `Agent`/`Task`, or — for `subagent_type: Explore` — the read-only set **intersected with** the parent's, so a child never reaches past its parent. An empty result becomes `--no-builtin-tools`, as it does for the parent |
 | `personas` | Per-persona model/tools table, keyed by persona name. Present when `sub-agents/*.md` files were discovered under skill roots. The extension dispatches a `subagent_type` that names a persona using its resolved model and tool set; an unknown non-empty type is rejected when personas are registered. Model resolution: repo `subagents.<persona>` > frontmatter `model:` > `subagents.default` > the parent's live model. An entry carries **no** `model` for that last case, so the extension inherits the parent the same way an anonymous child does — writing the agent definition's model here instead would split the two apart whenever config or a flag overrode the parent. A persona's `tools` are intersected with the parent's at dispatch; a present-but-empty array means no tools, and Bootstrap refuses such a persona rather than letting it fall back to the parent's set. Each spec is canonicalised and checked against the trusted set before it enters the manifest, so a persona never widens the set that admits it (#7031) |
@@ -997,7 +1018,7 @@ with `-e`, after the hook adapter — when the agent definition has no `tools:` 
 
 ### OpenAI via Workload Identity Federation
 
-GPT models run on pi's built-in `openai` provider with no OpenAI credential in the sandbox ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)): `fullsend run` exchanges the job's GitHub OIDC token for a ≤1 h access token (`internal/inference/openaiwif`, or `OPENAI_API_KEY` from the runner environment for local runs), imports the `fullsend-openai` profile from the scaffold embedded in the binary (this is a separate mechanism from harness-listed `openshell.profiles` imports; wholesale `.fullsend/profiles` directory import was removed (#7095), and the OpenAI profile is always sourced from the embedded scaffold copy rather than a repository file regardless), creates a run-scoped OpenShell provider `openai-<sandbox suffix>` of that type carrying it, and deletes that provider when the run ends; the `fullsend-openai` profile allows only `POST /v1/responses` on `api.openai.com`, and only for `**/node` (pi) and `**/codex` (the codex runtime's native binary, #6920). The provider is created only for a run whose selected runtime will actually call OpenAI (`runtime.NeedsOpenAIProvider`); a harness may declare it for every runtime, and a run that does not need it says so and skips it. A per-provider refresher re-exchanges a fresh assertion shortly before `expires_in` and hot-updates the provider (a static key only has its expiry pushed out), and is stopped before the deferred cleanup deletes — or, when a kept sandbox still references it, expires in place — the provider.
+GPT models run on pi's built-in `openai` provider with no OpenAI credential in the sandbox ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)): `fullsend run` exchanges the job's GitHub OIDC token for a ≤1 h access token (`internal/inference/openaiwif`, or `OPENAI_API_KEY` from the runner environment for local runs), imports the `fullsend-openai` profile from the scaffold embedded in the binary (this is a separate mechanism from harness-listed `openshell.profiles` imports; wholesale `.fullsend/profiles` directory import was removed (#7095), and the OpenAI profile is always sourced from the embedded scaffold copy rather than a repository file regardless), creates a run-scoped OpenShell provider `openai-<sandbox suffix>` of that type carrying it, and deletes that provider when the run ends; the `fullsend-openai` profile allows only `POST /v1/responses` on `api.openai.com`, and only for `**/node` (pi) and `**/codex` (the codex runtime's native binary, #6920). The provider is created only for a run whose selected runtime will actually call OpenAI: the parent's model (`runtime.NeedsOpenAIProvider`), or on pi a configured child's (`runtime.OpenAIChildren`: `subagents.<persona>`, `subagents.default`, or a persona's frontmatter `model:`, resolved exactly as Bootstrap resolves it, #7981). A harness may declare it for every runtime, and a run that does not need it says so and skips it. A `subagents` entry on `openai/` with no openai provider declared fails the run before the sandbox is created. A frontmatter-only one never fails the run over a missing declaration or credential: the provider is skipped, Bootstrap drops every `openai/` model-table entry (aliases included) when no provider is attached, and the persona is skipped with a warning. A per-provider refresher re-exchanges a fresh assertion shortly before `expires_in` and hot-updates the provider (a static key only has its expiry pushed out), and is stopped before the deferred cleanup deletes — or, when a kept sandbox still references it, expires in place — the provider.
 
 ### Other clouds
 
@@ -1012,7 +1033,7 @@ re-checked on a `CODEX_VERSION` bump. The decisions are
 [ADR 0099](../ADRs/0099-codex-agent-runtime.md) (credential delivery) and [ADR 0100](../ADRs/0100-codex-sandbox-hooks.md)
 (sandbox hooks).
 
-Everything below was read at tag `rust-v0.152.1`; the rows of [Re-check on a `CODEX_VERSION` bump](#re-check-on-a-codex_version-bump) were re-verified at `rust-v0.157.0`. Two of the findings are the reason the hook
+Everything below was read at tag `rust-v0.152.1`; the rows of [Re-check on a `CODEX_VERSION` bump](#re-check-on-a-codex_version-bump) were re-verified at `rust-v0.157.0` and again at `rust-v0.159.3`. Two of the findings are the reason the hook
 adapter exists at all, because forwarding the scripts' own convention would fail **open**.
 
 One iteration, end to end:
@@ -1061,9 +1082,13 @@ flowchart TB
   `WebFetch` and `WebSearch` have no codex tool — codex does that work through the shell, so the
   `Bash` groups already cover it.
 - **Skills** come from `$CODEX_HOME/skills`, which `Bootstrap` populates. Codex also discovers a
-  repo's `.agents/skills`, and (verified live at 0.157.0) its `.codex/skills` even with the project
-  untrusted; both are covered by the host-side and in-sandbox context scans, which match `SKILL.md`
-  anywhere in the repo.
+  repo's `.agents/skills`, and (verified live at 0.157.0; discovery source unchanged through
+  0.159.3) its `.codex/skills` even with the project untrusted; both are covered by the host-side
+  and in-sandbox context scans, which match `SKILL.md` anywhere in the repo. The agent reads those
+  files through the shell, and Codex 0.157.0 truncates a single exec at 10,000 tokens (head and
+  tail), so `codexNoSubagentNote` tells it to count lines with `awk 'END { print NR }'` (`wc -l`
+  misses a last line with no trailing newline) then `sed -n` a long `SKILL.md` in at most
+  200-line ranges, one per tool call (#7831).
 - **AGENTS.md** — codex skips a project's own `AGENTS.md` while the project is untrusted
   (`codex-rs/core/src/agents_md.rs`), but always loads `$CODEX_HOME/AGENTS.md` as user
   instructions. The runner copies the repo's root `AGENTS.md` (or the injected org-level one) there
@@ -1155,7 +1180,18 @@ Three codex behaviours are load-bearing, and the adapter exists because of the f
    block.** The shared scripts block with `exit 1` plus `{"decision":"block","reason"}`, so
    forwarding them verbatim would make every PreToolUse hook advisory. The adapter translates a
    block to **exit 2 with the reason on stderr**. An exit 2 whose stderr is empty is *also* `Failed`,
-   so the reason is never allowed to be empty.
+   so `block()` never writes through `sys.stderr` (`sys.stderr` may be `None`, or wrap an fd that is
+   not really the process's stderr, and a successful write through it says nothing about which fd it
+   actually reached): it delivers the reason solely with a raw `os.write(2, ...)` straight to the
+   real fd, which recovers the reason whenever fd 2 itself is still a live pipe. The process must
+   still exit 2 when stderr is unwritable: CPython 3.6+ overrides the status with 120 if a shutdown
+   flush of stderr fails, and 120 is `Failed` (fail open); `block()` closes and drops the stream
+   object after writing so that shutdown flush cannot fire. None of this reaches the one case that
+   is not recoverable: if fd 2 itself has been closed at the OS level (the transport torn down, not
+   just the Python object), no write from this process can put bytes on the other end of it, so
+   codex sees exit 2 with empty stderr and records `Failed` rather than a block. That residual gap
+   is inherent to a pipe whose write end is gone, not a bug in the adapter — see `block()`'s
+   docstring in `fullsend-codex-hook.py` for the full breakdown.
 2. **Only a synchronous handler can apply control effects.** A handler with `"async": true` still
    runs and still reports, but its block decision is discarded — so the rendered `hooks.json` never
    carries an `async` key at all, and `TestCodexHooksJSON_NeverAsync` asserts its absence.
@@ -1365,9 +1401,11 @@ Two artefacts of the run are worth knowing about:
 | `auth.command` semantics (trimmed stdout, non-zero exit fails, no env fallback) | the whole credential path | `codex-rs/login/src/auth/external_bearer.rs` |
 | `supports_websockets` default for custom providers | a true default would take traffic off `POST /v1/responses` and break the egress profile | `codex-rs/model-provider-info/src/lib.rs` |
 | `[skills.bundled]` and skill discovery | the bundled skills are disabled by the runner-owned config; a renamed key would silently bring `skill-installer` and friends back into the agent's roster | `codex-rs/config/src/skills_config.rs` |
+| Exec output truncation (`DEFAULT_MAX_OUTPUT_TOKENS`, head+tail) | the runtime note's 200-line window is sized to stay under this cap; on bump, confirm 200 lines of a dense `SKILL.md` still fits under the new cap and that a truncated exec still emits a warning the split rule can detect | `codex-rs/core/src/unified_exec/mod.rs`, `codex-rs/core/src/tools/context.rs`, `codex-rs/utils/string/src/truncate.rs` |
 | The `plugins` feature and what it gates | `[features] plugins = false` is what stops the startup fetch of `github.com/openai/plugins.git`; a renamed key, or a sync no longer gated on it, would bring the fetch back | `codex-rs/features/src/lib.rs`, `codex-rs/core-plugins/src/manager.rs` (`maybe_start_plugin_startup_tasks_for_config`) |
-| The native binary's path inside the platform package (`vendor/<triple>/bin/codex` at 0.157.0) | the `fullsend-openai` profile names it as `**/codex`; the node ancestor still admits a renamed file, but the pin in `runtimeEgressBinaries` should follow the rename | `npm pack --dry-run "@openai/codex@<pin>-linux-x64"` |
+| The native binary's path inside the platform package (`vendor/<triple>/bin/codex` at 0.159.3) | the `fullsend-openai` profile names it as `**/codex`; the node ancestor still admits a renamed file, but the pin in `runtimeEgressBinaries` should follow the rename | `npm pack --dry-run "@openai/codex@<pin>-linux-x64"` |
 | Whether a custom provider still issues `GET /v1/models` at startup | the `fullsend-openai` egress profile denies it; if the request ever became fatal or retried, it would delay or fail every first turn | `codex-rs/models-manager/` |
+| `models_cache.json` name and location, its TTL and the version/identity checks that decide whether it is used | `buildCodexRunCommand` deletes `$CODEX_HOME/models_cache.json` before launch so every run starts from the bundled catalog; a renamed or relocated file would need the deletion to follow it | `codex-rs/models-manager/src/manager.rs` (`MODEL_CACHE_FILE`, `DEFAULT_MODEL_CACHE_TTL`, `try_load_cache`), `codex-rs/models-manager/src/cache.rs` (`load_fresh_file`) |
 | `ConfigToml` keys and the `ReasoningEffort` enum | a renamed or removed key silently changes behaviour; `--strict-config` reports it | `codex-rs/config/src/config_toml.rs`, `codex-rs/protocol/src/openai_models.rs` |
 | Project trust and `AGENTS.md` | the pinned untrusted entry must still stop codex recording its own trust level, the repo's `.codex/` layer must stay unloaded, and `$CODEX_HOME/AGENTS.md` must still load while the project is untrusted, or the bridge stops reaching the agent | `codex-rs/app-server/src/request_processors/thread_processor.rs` (trust write), `codex-rs/config/src/loader/mod.rs`, `codex-rs/core/src/agents_md.rs`, `codex-rs/codex-home/src/instructions/mod.rs` |
 | JSONL event structs, rollout line types and rollout file naming | the stream parser and transcript extraction; a rollout line type missing from `codexRolloutEnvelopes` discards the whole transcript | `codex-rs/exec/src/exec_events.rs`, `codex-rs/history/src/rollout_payload.rs` (`RolloutItemWire`), `codex-rs/thread-store/src/local/helpers.rs` |

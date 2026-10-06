@@ -12,6 +12,7 @@ Feature: Fork PR dispatch
       slug: fullsend-ai-fork-pr-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "change_proposal"
         && event.transition.kind == "label_changed"
@@ -24,6 +25,7 @@ Feature: Fork PR dispatch
       slug: fullsend-ai-fork-issue-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -36,6 +38,7 @@ Feature: Fork PR dispatch
       slug: fullsend-ai-fork-pr-killed
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "change_proposal"
         && event.transition.kind == "label_changed"
@@ -48,6 +51,7 @@ Feature: Fork PR dispatch
       slug: fullsend-ai-fork-pr-nofork
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "change_proposal"
         && event.transition.kind == "label_changed"
@@ -75,6 +79,7 @@ Feature: Fork PR dispatch
       slug: fullsend-ai-fork-pr-killswitch
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "change_proposal"
         && event.transition.kind == "label_changed"
@@ -93,6 +98,7 @@ Feature: Fork PR dispatch
       slug: fullsend-ai-fork-pr-sync
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "change_proposal"
         && event.transition.kind == "label_changed"

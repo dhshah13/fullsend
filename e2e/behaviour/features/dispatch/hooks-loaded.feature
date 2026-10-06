@@ -18,6 +18,7 @@ Feature: Sandbox security hooks are loaded via --settings
       slug: fullsend-ai-hooks-smoke
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"

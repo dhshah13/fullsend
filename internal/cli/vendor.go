@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -54,42 +55,17 @@ type vendorFileBundle struct {
 	assetCount int
 }
 
-// makeVendorFunc returns a VendorFunc closure that uploads vendored assets.
-func makeVendorFunc(fullsendBinary, fullsendSource string) layers.VendorFunc {
-	return func(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string) error {
-		return acquireAndVendor(ctx, client, printer, owner, repo, fullsendBinary, fullsendSource)
-	}
-}
+func nopCleanup() {}
 
-// makeVendorCollectFunc returns a VendorCollectFunc for combined scaffold commits.
-func makeVendorCollectFunc(fullsendBinary, fullsendSource string) layers.VendorCollectFunc {
-	return func(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string) ([]forge.TreeFile, int, error) {
-		bundle, cleanup, err := prepareVendorFiles(ctx, client, printer, owner, repo, fullsendBinary, fullsendSource)
-		if err != nil {
-			return nil, 0, err
-		}
-		defer cleanup()
-		return bundle.files, bundle.assetCount, nil
-	}
-}
-
-func vendorStackArgs(vendor bool, fullsendBinary, fullsendSource string) (layers.VendorFunc, layers.VendorCollectFunc) {
+func appendVendorTreeFiles(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string, files []forge.TreeFile, vendor bool, fullsendBinary, fullsendSource string) ([]forge.TreeFile, int, func(), error) {
 	if !vendor {
-		return nil, nil
-	}
-	return makeVendorFunc(fullsendBinary, fullsendSource), makeVendorCollectFunc(fullsendBinary, fullsendSource)
-}
-
-func appendVendorTreeFiles(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string, files []forge.TreeFile, vendor bool, fullsendBinary, fullsendSource string) ([]forge.TreeFile, int, error) {
-	if !vendor {
-		return files, 0, nil
+		return files, 0, nopCleanup, nil
 	}
 	bundle, cleanup, err := prepareVendorFiles(ctx, client, printer, owner, repo, fullsendBinary, fullsendSource)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, cleanup, err
 	}
-	defer cleanup()
-	return append(files, bundle.files...), bundle.assetCount, nil
+	return append(files, bundle.files...), bundle.assetCount, cleanup, nil
 }
 
 func prepareVendorFiles(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo, fullsendBinary, fullsendSource string) (vendorFileBundle, func(), error) {
@@ -145,6 +121,13 @@ func prepareVendorFiles(ctx context.Context, client forge.Client, printer *ui.Pr
 		cleanupRoot()
 	}
 
+	absPath, err := filepath.Abs(binPath)
+	if err != nil {
+		cleanup()
+		return vendorFileBundle{}, func() {}, fmt.Errorf("resolving binary path: %w", err)
+	}
+	binPath = absPath
+
 	info, err := os.Stat(binPath)
 	if err != nil {
 		cleanup()
@@ -154,11 +137,6 @@ func prepareVendorFiles(ctx context.Context, client forge.Client, printer *ui.Pr
 	if info.Size() > maxVendoredBinarySize {
 		cleanup()
 		return vendorFileBundle{}, func() {}, fmt.Errorf("binary is %d bytes, exceeds %d byte limit", info.Size(), maxVendoredBinarySize)
-	}
-	binData, err := os.ReadFile(binPath)
-	if err != nil {
-		cleanup()
-		return vendorFileBundle{}, func() {}, fmt.Errorf("reading binary: %w", err)
 	}
 
 	assets, err := scaffold.CollectVendoredAssets(root.Path, pathPrefix)
@@ -178,9 +156,9 @@ func prepareVendorFiles(ctx context.Context, client forge.Client, printer *ui.Pr
 	}
 
 	files := []forge.TreeFile{{
-		Path:    destPath,
-		Content: binData,
-		Mode:    "100755",
+		Path:      destPath,
+		LocalPath: binPath,
+		Mode:      "100755",
 	}}
 	for _, f := range assets {
 		files = append(files, forge.TreeFile{
@@ -196,8 +174,8 @@ func prepareVendorFiles(ctx context.Context, client forge.Client, printer *ui.Pr
 	})
 
 	// Prune here, at the single point every --vendor commit path collects its
-	// tree: acquireAndVendor, the combined scaffold+vendor collect func, and
-	// appendVendorTreeFiles all receive the delete entries, so files that
+	// tree: appendVendorTreeFiles and every other prepareVendorFiles caller
+	// receive the delete entries, so files that
 	// left the vendored set are removed from consumer repos instead of
 	// becoming orphans the replaced manifest no longer tracks.
 	files, err = appendStaleVendoredDeletes(ctx, client, printer, owner, repo, files)
@@ -207,29 +185,6 @@ func prepareVendorFiles(ctx context.Context, client forge.Client, printer *ui.Pr
 	}
 
 	return vendorFileBundle{files: files, assetCount: len(assets)}, cleanup, nil
-}
-
-func acquireAndVendor(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo, fullsendBinary, fullsendSource string) error {
-	bundle, cleanup, err := prepareVendorFiles(ctx, client, printer, owner, repo, fullsendBinary, fullsendSource)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	printer.StepStart(fmt.Sprintf("Uploading vendored binary and %d content files", bundle.assetCount+1))
-	contentMsg := layers.VendorContentCommitMessage(version, vendorPathPrefix(owner, repo), len(bundle.files))
-	committed, err := client.CommitFiles(ctx, owner, repo, contentMsg, bundle.files)
-	if err != nil {
-		printer.StepFail("Failed to upload vendored content")
-		return fmt.Errorf("committing vendored content: %w", err)
-	}
-	if committed {
-		printer.StepDone(fmt.Sprintf("Uploaded vendored binary and %d content files", bundle.assetCount))
-	} else {
-		printer.StepDone("Vendored content up to date")
-	}
-
-	return nil
 }
 
 // appendStaleVendoredDeletes prunes files a previous vendor install
@@ -271,18 +226,8 @@ func vendorPathPrefix(owner, repo string) string {
 	return ""
 }
 
-func removeStaleVendoredAssets(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string, perRepo bool) error {
-	pathPrefix := ""
-	if perRepo {
-		pathPrefix = ".fullsend/"
-	}
-
-	destPath := layers.VendoredBinaryPath
-	if perRepo {
-		destPath = layers.VendoredBinaryPathPerRepo
-	}
-
-	return layers.RemoveStaleVendoredAssets(ctx, client, printer, owner, repo, pathPrefix, destPath)
+func removeStaleVendoredAssets(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string) error {
+	return layers.RemoveStaleVendoredAssets(ctx, client, printer, owner, repo, ".fullsend/", layers.VendoredBinaryPathPerRepo)
 }
 
 func vendorDryRunMessage(fullsendBinary, fullsendSource, destPath string) string {

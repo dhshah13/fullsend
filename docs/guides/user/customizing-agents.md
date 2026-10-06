@@ -72,12 +72,12 @@ agents:
 
 Because config-registered agents take precedence over built-in agents on name collision, your `code` agent replaces the default — with all of the base agent's scripts, policies, host_files, and plugins still inherited.
 
-To re-pin the `base:` URL to a new upstream commit (and recompute the integrity hash), run `fullsend agent update code --fullsend-dir .fullsend`. That writes the new SHA into the local harness file and leaves `config.yaml` unchanged.
+To re-pin the `base:` URL to a new upstream commit (and recompute the integrity hash), run `fullsend agent update code`. That writes the new SHA into the local harness file and leaves `config.yaml` unchanged.
 
 Test it locally first (add `--forge github` or `--forge gitlab` only if this
 repo's `.fullsend/config.yaml` does not already set `forge:`):
 ```bash
-fullsend run code --fullsend-dir .fullsend --target-repo ./my-repo --env-file .env.local
+fullsend run code --target-repo ./my-repo --env-file .env.local
 ```
 
 See [Running agents locally](running-agents-locally.md) for prerequisites and troubleshooting.
@@ -156,7 +156,7 @@ When using `base:` composition, the base harness can declare its own providers a
 - **Profiles:** base + child lists are concatenated; deduplicated by profile `id` (child wins)
 - **Providers:** base + child lists are concatenated; local names shadow URL-resolved names of the same `name`
 
-Only profiles listed in `openshell.profiles` are imported. A YAML file that merely exists under the `profiles/` directory is **not** imported unless the harness names it. To use a local profile as a per-repo override, list it explicitly (e.g., `profiles/fullsend-vertex-ai.yaml`); the child-wins dedup rule applies by `id`.
+Only profiles listed in `openshell.profiles` are imported. A YAML file that merely exists under the `profiles/` directory is **not** imported unless the harness names it. To use a local profile as a per-repo override, list it explicitly under its own `id` (e.g., `profiles/myorg-vertex-ai.yaml`); the child-wins dedup rule applies by `id`. The `fullsend-<name>` ids of the built-in profiles are reserved: list a copy under one and `fullsend run` warns and uses it for now, and a later release rejects it.
 
 Remote URLs must include a `#sha256=...` integrity hash and match an `allowed_remote_resources` prefix in the same config. The integrity hash is checked on every resolution to ensure the content hasn't been tampered with since it was pinned.
 
@@ -454,7 +454,7 @@ a custom role, see [Custom Agent Identity](custom-agent-identity.md).
 
 > **Note:** The "fix" role reuses the "coder" app and PEM — no separate GitHub App or secret is created for it.
 >
-> **Note:** The default deployment uses a shared vendor App (`fullsend-ai-review[bot]`). Code that gates on a review bot's identity must match both the org-specific and shared vendor forms — see [Bot Identities](../../contributing/bot-identities.md) for details.
+> **Note:** The default deployment uses a shared vendor App (`fullsend-ai-review[bot]`). Code that gates on a review bot's identity must match the org-specific and shared vendor forms, plus `${FULLSEND_APP_SET}-review[bot]` when a custom app set is configured — see [Bot Identities](../../contributing/bot-identities.md) for details.
 
 > **Note:** Mint-only dogfood roles such as `scribe` can be registered with
 > `fullsend mint add-role` (and used via remote harness registration) but are
@@ -531,7 +531,7 @@ agents:
 ```
 
 This prevents the agent from dispatching and from resolving via
-`fullsend run`. The role can stay in `defaults.roles` — only the agent
+`fullsend run`. The role can stay in `roles` — only the agent
 is suppressed. Omitting `enabled` (or setting it to `true`) keeps the
 agent active (backward compatible).
 
@@ -553,8 +553,27 @@ role name. The built-in agent names are: `code`, `triage`, `review`,
 agent named `code` — writing `name: coder` passes validation but
 disables nothing because no agent has that harness name.
 
+## Agent dispatch authorization
+
+By default, fullsend checks the forge's permission API to decide who can
+trigger agents. Users with `write` or above can trigger all agents; users
+with `triage` can trigger observation agents (`/fs-triage`, `/fs-review`)
+only. This triage-level access applies to **GitHub webhook dispatch** (slash
+commands, label-triggered dispatch, and event-triggered dispatch). The Go
+poll path used for GitLab and Jira currently requires `write` for all
+non-exception transitions — it does not yet distinguish observation from
+mutation thresholds.
+See the
+[Authorization Contract](../../normative/authorization/v1/README.md) for the
+full role hierarchy, exception rules, and implementation notes.
+
+To extend trigger access beyond forge collaborators using Prow-style
+OWNERS files, see the
+[OWNERS file authorization guide](owners-file-authorization.md).
+
 ## See also
 
+- [OWNERS file authorization](owners-file-authorization.md) — using Prow-style OWNERS files to authorize agent dispatch
 - [Customizing Agents](customizing-overview.md) — overview of all customization approaches
 - [Harness Field Reference](../../reference/harness-reference.md) — complete harness YAML field reference, merge rules, and resource referencing
 - [Bring Your Own Agent](bring-your-own-agent.md) — building and registering custom agents from scratch
@@ -562,6 +581,7 @@ disables nothing because no agent has that harness name.
 - [Configuring with Skills](customizing-with-skills.md) — extending agents with skills
 - [Default, derived, and custom agents](../../agents/topics/default-vs-custom.md) — when does configuration cross into derived or custom agent territory?
 - [Escalation ladder](../../agents/topics/escalation-ladder.md) — prove-it path before deriving or replacing a core agent
+- [Authorization Contract](../../normative/authorization/v1/README.md) — role hierarchy, thresholds, and exceptions
 - [Getting Started](../getting-started/) — initial setup
 - [Bugfix Workflow](bugfix-workflow.md) — how agents work together
 - [Standalone Mint](../infrastructure/standalone-mint.md) — running your own mint with custom agent roles

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/cucumber/godog"
-	messages "github.com/cucumber/messages/go/v21"
+	messages "github.com/cucumber/messages/go/v34"
 
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/install"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/steps"
@@ -21,7 +21,7 @@ import (
 // enrolled test repository"), and the After hook deallocates on cleanup.
 func InitScenario(sc *godog.ScenarioContext, template *world.World) {
 	sc.Before(func(ctx context.Context, scenario *godog.Scenario) (context.Context, error) {
-		return beforeScenario(ctx, tagNames(scenario.Tags), template)
+		return beforeScenario(ctx, tagNames(scenario.Tags), template, scenario.Name)
 	})
 	sc.After(func(ctx context.Context, scenario *godog.Scenario, err error) (context.Context, error) {
 		return afterScenario(ctx, template.Driver, err)
@@ -29,15 +29,24 @@ func InitScenario(sc *godog.ScenarioContext, template *world.World) {
 	steps.Register(sc)
 }
 
-// beforeScenario clones the template World, resets scenario fields.
-// Repo allocation is handled by the step (via Driver.AllocateRepo),
-// not by the Before hook.
-func beforeScenario(ctx context.Context, tags []string, template *world.World) (context.Context, error) {
+// beforeScenario clones the template World, resets scenario fields, and
+// records the scenario name. Repo allocation is handled by the step (via
+// Driver.AllocateRepo), not by the Before hook.
+//
+// name is the godog scenario name. In playback mode it is forwarded to
+// the PlaybackDriver via SetRepoHint so the driver can correlate its
+// per-repo bookkeeping back to the scenario that is running; for the
+// standard pool-based Driver, SetRepoHint is a no-op.
+func beforeScenario(ctx context.Context, tags []string, template *world.World, name string) (context.Context, error) {
 	if err := SkipErrorForTagNames(tags, template); err != nil {
 		return ctx, err
 	}
 	w := template.Clone()
 	resetScenarioWorld(w)
+
+	if pd, ok := w.Driver.(*install.PlaybackDriver); ok {
+		pd.SetRepoHint(name)
+	}
 
 	ctx = world.WithWorld(ctx, w)
 	return ctx, nil
@@ -113,6 +122,11 @@ func resetScenarioWorld(w *world.World) {
 	w.JiraMockServer = nil
 	w.JiraMockState = nil
 	w.JiraConfigDir = ""
+	w.PlaybackEntries = nil
+	w.PlaybackCommitted = false
+	w.ConsumedHarnessRunIDs = nil
+	w.HarnessRunArtifactDirs = nil
+	w.StagePublishedSHA = nil
 }
 
 func tagNames(tags []*messages.PickleTag) []string {
@@ -135,6 +149,16 @@ func SkipErrorForTagNames(tags []string, w *world.World) error {
 		case name == "requires:per-repo" && w.Config.InstallMode != "per-repo":
 			return godog.ErrSkip
 		case name == "skip:gitlab" && w.Config.SCM == "gitlab":
+			return godog.ErrSkip
+		case name == "playback" && !w.IsPlaybackMode():
+			// @playback scenarios replay canned results via the
+			// dummy-playback runtime and only make sense under the
+			// playback suite (pkg/behaviourtest.RunPlaybackSuite),
+			// whose template World wraps install.Driver in a
+			// *install.PlaybackDriver. Skip them under the standard
+			// behaviour suite regardless of GODOG_TAGS so a shared
+			// "features" directory can hold both without the normal
+			// suite trying (and failing) to run playback-only steps.
 			return godog.ErrSkip
 		case strings.HasPrefix(name, "requires:capability:"):
 			// Skip unless the runner declares the capability via

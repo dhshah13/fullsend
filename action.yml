@@ -1,8 +1,8 @@
 name: Fullsend
 description: >-
-  Install fullsend-cli, create ${GITHUB_WORKSPACE}/output, invoke fullsend run with
-  --output-dir pointing at that directory, then upload it with actions/upload-artifact. Does not
-  read agent configuration from the repository; configure the job environment or CLI as needed.
+  Install fullsend-cli, create ${GITHUB_WORKSPACE}/output, invoke fullsend run with --output-dir
+  pointing at that directory, then upload it with actions/upload-artifact. The run resolves the
+  selected agent's inference provider and prepares GCP credentials only for Vertex.
 
 branding:
   icon: zap
@@ -52,6 +52,14 @@ inputs:
       PR head commit SHA, passed explicitly by per-repo (workflow_call)
       callers where GITHUB_EVENT_PATH lacks the dispatched event_payload
       wrapper. Takes precedence over GITHUB_EVENT_PATH extraction.
+    default: ""
+  gcp_wif_provider:
+    description: Workload Identity Federation provider resource name, used only when the selected agent resolves to Vertex inference.
+    required: false
+    default: ""
+  gcp_project_id:
+    description: GCP project ID, used only when the selected agent resolves to Vertex inference.
+    required: false
     default: ""
 
 outputs:
@@ -387,10 +395,14 @@ runs:
         EOF
         cat > $HOME/.config/openshell/gateway.toml << EOF
         [openshell]
-        version = 1
+        version = 2
 
         [openshell.gateway]
+        compute_driver = "podman"
+
+        [openshell.drivers.podman]
         supervisor_image = "ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}"
+        health_check_interval_secs = 10
         EOF
 
     - name: Install OpenShell CLI
@@ -423,6 +435,8 @@ runs:
         STATUS_COMMENT_ID: ${{ inputs.status-comment-id }}
         MINT_URL: ${{ inputs.mint-url }}
         PR_HEAD_SHA: ${{ inputs.pr-head-sha }}
+        FULLSEND_GCP_WIF_PROVIDER: ${{ inputs.gcp_wif_provider }}
+        FULLSEND_GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
       run: |
         set -euo pipefail
         FULLSEND_DIR="${FULLSEND_DIR:-${GITHUB_WORKSPACE}}"

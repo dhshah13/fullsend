@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1539,24 +1540,58 @@ func (p *Provisioner) provisionRepoWIFProvider(ctx context.Context) (wifProvider
 	if err != nil {
 		return "", "", fmt.Errorf("getting project number: %w", err)
 	}
-	if err := p.gcpAPI.CreateWIFPool(ctx, projectNumber, p.cfg.WIFPoolName, "Fullsend GitHub OIDC Pool"); err != nil {
-		return "", "", fmt.Errorf("creating WIF pool: %w", err)
-	}
 	providerID := mintcore.BuildRepoProviderID(partsLower[0], partsLower[1])
-	attrCondition := fmt.Sprintf("assertion.repository == '%s'", p.cfg.Repo)
-	audiences := []string{mintconsts.OIDCAudience, iamAudience(projectNumber, p.cfg.WIFPoolName, providerID)}
-	if err := p.gcpAPI.CreateWIFProvider(ctx, projectNumber, p.cfg.WIFPoolName, providerID, OIDCProviderConfig{
+	desired := OIDCProviderConfig{
 		IssuerURI:          oidcIssuer,
-		AttributeCondition: attrCondition,
-		AllowedAudiences:   audiences,
-	}); err != nil {
-		return "", "", fmt.Errorf("creating WIF provider: %w", err)
+		AttributeCondition: fmt.Sprintf("assertion.repository == '%s'", p.cfg.Repo),
+		AllowedAudiences:   []string{mintconsts.OIDCAudience, iamAudience(projectNumber, p.cfg.WIFPoolName, providerID)},
 	}
-
 	wifProvider = fmt.Sprintf("projects/%s/locations/global/workloadIdentityPools/%s/providers/%s",
 		projectNumber, p.cfg.WIFPoolName, providerID)
 
+	// Read before write: an enrolled repo's provider already matches, and
+	// the create path below would otherwise issue four no-op IAM writes
+	// (pool create, provider create → conflict → undelete → update →
+	// enable) on every re-run, which exhausts the IAM write quota when
+	// many repos re-provision at once (#6179). The provider existing
+	// implies the pool exists. A read error falls through to the write
+	// path, which is idempotent.
+	existing, err := p.gcpAPI.GetWIFProvider(ctx, projectNumber, p.cfg.WIFPoolName, providerID)
+	if err != nil {
+		log.Printf("reading WIF provider %s before provisioning (continuing with create): %v", providerID, err)
+	} else if repoProviderMatches(existing, desired) {
+		return wifProvider, projectNumber, nil
+	}
+
+	if err := p.gcpAPI.CreateWIFPool(ctx, projectNumber, p.cfg.WIFPoolName, "Fullsend GitHub OIDC Pool"); err != nil {
+		return "", "", fmt.Errorf("creating WIF pool: %w", err)
+	}
+	if err := p.gcpAPI.CreateWIFProvider(ctx, projectNumber, p.cfg.WIFPoolName, providerID, desired); err != nil {
+		return "", "", fmt.Errorf("creating WIF provider: %w", err)
+	}
+
 	return wifProvider, projectNumber, nil
+}
+
+// repoProviderMatches reports whether an existing per-repo provider already
+// has the desired configuration and can exchange tokens, so provisioning
+// can skip every write. State must be exactly ACTIVE (an absent state falls
+// through to the idempotent write path). The condition is compared exactly, not
+// case-insensitively: the CEL == in the condition is case-sensitive, so a
+// re-run with a corrected repo case must still rewrite it. Audiences are
+// compared as a set.
+func repoProviderMatches(existing *WIFProviderInfo, desired OIDCProviderConfig) bool {
+	if existing == nil || existing.Disabled || existing.State != WIFProviderStateActive {
+		return false
+	}
+	if existing.IssuerURI != desired.IssuerURI || existing.AttributeCondition != desired.AttributeCondition {
+		return false
+	}
+	have := slices.Clone(existing.AllowedAudiences)
+	want := slices.Clone(desired.AllowedAudiences)
+	slices.Sort(have)
+	slices.Sort(want)
+	return slices.Equal(have, want)
 }
 
 // ProvisionWIF creates the WIF infrastructure (service account, pool, provider,

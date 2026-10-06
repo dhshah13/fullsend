@@ -65,9 +65,9 @@ type TokenSnapshot struct {
 //
 // Diagnostics still carry names, dates, and token IDs only — never
 // secret values. Runtime authentication failures stay ErrAuthFailed
-// and never fall back to the shared token.
-func DiagnoseLifecycle(mode Mode, present map[string]bool, reg Registry, tokens []TokenSnapshot, now time.Time, lead time.Duration) Report {
-	rep := Diagnose(mode, present, reg)
+// and never fall back to a different credential.
+func DiagnoseLifecycle(present map[string]bool, reg Registry, tokens []TokenSnapshot, now time.Time, lead time.Duration) Report {
+	rep := Diagnose(present, reg)
 	if tokens == nil {
 		return rep
 	}

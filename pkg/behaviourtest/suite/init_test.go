@@ -8,12 +8,13 @@ import (
 	"time"
 
 	"github.com/cucumber/godog"
-	messages "github.com/cucumber/messages/go/v21"
+	messages "github.com/cucumber/messages/go/v34"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/runtime"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/env"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/drivers/install"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/world"
@@ -37,6 +38,9 @@ func (p *panickingSCM) GetIssue(context.Context, string, string, int) (*forge.Is
 	return nil, nil
 }
 func (p *panickingSCM) GetFileContent(context.Context, string, string, string) ([]byte, error) {
+	return nil, nil
+}
+func (p *panickingSCM) GetFileContentAtRef(context.Context, string, string, string, string) ([]byte, error) {
 	return nil, nil
 }
 func (p *panickingSCM) CommitFile(context.Context, string, string, string, string, []byte) error {
@@ -78,6 +82,13 @@ func (p *panickingSCM) CommitFileToFork(context.Context, string, string, string,
 	return nil
 }
 func (p *panickingSCM) CreateForkChangeProposal(context.Context, string, string, string, string, string, string, string, string) (*forge.ChangeProposal, error) {
+	return nil, nil
+}
+func (p *panickingSCM) ListPullRequestCommits(context.Context, string, string, int) ([]string, error) {
+	return nil, nil
+}
+
+func (p *panickingSCM) ListPullRequestReviews(context.Context, string, string, int) ([]forge.PullRequestReview, error) {
 	return nil, nil
 }
 func (p *panickingSCM) ListIssueReactions(context.Context, string, string, int) ([]forge.Reaction, error) {
@@ -155,6 +166,9 @@ func TestResetScenarioWorld_ClearsSharedState(t *testing.T) {
 		AllowedResourcesOriginal:   []string{"https://example.com/"},
 		AgentsOverridden:           true,
 		AgentsOriginal:             []config.AgentEntry{{Name: "test", Source: "harness/test.yaml"}},
+		PlaybackEntries:            []runtime.PlaybackEntry{{Result: "triage/bug"}},
+		PlaybackCommitted:          true,
+		ConsumedHarnessRunIDs:      map[string]map[int]bool{"review": {10: true}},
 	}
 	resetScenarioWorld(w)
 	assert.Equal(t, 0, w.PRNumber)
@@ -172,16 +186,24 @@ func TestResetScenarioWorld_ClearsSharedState(t *testing.T) {
 	assert.Nil(t, w.AllowedResourcesOriginal)
 	assert.False(t, w.AgentsOverridden)
 	assert.Nil(t, w.AgentsOriginal)
+	assert.Nil(t, w.PlaybackEntries)
+	assert.False(t, w.PlaybackCommitted)
+	assert.Nil(t, w.ConsumedHarnessRunIDs)
 }
 
 func TestSkipErrorForTagNames(t *testing.T) {
 	w := &world.World{Config: env.RunnerConfig{InstallMode: "per-repo", SCM: "github"}}
+	playbackWorld := &world.World{
+		Config: env.RunnerConfig{InstallMode: "per-repo", SCM: "github"},
+		Driver: install.NewPlaybackDriver(newFakeDriver(1)),
+	}
 
 	tests := []struct {
 		name    string
 		tags    []string
 		wantErr error
 		cfg     env.RunnerConfig
+		world   *world.World
 	}{
 		{name: "no tags", tags: nil, wantErr: nil},
 		{name: "skip per-repo on per-repo", tags: []string{"@skip:per-repo"}, wantErr: godog.ErrSkip},
@@ -195,11 +217,16 @@ func TestSkipErrorForTagNames(t *testing.T) {
 			cfg: env.RunnerConfig{InstallMode: "per-repo", SCM: "github", Capabilities: []string{"applier-branch-namespace"}}},
 		{name: "requires capability other declared", tags: []string{"@requires:capability:applier-branch-namespace"}, wantErr: godog.ErrSkip,
 			cfg: env.RunnerConfig{InstallMode: "per-repo", SCM: "github", Capabilities: []string{"something-else"}}},
+		{name: "playback tag outside playback suite", tags: []string{"@playback"}, wantErr: godog.ErrSkip},
+		{name: "playback tag inside playback suite", tags: []string{"@playback"}, wantErr: nil, world: playbackWorld},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ww := w
-			if tt.cfg.InstallMode != "" || tt.cfg.SCM != "" {
+			switch {
+			case tt.world != nil:
+				ww = tt.world
+			case tt.cfg.InstallMode != "" || tt.cfg.SCM != "":
 				ww = &world.World{Config: tt.cfg}
 			}
 			err := SkipErrorForTagNames(tt.tags, ww)
@@ -229,7 +256,7 @@ func TestBeforeScenario_ClonesAndResetsWorld(t *testing.T) {
 		IssueNumber: 42, // scenario field — should be zeroed by reset
 	}
 
-	ctx, err := beforeScenario(context.Background(), nil, template)
+	ctx, err := beforeScenario(context.Background(), nil, template, "a scenario")
 	require.NoError(t, err)
 
 	w := world.FromContext(ctx)
@@ -245,7 +272,7 @@ func TestBeforeScenario_NoPoolAcquire(t *testing.T) {
 	driver := newFakeDriver(3)
 	template := &world.World{Org: "test-org", Driver: driver}
 
-	ctx, err := beforeScenario(context.Background(), nil, template)
+	ctx, err := beforeScenario(context.Background(), nil, template, "a scenario")
 	require.NoError(t, err)
 
 	w := world.FromContext(ctx)
@@ -259,12 +286,28 @@ func TestBeforeScenario_NoPoolAcquire(t *testing.T) {
 func TestBeforeScenario_NilDriver(t *testing.T) {
 	template := &world.World{Org: "test-org"}
 
-	ctx, err := beforeScenario(context.Background(), nil, template)
+	ctx, err := beforeScenario(context.Background(), nil, template, "a scenario")
 	require.NoError(t, err)
 
 	w := world.FromContext(ctx)
 	require.NotNil(t, w)
 	assert.Empty(t, w.LeasedRepoName, "no driver → no leased name")
+}
+
+func TestBeforeScenario_PlaybackDriverGetsRepoHint(t *testing.T) {
+	base := newFakeDriver(1)
+	pd := install.NewPlaybackDriver(base)
+	template := &world.World{Org: "test-org", Driver: pd}
+
+	// SetRepoHint on PlaybackDriver is a no-op (pool repos have stable
+	// names), so this only verifies that beforeScenario's type assertion
+	// finds the PlaybackDriver and calls it without error.
+	ctx, err := beforeScenario(context.Background(), nil, template, "A Playback Scenario")
+	require.NoError(t, err)
+
+	w := world.FromContext(ctx)
+	require.NotNil(t, w)
+	assert.True(t, w.IsPlaybackMode())
 }
 
 func TestAfterScenario_NilWorld(t *testing.T) {

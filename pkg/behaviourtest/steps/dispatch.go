@@ -11,6 +11,7 @@ import (
 	"github.com/cucumber/godog"
 	"gopkg.in/yaml.v3"
 
+	"github.com/fullsend-ai/fullsend/internal/agentnew"
 	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/scaffold"
 	"github.com/fullsend-ai/fullsend/pkg/behaviourtest/world"
@@ -253,10 +254,10 @@ func commitLocalHarnessResources(ctx context.Context, w *world.World, harnessNam
 
 	if h.Policy != "" && !strings.HasPrefix(h.Policy, "/") && !strings.HasPrefix(h.Policy, "https://") {
 		policyPath := filepath.Join(".fullsend", h.Policy)
-		minimalPolicy := fmt.Sprintf("# Minimal policy for %s\n", harnessName)
+		policy := agentnew.BasePolicy()
 		if err := w.SCM.CommitFile(ctx, owner, repo, policyPath,
 			fmt.Sprintf("behaviour: add policy resource for %s", harnessName),
-			[]byte(minimalPolicy)); err != nil {
+			policy); err != nil {
 			return fmt.Errorf("committing policy resource %s: %w", policyPath, err)
 		}
 	}
@@ -299,6 +300,10 @@ func thenHarnessWorkflowCompletes(w *world.World, agent string) error {
 	ctx := context.Background()
 	run, err := w.CI.WaitForHarnessAgent(ctx, w.Org, w.RepoName, agent, w.ScenarioStart)
 	if err != nil {
+		// A failed harness run is the one whose logs matter most, and the
+		// pool repository (with its run logs) is deleted when the lease
+		// ends, so save them before returning.
+		saveWorkflowRunLogs(ctx, w, agent, run)
 		return err
 	}
 	w.WorkflowRun = run

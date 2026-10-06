@@ -13,13 +13,12 @@ import (
 func TestDiagnoseLifecycleNilTokensMatchesDiagnose(t *testing.T) {
 	t.Parallel()
 	present := map[string]bool{
-		forge.SecretForgeToken:         true,
 		forge.SecretGitLabPollerToken:  true,
 		forge.SecretGitLabAnalystToken: true,
 		forge.SecretGitLabCoderToken:   true,
 	}
-	got := DiagnoseLifecycle(ModeEnforced, present, Registry{}, nil, time.Time{}, 0)
-	want := Diagnose(ModeEnforced, present, Registry{})
+	got := DiagnoseLifecycle(present, Registry{}, nil, time.Time{}, 0)
+	want := Diagnose(present, Registry{})
 	assert.Equal(t, want.Ready, got.Ready)
 	assert.Equal(t, want.Missing, got.Missing)
 	for _, rr := range got.Roles {
@@ -31,7 +30,6 @@ func TestDiagnoseLifecycleExpiryAndRevocation(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
 	present := map[string]bool{
-		forge.SecretForgeToken:         true,
 		forge.SecretGitLabPollerToken:  true,
 		forge.SecretGitLabAnalystToken: true,
 		forge.SecretGitLabCoderToken:   true,
@@ -41,7 +39,7 @@ func TestDiagnoseLifecycleExpiryAndRevocation(t *testing.T) {
 		{ID: 2, Name: AnalystTokenName, Active: true, ExpiresAt: "2026-09-01"}, // expired
 		{ID: 3, Name: CoderTokenName, Active: false, ExpiresAt: "2027-01-01", Revoked: true},
 	}
-	rep := DiagnoseLifecycle(ModeEnforced, present, Registry{}, tokens, now, DefaultRotationLead)
+	rep := DiagnoseLifecycle(present, Registry{}, tokens, now, DefaultRotationLead)
 	byName := map[Role]RoleReport{}
 	for _, rr := range rep.Roles {
 		byName[rr.Name] = rr
@@ -65,7 +63,6 @@ func TestDiagnoseLifecycleOverlappingAndOK(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
 	present := map[string]bool{
-		forge.SecretForgeToken:         true,
 		forge.SecretGitLabPollerToken:  true,
 		forge.SecretGitLabAnalystToken: true,
 		forge.SecretGitLabCoderToken:   true,
@@ -76,7 +73,7 @@ func TestDiagnoseLifecycleOverlappingAndOK(t *testing.T) {
 		{ID: 20, Name: AnalystTokenName, Active: true, ExpiresAt: "2027-09-21"},
 		{ID: 30, Name: CoderTokenName, Active: true, ExpiresAt: "2027-09-21"},
 	}
-	rep := DiagnoseLifecycle(ModeMigrating, present, Registry{}, tokens, now, DefaultRotationLead)
+	rep := DiagnoseLifecycle(present, Registry{}, tokens, now, DefaultRotationLead)
 	byName := map[Role]RoleReport{}
 	for _, rr := range rep.Roles {
 		byName[rr.Name] = rr
@@ -96,7 +93,6 @@ func TestDiagnoseLifecycleUnverifiedAndCustom(t *testing.T) {
 	require.NoError(t, err)
 	secret := CustomSecretName(Role("scanner"))
 	present := map[string]bool{
-		forge.SecretForgeToken:         true,
 		forge.SecretGitLabPollerToken:  true,
 		forge.SecretGitLabAnalystToken: true,
 		forge.SecretGitLabCoderToken:   true,
@@ -108,7 +104,7 @@ func TestDiagnoseLifecycleUnverifiedAndCustom(t *testing.T) {
 		{ID: 3, Name: CoderTokenName, Active: true, ExpiresAt: "2027-09-21"},
 		// scanner secret present but no matching PAT
 	}
-	rep := DiagnoseLifecycle(ModeEnforced, present, reg, tokens, now, DefaultRotationLead)
+	rep := DiagnoseLifecycle(present, reg, tokens, now, DefaultRotationLead)
 	var scanner RoleReport
 	for _, rr := range rep.Roles {
 		if rr.Name == Role("scanner") {
@@ -123,11 +119,11 @@ func TestDiagnoseLifecycleUnverifiedAndCustom(t *testing.T) {
 func TestRefreshLifecycleDiagnosticsAfterProof(t *testing.T) {
 	t.Parallel()
 	report := Report{
-		Diagnostics: []string{"mode=enforced", "coder: secret present but no matching project access token (FULLSEND_GITLAB_CODER_TOKEN)"},
+		Diagnostics: []string{"role policy loaded", "coder: secret present but no matching project access token (FULLSEND_GITLAB_CODER_TOKEN)"},
 		Roles:       []RoleReport{{Name: RoleCoder, SecretName: forge.SecretGitLabCoderToken, Lifecycle: LifecycleOK}},
 	}
 	RefreshLifecycleDiagnostics(&report, 1)
-	assert.Equal(t, []string{"mode=enforced"}, report.Diagnostics)
+	assert.Equal(t, []string{"role policy loaded"}, report.Diagnostics)
 }
 
 func TestDiagnoseLifecycleReuseFollowsTarget(t *testing.T) {
@@ -136,7 +132,6 @@ func TestDiagnoseLifecycleReuseFollowsTarget(t *testing.T) {
 	reg, err := ParseRegistry(`{"roles":[{"name":"deployer","credential":"reuse","reuse":"coder","capabilities":["write_repository"],"agents":["deploy"]}]}`)
 	require.NoError(t, err)
 	present := map[string]bool{
-		forge.SecretForgeToken:         true,
 		forge.SecretGitLabPollerToken:  true,
 		forge.SecretGitLabAnalystToken: true,
 		forge.SecretGitLabCoderToken:   true,
@@ -146,7 +141,7 @@ func TestDiagnoseLifecycleReuseFollowsTarget(t *testing.T) {
 		{ID: 2, Name: AnalystTokenName, Active: true, ExpiresAt: "2027-09-21"},
 		{ID: 3, Name: CoderTokenName, Active: true, ExpiresAt: "2026-10-01"},
 	}
-	rep := DiagnoseLifecycle(ModeEnforced, present, reg, tokens, now, DefaultRotationLead)
+	rep := DiagnoseLifecycle(present, reg, tokens, now, DefaultRotationLead)
 	var deployer RoleReport
 	for _, rr := range rep.Roles {
 		if rr.Name == Role("deployer") {
@@ -162,9 +157,9 @@ func TestDiagnoseLifecycleReuseFollowsMultipleTargets(t *testing.T) {
 	now := time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC)
 	reg, err := ParseRegistry(`{"roles":[{"name":"bridge","credential":"reuse","reuse":"coder","capabilities":["write_repository"],"agents":["bridge"]},{"name":"deployer","credential":"reuse","reuse":"bridge","capabilities":["write_repository"],"agents":["deploy"]}]}`)
 	require.NoError(t, err)
-	present := map[string]bool{forge.SecretForgeToken: true, forge.SecretGitLabPollerToken: true, forge.SecretGitLabAnalystToken: true, forge.SecretGitLabCoderToken: true}
+	present := map[string]bool{forge.SecretGitLabPollerToken: true, forge.SecretGitLabAnalystToken: true, forge.SecretGitLabCoderToken: true}
 	tokens := []TokenSnapshot{{ID: 1, Name: PollerTokenName, Active: true, ExpiresAt: "2027-09-21"}, {ID: 2, Name: AnalystTokenName, Active: true, ExpiresAt: "2027-09-21"}, {ID: 3, Name: CoderTokenName, Active: true, ExpiresAt: "2027-09-21"}}
-	rep := DiagnoseLifecycle(ModeEnforced, present, reg, tokens, now, DefaultRotationLead)
+	rep := DiagnoseLifecycle(present, reg, tokens, now, DefaultRotationLead)
 	for _, rr := range rep.Roles {
 		if rr.Name == Role("bridge") || rr.Name == Role("deployer") {
 			assert.Equal(t, LifecycleOK, rr.Lifecycle, rr.Name)
@@ -196,7 +191,7 @@ func TestDiagnoseLifecycleOverlappingWithoutExpiry(t *testing.T) {
 		{ID: 2, Name: AnalystTokenName, Active: false},
 		{ID: 3, Name: CoderTokenName, Active: true, ExpiresAt: "2027-09-21"},
 	}
-	rep := DiagnoseLifecycle(ModeEnforced, present, Registry{}, tokens, now, DefaultRotationLead)
+	rep := DiagnoseLifecycle(present, Registry{}, tokens, now, DefaultRotationLead)
 	byName := map[Role]RoleReport{}
 	for _, rr := range rep.Roles {
 		byName[rr.Name] = rr

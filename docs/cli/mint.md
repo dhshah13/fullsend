@@ -258,7 +258,7 @@ fullsend mint unenroll <org|owner/repo> \
 
 ## `mint workflow-host`
 
-Manages the `WORKFLOW_HOST_REPOS` allow-list that controls which repositories may host workflows calling the mint for per-repo callers. Per-org callers are not affected.
+Manages the `WORKFLOW_HOST_REPOS` allow-list that controls which repositories may host workflows calling the mint. The check applies to every admitted caller; the upstream `fullsend-ai/fullsend` is always accepted, and there is no implicit `{org}/.fullsend` host.
 
 ### `mint workflow-host add`
 

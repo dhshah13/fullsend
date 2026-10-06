@@ -484,15 +484,19 @@ func dropSkippedProviders(names []string, skipped map[string]struct{}) []string 
 	return out
 }
 
-// ensureOpenAIProfile imports the provider profile for a fullsend-openai
-// provider from the scaffold embedded in this binary. The profile is not
-// layered into .fullsend/profiles at run time — importing that directory
-// wholesale would replace the canonical profiles the fleet resolves from
-// fullsend-ai/agents — and a repository install ships only a .gitkeep, so
-// the runner brings its own, version-matched copy. ImportProfileVerified
-// drops the content cache, re-sends, and confirms the gateway lists it, so
-// a hash match against a recreated (empty) gateway cannot skip the import.
-func ensureOpenAIProfile(ctx context.Context, profileID string, printer *ui.Printer) error {
+// ensureEmbeddedProfile imports a provider profile from the scaffold
+// embedded in this binary — fullsend-openai's for the run-scoped OpenAI
+// provider, and (since #7268) every other builtin provider's reserved
+// profile id (isReservedProfileID) — so a bare provider name resolves
+// end to end with no openshell.profiles entry in the harness. The profile
+// is not layered into .fullsend/profiles at run time — importing that
+// directory wholesale would replace the canonical profiles the fleet
+// resolves from fullsend-ai/agents — and a repository install ships only a
+// .gitkeep, so the runner brings its own, version-matched copy.
+// ImportProfileVerified drops the content cache, re-sends, and confirms the
+// gateway lists it, so a hash match against a recreated (empty) gateway
+// cannot skip the import.
+func ensureEmbeddedProfile(ctx context.Context, profileID string, printer *ui.Printer) error {
 	data, err := scaffold.FullsendRepoFile("profiles/" + profileID + ".yaml")
 	if err != nil {
 		return fmt.Errorf("provider profile %q is not shipped by this fullsend build: %w", profileID, err)
@@ -522,17 +526,6 @@ func ensureOpenAIProfile(ctx context.Context, profileID string, printer *ui.Prin
 	}
 	printer.StepDone(fmt.Sprintf("Provider profile ready: %s (%.1fs)", profileID, time.Since(start).Seconds()))
 	return nil
-}
-
-// emptyCredentialRefusedRe matches the gateway's rejection of an empty
-// credential value on create — today "provider.credentials must not be
-// empty" (only for an empty map); a future value-level check is expected
-// to keep the words. Anything else is a real failure, not a cue to send the
-// value without its expiry.
-var emptyCredentialRefusedRe = regexp.MustCompile(`(?i)credential[^\n]*(empty|required|missing|invalid)`)
-
-func emptyCredentialRefused(err error) bool {
-	return err != nil && emptyCredentialRefusedRe.MatchString(err.Error())
 }
 
 // openAICredentialKeys returns the credential keys the run-scoped provider
@@ -681,6 +674,14 @@ func checkOpenAIEgressInspected(ctx context.Context, sandboxName string) error {
 		strings.Join(rules, ", "), openAIAPIHost)
 }
 
+// openAICredentialError marks an ensureOpenAIProvider failure to resolve
+// the credential itself, before anything was created on the gateway. The
+// runner tolerates it when only a persona's own frontmatter wanted the
+// provider (#7981).
+type openAICredentialError struct{ error }
+
+func (e openAICredentialError) Unwrap() error { return e.error }
+
 // ensureOpenAIProvider creates the run-scoped provider for one
 // fullsend-openai definition. backend is the runtime the run selected: when
 // it implements runtime.OpenAICredentialSeeder with a non-empty seed, the
@@ -695,7 +696,7 @@ func ensureOpenAIProvider(ctx context.Context, pd harness.ProviderDef, sandboxNa
 	cred, err := resolveOpenAICredential(ctx, os.Getenv, ids)
 	if err != nil {
 		printer.StepFail("OpenAI credential unavailable for provider " + pd.Name)
-		return openAIProviderHandle{}, fmt.Errorf("provider %q: %w", pd.Name, err)
+		return openAIProviderHandle{}, openAICredentialError{fmt.Errorf("provider %q: %w", pd.Name, err)}
 	}
 	// Two redaction layers: the exact value in the process-wide redactor
 	// (the token is opaque — no prefix pattern can be trusted; this is the
@@ -738,39 +739,30 @@ func ensureOpenAIProvider(ctx context.Context, pd harness.ProviderDef, sandboxNa
 
 	start := time.Now()
 	printer.StepStart("Ensuring run-scoped provider: " + name)
-	// Two steps, so the value is never on the gateway without its expiry:
-	// create the instance with empty credentials (nothing secret involved),
-	// then store value and expiry together in one update.
-	empty := make(map[string]string, len(keys))
-	for _, k := range keys {
-		empty[k] = ""
-	}
-	if err := sandbox.EnsureProviderLiteral(ctx, name, pd.Type, empty); err != nil {
-		// OpenShell 0.0.115 accepts an empty credential value on create
-		// (only an empty credential *map* is rejected — the same gap the
-		// _NOOP_* providers use). Should a later release validate values,
-		// fall back to creating with the value and attaching the expiry in
-		// the very next call: a one-call window instead of a hard failure.
-		if !emptyCredentialRefused(err) {
-			printer.StepFail("Failed to create run-scoped provider " + name)
-			return openAIProviderHandle{}, fmt.Errorf("ensuring provider %q: %w", name, err)
-		}
-		printer.StepWarn("Gateway refused an empty credential on create; creating with the value and attaching the expiry immediately")
-		if err := sandbox.EnsureProviderLiteral(ctx, name, pd.Type, creds); err != nil {
-			printer.StepFail("Failed to create run-scoped provider " + name)
-			return openAIProviderHandle{}, fmt.Errorf("ensuring provider %q: %w", name, err)
-		}
+	// OpenShell requires a declared credential's value on create and takes
+	// an expiry only on update, so the value is stored first and its expiry
+	// in the very next call.
+	if err := sandbox.EnsureProviderLiteral(ctx, name, pd.Type, creds); err != nil {
+		printer.StepFail("Failed to create run-scoped provider " + name)
+		return openAIProviderHandle{}, fmt.Errorf("ensuring provider %q: %w", name, err)
 	}
 	if err := sandbox.UpdateProviderLiteralWithExpiry(ctx, name, creds, cred.expiresAt); err != nil {
 		// The caller only registers the deferred delete once this function
-		// succeeds, so remove the instance here; if that fails too, blank
-		// the credential so nothing usable can be left behind.
+		// succeeds, so remove the instance here; if that fails too, expire
+		// the credential now (OpenShell refuses an empty value for a declared
+		// credential, so it cannot be blanked).
 		printer.StepFail("Failed to store the credential on " + name)
 		if delErr := sandbox.DeleteProvider(name); delErr != nil && !errors.Is(delErr, sandbox.ErrProviderNotFound) {
-			if blankErr := sandbox.UpdateProviderLiteral(ctx, name, empty); blankErr != nil {
-				printer.StepWarn(fmt.Sprintf("Run-scoped provider %s could be neither deleted (%v) nor blanked (%v); remove it with `openshell provider delete %s`", name, delErr, blankErr, name))
+			var expireErr error
+			for _, k := range keys {
+				if expireErr = sandbox.SetProviderCredentialExpiry(context.Background(), name, k, time.Now()); expireErr != nil {
+					break
+				}
+			}
+			if expireErr != nil {
+				printer.StepWarn(fmt.Sprintf("Run-scoped provider %s could be neither deleted (%v) nor expired (%v); remove it with `openshell provider delete %s`", name, delErr, expireErr, name))
 			} else {
-				printer.StepWarn(fmt.Sprintf("Run-scoped provider %s could not be deleted (%v); its credential was blanked", name, delErr))
+				printer.StepWarn(fmt.Sprintf("Run-scoped provider %s could not be deleted (%v); its credential was expired", name, delErr))
 			}
 		}
 		return openAIProviderHandle{}, fmt.Errorf("storing credential on provider %q: %w", name, err)
@@ -1032,4 +1024,15 @@ func cleanupRunScopedProvider(name string, keys []string, sandboxKept bool, prin
 		return
 	}
 	printer.StepWarn(fmt.Sprintf("Run-scoped provider %s expired in place instead of deleted (still reported attached after the sandbox was deleted: %v); remove it with `openshell provider delete %s`", name, delErr, name))
+}
+
+// anyConfiguredOpenAIChild reports whether a subagents entry (not just a
+// persona's frontmatter) resolves to the openai provider.
+func anyConfiguredOpenAIChild(children []runtime.PiChild) bool {
+	for _, c := range children {
+		if c.Configured {
+			return true
+		}
+	}
+	return false
 }

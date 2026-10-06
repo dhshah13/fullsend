@@ -52,7 +52,9 @@ These are the places Claude Code differs from pi — useful when comparing a run
 - **The agent definition *replaces* the system prompt.** `--agent` makes the agent `.md` body the
   system prompt outright. pi appends it to its own default instead, so an agent that relies on
   Claude Code's exact framing can read differently there.
-- **Native sub-agents** via the `Agent` tool.
+- **Native sub-agents** via the `Agent` tool. Their tokens and cost are included in the
+  `metrics.json` totals and broken down per model in `per_model_usage`, read from the result's
+  `modelUsage` (see [metrics.json fields](../cli/run.md#per-model-usage)).
 - **A `CLAUDE.md` bridge is injected** when the repo has `AGENTS.md` but no `CLAUDE.md`, because
   Claude Code auto-loads only the former. pi reads `AGENTS.md` natively and needs no bridge.
 - **`tools:` is enforced unreliably** (≥ 2.1.119); pi enforces its `--tools` allowlist strictly. In
@@ -76,6 +78,12 @@ override is visible after the fact.
 **A tool call was blocked.** The security hooks log to `/sandbox/workspace/.security/findings.jsonl`
 inside the sandbox. A blocked tool reports its reason in the transcript; an allowlist mismatch names
 the offending tool and the expected vocabulary.
+
+**A harness plugin did not load.** When Claude Code reports a plugin in the `plugin_errors` of its
+startup `system`/`init` event, the run output prints one `Plugin <name> failed to load …` warning per
+entry, with the error category and message. It also shows the plugin directory when Claude Code
+names one (2.1.283 and later, for `--plugin-dir` entries). The run continues: the warning is the
+signal to check the plugin's path and `plugin.json`.
 
 **Output looks truncated or condensed.** The PostToolUse chain condenses verification-command output
 only on positive evidence of success, and attaches a note saying it did. Anything carrying a failure

@@ -58,8 +58,9 @@ func CommitFilesViaPR(ctx context.Context, client forge.Client, printer *ui.Prin
 }
 
 // knownScaffoldBranches lists all branch names that have been used to deliver
-// scaffold files across different install modes. Per-org mode uses
-// "fullsend/onboard" (via reconcile-repos.sh); per-repo mode uses
+// scaffold files across different install modes. The removed per-org mode
+// used "fullsend/onboard" (via reconcile-repos.sh), kept here so stale
+// onboarding PRs are still cleaned up; per-repo mode uses
 // "fullsend/scaffold-install" (via the Go CLI) for both install and uninstall
 // delivery.
 var knownScaffoldBranches = []string{

@@ -53,10 +53,64 @@ fullsend is pinned to — the source of truth is
 in the fullsend repo at your release tag (also printed on Fullsend workflow runs).
 
 ```bash
-export OPENSHELL_VERSION=0.0.116  # check the pin file for the current version
+export OPENSHELL_VERSION=0.1.2  # check the pin file for the current version
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/v${OPENSHELL_VERSION}/install.sh | OPENSHELL_VERSION=v${OPENSHELL_VERSION} sh
 openshell --version
 ```
+
+The gateway reads a schema v2 config. With podman, pin the compute driver and the supervisor image
+that matches the CLI:
+
+```toml
+# ~/.config/openshell/gateway.toml (Homebrew on macOS: /opt/homebrew/var/openshell/gateway.toml
+# is used when this file does not exist)
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "podman"
+
+[openshell.drivers.podman]
+supervisor_image = "ghcr.io/nvidia/openshell/supervisor:0.1.2"  # match your openshell --version
+health_check_interval_secs = 10
+```
+
+Restart the gateway after editing it (`brew services restart openshell` on macOS). `openshell sandbox
+list` answering `No sandboxes found.` means the CLI reaches it.
+
+**Upgrading from OpenShell 0.0.x.** 0.1 cannot read 0.0.x gateway state or a schema v1 config, and
+its installer refuses to replace 0.0.x unless `OPENSHELL_ACK_BREAKING_UPGRADE=1` is set. Clean up
+while the 0.0.x CLI is still installed, and write the new config before installing: the installer
+starts the gateway straight away.
+
+```bash
+# 1. With the 0.0.x CLI: delete your sandboxes (they do not carry over)
+openshell sandbox delete --all
+
+# 2. Stop the 0.0.x gateway
+systemctl --user stop openshell-gateway
+
+# 3. Move the old config and gateway state aside
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/openshell"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/openshell"
+ts="$(date +%s)"
+if [ -f "$cfg/gateway.toml" ]; then mv "$cfg/gateway.toml" "$cfg/gateway.toml.pre-0.1"; fi
+for d in gateway tls; do
+  if [ -d "$state/$d" ]; then mv "$state/$d" "$state/$d.pre-0.1.$ts"; fi
+done
+
+# 4. Write the schema v2 config shown above to "$cfg/gateway.toml", then install
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/v${OPENSHELL_VERSION}/install.sh \
+  | OPENSHELL_ACK_BREAKING_UPGRADE=1 OPENSHELL_VERSION=v${OPENSHELL_VERSION} sh
+openshell sandbox list   # "No sandboxes found." means the new gateway is up
+```
+
+The paths are the XDG defaults, which a Homebrew install (what the installer uses on Apple Silicon
+macOS) also uses for the gateway state. With Homebrew, stop the gateway in step 2 with
+`brew services stop openshell` instead, and start it with `brew services start openshell` after
+installing. The rest is unchanged: `$cfg/gateway.toml` takes precedence over Homebrew's
+`$(brew --prefix)/var/openshell/gateway.toml`, and the installer manages Homebrew's TLS under that
+directory. fullsend recreates its providers and profiles on the next run.
 
 ## Get Google Cloud Platform credentials
 
@@ -357,7 +411,7 @@ fullsend run triage \
   --run-url "https://github.com/myorg/myrepo/actions/runs/12345"
 ```
 
-For GitLab repositories, use `--forge gitlab` instead of `--mint-url`. The agent resolves its credential through the [GitLab role-credential contract](../../contributing/gitlab-role-credentials.md) and exports `GITLAB_TOKEN` (and `PUSH_TOKEN`, for roles with repository-write access) itself; it does not require the mint service. While the role-identity gate is leftover unset/`disabled` or explicit `rollback`, `FULLSEND_FORGE_TOKEN` is preferred and exported to `GITLAB_TOKEN`; if it is absent, a directly-set `GITLAB_TOKEN` is still used as a fallback (a warning is logged). Once the gate is `migrating` or `enforced`, the matching per-role secret (Poller/Analyst/Coder, or a registered custom role) is strictly required; a missing role secret fails closed and does not fall back to `FULLSEND_FORGE_TOKEN`. In both `migrating` and `enforced` mode, the unmanaged fallback to a directly-set `GITLAB_TOKEN` (used above when `FULLSEND_FORGE_TOKEN` itself is absent) no longer applies. See the [operations guide](../getting-started/operations.md#gitlab-ci) for required environment variables. Self-hosted instances that use a private CA have a separate [certificate-provisioning contract](../getting-started/operations.md#private-ca-self-hosted-gitlab).
+For GitLab repositories, use `--forge gitlab` instead of `--mint-url`. The agent resolves its credential through the [GitLab role-credential contract](../../contributing/gitlab-role-credentials.md) and exports `GITLAB_TOKEN` (and `PUSH_TOKEN`, for roles with repository-write access) itself; it does not require the mint service. Set the matching per-role secret (Poller/Analyst/Coder, or a registered custom role). A missing role secret fails closed and does not fall back to `FULLSEND_FORGE_TOKEN` or a directly-set `GITLAB_TOKEN`. See the [operations guide](../getting-started/operations.md#gitlab-ci) for required environment variables. Self-hosted instances that use a private CA have a separate [certificate-provisioning contract](../getting-started/operations.md#private-ca-self-hosted-gitlab).
 
 Status comment behavior is configured via `status_notifications` in
 `config.yaml`. See [Status Notifications](customizing-agents.md#status-notifications).
@@ -472,7 +526,7 @@ to the server (gateway). It is likely that you need to bind the gateway to `0.0.
 
 **`API Error: Error code policy_denied` on the first model call (agent exits after ~2 s, 0 tokens)**
 - The gateway denied the agent's binary, not the model. Run `grep DENIED <run-dir>/logs/openshell-sandbox.log`; a line ending in `binary '…/claude.exe' not allowed in policy '_provider_vertex_ai'` means the Vertex profile lacks `**/claude.exe` (Claude Code 2.1.2xx runs as `claude.exe`, even on Linux)
-- Only profiles listed in `openshell.profiles` are imported. If `--fullsend-dir` contains a `profiles/` directory, files there are **not** imported unless explicitly listed on the harness. To override a harness profile locally, add it to `openshell.profiles` (e.g., `profiles/fullsend-vertex-ai.yaml`)
+- For the built-in `fullsend-vertex-ai` profile, upgrade fullsend: the profile ships in the binary. To try a changed profile locally, copy it under your own id (for example `profiles/myorg-vertex-ai.yaml` with `id: myorg-vertex-ai`), list it in `openshell.profiles`, and point a provider of your own at it (`type: myorg-vertex-ai`). Files under `profiles/` are **not** imported unless the harness lists them
 
 **Agent fails with missing environment variable**
 - Check your env file contains all variables listed in the agent's harness YAML (`harness/{agent}.yaml` in the `.fullsend` config directory)

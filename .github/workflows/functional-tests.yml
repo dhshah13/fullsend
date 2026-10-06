@@ -166,24 +166,6 @@ jobs:
         if: steps.changes.outputs.relevant != 'false'
         run: echo "${{ github.workspace }}/bin" >> "$GITHUB_PATH"
 
-      - name: Configure OpenShell gateway
-        if: steps.changes.outputs.relevant != 'false'
-        run: |
-          source .github/scripts/openshell-version.sh
-          mkdir -p "$HOME/.config/openshell"
-          echo "OPENSHELL_BIND_ADDRESS=0.0.0.0" > "$HOME/.config/openshell/gateway.env"
-          cat > "$HOME/.config/openshell/gateway.toml" << EOF
-          [openshell]
-          version = 1
-
-          [openshell.gateway]
-          supervisor_image = "ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}"
-          EOF
-
-      - name: Install OpenShell CLI
-        if: steps.changes.outputs.relevant != 'false'
-        run: .github/scripts/install-openshell.sh
-
       - name: Install Podman
         if: steps.changes.outputs.relevant != 'false'
         run: .github/scripts/install-podman.sh
@@ -198,16 +180,47 @@ jobs:
       - name: Start Podman API service
         if: steps.changes.outputs.relevant != 'false'
         run: |
+          # Socket-activated under the user's systemd, as in action.yml. The
+          # OpenShell gateway is a systemd user service that pins the podman
+          # driver and needs this socket to answer when it starts. With a
+          # `podman system service &` started from a step instead, it failed
+          # with "no responsive Podman API socket found".
+          systemctl --user start podman.socket
           SOCKET_PATH="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
-          if [ ! -S "${SOCKET_PATH}" ]; then
-            mkdir -p "$(dirname "${SOCKET_PATH}")"
-            podman system service --time=0 "unix://${SOCKET_PATH}" &
-            for _i in $(seq 1 30); do
-              [ -S "${SOCKET_PATH}" ] && podman --url "unix://${SOCKET_PATH}" info >/dev/null 2>&1 && break
-              sleep 1
-            done
-            [ -S "${SOCKET_PATH}" ] || { echo "::error::Podman socket not ready"; exit 1; }
+          for _i in $(seq 1 30); do
+            podman --url "unix://${SOCKET_PATH}" info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if ! podman --url "unix://${SOCKET_PATH}" info >/dev/null 2>&1; then
+            echo "::error::Podman socket not ready at ${SOCKET_PATH}"
+            systemctl --user status podman.socket podman.service --no-pager || true
+            journalctl --user -u podman.socket -u podman.service --no-pager -n 40 || true
+            exit 1
           fi
+
+      # After Podman: the gateway pins compute_driver = "podman" and does not
+      # start without the Podman API socket.
+      - name: Configure OpenShell gateway
+        if: steps.changes.outputs.relevant != 'false'
+        run: |
+          source .github/scripts/openshell-version.sh
+          mkdir -p "$HOME/.config/openshell"
+          echo "OPENSHELL_BIND_ADDRESS=0.0.0.0" > "$HOME/.config/openshell/gateway.env"
+          cat > "$HOME/.config/openshell/gateway.toml" << EOF
+          [openshell]
+          version = 2
+
+          [openshell.gateway]
+          compute_driver = "podman"
+
+          [openshell.drivers.podman]
+          supervisor_image = "ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}"
+          health_check_interval_secs = 10
+          EOF
+
+      - name: Install OpenShell CLI
+        if: steps.changes.outputs.relevant != 'false'
+        run: .github/scripts/install-openshell.sh
 
       - name: Install validation dependencies
         if: steps.changes.outputs.relevant != 'false'

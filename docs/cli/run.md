@@ -16,7 +16,7 @@ fullsend run <agent-name> [flags]
 
 | Flag | Description |
 |------|-------------|
-| `--fullsend-dir` | Path to the `.fullsend` configuration directory |
+| `--fullsend-dir` | Path to the `.fullsend` configuration directory (default `.fullsend`; when omitted and `.fullsend` does not exist in the current directory, the command stops and names the flag) |
 | `--runtime` | Override the agent runtime from `config.yaml` for this run (`claude`, `pi`, `codex`, `dummy` or `dummy-playback`); also `FULLSEND_RUNTIME` |
 | `--model` | Override the harness/agent model for this run (alias, model id, or `provider/id` on pi and codex — codex takes OpenAI ids only); also `FULLSEND_MODEL` |
 | `--effort` | Override the harness effort level for this run (`low`…`max`); also `FULLSEND_EFFORT` |
@@ -52,6 +52,26 @@ The runtime for a run is resolved once, in this order: `--runtime` flag, `FULLSE
 
 The plan block prints `Runtime: <name> (from <source>)` and, when an override applied, `Model: <value> (from <source>)`; stderr carries `runtime: selected "<name>" from <source>` (and `model: requested "<value>" from <source>`) for scripts. A value from the config file is labelled with the file path, suffixed ` agents.<name>` when the agent's entry decided. When `models.aliases` in `.fullsend/config.yaml` remaps the alias, the line keeps the alias and its source and adds the remap: `Model: sonnet (from <source>) → claude-sonnet-5 (from <config path> models.aliases)`, with `model: alias "sonnet" remapped to "claude-sonnet-5" from <config path> models.aliases` on stderr. Aliased entries in the `Fallback models` line show as `alias → id` (`sonnet → claude-sonnet-5, claude-opus-4-6 (from FULLSEND_FALLBACK_MODELS)`); literal ids print as written; pi uses the chain for aliased models when Vertex does not serve the model and ignores it for pinned ids. An invalid override — unknown runtime, unknown effort level, an `agents:` entry that names no agent, or a `models.aliases` key or value the block does not accept — fails before the sandbox is created.
 
+Each run then selects its inference provider from the resolved runtime and model, so different
+agents in one repository can use different providers. On GitHub Actions, a Vertex run picks its
+Google credentials before the harness pre-script:
+
+- When `FULLSEND_GCP_PROJECT_ID` and `FULLSEND_GCP_WIF_PROVIDER` are both set, the run prepares
+  Google WIF credentials and points `GOOGLE_APPLICATION_CREDENTIALS` at them. This replaces any
+  credential file an earlier step prepared, including one that impersonates a service account.
+- When neither is set, the run uses the credential file that `GOOGLE_APPLICATION_CREDENTIALS`
+  already names. An `external_account` file must read its token from `credential_source.file`.
+- When only one is set, the run fails.
+
+The run prints which source it used. For local and GitLab Vertex runs, point
+`GOOGLE_APPLICATION_CREDENTIALS` at a non-empty credential file when the harness mounts it.
+An OpenAI run uses the [OpenAI credential path](#openai-credentials-on-pi-and-codex). When both GCP
+inputs are set, an OpenAI run on GitHub Actions also prepares Google WIF credentials for Vertex
+sub-agents; a failure there is a warning. The `dummy` and `dummy-playback` runtimes follow the
+same rule and need no GCP inputs. On GitHub Actions, a run whose parent does not use Vertex clears a
+`GOOGLE_APPLICATION_CREDENTIALS` file that fails these checks, so the pre-script, the sandbox and
+the post-script do not get it.
+
 ```bash
 # try a repo's triage on pi with Gemini Flash, without touching its config
 fullsend run triage --fullsend-dir . --target-repo ../repo \
@@ -71,7 +91,18 @@ subagents: docs-currency → google-vertex/gemini-3.8-flash (from subagents.docs
 A malformed `subagents` key or model reference is rejected by config validation, before the
 sandbox is created, like the other invalid overrides above. A key that names no discovered
 persona, or a model this run cannot serve, is caught slightly later — at Bootstrap, once the
-harness's skills have been read — so the sandbox exists but the agent has not started. See
+harness's skills have been read — so the sandbox exists but the agent has not started. Two
+cases fail earlier:
+
+- A `subagents` entry on `openai/` when the harness declares no `openai` provider stops the run
+  before the sandbox is created
+  ([pi § Route a persona to OpenAI](../runtimes/pi.md#route-a-persona-to-openai)).
+- A `subagents` entry on a Vertex provider, under a parent off Vertex, stops the run before the
+  pre-script when the harness mounts `${GOOGLE_APPLICATION_CREDENTIALS}` and the variable has no
+  usable file
+  ([pi § Vertex sub-agents under an OpenAI parent](../runtimes/pi.md#vertex-sub-agents-under-an-openai-parent)).
+
+See
 [pi § Per-persona model configuration](../runtimes/pi.md#per-persona-model-configuration).
 
 ## Output artifacts
@@ -100,14 +131,26 @@ depend on the process cwd.
 | `total_cost_usd` | Total inference cost in USD, as reported by the runtime (raw floating-point aggregate across all iterations; no fullsend-side pricing-table fallback). See [Cost data contract](../guides/infrastructure/distributed-tracing.md#cost-data-contract) |
 | `num_turns` | Number of conversation turns |
 | `iterations` | Number of agent iterations run; an iteration killed at the budget is not retried (see [Budget and deadline](#budget-and-deadline)) |
-| `per_model_usage` | Per-model-spec breakdown, present only when a runtime reports one (today: `pi` with the `Agent` tool enabled). See below |
+| `per_model_usage` | Per-model breakdown, present only when a runtime reports one (today: `pi` with the `Agent` tool enabled, and `claude` when Claude Code's result carries `modelUsage`). See below |
 
 #### Per-model usage
 
-A map from pi model spec (`anthropic-vertex/claude-opus-4-6`) to
+A map from model spec to
 `{requests, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cost_usd}`.
-It exists because a pi sub-agent is a separate `pi` process whose tokens never appear in the
-parent's stream, so without it `total_cost_usd` would grow with no way to attribute it.
+On `pi` the key is the pi model spec (`anthropic-vertex/claude-opus-4-6`). It exists because a pi
+sub-agent is a separate `pi` process whose tokens never appear in the parent's stream, so without it
+`total_cost_usd` would grow with no way to attribute it.
+
+On `claude` the key is the model id Claude Code reports (`claude-haiku-4-5@20251001`), with one
+entry per model that ran, sub-agents included. The token totals come from the result event's
+`modelUsage` rather than its `usage` block, because `usage` covers only the top-level loop while
+`total_cost_usd` covers sub-agents too; the Claude token totals therefore include sub-agent usage.
+Claude Code reports `modelUsage` as a session running total, so a steered or retried session
+records its last value rather than adding each result's. `requests` has no counterpart in Claude
+Code's result and stays `0`. A result without `modelUsage` keeps the parent-only `usage` totals and
+records no breakdown, and an iteration that ends without a result (cancelled at the budget)
+contributes to the totals but not to the breakdown, so the invariant below can fall short in those
+two cases. The rest of this section describes the `pi` breakdown.
 
 - **What folds.** Tokens and cost, from both the parent and every child, summed across retry
   iterations. Each iteration contributes one `requests` for the parent plus one per sub-agent call,
@@ -287,21 +330,19 @@ gets its credential from the runner, never from the harness or the sandbox:
 | `FULLSEND_OPENAI_AUDIENCE`, `FULLSEND_OPENAI_IDENTITY_PROVIDER_ID`, `FULLSEND_OPENAI_SERVICE_ACCOUNT_ID` | Workload Identity Federation (GitHub Actions only): the run exchanges the job's OIDC token for a short-lived OpenAI token, refreshes it before expiry, and refuses a token whose mapping grants more than model access. All three must be set together; when unset, the `inference.openai` block of `config.yaml` (written by `fullsend github setup --openai-*`) supplies them — except on a machine without a GitHub OIDC endpoint where `OPENAI_API_KEY` is set, which then wins. |
 | `OPENAI_API_KEY` | Static key for local runs, or CI when supplied by the `FULLSEND_OPENAI_API_KEY` repository secret (used only when the three above are unset). In harness YAML, `env.sandbox` and provider definitions `${OPENAI_API_KEY}` expands to the empty string (like the other runner-only variables), and it is never passed to pre/post scripts; the sandbox sees only the gateway placeholder. In CI the runner warns and WIF remains preferred. |
 
-In CI the run prepares `.fullsend/providers/` from the upstream defaults, so a file there with a
-scaffold-shipped name (`openai.yaml`, `github-ro.yaml`, `vertex-ai.yaml`, …) is replaced by the
-upstream copy; give repository-specific providers their own file name. A harness that declares the
-bare name `openai` with no `providers/openai.yaml` on disk gets the definition built into fullsend;
-other bare names still need a file.
+A bare provider name that fullsend ships (`openai`, `github-ro`, `vertex-ai`, and the others listed
+in [`agent new`](agent.md#what-gets-written)) resolves to the
+definition and profile built into fullsend, locally and in CI, with nothing on disk. These names
+and their `fullsend-<name>` profile ids are reserved: a harness that still uses its own copy under
+one gets a warning and keeps the copy for now, and a later release rejects it (`fullsend-openai`
+is already rejected). Give repository-specific providers and profiles their own names.
 
 Both paths create a provider named after the run and remove it when the run ends. Setup and
 troubleshooting: [OpenAI Workload Identity](../guides/infrastructure/openai-workload-identity.md).
 
 ## GitLab role identity
 
-On `--forge gitlab` (or when `GITLAB_CI=true`), `fullsend run` does not mint a GitHub App token. It selects a registered GitLab role credential and exports `GITLAB_TOKEN` from that CI/CD variable:
-
-- Gate leftover unset/`disabled` or explicit `rollback`: shared `FULLSEND_FORGE_TOKEN` (leftover shared-token runtime, or emergency recovery — ordinary unflagged `repos install` converges existing shared-token installs to `enforced` once roles are ready). If `FULLSEND_FORGE_TOKEN` is absent, a directly-set `GITLAB_TOKEN` is still used as a fallback (a warning is logged). `--gitlab-role-migration` no longer accepts `disabled`.
-- `migrating`/`enforced`: Poller/Analyst/Coder (or a registered custom role) via `gitlabroles.SelectAgent`. A missing role secret fails closed; there is no shared-token fallback. Unregistered custom agents fail closed. Analyst jobs do not receive `PUSH_TOKEN`. A Coder identity cannot approve a merge request. `migrating` is an internal install intermediate, not an operator-settable flag.
+On `--forge gitlab` (or when `GITLAB_CI=true`), `fullsend run` does not mint a GitHub App token. It selects a registered GitLab role credential via `gitlabroles.SelectAgent` and exports `GITLAB_TOKEN` from that CI/CD variable. Poller/Analyst/Coder (or a registered custom role) is required unconditionally. A missing role secret fails closed; there is no shared-token fallback and no fallback to a directly-set `GITLAB_TOKEN`. Unregistered custom agents fail closed. Analyst jobs do not receive `PUSH_TOKEN`. A Coder identity cannot approve a merge request.
 
 See [GitLab Role-Credential Contract](../contributing/gitlab-role-credentials.md).
 

@@ -11,6 +11,7 @@ Feature: Harness CEL dispatch
       slug: fullsend-ai-issue-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -40,6 +41,7 @@ Feature: Harness CEL dispatch
       slug: fullsend-ai-pr-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "change_proposal"
         && event.transition.kind == "label_changed"
@@ -52,6 +54,7 @@ Feature: Harness CEL dispatch
       slug: fullsend-ai-issue-only-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -76,6 +79,7 @@ Feature: Harness CEL dispatch
       slug: fullsend-ai-enabled-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -88,6 +92,7 @@ Feature: Harness CEL dispatch
       slug: fullsend-ai-disabled-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -111,6 +116,7 @@ Feature: Harness CEL dispatch
       slug: fullsend-ai-review-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "change_proposal"
         && event.transition.kind == "review_submitted"

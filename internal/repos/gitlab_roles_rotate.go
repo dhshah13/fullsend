@@ -38,7 +38,6 @@ type RoleRotateConfig struct {
 	Client   forge.Client
 	Tokens   ProjectAccessTokenClient
 	Registry gitlabroles.Registry
-	Mode     gitlabroles.Mode
 	// Roles limits rotation to these names. Empty means every
 	// own-credential registered role.
 	Roles []gitlabroles.Role
@@ -63,19 +62,17 @@ type RoleRotateConfig struct {
 // RoleRotateResult is the observable outcome of a rotation run.
 // Token values are not included.
 type RoleRotateResult struct {
-	Mode            gitlabroles.Mode
-	Report          gitlabroles.Report
-	Rotated         []gitlabroles.Role
-	Skipped         []gitlabroles.Role
-	Reused          []gitlabroles.Role
-	Failed          []RoleProvisionFailure
-	Overlapping     []gitlabroles.Role
-	RolledBack      []gitlabroles.Role
-	Cleaned         []gitlabroles.Role
-	InProgress      []gitlabroles.Role
-	SharedPreserved bool
-	DryRun          bool
-	Diagnostics     []string
+	Report      gitlabroles.Report
+	Rotated     []gitlabroles.Role
+	Skipped     []gitlabroles.Role
+	Reused      []gitlabroles.Role
+	Failed      []RoleProvisionFailure
+	Overlapping []gitlabroles.Role
+	RolledBack  []gitlabroles.Role
+	Cleaned     []gitlabroles.Role
+	InProgress  []gitlabroles.Role
+	DryRun      bool
+	Diagnostics []string
 }
 
 type rotationStateFile struct {
@@ -104,21 +101,13 @@ type rotationRoleState struct {
 // place. Concurrent callers for the same role are serialized and
 // idempotent within gitlabroles.IdempotentRotationWindow.
 func RotateGitLabRoleCredentials(ctx context.Context, cfg RoleRotateConfig) (RoleRotateResult, error) {
-	result := RoleRotateResult{SharedPreserved: true, DryRun: cfg.DryRun}
+	result := RoleRotateResult{DryRun: cfg.DryRun}
 	if cfg.Client == nil {
 		return result, fmt.Errorf("GitLab role rotation requires a forge client")
 	}
 	operationLock := gitlabRoleOperationLock(cfg.Owner, cfg.Repo)
 	operationLock.Lock()
 	defer operationLock.Unlock()
-	mode := cfg.Mode
-	if mode == "" {
-		mode = gitlabroles.ModeDisabled
-	}
-	if !mode.Valid() {
-		return result, fmt.Errorf("%w: %q", gitlabroles.ErrInvalidMode, mode)
-	}
-	result.Mode = mode
 	reg := cfg.Registry
 	if len(reg.Registrations()) == 0 {
 		reg = gitlabroles.BuiltinRegistry()
@@ -147,18 +136,6 @@ func RotateGitLabRoleCredentials(ctx context.Context, cfg RoleRotateConfig) (Rol
 	lockTTL := cfg.LockTTL
 	if lockTTL <= 0 {
 		lockTTL = defaultRotateLockTTL
-	}
-
-	if mode.UsesSharedOnly() && !cfg.Force && len(cfg.Roles) == 0 {
-		result.Diagnostics = append(result.Diagnostics, fmt.Sprintf(
-			"mode=%s: role credentials unused; skip rotation (pass --rotate-gitlab-roles to refresh leftover secrets)", mode))
-		present, presErr := gitLabRolePresence(ctx, cfg.Client, cfg.Owner, cfg.Repo, reg)
-		if presErr != nil {
-			return result, fmt.Errorf("reading GitLab role credential presence: %w", presErr)
-		}
-		result.Report = gitlabroles.Diagnose(mode, present, reg)
-		result.Diagnostics = append(result.Diagnostics, result.Report.Diagnostics...)
-		return result, nil
 	}
 
 	if cfg.Tokens == nil && len(cfg.ProvidedTokens) == 0 {
@@ -205,11 +182,11 @@ func RotateGitLabRoleCredentials(ctx context.Context, cfg RoleRotateConfig) (Rol
 	if presErr != nil {
 		return result, fmt.Errorf("reading GitLab role credential presence: %w", presErr)
 	}
-	result.Report = gitlabroles.DiagnoseLifecycle(mode, present, reg, snapshotsFrom(listed), now, lead)
+	result.Report = gitlabroles.DiagnoseLifecycle(present, reg, snapshotsFrom(listed), now, lead)
 	result.Diagnostics = append(result.Diagnostics, result.Report.Diagnostics...)
 	sortRoleLists(&result)
 	if secretLeakRotate(result) != "" {
-		return RoleRotateResult{SharedPreserved: true}, fmt.Errorf("internal error: rotation result leaked a secret value")
+		return RoleRotateResult{}, fmt.Errorf("internal error: rotation result leaked a secret value")
 	}
 	return result, nil
 }
@@ -1000,7 +977,7 @@ func roleReportFrom(ctx context.Context, cfg RoleRotateConfig, rec gitlabroles.R
 			present[rec.Credential.SecretName] = exists
 		}
 	}
-	rep := gitlabroles.DiagnoseLifecycle(gitlabroles.ModeEnforced, present, cfg.Registry, snapshotsFrom(matches), now, lead)
+	rep := gitlabroles.DiagnoseLifecycle(present, cfg.Registry, snapshotsFrom(matches), now, lead)
 	for _, got := range rep.Roles {
 		if got.Name == rec.Name {
 			return got
@@ -1041,9 +1018,6 @@ func secretLeakRotate(result RoleRotateResult) string {
 		}
 		return ""
 	}
-	if n := check(string(result.Mode)); n != "" {
-		return n
-	}
 	for _, d := range result.Diagnostics {
 		if n := check(d); n != "" {
 			return n
@@ -1078,16 +1052,15 @@ func EnrichGitLabRoleStatus(ctx context.Context, client forge.Client, owner, rep
 	if status == nil || client == nil {
 		return false
 	}
-	mode, reg, present, err := LoadGitLabRoleState(ctx, client, owner, repo)
+	reg, present, err := LoadGitLabRoleState(ctx, client, owner, repo)
 	if err != nil {
 		return false
 	}
-	rep := gitlabroles.DiagnoseLifecycle(mode, present, reg, snapshotsFrom(tokens), now, gitlabroles.DefaultRotationLead)
+	rep := gitlabroles.DiagnoseLifecycle(present, reg, snapshotsFrom(tokens), now, gitlabroles.DefaultRotationLead)
 	rotation, _, rotationErr := loadRotationState(ctx, client, owner, repo)
 	if rotationErr == nil {
 		applyAdministratorEnrollmentProof(&rep, reg, rotation)
 	}
-	status.GitLabRoleMode = string(rep.Mode)
 	status.GitLabRolesReady = rep.Ready
 	status.GitLabRolesPartial = rep.Partial
 	status.GitLabRoleDiagnostics = rep.Diagnostics
@@ -1095,14 +1068,9 @@ func EnrichGitLabRoleStatus(ctx context.Context, client forge.Client, owner, rep
 	for _, rr := range rep.Roles {
 		lifecycle[rr.Name] = rr.Lifecycle
 	}
-	if gitLabRoleReadinessRequired(mode) {
-		builtin := appendBuiltinRoleReadiness(status, present, reg, lifecycle)
-		registered := appendRegisteredRoleReadiness(status, present, reg, lifecycle)
-		status.GitLabRolesReady = status.GitLabRolesReady && builtin.Ready && registered.Ready
-	}
-	if !mode.RequiresRoleCredentials() {
-		return false
-	}
+	builtin := appendBuiltinRoleReadiness(status, present, reg, lifecycle)
+	registered := appendRegisteredRoleReadiness(status, present, reg, lifecycle)
+	status.GitLabRolesReady = status.GitLabRolesReady && builtin.Ready && registered.Ready
 	before := len(status.Drifts)
 	seen := make(map[string]struct{}, len(status.Drifts))
 	for _, d := range status.Drifts {
@@ -1123,4 +1091,43 @@ func EnrichGitLabRoleStatus(ctx context.Context, client forge.Client, owner, rep
 		}
 	}
 	return len(status.Drifts) > before
+}
+
+// applyAdministratorEnrollmentProof treats an administrator-provided
+// credential (enrolled via --gitlab-role-token, which has no GitLab
+// token ID to verify against the project-token inventory) as healthy
+// when rotation state already recorded a distributed, idle proof for
+// it. Without this, DiagnoseLifecycle would otherwise classify such a
+// credential as unverified forever, since it never has a matching
+// project access token snapshot to confirm.
+func applyAdministratorEnrollmentProof(report *gitlabroles.Report, reg gitlabroles.Registry, rotation rotationStateFile) {
+	if report == nil {
+		return
+	}
+	oldLifecycleDiagnostics := 0
+	for _, role := range report.Roles {
+		if role.Lifecycle != "" && role.Lifecycle != gitlabroles.LifecycleUnconfigured && role.Lifecycle != gitlabroles.LifecycleOK {
+			oldLifecycleDiagnostics++
+		}
+	}
+	for i := range report.Roles {
+		if report.Roles[i].Lifecycle != gitlabroles.LifecycleUnverified {
+			continue
+		}
+		proofRole := report.Roles[i].Name
+		seen := map[gitlabroles.Role]bool{}
+		for !seen[proofRole] {
+			seen[proofRole] = true
+			registration, ok := reg.Lookup(proofRole)
+			if !ok || registration.Credential.ReuseOf == "" {
+				break
+			}
+			proofRole = registration.Credential.ReuseOf
+		}
+		state, ok := rotation.Roles[string(proofRole)]
+		if ok && state.IncomingID == 0 && state.Phase == rotationPhaseIdle && state.DistributedAt != "" {
+			report.Roles[i].Lifecycle = gitlabroles.LifecycleOK
+		}
+	}
+	gitlabroles.RefreshLifecycleDiagnostics(report, oldLifecycleDiagnostics)
 }

@@ -20,7 +20,7 @@ v1 reference implementations:
 - `pkg/behaviourtest/drivers/install/repopool_cfmint_previews.go` (RepoPoolCFMintPreviews)
 - `pkg/behaviourtest/drivers/install/repopool_cfmint_stage.go` (RepoPoolCFMintStage)
 - `pkg/behaviourtest/drivers/install/repopool_external_mint.go` (RepoPoolExternalMint)
-- `pkg/behaviourtest/drivers/install/common/setup.go` (shared helpers: `RunGitHubSetup`, `ProvisionInference`)
+- `pkg/behaviourtest/drivers/install/common/setup.go` (shared helpers: `RunGitHubSetup`, `ResolveInferenceWIFProvider`, `InferenceStatusWIFProvider`, `ProvisionInference`)
 
 ## Runner configuration
 
@@ -31,6 +31,7 @@ BEHAVIOUR_SCM=github              # also: gitlab; future: forgejo
 BEHAVIOUR_CI=githubactions        # also: gitlabci; future: tekton
 BEHAVIOUR_INSTALL_MODE=per-repo   # v1 default and only supported value
 BEHAVIOUR_CONFIG_PRESET=          # optional local path or HTTPS URL forwarded as github setup --config
+PLAYBACK_RUNTIME=                 # unset: normal "dummy" runtime; "dummy-playback": installs with playback tracking hooks (see behaviour-testing.md)
 ENVIRONMENT=dev                   # mint/infra target: dev (default) or stage
 ```
 
@@ -69,8 +70,8 @@ Use `forge.Client` for operations it already exposes; add REST helpers inside th
 
 ## Adding a CI driver
 
-1. Implement `ci.Driver` — `WaitForWorkflow`, `FindCompletedWorkflowRun`, `AssertNoWorkflow`, `GetRunLogs`, `DownloadArtifacts`, `DownloadNamedArtifactFromRun`, `DownloadNamedArtifactAfter`, `WaitForHarnessAgent`, `WaitForFailedHarnessAgent`, `AssertNoHarnessAgentArtifact`, `CountHarnessDispatches`.
-2. Map forge `WorkflowRun` types to portable polling logic; reuse patterns from `e2e/admin/admin_test.go`.
+1. Implement `ci.Driver` — `WaitForWorkflow`, `FindCompletedWorkflowRun`, `AssertNoWorkflow`, `GetRunLogs`, `DownloadArtifacts`, `DownloadNamedArtifactFromRun`, `DownloadNamedArtifactAfter`, `WaitForHarnessAgent`, `WaitForHarnessAgentRound`, `WaitForFailedHarnessAgent`, `AssertNoHarnessAgentArtifact`, `CountHarnessDispatches`.
+2. Map forge `WorkflowRun` types to portable polling logic; reuse patterns from the GitHub Actions driver in `pkg/behaviourtest/drivers/ci/githubactions/`.
 3. Register in `behaviourtest.RunSuite` for the matching `BEHAVIOUR_CI` value.
 
 ## Adding an install driver
@@ -100,7 +101,7 @@ Use `forge.Client` for operations it already exposes; add REST helpers inside th
    the same package (e.g., `repopool_cfmint_previews.go`,
    `repopool_external_mint.go`) behind the shared `install.Driver`
    interface. Place common helpers shared across drivers in
-   `install/common/` (e.g., `RunGitHubSetup`, `ProvisionInference`).
+   `install/common/` (e.g., `RunGitHubSetup`, `ResolveInferenceWIFProvider`).
 5. **Register the driver** in `behaviourtest.RunSuite` (`installFactoryFor`
    in `pkg/behaviourtest/select.go`). Install driver selection is keyed by
    `ENVIRONMENT`, not `BEHAVIOUR_INSTALL_MODE`.
@@ -122,7 +123,7 @@ Steps use `w.Org` and `w.RepoName` (the allocated repo name) plus per-repo const
 
 ## Testing drivers
 
-Prefer unit tests with `httptest` for REST helpers. Optional smoke scenarios against live backends mirror admin e2e credentials (`GITHUB_TOKEN`, halfsend org pool).
+Prefer unit tests with `httptest` for REST helpers. Optional smoke scenarios against live backends use the behaviour suite's credentials (`GITHUB_TOKEN`, halfsend org pool).
 
 ## Future backends checklist
 

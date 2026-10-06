@@ -56,7 +56,7 @@ Each row lists the documentation touchpoints for a major CLI command group. The 
 
 ### `admin foreign`
 
-The `admin` command group's `install`/`uninstall`/`analyze`/`enable`/`disable` subcommands are deprecated per-org installation tooling ([ADR-0044](../ADRs/0044-deprecate-per-org-installation-mode.md)). The actively supported subcommand is `admin foreign` (cross-org mint-authorization allow-list).
+The `admin` command group's `uninstall`/`analyze`/`enable`/`disable` subcommands were removed with per-org installation ([ADR-0044](../ADRs/0044-deprecate-per-org-installation-mode.md)); `admin install` remains as repository-only (`<owner/repo>`) installation. The other actively supported subcommand is `admin foreign` (cross-org mint-authorization allow-list).
 
 | Category | Files |
 |----------|-------|
@@ -122,6 +122,6 @@ The `admin` command group's `install`/`uninstall`/`analyze`/`enable`/`disable` s
 
 The commands below have lighter documentation footprints. Apply the general `grep` rule when changing them:
 
-`dispatch`, `scan`, `lock`, `poll`, `fetch-skill`, `post-review`, `post-comment`, `reconcile-status`
+`dispatch`, `scan`, `lock`, `poll`, `fetch-skill`, `post-review`, `post-comment`, `reconcile-status`, `resolve-mr-source`, `check-protected-branch`
 
 The most comprehensive single reference for all commands (including minor ones) is `docs/guides/dev/cli-internals.md`, which documents the full command tree with flags.

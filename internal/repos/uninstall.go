@@ -1,6 +1,7 @@
 package repos
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,13 +15,20 @@ import (
 
 var uninstallVariables = slices.Concat([]string{forge.PerRepoGuardVar}, requiredVariables, []string{forge.VarGCPRegion, forge.VarReviewClientID})
 
-// uninstallSecrets deletes every required secret plus the opt-in
-// FULLSEND_OPENAI_API_KEY if present. It must not become requiredSecrets
-// itself (or be added to it) — probe/converge use requiredSecretsForForge
-// to decide whether an installation is healthy, and the opt-in key's
-// absence is not a health problem, only its presence after uninstall is.
-var uninstallSecrets = slices.Concat(requiredSecrets, []string{forge.SecretOpenAIAPIKey})
+// uninstallSecrets deletes every Fullsend-managed inference secret of
+// every inference.auth method (managedInferenceSecrets), independent of
+// the repository's current selection, so leftovers from an earlier
+// selection are removed and a missing or invalid inference.auth does not
+// block cleanup. Deleting an absent secret is a no-op, so repeating
+// uninstall is safe. It must not become requiredSecrets — probe/converge
+// require only the selected method's secrets.
+var uninstallSecrets = managedInferenceSecrets()
 
+// gitlabUninstallVars intentionally does NOT include the legacy
+// FULLSEND_FORGE_TOKEN shared secret. Uninstall no longer retires it
+// automatically: a repository installed before the role-only rollout
+// may require manual cleanup of that secret and its matching
+// fullsend-bot project access token.
 var gitlabUninstallVars = []string{
 	forge.PerRepoGuardVar,
 	forge.VarLegacyBotTokenSecret,
@@ -29,7 +37,6 @@ var gitlabUninstallVars = []string{
 	forge.VarFailedKeysFast,
 	forge.VarFailedKeysFull,
 	forge.VarLegacyForge,
-	forge.SecretForgeToken,
 	forge.SecretDispatch,
 	forge.VarGCPRegion,
 	forge.VarLabelState,
@@ -37,7 +44,6 @@ var gitlabUninstallVars = []string{
 	forge.VarLastPollAtFull,
 	forge.VarLegacySA,
 	forge.VarLegacyWIFProvider,
-	forge.VarGitLabRoleMigration,
 	forge.VarGitLabRoleRegistry,
 	forge.VarGitLabRoleRotation,
 	forge.SecretGitLabPollerToken,
@@ -45,21 +51,21 @@ var gitlabUninstallVars = []string{
 	forge.SecretGitLabCoderToken,
 }
 
-// gitlabUninstallSecrets intentionally does NOT include the OpenAI static
-// key. Unlike FULLSEND_OPENAI_API_KEY on GitHub — a dedicated,
-// FULLSEND_-namespaced secret fullsend can safely delete regardless of
-// whether it was set via `fullsend github set` or pasted directly into
-// GitHub settings — GitLab's OPENAI_API_KEY CI/CD variable is never
-// forwarded by fullsend and shares no such namespace (per
-// docs/guides/infrastructure/openai-workload-identity.md's GitLab CI
-// note: it "already works" as a plain CI/CD variable, set by whoever
-// manages the project). Deleting an unprefixed, potentially-shared
-// variable on uninstall risks destroying a credential unrelated jobs in
-// the same project depend on.
-var gitlabUninstallSecrets = []string{
-	forge.SecretGCPProjectID,
-	forge.SecretGCPWIFProvider,
-}
+// gitlabUninstallSecrets intentionally does NOT include GitLab's
+// unprefixed OPENAI_API_KEY CI/CD variable. Unlike FULLSEND_OPENAI_API_KEY
+// — a dedicated, FULLSEND_-namespaced variable — the unprefixed one
+// shares no such namespace and may have been set by whoever manages the
+// project for other jobs. The Fullsend CI job no longer reads it (it maps
+// FULLSEND_OPENAI_API_KEY instead), and deleting an unprefixed,
+// potentially-shared variable on uninstall risks destroying a credential
+// unrelated jobs in the same project depend on. Like uninstallSecrets it
+// is derived from managedInferenceSecrets so both forges and orphan
+// detection share one classification.
+//
+// It also includes the webhook fast-path credentials (FULLSEND_TRIGGER_TOKEN
+// and FULLSEND_WEBHOOK_SECRET). Secret deletion addresses only the
+// wildcard-scoped variable, which is the one Fullsend creates.
+var gitlabUninstallSecrets = append(managedInferenceSecrets(), forge.SecretTriggerToken, forge.SecretWebhookSecret)
 
 // gitlabScaffoldPaths is the full set of files uninstall removes. It is
 // a superset of the current install set: fullsend-dispatch.yml is no
@@ -70,11 +76,15 @@ var gitlabScaffoldPaths = []string{
 	".gitlab/ci/fullsend-agent.yml",
 	fullsendDispatchInclude,
 	".gitlab/ci/fullsend-poll.yml",
+	fullsendDispatcherTemplatePath,
 	".gitlab/ci/scripts/trust-ci-server-ca.sh",
+	".gitlab/ci/scripts/pin-ci-job-identity.sh",
 	".gitlab/ci/scripts/select-gitlab-role-token.sh",
 	".gitlab/ci/scripts/install-fullsend-cli.sh",
 	".gitlab/ci/scripts/run-poll-job.sh",
+	gitlabDispatcherJobScriptPath,
 	".gitlab/ci/scripts/run-agent-job.sh",
+	".gitlab/ci/scripts/checkout-mr-source.sh",
 	".fullsend/config.yaml",
 }
 
@@ -87,25 +97,56 @@ var gitlabRetiredScaffoldPaths = []string{
 
 const gitlabTrustScriptPath = ".gitlab/ci/scripts/trust-ci-server-ca.sh"
 
+const gitlabPinCIJobIdentityScriptPath = ".gitlab/ci/scripts/pin-ci-job-identity.sh"
+
 const gitlabRoleTokenScriptPath = ".gitlab/ci/scripts/select-gitlab-role-token.sh"
 
 const gitlabInstallCLIScriptPath = ".gitlab/ci/scripts/install-fullsend-cli.sh"
 
 const gitlabPollJobScriptPath = ".gitlab/ci/scripts/run-poll-job.sh"
 
+// gitlabDispatcherJobScriptPath is the webhook dispatcher job body (#7771)
+// sourced by fullsendDispatcherTemplatePath.
+const gitlabDispatcherJobScriptPath = ".gitlab/ci/scripts/run-dispatcher-job.sh"
+
 const gitlabAgentJobScriptPath = ".gitlab/ci/scripts/run-agent-job.sh"
+
+const gitlabCheckoutMRSourceScriptPath = ".gitlab/ci/scripts/checkout-mr-source.sh"
 
 // gitlabAuxiliaryScriptPaths returns the CI helper scripts sourced by the
 // generated poll and agent jobs. Probe and converge treat each as its own
-// scaffold component so a missing script is detected and repaired.
+// scaffold component so a missing script is detected and repaired. The
+// webhook dispatcher files are version-dependent and listed separately by
+// gitlabDispatcherPaths.
 func gitlabAuxiliaryScriptPaths() []string {
 	return []string{
 		gitlabTrustScriptPath,
+		gitlabPinCIJobIdentityScriptPath,
 		gitlabRoleTokenScriptPath,
 		gitlabInstallCLIScriptPath,
 		gitlabPollJobScriptPath,
 		gitlabAgentJobScriptPath,
+		gitlabCheckoutMRSourceScriptPath,
 	}
+}
+
+// gitlabDispatcherPaths returns the webhook dispatcher scaffold files (#7771):
+// the job template the pipeline wrapper includes and the script it sources.
+// Scaffold versions that predate the dispatcher ship neither, so they are
+// required only when the pipeline wrapper references the template (see
+// gitlabWrapperReferencesDispatcher).
+func gitlabDispatcherPaths() []string {
+	return []string{
+		fullsendDispatcherTemplatePath,
+		gitlabDispatcherJobScriptPath,
+	}
+}
+
+// gitlabWrapperReferencesDispatcher reports whether pipeline wrapper content
+// includes the webhook dispatcher template, i.e. the scaffold version that
+// produced it requires the dispatcher files.
+func gitlabWrapperReferencesDispatcher(wrapper []byte) bool {
+	return bytes.Contains(wrapper, []byte(fullsendDispatcherTemplatePath))
 }
 
 // UninstallVarsForForge returns the CI/CD variable names to delete for
@@ -307,6 +348,24 @@ func uninstallRepoResources(ctx context.Context, cfg ResolvedConfig, direct bool
 		}
 	}
 
+	// Tear down the webhook fast-path before the scaffold goes: it stops
+	// the webhook from requesting pipelines against a repository whose
+	// dispatcher is being removed, and revokes the separately minted
+	// trigger token. A failure stops uninstall here so the manifest entry
+	// is retained and a retry repeats the (idempotent) teardown.
+	var triggersRevoked int
+	if cfg.Forge == ForgeGitLab {
+		progress(fullName, "cleanup", "Removing GitLab webhook fast-path")
+		teardown, teardownErr := TeardownGitLabWebhookFastPath(ctx, client, owner, repo)
+		triggersRevoked = teardown.TriggersRevoked
+		if teardownErr != nil {
+			result.TokensRevoked = triggersRevoked
+			result.Error = fmt.Errorf("removing webhook fast-path: %w", teardownErr)
+			progress(fullName, "cleanup", fmt.Sprintf("Failed: %v", teardownErr))
+			return result
+		}
+	}
+
 	progress(fullName, "workflow", "Removing scaffold files")
 	if err := commitScaffold(ctx, owner, repo, files, direct, true); err != nil {
 		result.Error = fmt.Errorf("removing scaffold files: %w", err)
@@ -323,7 +382,7 @@ func uninstallRepoResources(ctx context.Context, cfg ResolvedConfig, direct bool
 		cleanup, cleanupErr := CleanupGitLabRoleIdentity(ctx, GitLabRoleCleanupConfig{
 			Owner: owner, Repo: repo, Client: client, Tokens: tokens,
 		})
-		result.TokensRevoked = cleanup.TokensRevoked
+		result.TokensRevoked = cleanup.TokensRevoked + triggersRevoked
 		result.VarsDeleted += cleanup.VarsDeleted
 		for _, d := range cleanup.Diagnostics {
 			progress(fullName, "cleanup", d)
@@ -359,7 +418,14 @@ func uninstallRepoResources(ctx context.Context, cfg ResolvedConfig, direct bool
 		defer innerWg.Done()
 		for _, name := range forgeSecrets {
 			if delErr := client.DeleteRepoSecret(ctx, owner, repo, name); delErr != nil {
-				secretErr = fmt.Errorf("deleting secret %s: %w", name, delErr)
+				if name == forge.SecretTriggerToken || name == forge.SecretWebhookSecret {
+					// The webhook credentials are not known to any redactor
+					// at this point, so an error echoing one must not reach
+					// uninstall output; withhold the server text.
+					secretErr = safeAPIError("deleting secret "+name, delErr)
+				} else {
+					secretErr = fmt.Errorf("deleting secret %s: %w", name, delErr)
+				}
 				return
 			}
 			secretsDeleted++

@@ -174,6 +174,11 @@ func CleanupScenario(w *world.World) {
 	// deleting the fork repo removes the branch implicitly, but we
 	// still attempt branch deletion first so partial failures leave
 	// less debris.
+	//
+	// DeleteRepo success (and a subsequent GetRepo 404) does not mean
+	// GitHub has released the name. Uniqueness can lag; givenFork
+	// retries CreateFork on 403 "Name already exists on this account"
+	// rather than polling here, because 404 is not a sufficient signal.
 	if w.ForkPRBranch != "" && w.ForkOwner != "" && w.ForkRepo != "" {
 		desc := fmt.Sprintf("delete fork branch %s", w.ForkPRBranch)
 		if err := cleanupRetry(w.Logf, desc, func() error {
@@ -224,6 +229,18 @@ func CleanupScenario(w *world.World) {
 	if w.ArtifactDir != "" && shouldRemoveArtifactDir(w.ArtifactDir, os.Getenv("BEHAVIOUR_ARTIFACT_DIR")) {
 		if err := os.RemoveAll(w.ArtifactDir); err != nil {
 			worldLogf(w, "behaviour cleanup: remove artifact dir: %v", err)
+		}
+	}
+	// A playback scenario's per-round artifact directories
+	// (HarnessRunArtifactDirs, playback.go) are cached separately from
+	// ArtifactDir above and include it, so clean up any not already
+	// removed. os.RemoveAll is idempotent on an already-removed path.
+	for _, dir := range w.HarnessRunArtifactDirs {
+		if dir == "" || !shouldRemoveArtifactDir(dir, os.Getenv("BEHAVIOUR_ARTIFACT_DIR")) {
+			continue
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			worldLogf(w, "behaviour cleanup: remove round artifact dir: %v", err)
 		}
 	}
 

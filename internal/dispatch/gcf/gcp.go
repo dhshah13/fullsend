@@ -44,6 +44,24 @@ type OIDCProviderConfig struct {
 type WIFProviderInfo struct {
 	AttributeCondition string
 	AllowedAudiences   []string
+	IssuerURI          string
+	// State is the provider's lifecycle state ("ACTIVE" or "DELETED").
+	// providers.get returns soft-deleted providers with HTTP 200 and
+	// State "DELETED" rather than 404, so a non-nil WIFProviderInfo does
+	// not by itself mean the provider can exchange tokens.
+	State string
+	// Disabled reports whether the provider has been disabled. A disabled
+	// provider cannot exchange tokens.
+	Disabled bool
+}
+
+// WIFProviderStateActive is the State of a provider that is not soft-deleted.
+const WIFProviderStateActive = "ACTIVE"
+
+// Usable reports whether the provider can exchange tokens: not disabled and
+// not soft-deleted. An absent State is treated as active.
+func (i *WIFProviderInfo) Usable() bool {
+	return !i.Disabled && (i.State == "" || i.State == WIFProviderStateActive)
 }
 
 // FunctionInfo holds metadata about a deployed Cloud Function.
@@ -392,7 +410,10 @@ func (c *LiveGCFClient) GetWIFProvider(ctx context.Context, projectNumber, poolI
 
 	var provider struct {
 		AttributeCondition string `json:"attributeCondition"`
+		State              string `json:"state"`
+		Disabled           bool   `json:"disabled"`
 		OIDC               struct {
+			IssuerURI        string   `json:"issuerUri"`
 			AllowedAudiences []string `json:"allowedAudiences"`
 		} `json:"oidc"`
 	}
@@ -403,6 +424,9 @@ func (c *LiveGCFClient) GetWIFProvider(ctx context.Context, projectNumber, poolI
 	return &WIFProviderInfo{
 		AttributeCondition: provider.AttributeCondition,
 		AllowedAudiences:   provider.OIDC.AllowedAudiences,
+		IssuerURI:          provider.OIDC.IssuerURI,
+		State:              provider.State,
+		Disabled:           provider.Disabled,
 	}, nil
 }
 

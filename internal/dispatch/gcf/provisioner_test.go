@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/fullsend-ai/fullsend/internal/mintcore"
+	"github.com/fullsend-ai/fullsend/internal/mintcore/mintconsts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -2090,7 +2091,9 @@ func TestProvisionWIF_RepoScoped(t *testing.T) {
 	require.Len(t, fake.projectIAMBindings, 1)
 	assert.Contains(t, fake.projectIAMBindings[0].Member, "attribute.repository/acme/widget")
 
-	assert.NotContains(t, fake.calls, "GetWIFProvider")
+	// Repo-scoped provisioning never merges orgs into a shared provider; its
+	// only provider read is the read-before-write check on its own provider.
+	assert.Equal(t, []string{"GetProjectNumber", "GetWIFProvider", "CreateWIFPool", "CreateWIFProvider", "SetProjectIAMBinding"}, fake.calls)
 }
 
 func TestProvisionWIF_RepoScoped_PreservesRepoCase(t *testing.T) {
@@ -2354,6 +2357,111 @@ func TestProvisionRepoWIFProvider_Errors(t *testing.T) {
 			assert.Empty(t, fake.projectIAMBindings)
 		})
 	}
+}
+
+// enrolledRepoProvider returns the provider state that provisioning
+// acme/widget would have written, as providers.get reports it.
+func enrolledRepoProvider() *WIFProviderInfo {
+	return &WIFProviderInfo{
+		AttributeCondition: "assertion.repository == 'acme/widget'",
+		// Reverse of the order provisioning writes: compared as a set.
+		AllowedAudiences: []string{
+			iamAudience("123456789", "fullsend-inference", "gh-acme-widget"),
+			mintconsts.OIDCAudience,
+		},
+		IssuerURI: oidcIssuer,
+		State:     WIFProviderStateActive,
+	}
+}
+
+func TestProvisionRepoWIFProvider_EnrolledSkipsWrites(t *testing.T) {
+	fake := newFakeGCFClient()
+	fake.wifProvider = enrolledRepoProvider()
+	p := NewProvisioner(Config{
+		ProjectID:   "my-project",
+		Repo:        "acme/widget",
+		WIFPoolName: "fullsend-inference",
+	}, fake)
+
+	wifPath, err := p.ProvisionRepoWIFProvider(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"GetProjectNumber", "GetWIFProvider"}, fake.calls,
+		"an enrolled, matching provider must not trigger any IAM write")
+	assert.Equal(t, "projects/123456789/locations/global/workloadIdentityPools/fullsend-inference/providers/gh-acme-widget", wifPath)
+}
+
+func TestProvisionWIF_RepoScopedEnrolled_OnlyIAMBindingCheck(t *testing.T) {
+	// inference provision on an enrolled repo: no pool/provider writes;
+	// the Vertex AI grant still runs (it is read-first on its own).
+	fake := newFakeGCFClient()
+	fake.wifProvider = enrolledRepoProvider()
+	p := NewProvisioner(Config{
+		ProjectID:   "my-project",
+		GitHubOrgs:  []string{"acme"},
+		Repo:        "acme/widget",
+		WIFPoolName: "fullsend-inference",
+	}, fake)
+
+	_, err := p.ProvisionWIF(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"GetProjectNumber", "GetWIFProvider", "SetProjectIAMBinding"}, fake.calls)
+}
+
+func TestProvisionRepoWIFProvider_NotReusableFallsThroughToWrites(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*WIFProviderInfo)
+	}{
+		{name: "soft-deleted", mutate: func(i *WIFProviderInfo) { i.State = "DELETED" }},
+		{name: "disabled", mutate: func(i *WIFProviderInfo) { i.Disabled = true }},
+		{name: "state absent", mutate: func(i *WIFProviderInfo) { i.State = "" }},
+		{name: "condition drift", mutate: func(i *WIFProviderInfo) {
+			i.AttributeCondition = "assertion.repository == 'acme/other'"
+		}},
+		{name: "condition case differs", mutate: func(i *WIFProviderInfo) {
+			// CEL == is case-sensitive: a corrected repo case must rewrite.
+			i.AttributeCondition = "assertion.repository == 'ACME/widget'"
+		}},
+		{name: "audience missing", mutate: func(i *WIFProviderInfo) {
+			i.AllowedAudiences = i.AllowedAudiences[:1]
+		}},
+		{name: "audience extra", mutate: func(i *WIFProviderInfo) {
+			i.AllowedAudiences = append(i.AllowedAudiences, "other")
+		}},
+		{name: "audience replaced", mutate: func(i *WIFProviderInfo) {
+			i.AllowedAudiences = []string{mintconsts.OIDCAudience, "other"}
+		}},
+		{name: "issuer differs", mutate: func(i *WIFProviderInfo) { i.IssuerURI = "https://example.com" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newFakeGCFClient()
+			fake.wifProvider = enrolledRepoProvider()
+			tt.mutate(fake.wifProvider)
+			p := NewProvisioner(Config{
+				ProjectID:   "my-project",
+				Repo:        "acme/widget",
+				WIFPoolName: "fullsend-inference",
+			}, fake)
+
+			_, err := p.ProvisionRepoWIFProvider(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, []string{"GetProjectNumber", "GetWIFProvider", "CreateWIFPool", "CreateWIFProvider"}, fake.calls)
+			assert.Equal(t, "assertion.repository == 'acme/widget'", fake.lastWIFProviderConfig.AttributeCondition)
+		})
+	}
+}
+
+func TestProvisionRepoWIFProvider_ReadErrorFallsThroughToWrites(t *testing.T) {
+	fake := newFakeGCFClient()
+	fake.errs["GetWIFProvider"] = fmt.Errorf("permission denied")
+	p := NewProvisioner(Config{ProjectID: "my-project", Repo: "acme/widget"}, fake)
+
+	_, err := p.ProvisionRepoWIFProvider(context.Background())
+	require.NoError(t, err)
+	assert.Contains(t, fake.calls, "CreateWIFPool")
+	assert.Contains(t, fake.calls, "CreateWIFProvider")
 }
 
 func TestProvisionWIF_RepoScoped_StillGrantsVertexAI(t *testing.T) {
@@ -3094,12 +3202,6 @@ func TestEnsureOrgInMint_ProceedsOnFirstEnrollment(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, fake.calls, "UpdateServiceEnvVars")
 	assert.Equal(t, "new-org", fake.lastUpdateServiceEnvVars["ALLOWED_ORGS"])
-}
-
-func TestParseAllowedOrgsEnv(t *testing.T) {
-	assert.Equal(t, []string{"*"}, mintcore.ParseAllowedOrgs("*"))
-	assert.Equal(t, []string{"org-a", "org-b"}, mintcore.ParseAllowedOrgs(" org-a , org-b "))
-	assert.Nil(t, mintcore.ParseAllowedOrgs(""))
 }
 
 func TestEnsureOrgInMint_PublicModeNoOp(t *testing.T) {

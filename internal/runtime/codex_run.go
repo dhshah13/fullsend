@@ -120,6 +120,16 @@ const codexModelHelp = "set FULLSEND_CODEX_MODEL=" + codexOpenAIProvider +
 	"/<id> for the repo, or model: " + codexOpenAIProvider +
 	"/<id> on the agent's agents: entry or the harness"
 
+// ValidateCodexModel reports whether model is one fullsend's codex
+// integration can serve. Empty, a Claude alias, or a non-openai provider
+// prefix are errors; the message names both ways to set a valid id. Used by
+// `agent new` so `--runtime codex` cannot generate a harness the runtime
+// will refuse (#7264).
+func ValidateCodexModel(model string) error {
+	_, err := translateCodexModel(model)
+	return err
+}
+
 // translateCodexModel resolves a model spec into codex's --model value: a bare
 // id passes through and an `openai/` prefix is stripped. A Claude alias or any
 // other provider prefix is an error naming both fixes, because codex would
@@ -235,6 +245,15 @@ func codexHooksAdapterCheck(hooksPath, adapter string) string {
 	return fmt.Sprintf(`[ "%s" = "%s" ]`, count(`"command":`), count(adapter))
 }
 
+// codexModelsCacheRemoval is the POSIX sh fragment that deletes
+// $CODEX_HOME/models_cache.json, so every run starts from codex's bundled model
+// catalog. The runner never writes this file, so deleting it is always safe.
+// `command -p` keeps a shell function or PATH entry from .env from replacing
+// `rm`.
+func codexModelsCacheRemoval(r CodexRuntime) string {
+	return "command -p rm -f " + shellQuote(r.codexModelsCachePath())
+}
+
 func codexSHACheck(path, sum string) string {
 	return fmt.Sprintf(`[ "$(command -p sha256sum %s | command -p cut -d' ' -f1)" = %s ]`,
 		shellQuote(path), shellQuote(sum))
@@ -287,7 +306,9 @@ func codexConfigGuard(r CodexRuntime, digests codexRunnerHeldDigestSet) string {
 //     repo's own .codex/ layer — including repo-owned hooks — never loads;
 //   - whether the hook adapter is required is decided from the runner's own
 //     signal (params.HooksSettingsPath, the same one ClaudeRuntime uses for
-//     --settings), never from the agent-writable manifest.
+//     --settings), never from the agent-writable manifest;
+//   - models_cache.json is removed before .env and again just before launch,
+//     so codex starts from its bundled model catalog.
 func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled bool, digests codexRunnerHeldDigestSet) string {
 	r := CodexRuntime{}
 	envFile := sandbox.SandboxWorkspace + "/.env"
@@ -305,6 +326,7 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		"&& readonly "+codexPathVar+`="$PATH"`,
 		"&& "+codexAssetGuard(r, hooksEnabled, digests),
 		"&& "+codexConfigGuard(r, digests),
+		"&& "+codexModelsCacheRemoval(r),
 		"&& "+r.OpenAIAuthSeed(),
 		"&& . "+shellQuote(envFile),
 		// .env is agent-writable; re-pin the runner-owned config location
@@ -330,6 +352,8 @@ func buildCodexRunCommand(params RunParams, model, effort string, hooksEnabled b
 		"&& unset -f test command grep cut wc sha256sum printf codex",
 		"&& "+codexAssetGuard(r, hooksEnabled, digests),
 		"&& "+codexConfigGuard(r, digests),
+		// Again after .env, which runs in this shell and could recreate it.
+		"&& "+codexModelsCacheRemoval(r),
 	)
 	if params.Debug != "" {
 		// codex exec has no --debug flag. Its tracing goes to stderr, at

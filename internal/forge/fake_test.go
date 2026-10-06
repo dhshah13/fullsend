@@ -4,12 +4,32 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFakeClient_ListPullRequestCommits(t *testing.T) {
+	f := NewFakeClient()
+	f.PRCommits = map[string][]string{"o/r/7": {"a", "b"}}
+
+	shas, err := f.ListPullRequestCommits(context.Background(), "o", "r", 7)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, shas)
+
+	shas, err = f.ListPullRequestCommits(context.Background(), "o", "r", 8)
+	require.NoError(t, err)
+	assert.Empty(t, shas)
+
+	f.Errors["ListPullRequestCommits"] = errors.New("boom")
+	_, err = f.ListPullRequestCommits(context.Background(), "o", "r", 7)
+	require.Error(t, err)
+}
 
 func TestFakeClient_ListOrgRepos(t *testing.T) {
 	ctx := context.Background()
@@ -528,75 +548,6 @@ func TestFakeClient_OrgSecretExists(t *testing.T) {
 	})
 }
 
-func TestFakeClient_CreateOrgSecret(t *testing.T) {
-	ctx := context.Background()
-	fc := &FakeClient{}
-
-	err := fc.CreateOrgSecret(ctx, "myorg", "DISPATCH_TOKEN", "secret-value", []int64{100, 200})
-	require.NoError(t, err)
-
-	// Should be recorded.
-	require.Len(t, fc.CreatedOrgSecrets, 1)
-	assert.Equal(t, "myorg", fc.CreatedOrgSecrets[0].Org)
-	assert.Equal(t, "DISPATCH_TOKEN", fc.CreatedOrgSecrets[0].Name)
-	assert.Equal(t, "secret-value", fc.CreatedOrgSecrets[0].Value)
-	assert.Equal(t, []int64{100, 200}, fc.CreatedOrgSecrets[0].RepoIDs)
-
-	// Should be queryable.
-	exists, err := fc.OrgSecretExists(ctx, "myorg", "DISPATCH_TOKEN")
-	require.NoError(t, err)
-	assert.True(t, exists)
-}
-
-func TestFakeClient_OrgVariableExists(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("exists", func(t *testing.T) {
-		fc := &FakeClient{
-			OrgVariables: map[string]bool{"myorg/DISPATCH_URL": true},
-		}
-		exists, err := fc.OrgVariableExists(ctx, "myorg", "DISPATCH_URL")
-		require.NoError(t, err)
-		assert.True(t, exists)
-	})
-
-	t.Run("not exists", func(t *testing.T) {
-		fc := &FakeClient{
-			OrgVariables: map[string]bool{},
-		}
-		exists, err := fc.OrgVariableExists(ctx, "myorg", "MISSING")
-		require.NoError(t, err)
-		assert.False(t, exists)
-	})
-
-	t.Run("nil map", func(t *testing.T) {
-		fc := &FakeClient{}
-		exists, err := fc.OrgVariableExists(ctx, "myorg", "VAR")
-		require.NoError(t, err)
-		assert.False(t, exists)
-	})
-}
-
-func TestFakeClient_CreateOrUpdateOrgVariable(t *testing.T) {
-	ctx := context.Background()
-	fc := &FakeClient{}
-
-	err := fc.CreateOrUpdateOrgVariable(ctx, "myorg", "DISPATCH_URL", "https://func.example.com", []int64{100, 200})
-	require.NoError(t, err)
-
-	// Should be recorded.
-	require.Len(t, fc.CreatedOrgVariables, 1)
-	assert.Equal(t, "myorg", fc.CreatedOrgVariables[0].Org)
-	assert.Equal(t, "DISPATCH_URL", fc.CreatedOrgVariables[0].Name)
-	assert.Equal(t, "https://func.example.com", fc.CreatedOrgVariables[0].Value)
-	assert.Equal(t, []int64{100, 200}, fc.CreatedOrgVariables[0].RepoIDs)
-
-	// Should be queryable.
-	exists, err := fc.OrgVariableExists(ctx, "myorg", "DISPATCH_URL")
-	require.NoError(t, err)
-	assert.True(t, exists)
-}
-
 func TestFakeClient_GetOrgVariable(t *testing.T) {
 	ctx := context.Background()
 	fc := &FakeClient{
@@ -643,9 +594,18 @@ func TestFakeClient_CreateOrUpdateOrgVariableAll(t *testing.T) {
 	ctx := context.Background()
 	fc := &FakeClient{}
 	require.NoError(t, fc.CreateOrUpdateOrgVariableAll(ctx, "myorg", "FOREIGN", "caller"))
-	exists, err := fc.OrgVariableExists(ctx, "myorg", "FOREIGN")
+
+	// Should be recorded.
+	require.Len(t, fc.CreatedOrgVariables, 1)
+	assert.Equal(t, "myorg", fc.CreatedOrgVariables[0].Org)
+	assert.Equal(t, "FOREIGN", fc.CreatedOrgVariables[0].Name)
+	assert.Equal(t, "caller", fc.CreatedOrgVariables[0].Value)
+
+	// Should be queryable.
+	value, exists, err := fc.GetOrgVariable(ctx, "myorg", "FOREIGN")
 	require.NoError(t, err)
 	assert.True(t, exists)
+	assert.Equal(t, "caller", value)
 }
 
 func TestFakeClient_DeleteOrgVariable(t *testing.T) {
@@ -851,17 +811,11 @@ func TestFakeClient_ErrorInjection(t *testing.T) {
 			_, err := fc.ListOrgInstallations(ctx, "org")
 			return err
 		}},
-		{"CreateOrgSecret", func(fc *FakeClient) error {
-			return fc.CreateOrgSecret(ctx, "o", "n", "v", nil)
-		}},
 		{"OrgSecretExists", func(fc *FakeClient) error {
 			_, err := fc.OrgSecretExists(ctx, "o", "n")
 			return err
 		}},
 		{"DeleteOrgSecret", func(fc *FakeClient) error { return fc.DeleteOrgSecret(ctx, "o", "n") }},
-		{"SetOrgSecretRepos", func(fc *FakeClient) error {
-			return fc.SetOrgSecretRepos(ctx, "o", "n", nil)
-		}},
 		{"CommitFiles", func(fc *FakeClient) error {
 			_, err := fc.CommitFiles(ctx, "o", "r", "m", nil)
 			return err
@@ -869,15 +823,19 @@ func TestFakeClient_ErrorInjection(t *testing.T) {
 		{"ForceCommitFileToBranch", func(fc *FakeClient) error {
 			return fc.ForceCommitFileToBranch(ctx, "o", "r", "b", "p", "m", []byte("c"))
 		}},
-		{"CreateOrUpdateOrgVariable", func(fc *FakeClient) error {
-			return fc.CreateOrUpdateOrgVariable(ctx, "o", "n", "v", nil)
-		}},
-		{"OrgVariableExists", func(fc *FakeClient) error {
-			_, err := fc.OrgVariableExists(ctx, "o", "n")
+		{"GetPipelineVariablesMinimumOverrideRole", func(fc *FakeClient) error {
+			_, err := fc.GetPipelineVariablesMinimumOverrideRole(ctx, "o", "r")
 			return err
+		}},
+		{"SetPipelineVariablesMinimumOverrideRole", func(fc *FakeClient) error {
+			return fc.SetPipelineVariablesMinimumOverrideRole(ctx, "o", "r", PipelineVarOverrideOwner)
+		}},
+		{"CreateOrUpdateOrgVariableAll", func(fc *FakeClient) error {
+			return fc.CreateOrUpdateOrgVariableAll(ctx, "o", "n", "v")
 		}},
 		{"GetOrgVariable", func(fc *FakeClient) error { _, _, err := fc.GetOrgVariable(ctx, "o", "n"); return err }},
 		{"ListOrgVariables", func(fc *FakeClient) error { _, err := fc.ListOrgVariables(ctx, "o"); return err }},
+		{"ListInstanceVariables", func(fc *FakeClient) error { _, err := fc.ListInstanceVariables(ctx); return err }},
 		{"IsInstallationToken", func(fc *FakeClient) error { _, err := fc.IsInstallationToken(ctx); return err }},
 		{"DeleteOrgVariable", func(fc *FakeClient) error {
 			return fc.DeleteOrgVariable(ctx, "o", "n")
@@ -885,15 +843,12 @@ func TestFakeClient_ErrorInjection(t *testing.T) {
 		{"DeleteRepoVariable", func(fc *FakeClient) error {
 			return fc.DeleteRepoVariable(ctx, "o", "r", "n")
 		}},
-		{"SetOrgVariableRepos", func(fc *FakeClient) error {
-			return fc.SetOrgVariableRepos(ctx, "o", "n", nil)
-		}},
-		{"GetOrgVariableRepos", func(fc *FakeClient) error {
-			_, err := fc.GetOrgVariableRepos(ctx, "o", "n")
-			return err
-		}},
 		{"DeleteIssueComment", func(fc *FakeClient) error {
 			return fc.DeleteIssueComment(ctx, "o", "r", 1)
+		}},
+		{"GetIssueComment", func(fc *FakeClient) error {
+			_, err := fc.GetIssueComment(ctx, "o", "r", 1)
+			return err
 		}},
 		{"ListDirectoryContents", func(fc *FakeClient) error {
 			_, err := fc.ListDirectoryContents(ctx, "o", "r", "p", "main", false)
@@ -917,6 +872,32 @@ func TestFakeClient_ErrorInjection(t *testing.T) {
 		{"ListWorkflowRunJobs", func(fc *FakeClient) error {
 			_, err := fc.ListWorkflowRunJobs(ctx, "o", "r", 1)
 			return err
+		}},
+		{"CreatePipelineTriggerToken", func(fc *FakeClient) error {
+			_, err := fc.CreatePipelineTriggerToken(ctx, "o", "r", "d")
+			return err
+		}},
+		{"ListPipelineTriggerTokens", func(fc *FakeClient) error {
+			_, err := fc.ListPipelineTriggerTokens(ctx, "o", "r")
+			return err
+		}},
+		{"RevokePipelineTriggerToken", func(fc *FakeClient) error {
+			return fc.RevokePipelineTriggerToken(ctx, "o", "r", 1)
+		}},
+		{"CreateProjectHook", func(fc *FakeClient) error {
+			_, err := fc.CreateProjectHook(ctx, "o", "r", ProjectHook{URL: "https://example.test"})
+			return err
+		}},
+		{"ListProjectHooks", func(fc *FakeClient) error {
+			_, err := fc.ListProjectHooks(ctx, "o", "r")
+			return err
+		}},
+		{"UpdateProjectHook", func(fc *FakeClient) error {
+			_, err := fc.UpdateProjectHook(ctx, "o", "r", 1, ProjectHook{})
+			return err
+		}},
+		{"DeleteProjectHook", func(fc *FakeClient) error {
+			return fc.DeleteProjectHook(ctx, "o", "r", 1)
 		}},
 	}
 
@@ -981,17 +962,13 @@ func TestFakeClient_ThreadSafety(t *testing.T) {
 			_, _ = fc.GetLatestWorkflowRun(ctx, "o", "r", "ci.yml")
 			_, _ = fc.GetWorkflowRun(ctx, "o", "r", 1)
 			_, _ = fc.ListOrgInstallations(ctx, "org")
-			_ = fc.CreateOrgSecret(ctx, "o", "n", "v", []int64{1})
 			_, _ = fc.OrgSecretExists(ctx, "o", "secret")
 			_ = fc.DeleteOrgSecret(ctx, "o", "n")
-			_ = fc.SetOrgSecretRepos(ctx, "o", "n", []int64{1, 2})
 			_, _ = fc.CommitFiles(ctx, "o", "r", "m", []TreeFile{{Path: "p", Content: []byte("c"), Mode: "100644"}})
 			_ = fc.ForceCommitFileToBranch(ctx, "o", "r", "state-branch", "state.json", "m", []byte("data"))
-			_ = fc.CreateOrUpdateOrgVariable(ctx, "o", "n", "v", []int64{1})
-			_, _ = fc.OrgVariableExists(ctx, "o", "var")
+			_ = fc.CreateOrUpdateOrgVariableAll(ctx, "o", "n", "v")
+			_, _, _ = fc.GetOrgVariable(ctx, "o", "var")
 			_ = fc.DeleteOrgVariable(ctx, "o", "n")
-			_ = fc.SetOrgVariableRepos(ctx, "o", "n", []int64{1, 2})
-			_, _ = fc.GetOrgVariableRepos(ctx, "o", "n")
 			_ = fc.DeleteIssueComment(ctx, "o", "r", 1)
 			_, _ = fc.ListDirectoryContents(ctx, "o", "r", "p", "main", false)
 			_, _ = fc.ListRepositoryFiles(ctx, "o", "r")
@@ -999,6 +976,15 @@ func TestFakeClient_ThreadSafety(t *testing.T) {
 			_ = fc.DeleteRepoSecret(ctx, "o", "r", "n")
 			_, _ = fc.ListRepoVariables(ctx, "o", "r")
 			_, _ = fc.ListWorkflowRunJobs(ctx, "o", "r", 1)
+			_, _ = fc.CreatePipelineTriggerToken(ctx, "o", "r", "d")
+			_, _ = fc.ListPipelineTriggerTokens(ctx, "o", "r")
+			_ = fc.RevokePipelineTriggerToken(ctx, "o", "r", 1)
+			_, _ = fc.CreateProjectHook(ctx, "o", "r", ProjectHook{URL: "https://example.test"})
+			_, _ = fc.ListProjectHooks(ctx, "o", "r")
+			_, _ = fc.UpdateProjectHook(ctx, "o", "r", 1, ProjectHook{})
+			_ = fc.DeleteProjectHook(ctx, "o", "r", 1)
+			_ = fc.SetPipelineVariablesMinimumOverrideRole(ctx, "o", "r", PipelineVarOverrideOwner)
+			_, _ = fc.GetPipelineVariablesMinimumOverrideRole(ctx, "o", "r")
 		}(i)
 	}
 
@@ -1352,6 +1338,83 @@ func TestFakeClient_ReactionErrorInjection(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestFakeClient_GetIssueComment(t *testing.T) {
+	fc := NewFakeClient()
+	created, err := fc.CreateIssueComment(context.Background(), "org", "repo", 7, "playback-current: 1")
+	require.NoError(t, err)
+
+	got, err := fc.GetIssueComment(context.Background(), "org", "repo", created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, created.ID, got.ID)
+	assert.Equal(t, "playback-current: 1", got.Body)
+}
+
+func TestFakeClient_GetIssueComment_NotFound(t *testing.T) {
+	fc := NewFakeClient()
+	_, err := fc.GetIssueComment(context.Background(), "org", "repo", 404)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestFakeClient_GetNoteOnParent(t *testing.T) {
+	fc := NewFakeClient()
+	created, err := fc.CreateIssueComment(context.Background(), "org", "repo", 7, "playback-current: 1")
+	require.NoError(t, err)
+
+	got, err := fc.GetNoteOnParent(context.Background(), "org", "repo", "merge_requests", 7, created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, created.ID, got.ID)
+	require.Len(t, fc.GetNoteOnParentCalls, 1)
+	assert.Equal(t, NoteOnParentRecord{
+		Owner: "org", Repo: "repo", ParentType: "merge_requests", ParentIID: 7, NoteID: created.ID,
+	}, fc.GetNoteOnParentCalls[0])
+}
+
+func TestFakeClient_GetNoteOnParent_NotFound(t *testing.T) {
+	fc := NewFakeClient()
+	_, err := fc.GetNoteOnParent(context.Background(), "org", "repo", "issues", 1, 404)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestFakeClient_GetNoteOnParent_Error(t *testing.T) {
+	fc := NewFakeClient()
+	fc.Errors = map[string]error{"GetNoteOnParent": errors.New("boom")}
+	_, err := fc.GetNoteOnParent(context.Background(), "org", "repo", "issues", 1, 1)
+	assert.Error(t, err)
+}
+
+func TestFakeClient_UpdateNoteOnParent(t *testing.T) {
+	fc := NewFakeClient()
+	created, err := fc.CreateIssueComment(context.Background(), "org", "repo", 7, "playback-current: 1")
+	require.NoError(t, err)
+
+	err = fc.UpdateNoteOnParent(context.Background(), "org", "repo", "merge_requests", 7, created.ID, "playback-current: 2")
+	require.NoError(t, err)
+	require.Len(t, fc.UpdateNoteOnParentCalls, 1)
+	assert.Equal(t, NoteOnParentRecord{
+		Owner: "org", Repo: "repo", ParentType: "merge_requests", ParentIID: 7, NoteID: created.ID, Body: "playback-current: 2",
+	}, fc.UpdateNoteOnParentCalls[0])
+
+	got, err := fc.GetIssueComment(context.Background(), "org", "repo", created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "playback-current: 2", got.Body)
+}
+
+func TestFakeClient_UpdateNoteOnParent_NotFound(t *testing.T) {
+	fc := NewFakeClient()
+	err := fc.UpdateNoteOnParent(context.Background(), "org", "repo", "issues", 1, 404, "x")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestFakeClient_UpdateNoteOnParent_Error(t *testing.T) {
+	fc := NewFakeClient()
+	fc.Errors = map[string]error{"UpdateNoteOnParent": errors.New("boom")}
+	err := fc.UpdateNoteOnParent(context.Background(), "org", "repo", "issues", 1, 1, "x")
+	assert.Error(t, err)
+}
+
 func TestFakeClient_AddIssueCommentReaction(t *testing.T) {
 	fc := NewFakeClient()
 
@@ -1470,6 +1533,53 @@ func TestFakeClient_ListWorkflowRuns_WorkflowRunsList(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, runs, 1)
 	assert.Equal(t, 1, runs[0].ID)
+}
+
+// TestFakeClient_ListWorkflowRunsSince is a regression test (#7996 review):
+// ListWorkflowRunsSince was added to FakeClient alongside the live GitHub
+// and GitLab clients' paginated implementations, but nothing exercised it
+// directly within this package, leaving it at 0% patch coverage. It filters
+// the same configured runs as ListWorkflowRuns down to those created at or
+// after since, and must also surface a ListWorkflowRuns error and treat an
+// unparsable CreatedAt as excluded rather than included.
+func TestFakeClient_ListWorkflowRunsSince(t *testing.T) {
+	fc := NewFakeClient()
+	fc.WorkflowRunsList = map[string][]WorkflowRun{
+		"org/repo/ci.yml": {
+			{ID: 1, Status: "completed", Conclusion: "success", CreatedAt: "2026-01-03T00:00:00Z"},
+			{ID: 2, Status: "completed", Conclusion: "success", CreatedAt: "2026-01-01T00:00:00Z"},
+			{ID: 3, Status: "completed", Conclusion: "success", CreatedAt: "not-a-time"},
+		},
+	}
+
+	since := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	runs, err := fc.ListWorkflowRunsSince(context.Background(), "org", "repo", "ci.yml", since)
+	require.NoError(t, err)
+	require.Len(t, runs, 1, "only the run at or after since with a parsable CreatedAt must be included")
+	assert.Equal(t, 1, runs[0].ID)
+
+	fc.Errors = map[string]error{"ListWorkflowRuns": errors.New("boom")}
+	_, err = fc.ListWorkflowRunsSince(context.Background(), "org", "repo", "ci.yml", since)
+	require.Error(t, err, "an underlying ListWorkflowRuns error must propagate")
+}
+
+// TestFakeClient_ListWorkflowRunsSince_OwnErrorKey is a regression test
+// (#7996 review): ListWorkflowRunsSince delegated to ListWorkflowRuns, which
+// only checks FakeClient.Errors["ListWorkflowRuns"], so tests could not
+// inject a failure under the method-name error-injection convention's
+// expected key, "ListWorkflowRunsSince".
+func TestFakeClient_ListWorkflowRunsSince_OwnErrorKey(t *testing.T) {
+	fc := NewFakeClient()
+	fc.WorkflowRunsList = map[string][]WorkflowRun{
+		"org/repo/ci.yml": {
+			{ID: 1, Status: "completed", Conclusion: "success", CreatedAt: "2026-01-03T00:00:00Z"},
+		},
+	}
+	fc.Errors = map[string]error{"ListWorkflowRunsSince": errors.New("boom")}
+
+	since := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	_, err := fc.ListWorkflowRunsSince(context.Background(), "org", "repo", "ci.yml", since)
+	require.Error(t, err, "injecting ListWorkflowRunsSince's own error key must fail the call")
 }
 
 func TestFakeClient_DownloadWorkflowRunArtifact(t *testing.T) {
@@ -1591,6 +1701,8 @@ func TestNewFakeClient_MapsInitialized(t *testing.T) {
 	assert.NotNil(t, fc.ProtectedBranches)
 	assert.NotNil(t, fc.ProtectedBranchRules)
 	assert.NotNil(t, fc.PipelineSchedules)
+	assert.NotNil(t, fc.PipelineTriggerTokens)
+	assert.NotNil(t, fc.ProjectHooks)
 }
 
 func TestFakeClient_PipelineScheduleRoundTrip(t *testing.T) {
@@ -1661,6 +1773,144 @@ func TestFakeClient_CreatePipeline_Error(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, p)
 	assert.Empty(t, fc.CreatedPipelines)
+}
+
+func TestFakeClient_CreatePipelineWithInputs(t *testing.T) {
+	ctx := context.Background()
+	fc := NewFakeClient()
+
+	p, err := fc.CreatePipelineWithInputs(ctx, "org", "repo", "main", map[string]PipelineInputValue{
+		"STAGE": StringInput("triage"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), p.ID)
+	assert.Contains(t, p.WebURL, "pipelines/1")
+	require.Len(t, fc.PipelineInputsCalls, 1)
+	assert.Equal(t, "org", fc.PipelineInputsCalls[0].Owner)
+	assert.Equal(t, StringInput("triage"), fc.PipelineInputsCalls[0].Inputs["STAGE"])
+	// CreatePipelineWithInputs must never populate the variables-based
+	// call record — that would misrepresent the no-user-defined-variable
+	// dispatch path this method exists for.
+	assert.Empty(t, fc.PipelineCalls)
+
+	p2, err := fc.CreatePipelineWithInputs(ctx, "org", "repo", "main", nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), p2.ID)
+	require.Len(t, fc.PipelineInputsCalls, 2)
+}
+
+func TestFakeClient_CreatePipelineWithInputs_Error(t *testing.T) {
+	ctx := context.Background()
+	fc := NewFakeClient()
+	fc.Errors["CreatePipelineWithInputs"] = fmt.Errorf("forbidden")
+
+	p, err := fc.CreatePipelineWithInputs(ctx, "org", "repo", "main", nil)
+	require.Error(t, err)
+	assert.Nil(t, p)
+	assert.Empty(t, fc.CreatedPipelines)
+}
+
+func TestFakeClient_PipelineTriggerTokenRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	fc := NewFakeClient()
+
+	tok, err := fc.CreatePipelineTriggerToken(ctx, "org", "repo", "fullsend-dispatcher")
+	require.NoError(t, err)
+	require.NotNil(t, tok)
+	assert.Equal(t, int64(1), tok.ID)
+	assert.Equal(t, "fullsend-dispatcher", tok.Description)
+	assert.NotEmpty(t, tok.Token)
+
+	listed, err := fc.ListPipelineTriggerTokens(ctx, "org", "repo")
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	assert.Equal(t, tok.ID, listed[0].ID)
+	assert.Empty(t, listed[0].Token, "list must not return the secret")
+
+	err = fc.RevokePipelineTriggerToken(ctx, "org", "repo", tok.ID)
+	require.NoError(t, err)
+	listed, err = fc.ListPipelineTriggerTokens(ctx, "org", "repo")
+	require.NoError(t, err)
+	assert.Empty(t, listed)
+	assert.Equal(t, []int64{tok.ID}, fc.RevokedTriggerTokenIDs)
+}
+
+func TestFakeClient_RevokePipelineTriggerToken_NotFound(t *testing.T) {
+	ctx := context.Background()
+	fc := NewFakeClient()
+
+	err := fc.RevokePipelineTriggerToken(ctx, "org", "repo", 99)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestFakeClient_ProjectHookRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	fc := NewFakeClient()
+
+	hook := ProjectHook{
+		URL:                   "https://gitlab.example.com/api/v4/projects/org%2F.fullsend/ref/main/trigger/pipeline",
+		Name:                  "fullsend-dispatcher",
+		Token:                 "webhook-secret",
+		IssuesEvents:          true,
+		MergeRequestsEvents:   true,
+		NoteEvents:            true,
+		EnableSSLVerification: true,
+	}
+	created, err := fc.CreateProjectHook(ctx, "org", "repo", hook)
+	require.NoError(t, err)
+	require.NotNil(t, created)
+	assert.Equal(t, int64(1), created.ID)
+	assert.Equal(t, hook.URL, created.URL)
+	assert.Empty(t, created.Token, "GitLab never returns the webhook secret")
+	require.Len(t, fc.CreatedProjectHooks, 1)
+	assert.Equal(t, "webhook-secret", fc.CreatedProjectHooks[0].Token)
+
+	listed, err := fc.ListProjectHooks(ctx, "org", "repo")
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	assert.Equal(t, created.ID, listed[0].ID)
+	assert.Empty(t, listed[0].Token, "list must not return the secret")
+	assert.True(t, listed[0].IssuesEvents)
+
+	updated, err := fc.UpdateProjectHook(ctx, "org", "repo", created.ID, ProjectHook{
+		URL:          hook.URL,
+		Token:        "rotated-secret",
+		IssuesEvents: false,
+		NoteEvents:   true,
+	})
+	require.NoError(t, err)
+	assert.False(t, updated.IssuesEvents)
+	assert.True(t, updated.NoteEvents)
+	assert.Empty(t, updated.Token, "GitLab never returns the webhook secret")
+	require.Len(t, fc.UpdatedProjectHooks, 1)
+	assert.Equal(t, "rotated-secret", fc.UpdatedProjectHooks[0].Token,
+		"the recorded update call must retain the token so tests can verify rotation")
+
+	err = fc.DeleteProjectHook(ctx, "org", "repo", created.ID)
+	require.NoError(t, err)
+	listed, err = fc.ListProjectHooks(ctx, "org", "repo")
+	require.NoError(t, err)
+	assert.Empty(t, listed)
+	assert.Equal(t, []int64{created.ID}, fc.DeletedProjectHookIDs)
+}
+
+func TestFakeClient_UpdateProjectHook_NotFound(t *testing.T) {
+	ctx := context.Background()
+	fc := NewFakeClient()
+
+	_, err := fc.UpdateProjectHook(ctx, "org", "repo", 99, ProjectHook{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestFakeClient_DeleteProjectHook_NotFound(t *testing.T) {
+	ctx := context.Background()
+	fc := NewFakeClient()
+
+	err := fc.DeleteProjectHook(ctx, "org", "repo", 99)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestFakeClient_UpdateCIVariable_RecordsProtected(t *testing.T) {
@@ -1802,6 +2052,68 @@ func TestFakeClient_CreateProtectedCIVariable(t *testing.T) {
 	assert.True(t, fc.CreatedProtectedVars[0].Protected)
 }
 
+func TestFakeClient_CommitFiles_LocalPath(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fullsend")
+	content := []byte{0x7f, 0x45, 0x4c, 0x46, 0xff}
+	require.NoError(t, os.WriteFile(path, content, 0o755))
+
+	fc := NewFakeClient()
+	changed, err := fc.CommitFiles(ctx, "org", "repo", "vendor", []TreeFile{
+		{Path: "bin/fullsend", LocalPath: path, Mode: "100755"},
+	})
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, content, fc.FileContents["org/repo/bin/fullsend"])
+}
+
+func TestFakeClient_CommitFiles_LocalPathMissing(t *testing.T) {
+	ctx := context.Background()
+	fc := NewFakeClient()
+	_, err := fc.CommitFiles(ctx, "org", "repo", "vendor", []TreeFile{
+		{Path: "bin/fullsend", LocalPath: filepath.Join(t.TempDir(), "missing"), Mode: "100755"},
+	})
+	require.Error(t, err)
+}
+
+func TestFakeClient_CommitFiles_LocalPathMissingIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	missing := filepath.Join(t.TempDir(), "missing")
+	files := []TreeFile{
+		{Path: "update.txt", Content: []byte("new"), Mode: "100644"},
+		{Path: "delete.txt", Delete: true},
+		{Path: "bin/fullsend", LocalPath: missing, Mode: "100755"},
+	}
+	setup := func() *FakeClient {
+		fc := NewFakeClient()
+		fc.FileContents["org/repo/update.txt"] = []byte("old")
+		fc.FileContents["org/repo/delete.txt"] = []byte("keep")
+		return fc
+	}
+	assertUnchanged := func(t *testing.T, fc *FakeClient) {
+		t.Helper()
+		assert.Equal(t, []byte("old"), fc.FileContents["org/repo/update.txt"])
+		assert.Equal(t, []byte("keep"), fc.FileContents["org/repo/delete.txt"])
+		assert.NotContains(t, fc.FileContents, "org/repo/bin/fullsend")
+		assert.Empty(t, fc.CommittedFiles)
+		assert.Empty(t, fc.CommittedFilesToBranch)
+	}
+
+	t.Run("CommitFiles", func(t *testing.T) {
+		fc := setup()
+		_, err := fc.CommitFiles(ctx, "org", "repo", "msg", files)
+		require.Error(t, err)
+		assertUnchanged(t, fc)
+	})
+	t.Run("CommitFilesToBranch", func(t *testing.T) {
+		fc := setup()
+		_, err := fc.CommitFilesToBranch(ctx, "org", "repo", "branch", "msg", files)
+		require.Error(t, err)
+		assertUnchanged(t, fc)
+	})
+}
+
 func TestFakeClient_CommitFilesErrSeq(t *testing.T) {
 	ctx := context.Background()
 	files := []TreeFile{{Path: "f.txt", Content: []byte("x"), Mode: "100644"}}
@@ -1916,6 +2228,65 @@ func TestFakeClient_UpdateRepoVisibility(t *testing.T) {
 		err := fc.UpdateRepoVisibility(ctx, "org", "repo", true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "forbidden")
+	})
+}
+
+func TestFakeClient_PipelineVariablesMinimumOverrideRole(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("round-trips a set value through a subsequent get", func(t *testing.T) {
+		fc := NewFakeClient()
+		err := fc.SetPipelineVariablesMinimumOverrideRole(ctx, "org", "repo", PipelineVarOverrideOwner)
+		require.NoError(t, err)
+
+		got, err := fc.GetPipelineVariablesMinimumOverrideRole(ctx, "org", "repo")
+		require.NoError(t, err)
+		assert.Equal(t, PipelineVarOverrideOwner, got)
+	})
+
+	t.Run("get on unset project returns empty string", func(t *testing.T) {
+		fc := NewFakeClient()
+		got, err := fc.GetPipelineVariablesMinimumOverrideRole(ctx, "org", "missing")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("returns injected get error", func(t *testing.T) {
+		fc := &FakeClient{
+			Errors: map[string]error{"GetPipelineVariablesMinimumOverrideRole": errors.New("forbidden")},
+		}
+		_, err := fc.GetPipelineVariablesMinimumOverrideRole(ctx, "org", "repo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "forbidden")
+	})
+
+	t.Run("returns injected set error", func(t *testing.T) {
+		fc := &FakeClient{
+			Errors: map[string]error{"SetPipelineVariablesMinimumOverrideRole": errors.New("forbidden")},
+		}
+		err := fc.SetPipelineVariablesMinimumOverrideRole(ctx, "org", "repo", PipelineVarOverrideOwner)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "forbidden")
+	})
+
+	t.Run("rejects an unknown role and does not store it", func(t *testing.T) {
+		fc := NewFakeClient()
+		err := fc.SetPipelineVariablesMinimumOverrideRole(ctx, "org", "repo", "admin")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidPipelineVarOverrideRole)
+
+		got, err := fc.GetPipelineVariablesMinimumOverrideRole(ctx, "org", "repo")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("PipelineVarOverrideRoles is initialised by NewFakeClient", func(t *testing.T) {
+		fc := NewFakeClient()
+		// Mirrors the direct-assignment seeding convention used by sibling
+		// maps (e.g. ProtectedBranches) elsewhere in this file; would panic
+		// on a nil map.
+		fc.PipelineVarOverrideRoles["org/repo"] = PipelineVarOverrideOwner
+		assert.Equal(t, PipelineVarOverrideOwner, fc.PipelineVarOverrideRoles["org/repo"])
 	})
 }
 

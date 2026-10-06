@@ -39,7 +39,11 @@ overlay falls through directly to code defaults.
 and writes only explicitly passed persistent setup flags into
 `config.yaml`. Required values such as `inference.project` may come from
 the preset alone; CLI flags override the same keys without rewriting the
-preset file.
+preset file. Passing a persistent flag whose normalized value already
+matches the inherited base or compiled default still writes the overlay
+key and warns that the value is now pinned locally — it will not pick up
+later changes from that lower layer. Delete the key from `config.yaml`
+to inherit again. Omitted flags and per-run flags do not pin.
 
 `fullsend repos install` uses the same preset implementation. Declare a
 default source in `defaults.config_base.source` (optional
@@ -497,6 +501,9 @@ compiled-in defaults apply:
 
 - [Config Reference](../../reference/config-reference.md) — canonical
   user-facing reference for every `.fullsend/config.yaml` field.
+- [Configuration source inventory](../../contributing/config-source-inventory.md)
+  — which source wins for each setting, including workflow variables that
+  still override the files.
 - [ADR 0069 — Ready-made configuration presets](../../ADRs/0069-ready-made-configuration-presets.md)
   — the architectural decision that introduced layered configuration.
 - [ADR 0033 — Per-repo installation mode](../../ADRs/0033-per-repo-installation-mode.md)

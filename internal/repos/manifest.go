@@ -15,10 +15,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/fullsend-ai/fullsend/internal/appsetup"
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	"github.com/fullsend-ai/fullsend/internal/netutil"
 	"gopkg.in/yaml.v3"
@@ -46,6 +48,43 @@ const (
 // field in the override cascade. Use "fullsend_ref: none" in YAML to
 // stop the per-repo → platform-default → built-in-default chain.
 const NoneSentinel = "none"
+
+// Inference authentication methods accepted by inference.auth in
+// repos.yaml and by repos install --inference-auth. There is no built-in
+// default: every repository must resolve an explicit selection from its
+// entry, its forge section, or defaults.
+const (
+	InferenceAuthVertexWIF    = "vertex-wif"
+	InferenceAuthOpenAIAPIKey = "openai-api-key"
+)
+
+// ValidInferenceAuths returns the accepted inference.auth values in
+// documentation order.
+func ValidInferenceAuths() []string {
+	return []string{InferenceAuthVertexWIF, InferenceAuthOpenAIAPIKey}
+}
+
+// ValidateInferenceAuth accepts an empty value (inherit) or one of
+// ValidInferenceAuths. The key names the offending field or flag in the
+// error message.
+func ValidateInferenceAuth(key, value string) error {
+	if value == "" || slices.Contains(ValidInferenceAuths(), value) {
+		return nil
+	}
+	return fmt.Errorf("%s %q is not a valid inference authentication method; valid values: %s",
+		key, value, strings.Join(ValidInferenceAuths(), ", "))
+}
+
+// InferenceSettings is the nested inference block in repos.yaml. It may
+// appear under defaults, a forge section, or a repository entry. It holds
+// only the non-secret authentication selection; credential and connection
+// values are supplied on the command line and never stored here.
+type InferenceSettings struct {
+	// Auth selects which managed inference credentials the repository
+	// needs: "vertex-wif" or "openai-api-key". Empty inherits from the
+	// next level (entry → forge section → defaults).
+	Auth string `yaml:"auth,omitempty"`
+}
 
 // validForges is the set of accepted forge values.
 var validForges = map[string]bool{
@@ -84,6 +123,11 @@ type PlatformConfig struct {
 	MintURL     string `yaml:"mint_url,omitempty"`
 	MintMode    string `yaml:"mint_mode,omitempty"`
 	FullsendRef string `yaml:"fullsend_ref,omitempty"`
+	// AppSet is the GitHub App set prefix (apps named "{app_set}-{role}")
+	// persisted as the FULLSEND_APP_SET repo variable. GitHub-only; the
+	// sentinel "none" resets a per-repo override back to the built-in
+	// default. Rejected under the gitlab platform.
+	AppSet string `yaml:"app_set,omitempty"`
 	// AgentRunnerTags routes GitLab agent (data-plane) jobs. GitLab-only.
 	AgentRunnerTags []string `yaml:"agent_runner_tags,omitempty"`
 	// ControlRunnerTags routes GitLab control-plane jobs (poll today;
@@ -95,8 +139,11 @@ type PlatformConfig struct {
 	// Parse populates AgentRunnerTags from it when agent_runner_tags is
 	// unset; MarshalWithHeader / Manifest.Marshal drop it so rewrites
 	// emit agent_runner_tags.
-	DeprecatedRunnerTags []string    `yaml:"runner_tags,omitempty"`
-	Repos                []RepoEntry `yaml:"repos"`
+	DeprecatedRunnerTags []string `yaml:"runner_tags,omitempty"`
+	// Inference holds the forge-wide inference authentication selection,
+	// overriding defaults.inference and overridden by repository entries.
+	Inference InferenceSettings `yaml:"inference,omitempty"`
+	Repos     []RepoEntry       `yaml:"repos"`
 }
 
 // ConfigBase is the nested config_base object in repos.yaml. Source is
@@ -136,10 +183,17 @@ type RepoEntry struct {
 	MintURL                string   `yaml:"mint_url,omitempty"`
 	MintMode               string   `yaml:"mint_mode,omitempty"`
 	AllowedRemoteResources []string `yaml:"allowed_remote_resources,omitempty"`
+	// AppSet overrides the GitHub App set prefix for this repository,
+	// persisted as the FULLSEND_APP_SET repo variable. GitHub-only; the
+	// sentinel "none" resets back to the built-in default.
+	AppSet string `yaml:"app_set,omitempty"`
 	// Runtime is the agent runtime written as the repo's `runtime:` at
 	// install time (claude, pi, codex); empty inherits defaults.runtime,
 	// and an empty resolved value keeps the code default (claude).
 	Runtime string `yaml:"runtime,omitempty"`
+	// Inference overrides the inference authentication selection for this
+	// repository (or every repository matched by this glob entry).
+	Inference InferenceSettings `yaml:"inference,omitempty"`
 	// Vendor overrides the default vendor setting for this repo.
 	// nil inherits defaults.vendor; non-nil overrides it.
 	Vendor *bool `yaml:"vendor,omitempty"`
@@ -161,6 +215,11 @@ type DefaultsConfig struct {
 	AllowedRemoteResources []string `yaml:"allowed_remote_resources,omitempty"`
 	// Runtime is the default agent runtime for every repo (claude, pi, codex).
 	Runtime string `yaml:"runtime,omitempty"`
+	// Inference is the operator-provided default inference authentication
+	// selection for every repository. It is not a built-in fallback: when
+	// no level sets inference.auth, install/convergence/status report a
+	// configuration error for the repository.
+	Inference InferenceSettings `yaml:"inference,omitempty"`
 	// Vendor, when true, vendors the fullsend binary and content into
 	// each repo so CI does not need network access to fetch them.
 	Vendor *bool `yaml:"vendor,omitempty"`
@@ -199,9 +258,22 @@ type ResolvedConfig struct {
 	MintMode               string
 	FullsendRef            string
 	AllowedRemoteResources []string
+	// AppSet is the resolved GitHub App set prefix persisted as the
+	// FULLSEND_APP_SET repo variable. GitHub-only; empty for GitLab.
+	AppSet string
+	// AppSetExplicit reports whether app_set was explicitly configured
+	// (per-repo override or manifest default, including the "none"
+	// sentinel). When false, convergence preserves any existing
+	// FULLSEND_APP_SET value on the repo rather than forcing the default.
+	AppSetExplicit bool
 	// Runtime is the resolved agent runtime (entry, then defaults); empty
 	// means the code default.
 	Runtime string
+	// InferenceAuth is the resolved inference authentication method
+	// (entry, then forge section, then defaults). Empty means no level
+	// declared one; RequireInferenceAuth turns that into an actionable
+	// error for install, convergence, and status.
+	InferenceAuth string
 	// Vendor is true when the fullsend binary and content should be
 	// vendored into the repo for offline CI.
 	Vendor bool
@@ -453,12 +525,37 @@ func (m *Manifest) AllRepos() []RepoEntry {
 //   - no duplicate repo entries (before glob expansion)
 //   - glob patterns must be valid filepath.Match patterns
 //   - forge URLs must be valid HTTPS URLs with no path component
+//   - inference.auth values must be one of ValidInferenceAuths
 func (m *Manifest) Validate() error {
+	return m.validate(ValidateInferenceAuth)
+}
+
+// ValidateStructure is Validate without the inference.auth value checks.
+// Callers that evaluate repositories independently (status, uninstall)
+// use it so one invalid inference.auth does not abort the whole command;
+// the effective selection is checked per repository via
+// ResolvedConfig.RequireInferenceAuth where it matters.
+func (m *Manifest) ValidateStructure() error {
+	return m.validate(func(_, _ string) error { return nil })
+}
+
+// ValidateForUninstall is Validate without the inference.auth value
+// checks. Uninstall removes every Fullsend-managed inference credential
+// regardless of the selected method, so a missing or invalid
+// inference.auth must not block cleanup of an installation.
+func (m *Manifest) ValidateForUninstall() error {
+	return m.ValidateStructure()
+}
+
+func (m *Manifest) validate(checkInferenceAuth func(key, value string) error) error {
 	if m.Version != 1 {
 		return fmt.Errorf("unsupported manifest version %d (expected 1)", m.Version)
 	}
 
 	if err := validateRuntimeValue("defaults.runtime", m.Defaults.Runtime); err != nil {
+		return err
+	}
+	if err := checkInferenceAuth("defaults.inference.auth", m.Defaults.Inference.Auth); err != nil {
 		return err
 	}
 	if err := ValidateAllowedRemoteResourcesFormat("defaults.allowed_remote_resources", m.Defaults.AllowedRemoteResources); err != nil {
@@ -486,9 +583,15 @@ func (m *Manifest) Validate() error {
 		if p.cfg == nil {
 			continue
 		}
+		if err := checkInferenceAuth(p.name+".inference.auth", p.cfg.Inference.Auth); err != nil {
+			return err
+		}
 		for i := range p.cfg.Repos {
 			e := &p.cfg.Repos[i]
 			if err := validateRuntimeValue(fmt.Sprintf("%s.repos[%s].runtime", p.name, e.Name), e.Runtime); err != nil {
+				return err
+			}
+			if err := checkInferenceAuth(fmt.Sprintf("%s.repos[%s].inference.auth", p.name, e.Name), e.Inference.Auth); err != nil {
 				return err
 			}
 			if err := ValidateAllowedRemoteResourcesFormat(fmt.Sprintf("%s.repos[%s].allowed_remote_resources", p.name, e.Name), e.AllowedRemoteResources); err != nil {
@@ -543,6 +646,13 @@ func (m *Manifest) Validate() error {
 		if m.GitHub.FullsendRef != "" && !IsValidRef(m.GitHub.FullsendRef) {
 			return fmt.Errorf("github.fullsend_ref %q contains invalid characters; only alphanumeric, dot, underscore, and hyphen are allowed", m.GitHub.FullsendRef)
 		}
+		// app_set is well-formed except for the "none" sentinel, which
+		// resets a per-repo override back to the built-in default.
+		if m.GitHub.AppSet != "" && m.GitHub.AppSet != NoneSentinel {
+			if err := appsetup.ValidateAppSet(m.GitHub.AppSet); err != nil {
+				return fmt.Errorf("github.app_set: %w", err)
+			}
+		}
 
 		if err := m.validatePlatformRepos(ForgeGitHub, m.GitHub, allSeen); err != nil {
 			return err
@@ -557,6 +667,9 @@ func (m *Manifest) Validate() error {
 		}
 		if m.GitLab.MintMode != "" {
 			return fmt.Errorf("gitlab.mint_mode is not supported; mint_mode is a GitHub-only field")
+		}
+		if m.GitLab.AppSet != "" {
+			return fmt.Errorf("gitlab.app_set is not supported; app_set is a GitHub-only field")
 		}
 
 		if len(m.GitLab.Repos) > 0 && m.GitLab.URL == "" {
@@ -621,6 +734,17 @@ func (m *Manifest) validatePlatformRepos(forgeName string, platform *PlatformCon
 			}
 			if entry.MintURL != "" {
 				return fmt.Errorf("%s.repos[%d]: mint_url is only supported for GitHub repos", forgeName, i)
+			}
+			if entry.AppSet != "" {
+				return fmt.Errorf("%s.repos[%d]: app_set is only supported for GitHub repos", forgeName, i)
+			}
+		}
+
+		// Validate per-repo app_set override (GitHub). The "none" sentinel
+		// resets to the built-in default and skips format validation.
+		if forgeName == ForgeGitHub && entry.AppSet != "" && entry.AppSet != NoneSentinel {
+			if err := appsetup.ValidateAppSet(entry.AppSet); err != nil {
+				return fmt.Errorf("%s.repos[%d]: per-repo app_set: %w", forgeName, i, err)
 			}
 		}
 
@@ -778,14 +902,17 @@ func (m *Manifest) ExpandGlobsFor(ctx context.Context, clients ForgeClientFactor
 			if strings.ContainsAny(name, "*?[") {
 				globs = append(globs, globEntry{org: org, pattern: name, entry: entry})
 			} else {
-				explicit[entry.Name] = entry
+				// Keys are lowercased: forges treat repository paths
+				// case-insensitively, and manifest validation and filter
+				// matching already do.
+				explicit[strings.ToLower(entry.Name)] = entry
 			}
 		}
 
 		// Add explicit entries first (they take priority).
-		for fullName, entry := range explicit {
-			parts := strings.SplitN(fullName, "/", 2)
-			resolved[fullName] = ResolvedRepo{
+		for key, entry := range explicit {
+			parts := strings.SplitN(entry.Name, "/", 2)
+			resolved[key] = ResolvedRepo{
 				Owner: parts[0],
 				Repo:  parts[1],
 				Forge: p.name,
@@ -819,12 +946,13 @@ func (m *Manifest) ExpandGlobsFor(ctx context.Context, clients ForgeClientFactor
 				}
 
 				fullName := g.org + "/" + repo.Name
+				key := strings.ToLower(fullName)
 				// Explicit entries win over glob matches.
-				if _, exists := explicit[fullName]; exists {
+				if _, exists := explicit[key]; exists {
 					continue
 				}
 				// First glob match wins (if multiple globs match the same repo).
-				if _, exists := resolved[fullName]; exists {
+				if _, exists := resolved[key]; exists {
 					continue
 				}
 
@@ -833,7 +961,7 @@ func (m *Manifest) ExpandGlobsFor(ctx context.Context, clients ForgeClientFactor
 				// actual repo name.
 				entry := g.entry
 				entry.Name = fullName
-				resolved[fullName] = ResolvedRepo{
+				resolved[key] = ResolvedRepo{
 					Owner: g.org,
 					Repo:  repo.Name,
 					Forge: p.name,
@@ -945,6 +1073,9 @@ func (m *Manifest) resolveWithEntry(owner, repo, forgeName string, platform *Pla
 	// Runtime: per-repo overrides the global default; "none" stops the
 	// chain like the other string fields.
 	cfg.Runtime = resolveField(entry.Runtime, m.Defaults.Runtime, "")
+	// InferenceAuth: entry, then forge section, then defaults. There is
+	// deliberately no built-in fallback (see RequireInferenceAuth).
+	cfg.InferenceAuth = firstNonEmpty(entry.Inference.Auth, platform.Inference.Auth, m.Defaults.Inference.Auth)
 	// Vendor: per-repo *bool overrides defaults *bool; default is false.
 	cfg.Vendor = resolveBoolField(entry.Vendor, m.Defaults.Vendor, false)
 	// ConfigBase: per-repo overrides defaults; source "none" disables
@@ -980,10 +1111,47 @@ func (m *Manifest) resolveWithEntry(owner, repo, forgeName string, platform *Pla
 		}
 		cfg.MintURL = resolveField(entry.MintURL, platform.MintURL, mintURLDefault)
 		cfg.FullsendRef = resolveField(entry.FullsendRef, platform.FullsendRef, "")
+		// AppSet: per-repo override, then manifest default, then the
+		// built-in default. The "none" sentinel resolves to empty, which
+		// we then map back to the built-in default (a reset, not a disable).
+		// AppSetExplicit records whether app_set was configured at all so
+		// convergence can preserve an existing custom value when it is not.
+		cfg.AppSet = resolveField(entry.AppSet, platform.AppSet, appsetup.DefaultAppSet)
+		if cfg.AppSet == "" {
+			cfg.AppSet = appsetup.DefaultAppSet
+		}
+		cfg.AppSetExplicit = entry.AppSet != "" || platform.AppSet != ""
 	case ForgeGitLab:
 		cfg.FullsendRef = resolveField(entry.FullsendRef, platform.FullsendRef, "")
 	}
 	return cfg
+}
+
+// RequireInferenceAuth returns an actionable configuration error when no
+// manifest level (entry, forge section, defaults) selects an inference
+// authentication method for this repository, or when the effective
+// selection is not a valid method. Install, convergence, and status call
+// it before any dependent forge reads or writes; uninstall deliberately
+// does not, so incomplete or older installations can still be cleaned up.
+func (c ResolvedConfig) RequireInferenceAuth() error {
+	if c.InferenceAuth != "" {
+		if err := ValidateInferenceAuth("inference.auth", c.InferenceAuth); err != nil {
+			return fmt.Errorf("invalid inference authentication for %s/%s: %w", c.Owner, c.Repo, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("no inference authentication selected for %s/%s: set inference.auth (%s) on the repository entry, in the %s section, or under defaults in repos.yaml, or pass --inference-auth to repos install",
+		c.Owner, c.Repo, strings.Join(ValidInferenceAuths(), " or "), c.Forge)
+}
+
+// firstNonEmpty returns the first non-empty value, or "" when all are empty.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // resolveBoolField implements the three-level fallback chain for a
@@ -1221,6 +1389,21 @@ func IsNumeric(s string) bool {
 // are unchanged after a call to Marshal.
 func (m *Manifest) Marshal() ([]byte, error) {
 	return yaml.Marshal(migratedManifestForMarshal(m))
+}
+
+// MarshalWithHeader serializes the manifest with a descriptive header
+// comment. Like Manifest.Marshal, it does not mutate the receiver — the
+// deprecated runner_tags migration runs against a shallow copy.
+func MarshalWithHeader(m *Manifest) ([]byte, error) {
+	data, err := yaml.Marshal(migratedManifestForMarshal(m))
+	if err != nil {
+		return nil, fmt.Errorf("marshalling manifest: %w", err)
+	}
+
+	header := fmt.Sprintf("# Generated by fullsend on %s.\n# Review and adjust before running fullsend repos install.\n",
+		time.Now().UTC().Format("2006-01-02"))
+
+	return append([]byte(header), data...), nil
 }
 
 // migratedManifestForMarshal returns a shallow copy of m with the

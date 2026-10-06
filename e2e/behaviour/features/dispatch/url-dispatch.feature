@@ -12,6 +12,7 @@ Feature: URL-sourced harness dispatch
       slug: fullsend-ai-url-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -34,6 +35,7 @@ Feature: URL-sourced harness dispatch
       slug: fullsend-ai-local-ping
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -46,6 +48,7 @@ Feature: URL-sourced harness dispatch
       slug: fullsend-ai-url-mixed
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -67,6 +70,7 @@ Feature: URL-sourced harness dispatch
       slug: fullsend-ai-good-local
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -79,6 +83,7 @@ Feature: URL-sourced harness dispatch
       slug: fullsend-ai-bad-hash
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -105,6 +110,7 @@ Feature: URL-sourced harness dispatch
       slug: fullsend-ai-good-allowed
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"
@@ -117,6 +123,7 @@ Feature: URL-sourced harness dispatch
       slug: fullsend-ai-no-allow
       model: opus
       image: ghcr.io/fullsend-ai/fullsend-sandbox:latest
+      policy: policies/base.yaml
       trigger: |
         event.entity.kind == "work_item"
         && event.transition.kind == "label_changed"

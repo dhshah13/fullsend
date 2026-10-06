@@ -708,6 +708,11 @@ sys.exit(0)`)
 // write would take the interpreter down with exit 1 — which codex records as
 // Failed, and a failed hook does not block. A block without its reason still
 // beats a block that never happens.
+//
+// Closing fd 2 *before* the interpreter starts is the real-world shape (a
+// parent that discarded stderr). Some CPython builds then set sys.stderr =
+// None; pyenv-built ones leave a live TextIOWrapper, whose shutdown flush
+// would override exit 2 with 120. block() must survive both.
 func TestCodexAdapter_BlocksWithUnwritableStderr(t *testing.T) {
 	h := newCodexAdapterHarness(t)
 	h.script("blocker.py", `print(json.dumps({"decision": "block", "reason": "nope"}))
@@ -726,6 +731,103 @@ sys.exit(1)`)
 	var exitErr *exec.ExitError
 	require.ErrorAs(t, runErr, &exitErr)
 	assert.Equal(t, 2, exitErr.ExitCode(), "the block must still be an exit 2, reason or no reason")
+}
+
+// TestCodexAdapter_BlockExitTwoIndependentOfStderrBuild pins the fail-closed
+// contract across CPython builds that disagree on a closed fd 2, and pins
+// codex's actual consumer semantics, not just the exit code: codex's
+// `parse_completed` only treats exit 2 as a block when stderr is non-empty
+// (`events/pre_tool_use.rs`), so a case that exits 2 with nothing on the real
+// fd 2 would still fail open in production even though the subprocess exit
+// code looks right. "Closing fd 2 after the interpreter has started" forces
+// a live TextIOWrapper around a closed fd — the pyenv case that turns an
+// unguarded block() into exit 120 — so CI does not depend on how python3 was
+// provisioned.
+//
+// "sys.stderr is None" and "TextIOWrapper around a closed fd" both leave the
+// real fd 2 itself untouched — only the Python-level stream object is
+// broken, and block() never writes through it — so block()'s raw
+// os.write(2, ...) recovers the reason and this asserts it actually lands on
+// the real fd, exactly once, not just that the process exits 2. "fd 2 closed
+// after interpreter start" tears down the real fd itself: no process-local
+// write can put bytes on the other end of a closed fd, so that case is
+// asserted to still exit 2 (a block attempt beats a crash) but to NOT carry
+// the reason — codex sees this one as `Failed`, not a block, and no
+// in-process fix changes that (see block()'s docstring).
+func TestCodexAdapter_BlockExitTwoIndependentOfStderrBuild(t *testing.T) {
+	cases := []struct {
+		name       string
+		setup      string
+		want       string
+		wantAbsent string
+	}{
+		{
+			name: "writable stderr",
+			want: "forced-stderr",
+		},
+		{
+			name:  "homebrew-style sys.stderr is None",
+			setup: "sys.stderr = None",
+			want:  "forced-stderr",
+		},
+		{
+			name:       "fd 2 closed after interpreter start",
+			setup:      "os.close(2)",
+			wantAbsent: "forced-stderr",
+		},
+		{
+			name: "live TextIOWrapper around a closed fd",
+			setup: "import io\n" +
+				"fd = os.open(os.devnull, os.O_WRONLY)\n" +
+				"sys.stderr = io.TextIOWrapper(io.BufferedWriter(io.FileIO(fd, \"w\")), " +
+				"line_buffering=False, write_through=False)\n" +
+				"os.close(fd)",
+			want: "forced-stderr",
+		},
+		{
+			// Unlike the previous case, this one stages unflushed bytes in
+			// the wrapper's buffer before the fd is torn down, so there is
+			// something for interpreter shutdown to fail on flushing. That
+			// is what actually exercises the pyenv 120 regression: without
+			// block()'s close()/`sys.stderr = None` guard, CPython's
+			// finalization flush of this wrapper raises against the closed
+			// fd and overrides exit 2 with 120. block() never writes
+			// through sys.stderr itself, so the "pending" bytes only get
+			// there because this test put them there directly.
+			name: "live TextIOWrapper with unflushed bytes over a closed fd",
+			setup: "import io\n" +
+				"fd = os.open(os.devnull, os.O_WRONLY)\n" +
+				"sys.stderr = io.TextIOWrapper(io.BufferedWriter(io.FileIO(fd, \"w\")), " +
+				"line_buffering=False, write_through=False)\n" +
+				"sys.stderr.write('pending')\n" +
+				"os.close(fd)",
+			want: "forced-stderr",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newCodexAdapterHarness(t)
+			src := "import importlib.util, os, sys\n" +
+				"spec = importlib.util.spec_from_file_location('adapter', " + pyStr(h.adapter) + ")\n" +
+				"m = importlib.util.module_from_spec(spec)\n" +
+				"spec.loader.exec_module(m)\n" +
+				tc.setup + "\n" +
+				"m.block('forced-stderr')\n"
+			cmd := exec.Command(h.python, "-c", src)
+			var stdout, stderr strings.Builder
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			runErr := cmd.Run()
+			require.Error(t, runErr, "stdout: %s stderr: %s", stdout.String(), stderr.String())
+			assert.Equal(t, 2, exitCodeOf(t, runErr), "stdout: %s stderr: %s", stdout.String(), stderr.String())
+			if tc.want != "" {
+				assert.Equal(t, tc.want, stderr.String(), "codex only treats exit 2 as a block when stderr is non-empty, and a duplicate write must not pass")
+			}
+			if tc.wantAbsent != "" {
+				assert.NotContains(t, stderr.String(), tc.wantAbsent, "a genuinely closed fd 2 cannot carry the reason from this process")
+			}
+		})
+	}
 }
 
 // TestCodexAdapter_LeavesTheHooksDirUntouched is the regression test for a

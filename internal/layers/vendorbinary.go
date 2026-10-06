@@ -13,10 +13,6 @@ import (
 // VendorFunc uploads vendored binary and content when --vendor is set.
 type VendorFunc func(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string) error
 
-// VendorCollectFunc gathers vendored tree files without committing.
-// Used to combine scaffold and vendor assets in a single CommitFiles call.
-type VendorCollectFunc func(ctx context.Context, client forge.Client, printer *ui.Printer, owner, repo string) ([]forge.TreeFile, int, error)
-
 // VendorBinaryLayer manages vendored binary and content assets.
 // The type name retains "Binary" from when the layer only uploaded the CLI
 // binary; it now vendors the full stack (workflows, actions, agent content).
@@ -30,7 +26,6 @@ type VendorBinaryLayer struct {
 	ui                    *ui.Printer
 	enabled               bool
 	vendorFn              VendorFunc
-	combinedWithScaffold  bool
 	analyzeFullsendSource string
 	cliVersion            string
 }
@@ -54,11 +49,6 @@ func NewVendorBinaryLayer(org, repo string, client forge.Client, printer *ui.Pri
 func (l *VendorBinaryLayer) SetAnalyzeOptions(fullsendSource, cliVersion string) {
 	l.analyzeFullsendSource = fullsendSource
 	l.cliVersion = cliVersion
-}
-
-// SetCombinedWithScaffold marks vendored assets as already committed by WorkflowsLayer.
-func (l *VendorBinaryLayer) SetCombinedWithScaffold(combined bool) {
-	l.combinedWithScaffold = combined
 }
 
 func (l *VendorBinaryLayer) Name() string { return "vendor" }
@@ -94,9 +84,6 @@ func (l *VendorBinaryLayer) RequiredScopes(op Operation) []string {
 // Install either vendors assets (when enabled) or removes stale ones.
 func (l *VendorBinaryLayer) Install(ctx context.Context) error {
 	if l.enabled {
-		if l.combinedWithScaffold {
-			return nil
-		}
 		if l.vendorFn == nil {
 			return fmt.Errorf("vendor function not configured")
 		}
@@ -107,7 +94,7 @@ func (l *VendorBinaryLayer) Install(ctx context.Context) error {
 }
 
 // Uninstall is a no-op. Vendored assets are removed when the config repo is
-// deleted by ConfigRepoLayer, or when install runs without --vendor.
+// deleted, or when install runs without --vendor.
 func (l *VendorBinaryLayer) Uninstall(_ context.Context) error { return nil }
 
 // Analyze reports vendored asset presence, manifest alignment, and optional

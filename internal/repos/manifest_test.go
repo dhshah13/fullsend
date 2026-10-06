@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fullsend-ai/fullsend/internal/appsetup"
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	"github.com/fullsend-ai/fullsend/internal/scaffold"
 	"github.com/stretchr/testify/assert"
@@ -588,6 +589,45 @@ gitlab:
 	assert.Equal(t, ForgeGitLab, resolved[0].Forge)
 }
 
+func TestExpandGlobsFor_ExplicitEntryWinsCaseInsensitively(t *testing.T) {
+	// A carved explicit entry keeps the spelling of the concrete filter
+	// ("acme/API"), while the forge returns "api". The explicit entry must
+	// suppress the glob-expanded row so the repository resolves exactly once
+	// with the persisted override.
+	input := `
+version: 1
+github:
+  mint_url: https://mint.example.com
+  repos:
+    - name: acme/*
+    - name: acme/API
+      fullsend_ref: pinned
+`
+	var m Manifest
+	require.NoError(t, yaml.Unmarshal([]byte(input), &m))
+
+	fc := forge.NewFakeClient()
+	fc.Repos = []forge.Repository{
+		{Name: "api", FullName: "acme/api"},
+		{Name: "web", FullName: "acme/web"},
+	}
+
+	resolved, err := m.ExpandGlobsFor(context.Background(), newTestClientFactory(fc), nil)
+	require.NoError(t, err)
+	require.Len(t, resolved, 2)
+
+	var apiRows int
+	for _, rr := range resolved {
+		if strings.EqualFold(rr.Repo, "api") {
+			apiRows++
+			assert.Equal(t, "pinned", rr.Entry.FullsendRef)
+		} else {
+			assert.Empty(t, rr.Entry.FullsendRef)
+		}
+	}
+	assert.Equal(t, 1, apiRows)
+}
+
 func TestExpandGlobsFor_EmptyFilterExpandsEveryPlatform(t *testing.T) {
 	input := `
 version: 1
@@ -707,6 +747,153 @@ github:
 	cfg, found := m.ResolveConfig("acme", "no-ref")
 	assert.True(t, found)
 	assert.Equal(t, "", cfg.FullsendRef) // none stops fallback
+}
+
+func TestResolveConfig_AppSet(t *testing.T) {
+	input := `
+version: 1
+github:
+  mint_url: https://mint.example.com
+  app_set: org-wide
+  repos:
+    - name: acme/inherits
+    - name: acme/overrides
+      app_set: repo-local
+    - name: acme/resets
+      app_set: none
+`
+	var m Manifest
+	require.NoError(t, yaml.Unmarshal([]byte(input), &m))
+
+	// Inherits the manifest default; explicit because the platform set it.
+	cfg, found := m.ResolveConfig("acme", "inherits")
+	require.True(t, found)
+	assert.Equal(t, "org-wide", cfg.AppSet)
+	assert.True(t, cfg.AppSetExplicit)
+
+	// Per-repo override wins over the manifest default.
+	cfg, found = m.ResolveConfig("acme", "overrides")
+	require.True(t, found)
+	assert.Equal(t, "repo-local", cfg.AppSet)
+	assert.True(t, cfg.AppSetExplicit)
+
+	// "none" resets to the built-in default (reset, not disable).
+	cfg, found = m.ResolveConfig("acme", "resets")
+	require.True(t, found)
+	assert.Equal(t, appsetup.DefaultAppSet, cfg.AppSet)
+	assert.True(t, cfg.AppSetExplicit)
+}
+
+func TestResolveConfig_AppSet_BuiltinDefaultWhenUnset(t *testing.T) {
+	input := `
+version: 1
+github:
+  mint_url: https://mint.example.com
+  repos:
+    - name: acme/plain
+`
+	var m Manifest
+	require.NoError(t, yaml.Unmarshal([]byte(input), &m))
+
+	cfg, found := m.ResolveConfig("acme", "plain")
+	require.True(t, found)
+	assert.Equal(t, appsetup.DefaultAppSet, cfg.AppSet)
+	assert.False(t, cfg.AppSetExplicit)
+}
+
+func TestResolveConfig_AppSet_EmptyForGitLab(t *testing.T) {
+	input := `
+version: 1
+gitlab:
+  url: https://gitlab.example.com
+  repos:
+    - name: acme/service
+`
+	var m Manifest
+	require.NoError(t, yaml.Unmarshal([]byte(input), &m))
+
+	cfg, found := m.ResolveConfig("acme", "service")
+	require.True(t, found)
+	assert.Equal(t, "", cfg.AppSet)
+	assert.False(t, cfg.AppSetExplicit)
+}
+
+func TestValidate_AppSet_GitHubValid(t *testing.T) {
+	m := &Manifest{
+		Version: 1,
+		GitHub: &PlatformConfig{
+			MintURL: "https://mint.example.com",
+			AppSet:  "org-wide",
+			Repos:   []RepoEntry{{Name: "acme/repo", AppSet: "repo-local"}},
+		},
+	}
+	assert.NoError(t, m.Validate())
+}
+
+func TestValidate_AppSet_GitHubInvalid(t *testing.T) {
+	m := &Manifest{
+		Version: 1,
+		GitHub: &PlatformConfig{
+			MintURL: "https://mint.example.com",
+			AppSet:  "Invalid_AppSet",
+			Repos:   []RepoEntry{{Name: "acme/repo"}},
+		},
+	}
+	err := m.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "github.app_set")
+}
+
+func TestValidate_AppSet_PerRepoInvalid(t *testing.T) {
+	m := &Manifest{
+		Version: 1,
+		GitHub: &PlatformConfig{
+			MintURL: "https://mint.example.com",
+			Repos:   []RepoEntry{{Name: "acme/repo", AppSet: "Bad Value"}},
+		},
+	}
+	err := m.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "app_set")
+}
+
+func TestValidate_AppSet_NoneSentinelSkipsFormatCheck(t *testing.T) {
+	m := &Manifest{
+		Version: 1,
+		GitHub: &PlatformConfig{
+			MintURL: "https://mint.example.com",
+			AppSet:  "none",
+			Repos:   []RepoEntry{{Name: "acme/repo", AppSet: "none"}},
+		},
+	}
+	assert.NoError(t, m.Validate())
+}
+
+func TestValidate_AppSet_RejectedOnGitLabPlatform(t *testing.T) {
+	m := &Manifest{
+		Version: 1,
+		GitLab: &PlatformConfig{
+			URL:    "https://gitlab.example.com",
+			AppSet: "org-wide",
+			Repos:  []RepoEntry{{Name: "acme/repo"}},
+		},
+	}
+	err := m.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gitlab.app_set is not supported")
+}
+
+func TestValidate_AppSet_RejectedOnGitLabRepo(t *testing.T) {
+	m := &Manifest{
+		Version: 1,
+		GitLab: &PlatformConfig{
+			URL:   "https://gitlab.example.com",
+			Repos: []RepoEntry{{Name: "acme/repo", AppSet: "repo-local"}},
+		},
+	}
+	err := m.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "app_set is only supported for GitHub repos")
 }
 
 func TestResolveConfig_UnknownRepo(t *testing.T) {
@@ -2546,4 +2733,25 @@ func TestGitLabControlRunnerTags_NilManifest(t *testing.T) {
 	assert.Nil(t, gitlabAgentRunnerTags(&Manifest{}))
 	assert.Nil(t, gitlabControlRunnerTags(&Manifest{}))
 	migrateDeprecatedRunnerTags(nil)
+}
+
+func TestMarshalWithHeader(t *testing.T) {
+	m := &Manifest{
+		Version: 1,
+		GitHub: &PlatformConfig{
+			MintURL: "https://mint.example.com",
+			Repos: []RepoEntry{
+				{Name: "acme/api"},
+			},
+		},
+	}
+
+	data, err := MarshalWithHeader(m)
+	require.NoError(t, err)
+
+	s := string(data)
+	assert.Contains(t, s, "# Generated by fullsend on")
+	assert.Contains(t, s, "# Review and adjust before running fullsend repos install.")
+	assert.Contains(t, s, "version: 1")
+	assert.Contains(t, s, "acme/api")
 }

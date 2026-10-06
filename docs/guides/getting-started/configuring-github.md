@@ -10,7 +10,7 @@ See [Configuring GitLab](configuring-gitlab.md) for that flow.
 
 ## Prerequisites
 
-* You have your WIF provider URL from [Getting Inference](getting-inference.md).
+* For Vertex agents, you have your WIF provider URL from [Getting Inference](getting-inference.md). OpenAI-only setup does not need it.
 * Download the latest [fullsend](https://github.com/fullsend-ai/fullsend/releases) CLI.
 * Download the latest [gh](https://cli.github.com/) CLI and authenticate with it.
 
@@ -70,7 +70,12 @@ Where `<org>/<repo>` refers to the GitHub organization and repository you want t
 for, `<gcp-project>` is your GCP project name, and `<wif-provider-url>` is the WIF Provider URL
 created at [Getting Inference](getting-inference.md).
 
-The command creates files, secrets and variables in your repository.
+The command creates files, secrets and variables in your repository. If you
+will use only OpenAI agents, omit both `--inference-project` and
+`--inference-wif-provider`. Setup then writes no GCP inference secrets;
+a later Vertex run requires both credentials.
+Configure each enabled agent's runtime and model for OpenAI before it runs.
+For OpenAI credentials, see [OpenAI Workload Identity](../infrastructure/openai-workload-identity.md).
 
 ### Enabling a subset of agents
 
@@ -109,7 +114,12 @@ When `--config` is provided, the preset content is committed unchanged as
 `--agents`, `--mint-url`, `--inference-*`) are written to the
 `.fullsend/config.yaml` overlay and override the same values from the
 preset. Omitted flags inherit from the preset, then from compiled-in
-defaults. The `--config-hash` flag is optional but recommended for remote
+defaults. If you pass a persistent flag whose value already matches the
+preset or compiled default, setup still writes it into the overlay and
+warns that the field is now pinned locally — later updates to the base
+layer or default will not apply until you remove that key from
+`.fullsend/config.yaml`. Per-run flags such as `--dry-run` never pin.
+The `--config-hash` flag is optional but recommended for remote
 URLs — it verifies the SHA-256 digest of the fetched content before
 committing. `--config` is only valid for per-repo mode.
 
@@ -125,8 +135,8 @@ Actions tab to see the Fullsend workflow in action. In some minutes the
 
 ## Next steps
 
-* Read [Organization installation mode](org-mode.md) to learn how to share GCP project with other repositories
-within your GitHub organization.
+* Read [Repo Management](repo-management.md) to learn how to install and manage Fullsend across
+many repositories, including sharing configuration presets between them.
 * Read the [Agents](../../agents/README.md) section to learn about the default agents Fullsend
 ships with.
 * Explore other sections of this documentation for more information.

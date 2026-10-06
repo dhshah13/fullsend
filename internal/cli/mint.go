@@ -112,7 +112,7 @@ func rolesFromAppIDs(roleAppIDs map[string]string) []string {
 // parseAllowedOrgs splits ALLOWED_ORGS, excluding the deploy placeholder.
 func parseAllowedOrgs(allowedOrgs string) []string {
 	var orgs []string
-	for _, o := range mintcore.ParseAllowedOrgs(allowedOrgs) {
+	for _, o := range mintcore.SplitCSV(allowedOrgs) {
 		if o != gcf.PlaceholderOrg {
 			orgs = append(orgs, o)
 		}

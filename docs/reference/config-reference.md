@@ -193,9 +193,9 @@ For agent registration and management, see
 
 URL prefixes allowed for remote resources in harness files — agent sources
 (`agents:` entries with URLs), policies, skills, plugins, profiles, providers,
-and `base:` composition. The org-level list acts as a fallback for all URL
+and `base:` composition. The config-level list acts as a fallback for all URL
 resolution: a URL is accepted if it matches either the harness-level or the
-org-level list. Default prefixes cover the fullsend and agents repositories.
+config-level list. Default prefixes cover the fullsend and agents repositories.
 
 In the layered config system, this field uses union-with-deny-all semantics:
 omitted inherits from parent; explicit empty (`[]`) denies all remote
@@ -236,7 +236,9 @@ The only provider is `owners_file`:
 
 Default: absent (collaborator API only). The field is not inherited from
 `config.base.yaml`: each repo opts in in its own `config.yaml`. Unknown or
-duplicate providers fail config validation.
+duplicate providers fail config validation. See
+[OWNERS file authorization](../guides/user/owners-file-authorization.md)
+for a setup walkthrough.
 
 ### `status_notifications`
 

@@ -61,12 +61,17 @@ See [architecture.md](architecture.md).
 
 ### Agent Runtime
 
-The agent itself in execution — the LLM, its tool-use loop, and the interface to the model provider. This is the thing that actually reasons and acts; everything else in the architecture exists to support, constrain, or coordinate it. Claude Code is the default runtime; [pi](https://github.com/earendil-works/pi) and [Codex](https://github.com/openai/codex) are available as opt-in runtimes (`runtime: pi`, `runtime: codex`), and OpenCode is a stub. See [runtimes.md](runtimes.md).
+The agent itself in execution — the LLM, its tool-use loop, and the interface to the model provider. This is the thing that actually reasons and acts; everything else in the architecture exists to support, constrain, or coordinate it. Claude Code is the default runtime; [pi](https://github.com/earendil-works/pi) and [Codex](https://github.com/openai/codex) are available as opt-in runtimes (`runtime: pi`, `runtime: codex`), and OpenCode is a stub. Other projects call this layer a [harness](#harness); see that entry for the naming difference. See [runtimes.md](runtimes.md).
 See [architecture.md](architecture.md) and [agent-infrastructure.md](problems/agent-infrastructure.md).
 
 ### AGENTS.md
 
 Project-wide instructions for humans and agents (conventions, testing, architecture). Fullsend agents operating on a checked-out target repo read it there ([Configuring with AGENTS.md](guides/user/customizing-with-agents-md.md)). Using `AGENTS.md` keeps you in [configured default](#configured-default-agent) territory; it is not a [custom agent](#custom-agent). Prefer `AGENTS.md` for rules that apply to every agent; use a [skill](#skill) when behavior is agent- or task-specific.
+
+### Agent Spec
+
+The preferred docs term for the per-role [harness](#harness) YAML: skills, env, providers, sandbox profiles, and `base:` composition. It avoids confusion with the industry sense of "harness", which fullsend calls the [agent runtime](#agent-runtime). This is a docs preference, not a rename: the YAML schema, field names, the `internal/harness/` package, and ADR titles still say "harness".
+See [Harness](#harness), [Base Composition](#base-composition), and [harness-reference.md](reference/harness-reference.md).
 
 ### Always-on Skill
 
@@ -131,10 +136,13 @@ Collapsing rapid-fire events on the same issue or PR so they do not produce
 redundant agent work. Today, the
 [webhook + dispatch service](ADRs/0002-initial-fullsend-design.md#1-webhook--dispatch-service)
 deduplicates flapping events before dispatch. On GitHub this uses real-time
-webhooks; on GitLab the cron poller provides watermark-based deduplication at
-5–60 minute intervals, which is functionally analogous but operates on a
-coarser time scale (see
-[ADR 0067](ADRs/0067-gitlab-cron-polling-event-dispatch.md)).
+webhooks; on GitLab, dedup is hybrid under
+[ADR 0125](ADRs/0125-gitlab-hybrid-webhook-poller-dispatch.md): webhook
+fast-path events deduplicate against poll-detected events through
+concurrency-safe per-mode dispatch state, with the cron poller's
+watermark-based deduplication at 5–60 minute intervals
+([ADR 0067](ADRs/0067-gitlab-cron-polling-event-dispatch.md)) remaining the
+reconciliation backstop.
 [ADR 0106](ADRs/0106-serialize-agent-runs-and-coalesce-subsequent-events.md)
 additionally adopts preserve-and-coalesce scheduling at the execution-platform
 layer: after implementation, an active run finishes while later matching
@@ -155,7 +163,7 @@ See [Default, derived, and custom agents](agents/topics/default-vs-custom.md).
 
 ### Entry Point
 
-The single deterministic component that receives forge events and decides which agent combination to run. On GitHub, events arrive via webhooks; on GitLab, via cron-polled scheduled pipelines (see [ADR 0067](ADRs/0067-gitlab-cron-polling-event-dispatch.md)). Previously called **wrapper** — the rename was adopted to avoid confusion with the sandbox/wrapping layer (see [#101](https://github.com/fullsend-ai/fullsend/issues/101) for the terminology evolution). The entry point is non-AI: it is a conventional program (currently Go) that parses events, enforces ACLs on slash commands, validates label transitions, and dispatches to agent runtimes. It does not make LLM calls.
+The single deterministic component that receives forge events and decides which agent combination to run. On GitHub, events arrive via webhooks; on GitLab, via a native webhook fast-path with cron-poller reconciliation (see [ADR 0125](ADRs/0125-gitlab-hybrid-webhook-poller-dispatch.md), [ADR 0067](ADRs/0067-gitlab-cron-polling-event-dispatch.md)). Previously called **wrapper** — the rename was adopted to avoid confusion with the sandbox/wrapping layer (see [#101](https://github.com/fullsend-ai/fullsend/issues/101) for the terminology evolution). The entry point is non-AI: it is a conventional program (currently Go) that parses events, enforces ACLs on slash commands, validates label transitions, and dispatches to agent runtimes. It does not make LLM calls.
 See [ADR 0002](ADRs/0002-initial-fullsend-design.md) building block 1 and [#101](https://github.com/fullsend-ai/fullsend/issues/101).
 
 ### Escalation
@@ -198,7 +206,9 @@ See [autonomy-spectrum.md](problems/autonomy-spectrum.md).
 
 ### Harness
 
-The configuration and context layer that prepares an agent for its task. The harness assembles skills, system prompts, codebase context, tool definitions, and behavioral instructions — it is what transforms a generic LLM into a specific agent with a specific role. "Harness engineering" is a relatively new term in the industry (emerging early 2026); in fullsend, the harness is a distinct architectural layer between the sandbox and the agent runtime.
+In fullsend, the configuration and context layer that prepares an agent for its task. It assembles skills, system prompts, codebase context, tool definitions, and behavioral instructions, turning a generic LLM into an agent with a specific role. Concretely, it is the per-role YAML between the sandbox and the [agent runtime](#agent-runtime): skills, env, providers, sandbox profiles, and `base:` composition. New docs call it the [agent spec](#agent-spec).
+
+Elsewhere in the industry (Anthropic's "agent harness" writing, meta-harness projects such as Omnigent), "harness" means the agent CLI itself — Claude Code, Codex, or pi — which fullsend calls the agent runtime. In those terms, fullsend is a [meta-harness](#meta-harness).
 See [architecture.md](architecture.md).
 
 ## I
@@ -221,6 +231,11 @@ See [ADR 0002](ADRs/0002-initial-fullsend-design.md) building block 3 and [Bring
 
 An external process that exposes tools to an agent via the Model Context Protocol. In fullsend, MCP servers are used as controlled access points outside the sandbox — for example, an MCP server that wraps the `gh` CLI can provide GitHub access while keeping credentials out of the agent's environment. MCP servers are preferred where necessary (particularly for mediating writes that the sandbox cannot natively constrain), while direct API calls or skills are preferred for static, deterministic processes to avoid performance overhead.
 See [#101](https://github.com/fullsend-ai/fullsend/issues/101) and [security-threat-model.md](problems/security-threat-model.md).
+
+### Meta-harness
+
+A platform that configures, sandboxes, and orchestrates agent harnesses — [agent runtimes](#agent-runtime) in fullsend terms — rather than being one itself. Fullsend is a meta-harness: it assembles the [agent spec](#agent-spec) for each role, provisions the [sandbox](#sandbox), and dispatches to a runtime such as Claude Code, Codex, or pi. Omnigent is another example.
+See [architecture.md](architecture.md).
 
 ### Model Armor
 
@@ -329,7 +344,7 @@ See [ADR 0002](ADRs/0002-initial-fullsend-design.md) building block 2.
 
 ### Trigger
 
-What initiates an agent run. Could be a forge event (issue filed, label applied, comment posted, PR/MR opened, check completed), a [slash command](#slash-command), or a scheduled action. The term is used loosely in discussions — sometimes meaning the raw forge event (GitHub webhook or GitLab cron-polled change), sometimes meaning the processed signal that actually starts an agent after debouncing and validation. In fullsend's architecture, triggers flow through the [entry point](#entry-point), which normalizes and dispatches them.
+What initiates an agent run. Could be a forge event (issue filed, label applied, comment posted, PR/MR opened, check completed), a [slash command](#slash-command), or a scheduled action. The term is used loosely in discussions — sometimes meaning the raw forge event (GitHub webhook or GitLab webhook / cron-polled change), sometimes meaning the processed signal that actually starts an agent after debouncing and validation. In fullsend's architecture, triggers flow through the [entry point](#entry-point), which normalizes and dispatches them.
 See [architecture.md](architecture.md) (building block 1).
 
 ### Triage

@@ -10,6 +10,12 @@ ever holds a placeholder that the OpenShell gateway swaps for the real token on 
 Setting it up is one visit to the OpenAI console — yours, or your IT administrator's — and one
 command per repository. No key is created, downloaded or rotated.
 
+`fullsend run` selects inference credentials from each agent's effective runtime and model.
+An agent using an OpenAI model does not require GCP credentials; another agent in the same
+repository can still use Vertex. Initial `fullsend github setup` and `fullsend repos install`
+can omit GCP inference flags. A later Vertex run still requires usable GCP credentials. When the
+repository has the GCP secrets, an OpenAI run also gets Vertex credentials for Vertex sub-agents.
+
 > **GitHub Actions only** for Workload Identity Federation. The exchange needs the job's OIDC
 > endpoint. If you cannot enrol a WIF provider, [Route C](#c-static-key-as-a-repository-secret) uses
 > a repository secret. For GitLab CI and for runs on your own machine, use an API key in the runner
@@ -272,10 +278,11 @@ runner uses it only when the three `FULLSEND_OPENAI_*` WIF identifiers are unset
 errors — a typo cannot fall through to the key. When the trio and the secret are both set, WIF wins
 and the secret is unused.
 
-1. If the repository was installed or its workflow files were last synced before this feature shipped,
-   re-run `fullsend github setup <owner/repo>` (or `fullsend repos install` for a manifest-managed
-   repository) first — the reusable workflow's caller shim has to forward the secret before setting it
-   does anything.
+1. If the repository's workflow files predate OpenAI credential forwarding, update them before
+   running the agent. Re-running `fullsend github setup <owner/repo>` (or `fullsend repos install`
+   for a manifest-managed repository) can sync them without GCP credentials. A Vertex run still
+   needs credentials; the caller shim must forward `FULLSEND_OPENAI_API_KEY` before setting the
+   secret has an effect.
 2. Create an API key in the OpenAI project the runs should be billed to.
 3. Set it on the repository:
    ```bash
@@ -292,8 +299,11 @@ What this trades away: a long-lived key stored as a GitHub secret, no per-reposi
 not change: the key never enters the sandbox, only the endpoint-bound placeholder does; egress stays
 `POST /v1/responses` on `api.openai.com`; the value is masked and reserved through `oidcDenyKeys`.
 
-**GitLab CI.** A masked `OPENAI_API_KEY` CI/CD variable already works on the same runner path — GitLab
-injects CI variables into the job environment, so no extra forwarding is required.
+**GitLab CI.** Store the key as a masked `FULLSEND_OPENAI_API_KEY` CI/CD variable. You can do this
+with `fullsend repos install <group/project> --openai-api-key <value>` for projects whose
+`inference.auth` is `openai-api-key`. The Fullsend job maps it to `OPENAI_API_KEY` on the runner.
+An unprefixed `OPENAI_API_KEY` CI/CD variable is no longer used, with no fallback. See the
+[upgrade steps](../../cli/repos.md#gitlab-fullsend_openai_api_key-replaces-openai_api_key-breaking).
 
 ## 4. Tell fullsend the three identifiers
 
@@ -302,17 +312,17 @@ injects CI variables into the job environment, so no extra forwarding is require
 > repository variables instead. See
 > [`fullsend inference openai import`](../../cli/inference.md#inference-openai-import).
 
-Re-run the setup command you enrolled the repository with, adding the three values:
+For an existing installation, import the values into the local `.fullsend/config.yaml`:
 
 ```bash
-fullsend github setup <your-github-org>/<repo> \
-  --openai-audience "<the provider's audience>" \
-  --openai-identity-provider-id "<identity provider ID>" \
-  --openai-service-account-id "<service account ID>"
+fullsend inference openai import \
+  --audience "<the provider's audience>" \
+  --identity-provider-id "<identity provider ID>" \
+  --service-account-id "<service account ID>"
 ```
 
-It writes them into the repository's `.fullsend/config.yaml`, the same way it records the Vertex
-project and provider:
+This writes only the OpenAI identifiers; it does not re-run repository setup or require GCP
+credentials. The resulting block is:
 
 ```yaml
 inference:
@@ -322,7 +332,8 @@ inference:
     service_account_id: <service account ID>
 ```
 
-Commit that change (setup opens a pull request for it unless you pass `--direct`). A base
+Commit the config change so CI can read it. If you use `fullsend github setup --openai-*` instead,
+the GCP pair is optional and setup opens a pull request unless you pass `--direct`. A base
 configuration (`config.base.yaml`, or a vendor preset) can carry the block for many repositories,
 and a repository can restate any one of the three — with a centrally managed provider, the audience
 and the provider ID are typically the same for every repository and only the service account differs.
@@ -348,7 +359,7 @@ workflows pass them to every agent run, and when any of them is set they replace
 
 In `.fullsend/config.yaml`, put the agent on a runtime that serves OpenAI models — `pi` or
 `codex` — with an OpenAI model, or run
-`fullsend agent set code --fullsend-dir .fullsend --runtime pi --model openai/gpt-5.6-luna`
+`fullsend agent set code --runtime pi --model openai/gpt-5.6-luna`
 (swap in `--runtime codex` for codex), which writes the same entry after validating it:
 
 ```yaml
@@ -371,14 +382,15 @@ providers:
 ```
 
 Declaring it costs nothing on runs that do not use it: the run-scoped provider is created only
-when the selected runtime will actually call OpenAI (codex, or pi on an `openai/` model), so the
-same harness can carry the provider for every runtime — a Vertex run notes that the declared
+when the selected runtime will actually call OpenAI — codex, pi on an `openai/` model, or a pi run
+on any model whose sub-agents are routed to `openai/`
+([pi › Route a persona to OpenAI](../../runtimes/pi.md#route-a-persona-to-openai)) — so the same
+harness can carry the provider for every runtime. Any other Vertex run notes that the declared
 provider was skipped and needs no OpenAI credential.
 
 A custom agent (a `source:` entry) declares it on its own harness; the built-in fleet agents declare
-it from the first fullsend release after v0.43.0. `providers/openai.yaml` arrives with
-the other upstream defaults when a run prepares its workspace, and both it and the matching profile
-are built into fullsend — a local run needs nothing on disk, and you commit neither. The profile lets the sandbox reach `api.openai.com` for the Responses API and
+it from the first fullsend release after v0.43.0. The provider definition and the matching profile
+are built into fullsend — a run needs nothing on disk, and you commit neither. The profile lets the sandbox reach `api.openai.com` for the Responses API and
 nothing else. Use a model id from OpenAI's catalog — on pi, `pi --list-models openai` in the sandbox image
 prints the ones it knows; `gpt-5.6-luna` is the inexpensive
 reasoning model and `gpt-5.6-sol` the capable one, and a model the mapping's project cannot use is

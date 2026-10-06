@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -27,6 +28,8 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/fetch"
 	"github.com/fullsend-ai/fullsend/internal/fetchsvc"
 	"github.com/fullsend-ai/fullsend/internal/forge"
+	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
+	"github.com/fullsend-ai/fullsend/internal/gitlabroles"
 	"github.com/fullsend-ai/fullsend/internal/harness"
 	"github.com/fullsend-ai/fullsend/internal/mintclient"
 	"github.com/fullsend-ai/fullsend/internal/resolve"
@@ -47,10 +50,8 @@ func TestRunCommand_HasFullsendDirFlag(t *testing.T) {
 	cmd := newRunCmd()
 	flag := cmd.Flags().Lookup("fullsend-dir")
 	require.NotNil(t, flag)
-	assert.Equal(t, "", flag.DefValue)
-
-	annotations := flag.Annotations
-	require.Contains(t, annotations, "cobra_annotation_bash_completion_one_required_flag")
+	assert.Equal(t, defaultFullsendDir, flag.DefValue)
+	assert.NotContains(t, flag.Annotations, "cobra_annotation_bash_completion_one_required_flag")
 }
 
 func TestRunCommand_RegisteredOnRoot(t *testing.T) {
@@ -70,6 +71,12 @@ func TestRunCommand_HasNoPostScriptFlag(t *testing.T) {
 	flag := cmd.Flags().Lookup("no-post-script")
 	require.NotNil(t, flag)
 	assert.Equal(t, "false", flag.DefValue)
+}
+
+func TestRunCommand_HasNoResolveInferenceProviderFlag(t *testing.T) {
+	cmd := newRunCmd()
+	flag := cmd.Flags().Lookup("resolve-inference-provider")
+	assert.Nil(t, flag)
 }
 
 func TestRunCommand_HasOutputDirFlag(t *testing.T) {
@@ -182,6 +189,7 @@ func neutralizeAgentsRepoFallback(t *testing.T) {
 // fallback from bypassing local fixtures (#5569).
 func useFakeOpenshell(t *testing.T) {
 	t.Helper()
+	t.Setenv("GITHUB_ACTIONS", "false")
 	neutralizeAgentsRepoFallback(t)
 	testdataDir, err := filepath.Abs("testdata")
 	require.NoError(t, err)
@@ -195,6 +203,7 @@ func useFakeOpenshell(t *testing.T) {
 // ambient GitHub credentials (#5569).
 func useFakeOpenshellProviders(t *testing.T) {
 	t.Helper()
+	t.Setenv("GITHUB_ACTIONS", "false")
 	neutralizeAgentsRepoFallback(t)
 	// ImportProfileVerified keeps a per-id content cache under os.TempDir()
 	// and the providers-stub records imported ids there; isolate both.
@@ -362,11 +371,9 @@ func TestTryLoadFullsendConfig_PerRepoFallback(t *testing.T) {
 	assert.Equal(t, expected, cfg.AllowedResources())
 	require.Len(t, cfg.AgentEntries(), 1)
 	assert.Equal(t, "lint", cfg.AgentEntries()[0].Name)
-	if prc, ok := cfg.(config.PerRepoConfigReader); ok {
-		assert.Equal(t, []string{"triage"}, prc.ConfigRoles())
-	} else {
-		assert.Equal(t, []string{"triage"}, cfg.(config.OrgConfigReader).OrgRepoDefaults().Roles)
-	}
+	prc, ok := cfg.(config.PerRepoConfigReader)
+	require.True(t, ok)
+	assert.Equal(t, []string{"triage"}, prc.ConfigRoles())
 }
 
 func TestTryLoadFullsendConfig_MissingFile(t *testing.T) {
@@ -448,11 +455,9 @@ func TestRequireFullsendConfig_PerRepoFallback(t *testing.T) {
 		"https://raw.githubusercontent.com/fullsend-ai/agents/",
 	}
 	assert.Equal(t, expected, cfg.AllowedResources())
-	if prc, ok := cfg.(config.PerRepoConfigReader); ok {
-		assert.Equal(t, []string{"triage"}, prc.ConfigRoles())
-	} else {
-		assert.Equal(t, []string{"triage"}, cfg.(config.OrgConfigReader).OrgRepoDefaults().Roles)
-	}
+	prc, ok := cfg.(config.PerRepoConfigReader)
+	require.True(t, ok)
+	assert.Equal(t, []string{"triage"}, prc.ConfigRoles())
 }
 
 func TestIsPerRepoYAML(t *testing.T) {
@@ -489,7 +494,7 @@ func TestTryLoadFullsendConfig_PerRepoMalformed(t *testing.T) {
 	assert.Nil(t, cfg)
 }
 
-func TestTryLoadFullsendConfig_OrgConfig(t *testing.T) {
+func TestTryLoadFullsendConfig_PerOrgConfigRejected(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(
@@ -497,22 +502,18 @@ func TestTryLoadFullsendConfig_OrgConfig(t *testing.T) {
 	), 0o644))
 
 	printer := ui.New(io.Discard)
-	cfg := tryLoadFullsendConfig(path, printer)
-	require.NotNil(t, cfg)
-	assert.Equal(t, "github", cfg.(config.OrgConfigReader).DispatchSettings().Platform)
-	expected := []string{
-		"https://example.com/",
-		"https://raw.githubusercontent.com/fullsend-ai/fullsend/",
-		"https://raw.githubusercontent.com/fullsend-ai/agents/",
-	}
-	assert.Equal(t, expected, cfg.AllowedResources())
+	assert.Nil(t, tryLoadFullsendConfig(path, printer))
+
+	_, err := requireFullsendConfig(path, printer)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "per-org configuration format")
 }
 
 func TestTryLoadFullsendConfig_ExplicitEmptyAllowlist(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(
-		"version: \"1\"\ndispatch:\n  platform: github\nallowed_remote_resources: []\n",
+		"version: \"1\"\nallowed_remote_resources: []\n",
 	), 0o644))
 
 	printer := ui.New(io.Discard)
@@ -525,7 +526,7 @@ func TestTryLoadFullsendConfig_OmittedAllowlist(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(
-		"version: \"1\"\ndispatch:\n  platform: github\n",
+		"version: \"1\"\n",
 	), 0o644))
 
 	printer := ui.New(io.Discard)
@@ -553,7 +554,7 @@ func TestRequireFullsendConfig_ExplicitEmptyAllowlist(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(
-		"version: \"1\"\ndispatch:\n  platform: github\nallowed_remote_resources: []\n",
+		"version: \"1\"\nallowed_remote_resources: []\n",
 	), 0o644))
 
 	printer := ui.New(io.Discard)
@@ -576,8 +577,8 @@ func TestRequireFullsendConfig_PerRepoMalformed(t *testing.T) {
 }
 
 func TestRunAgent_MalformedOrgConfig(t *testing.T) {
-	// A malformed config.yaml means no agents can be resolved from config.
-	// Without disk fallback, agent resolution fails.
+	// A malformed config.yaml fails the run with the config load error
+	// before any agent source resolution.
 	useFakeOpenshell(t)
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "harness"), 0o755))
@@ -604,13 +605,13 @@ func TestRunAgent_MalformedOrgConfig(t *testing.T) {
 	repoDir := t.TempDir()
 	err := runAgent(context.Background(), "code", dir, "", repoDir, "", nil, false, "", "", "", rFlags, statusOpts{}, printer, false, runOverrideFlags{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no config and agents-repo fallback unavailable")
+	assert.Contains(t, err.Error(), "loading fullsend config")
 }
 
 func TestRunAgent_MalformedOrgConfigWithURLRefs(t *testing.T) {
 	useFakeOpenshell(t)
-	// A malformed config.yaml means no agents can be resolved from config.
-	// Without disk fallback, agent resolution fails before URL refs are checked.
+	// A malformed config.yaml fails the run with the config load error
+	// before agent resolution and before URL refs are checked.
 	agentHash := fetch.ComputeSHA256([]byte("agent content"))
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "harness"), 0o755))
@@ -631,7 +632,7 @@ func TestRunAgent_MalformedOrgConfigWithURLRefs(t *testing.T) {
 	repoDir := t.TempDir()
 	err := runAgent(context.Background(), "code", dir, "", repoDir, "", nil, false, "", "", "", rFlags, statusOpts{}, printer, false, runOverrideFlags{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no config and agents-repo fallback unavailable")
+	assert.Contains(t, err.Error(), "loading fullsend config")
 }
 
 func TestRunAgent_URLRefsNoOrgConfig(t *testing.T) {
@@ -761,6 +762,141 @@ openshell:
 	assert.NotContains(t, err.Error(), "creating sandbox")
 }
 
+// TestRunAgent_BareBuiltinProviderResolvesEmbeddedDefinitionAndProfile
+// exercises the #7268 path end to end: a harness declares the bare name
+// "vertex-ai" with no local providers/vertex-ai.yaml and no
+// openshell.profiles entry at all. appendEmbeddedProviderDefs must fill in
+// the scaffold's embedded provider definition, and the orchestration loop in
+// runAgent must import the embedded fullsend-vertex-ai profile
+// (ensureEmbeddedProfile) and create the provider — the same way it always
+// has for the bare "openai" name, now generalised to every builtin. Uses
+// recordingProvidersStub (like TestRunAgent_UnlistedProfileDirectoryFileIsNotImported)
+// so the run gets past sandbox creation — the stub fails the first
+// in-sandbox exec on purpose, stopping the run right after.
+func TestRunAgent_BareBuiltinProviderResolvesEmbeddedDefinitionAndProfile(t *testing.T) {
+	logPath := recordingProvidersStub(t)
+
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "harness"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "agents"), 0o755))
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "agents", "code.md"),
+		[]byte("You are a coding agent."),
+		0o644,
+	))
+	// No providers/vertex-ai.yaml on disk and no openshell.profiles entry:
+	// both the provider definition and its profile must come from the
+	// binary's embedded scaffold.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "harness", "code.yaml"),
+		[]byte("agent: agents/code.md\nrole: test\nproviders:\n  - vertex-ai\n"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "config.yaml"),
+		[]byte("agents:\n  - harness/code.yaml\n"),
+		0o644,
+	))
+
+	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	repoDir := t.TempDir()
+	err := runAgent(context.Background(), "code", dir, "", repoDir, "", nil, false, "", "", "", rFlags, statusOpts{}, printer, false, runOverrideFlags{})
+	// The stub cannot bootstrap an agent past sandbox creation, but the run
+	// must get past the provider/profile orchestration steps without error.
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "gateway check failed")
+	assert.NotContains(t, err.Error(), "enabling providers v2")
+	assert.NotContains(t, err.Error(), "importing provider profile")
+	assert.NotContains(t, err.Error(), "ensuring provider")
+	assert.Contains(t, buf.String(), `using the definition shipped with fullsend`, "appendEmbeddedProviderDefs should report the embedded fallback")
+
+	data, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr)
+	log := string(data)
+	assert.Regexp(t, `provider profile import --file \S*fullsend-vertex-ai-\S*\.yaml`, log, "the embedded fullsend-vertex-ai profile must be imported (ensureEmbeddedProfile)")
+	assert.Contains(t, log, "provider create --name vertex-ai --type fullsend-vertex-ai", "the embedded vertex-ai provider definition must be used to create the provider")
+}
+
+// runAgentWithProviderFiles writes a minimal workspace whose harness
+// declares providers and lists openshell.profiles, plus the given files
+// (relative path -> content), runs it against recordingProvidersStub, and
+// returns the stub's argument log and the printer output.
+func runAgentWithProviderFiles(t *testing.T, harnessYAML string, files map[string]string) (dir, log, out string) {
+	t.Helper()
+	logPath := recordingProvidersStub(t)
+	dir = t.TempDir()
+	files["agents/code.md"] = "You are a coding agent."
+	files["harness/code.yaml"] = harnessYAML
+	files["config.yaml"] = "agents:\n  - harness/code.yaml\n"
+	for rel, content := range files {
+		path := filepath.Join(dir, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	}
+	rFlags := resolveFlags{maxDepth: 10, maxResources: 50}
+	var buf bytes.Buffer
+	err := runAgent(context.Background(), "code", dir, "", t.TempDir(), "", nil, false, "", "", "", rFlags, statusOpts{}, ui.New(&buf), false, runOverrideFlags{})
+	// The stub fails the first in-sandbox exec, after provider setup.
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "importing")
+	assert.NotContains(t, err.Error(), "ensuring provider")
+	data, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr)
+	return dir, string(data), buf.String()
+}
+
+// TestRunAgent_ReservedProfileCopyWarnsAndStaysLive: during the warning
+// release, a harness that still lists its own copy of a reserved profile
+// keeps it. The copy is imported, the run warns with the migration, and the
+// embedded copy is not imported over it under the same id (#7268).
+func TestRunAgent_ReservedProfileCopyWarnsAndStaysLive(t *testing.T) {
+	dir, log, out := runAgentWithProviderFiles(t,
+		"agent: agents/code.md\nrole: test\nproviders:\n  - github-ro\nopenshell:\n  profiles:\n    - profiles/fullsend-github-ro.yaml\n",
+		map[string]string{"profiles/fullsend-github-ro.yaml": "id: fullsend-github-ro\ndisplay_name: Repo copy\n"})
+
+	assert.Contains(t, out, `provider profile "fullsend-github-ro" will be rejected in a future release`)
+	assert.Contains(t, out, `declare the bare provider name "github-ro"`)
+	imports := regexp.MustCompile(`provider profile import --file (\S+)`).FindAllStringSubmatch(log, -1)
+	require.Len(t, imports, 1, "only the repo copy is imported; the embedded copy must not replace it: %q", log)
+	assert.Equal(t, filepath.Join(dir, "profiles", "fullsend-github-ro.yaml"), imports[0][1])
+	assert.Contains(t, log, "provider create --name github-ro --type fullsend-github-ro")
+}
+
+// TestRunAgent_ReservedProfileCopyWithoutProviderWarns: a listed copy of a
+// reserved profile that no provider in the run uses is still imported and
+// still warned about (#7268).
+func TestRunAgent_ReservedProfileCopyWithoutProviderWarns(t *testing.T) {
+	dir, log, out := runAgentWithProviderFiles(t,
+		"agent: agents/code.md\nrole: test\nproviders:\n  - vertex-ai\nopenshell:\n  profiles:\n    - profiles/fullsend-gitleaks.yaml\n",
+		map[string]string{"profiles/fullsend-gitleaks.yaml": "id: fullsend-gitleaks\ndisplay_name: Repo copy\n"})
+
+	assert.Contains(t, out, `provider profile "fullsend-gitleaks" will be rejected in a future release`)
+	assert.Contains(t, log, "provider profile import --file "+filepath.Join(dir, "profiles", "fullsend-gitleaks.yaml"))
+	assert.Regexp(t, `provider profile import --file \S*fullsend-vertex-ai-\S*\.yaml`, log, "the unlisted reserved profile still comes from the embed")
+}
+
+// TestRunAgent_CustomNamedProviderOverrideWins: a provider and profile under
+// the operator's own name are used as written, with no reservation warning
+// and no embedded profile import (#7268).
+func TestRunAgent_CustomNamedProviderOverrideWins(t *testing.T) {
+	dir, log, out := runAgentWithProviderFiles(t,
+		"agent: agents/code.md\nrole: test\nproviders:\n  - myorg-github-ro\nopenshell:\n  profiles:\n    - profiles/myorg-github-ro.yaml\n",
+		map[string]string{
+			"providers/myorg-github-ro.yaml": "name: myorg-github-ro\ntype: myorg-github-ro\n",
+			"profiles/myorg-github-ro.yaml":  "id: myorg-github-ro\ndisplay_name: My org GitHub RO\n",
+		})
+
+	assert.NotContains(t, out, "reserved")
+	assert.NotContains(t, out, "future release")
+	imports := regexp.MustCompile(`provider profile import --file (\S+)`).FindAllStringSubmatch(log, -1)
+	require.Len(t, imports, 1, "%q", log)
+	assert.Equal(t, filepath.Join(dir, "profiles", "myorg-github-ro.yaml"), imports[0][1])
+	assert.Contains(t, log, "provider create --name myorg-github-ro --type myorg-github-ro")
+}
+
 // TestRunAgent_UnlistedProfileDirectoryFileIsNotImported guards the #7095
 // fix: an unlisted file under the fullsend dir's profiles/ directory must
 // never be scanned or imported, even when it shares an id with a profile
@@ -858,8 +994,8 @@ func TestRunAgent_URLBaseNoAllowlist(t *testing.T) {
 
 func TestRunAgent_URLBaseMalformedOrgConfig(t *testing.T) {
 	useFakeOpenshell(t)
-	// Malformed config.yaml means no agents can be resolved from config.
-	// Without disk fallback, agent resolution fails before URL base is checked.
+	// Malformed config.yaml fails the run with the config load error
+	// before agent resolution and before URL base is checked.
 	baseContent := []byte("agent: agents/shared.md\n")
 	baseHash := fetch.ComputeSHA256(baseContent)
 
@@ -882,7 +1018,7 @@ func TestRunAgent_URLBaseMalformedOrgConfig(t *testing.T) {
 	repoDir := t.TempDir()
 	err := runAgent(context.Background(), "code", dir, "", repoDir, "", nil, false, "", "", "", rFlags, statusOpts{}, printer, false, runOverrideFlags{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no config and agents-repo fallback unavailable")
+	assert.Contains(t, err.Error(), "loading fullsend config")
 }
 
 func TestBuildScanContextCommand_SourcesEnv(t *testing.T) {
@@ -1138,14 +1274,14 @@ func TestResolveAgentSource_ConfigLocalPath(t *testing.T) {
 		0o644,
 	))
 
-	orgCfg := config.NewOrgConfig(nil, nil, nil, "", "")
-	orgCfg.SetAgents([]config.AgentEntry{
+	cfg := config.NewPerRepoConfig(nil, "")
+	cfg.SetAgents([]config.AgentEntry{
 		{Source: "harness/custom.yaml"},
 	})
-	orgCfg.SetAllowedRemoteResources([]string{"https://example.com/"})
+	cfg.SetAllowedRemoteResources([]string{"https://example.com/"})
 
 	printer := ui.New(io.Discard)
-	path, deps, err := resolveAgentSource(context.Background(), dir, "custom", nil, orgCfg, harness.ComposeOpts{}, printer)
+	path, deps, err := resolveAgentSource(context.Background(), dir, "custom", nil, cfg, harness.ComposeOpts{}, printer)
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(dir, "harness", "custom.yaml"), path)
 	assert.Empty(t, deps)
@@ -1155,14 +1291,14 @@ func TestResolveAgentSource_ConfigLocalPathNotFound(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "harness"), 0o755))
 
-	orgCfg := config.NewOrgConfig(nil, nil, nil, "", "")
-	orgCfg.SetAgents([]config.AgentEntry{
+	cfg := config.NewPerRepoConfig(nil, "")
+	cfg.SetAgents([]config.AgentEntry{
 		{Source: "harness/missing.yaml"},
 	})
-	orgCfg.SetAllowedRemoteResources([]string{"https://example.com/"})
+	cfg.SetAllowedRemoteResources([]string{"https://example.com/"})
 
 	printer := ui.New(io.Discard)
-	_, _, err := resolveAgentSource(context.Background(), dir, "missing", nil, orgCfg, harness.ComposeOpts{}, printer)
+	_, _, err := resolveAgentSource(context.Background(), dir, "missing", nil, cfg, harness.ComposeOpts{}, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `config agent "missing"`)
 }
@@ -1170,14 +1306,14 @@ func TestResolveAgentSource_ConfigLocalPathNotFound(t *testing.T) {
 func TestResolveAgentSource_ConfigLocalPathAbsoluteRejected(t *testing.T) {
 	dir := t.TempDir()
 
-	orgCfg := config.NewOrgConfig(nil, nil, nil, "", "")
-	orgCfg.SetAgents([]config.AgentEntry{
+	cfg := config.NewPerRepoConfig(nil, "")
+	cfg.SetAgents([]config.AgentEntry{
 		{Source: "/etc/evil.yaml"},
 	})
-	orgCfg.SetAllowedRemoteResources([]string{"https://example.com/"})
+	cfg.SetAllowedRemoteResources([]string{"https://example.com/"})
 
 	printer := ui.New(io.Discard)
-	_, _, err := resolveAgentSource(context.Background(), dir, "evil", nil, orgCfg, harness.ComposeOpts{}, printer)
+	_, _, err := resolveAgentSource(context.Background(), dir, "evil", nil, cfg, harness.ComposeOpts{}, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "absolute paths")
 }
@@ -1185,14 +1321,14 @@ func TestResolveAgentSource_ConfigLocalPathAbsoluteRejected(t *testing.T) {
 func TestResolveAgentSource_ConfigLocalPathTraversalRejected(t *testing.T) {
 	dir := t.TempDir()
 
-	orgCfg := config.NewOrgConfig(nil, nil, nil, "", "")
-	orgCfg.SetAgents([]config.AgentEntry{
+	cfg := config.NewPerRepoConfig(nil, "")
+	cfg.SetAgents([]config.AgentEntry{
 		{Source: "harness/../../etc/passwd"},
 	})
-	orgCfg.SetAllowedRemoteResources([]string{"https://example.com/"})
+	cfg.SetAllowedRemoteResources([]string{"https://example.com/"})
 
 	printer := ui.New(io.Discard)
-	_, _, err := resolveAgentSource(context.Background(), dir, "passwd", nil, orgCfg, harness.ComposeOpts{}, printer)
+	_, _, err := resolveAgentSource(context.Background(), dir, "passwd", nil, cfg, harness.ComposeOpts{}, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "path traversal")
 }
@@ -1240,13 +1376,13 @@ func TestResolveAgentSource_DisabledAgentBlocksFallback(t *testing.T) {
 	))
 
 	f := false
-	orgCfg := config.NewOrgConfig(nil, nil, nil, "", "")
-	orgCfg.SetAgents([]config.AgentEntry{
+	cfg := config.NewPerRepoConfig(nil, "")
+	cfg.SetAgents([]config.AgentEntry{
 		{Name: "triage", Enabled: &f},
 	})
 
 	printer := ui.New(io.Discard)
-	_, _, err := resolveAgentSource(context.Background(), dir, "triage", nil, orgCfg, harness.ComposeOpts{}, printer)
+	_, _, err := resolveAgentSource(context.Background(), dir, "triage", nil, cfg, harness.ComposeOpts{}, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "explicitly disabled")
 }
@@ -1262,14 +1398,14 @@ func TestResolveAgentSource_DisabledFirstPartyAgentBlocksFallback(t *testing.T) 
 	))
 
 	f := false
-	orgCfg := config.NewOrgConfig(nil, nil, nil, "", "")
-	orgCfg.SetAgents([]config.AgentEntry{
+	cfg := config.NewPerRepoConfig(nil, "")
+	cfg.SetAgents([]config.AgentEntry{
 		{Name: "retro", Enabled: &f},
 	})
 
 	fakeClient := forge.NewFakeClient()
 	printer := ui.New(io.Discard)
-	_, _, err := resolveAgentSource(context.Background(), dir, "retro", fakeClient, orgCfg, harness.ComposeOpts{}, printer)
+	_, _, err := resolveAgentSource(context.Background(), dir, "retro", fakeClient, cfg, harness.ComposeOpts{}, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "explicitly disabled")
 }
@@ -1285,13 +1421,13 @@ func TestResolveAgentSource_SuppressionOnlyEntryBlocksFallback(t *testing.T) {
 
 	// Suppression-only entry: enabled=false, no source.
 	f := false
-	orgCfg := config.NewOrgConfig(nil, nil, nil, "", "")
-	orgCfg.SetAgents([]config.AgentEntry{
+	cfg := config.NewPerRepoConfig(nil, "")
+	cfg.SetAgents([]config.AgentEntry{
 		{Name: "retro", Enabled: &f},
 	})
 
 	printer := ui.New(io.Discard)
-	_, _, err := resolveAgentSource(context.Background(), dir, "retro", nil, orgCfg, harness.ComposeOpts{}, printer)
+	_, _, err := resolveAgentSource(context.Background(), dir, "retro", nil, cfg, harness.ComposeOpts{}, printer)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "explicitly disabled")
 }
@@ -1306,13 +1442,13 @@ func TestResolveAgentSource_EnabledAgentStillResolves(t *testing.T) {
 	))
 
 	tr := true
-	orgCfg := config.NewOrgConfig(nil, nil, nil, "", "")
-	orgCfg.SetAgents([]config.AgentEntry{
+	cfg := config.NewPerRepoConfig(nil, "")
+	cfg.SetAgents([]config.AgentEntry{
 		{Name: "custom", Source: "harness/custom.yaml", Enabled: &tr},
 	})
 
 	printer := ui.New(io.Discard)
-	path, _, err := resolveAgentSource(context.Background(), dir, "custom", nil, orgCfg, harness.ComposeOpts{}, printer)
+	path, _, err := resolveAgentSource(context.Background(), dir, "custom", nil, cfg, harness.ComposeOpts{}, printer)
 	require.NoError(t, err)
 	assert.Contains(t, path, "custom.yaml")
 }
@@ -2240,6 +2376,8 @@ func TestReservedSandboxKeys_IncludesOIDCVars(t *testing.T) {
 		"ACTIONS_ID_TOKEN_REQUEST_TOKEN",
 		"FULLSEND_GCP_OIDC_URL",
 		"FULLSEND_GCP_OIDC_AUTH_FILE",
+		"FULLSEND_GCP_PROJECT_ID",
+		"FULLSEND_GCP_WIF_PROVIDER",
 	} {
 		assert.True(t, reservedSandboxKeys[key], "reservedSandboxKeys must include %s", key)
 	}
@@ -2361,18 +2499,55 @@ func TestOIDCDenyKeys_Completeness(t *testing.T) {
 		"ACTIONS_ID_TOKEN_REQUEST_TOKEN",
 		"FULLSEND_GCP_OIDC_URL",
 		"FULLSEND_GCP_OIDC_AUTH_FILE",
+		"FULLSEND_GCP_PROJECT_ID",
+		"FULLSEND_GCP_WIF_PROVIDER",
 		// OpenAI WIF configuration (#6689)
 		"FULLSEND_OPENAI_AUDIENCE",
 		"FULLSEND_OPENAI_IDENTITY_PROVIDER_ID",
 		"FULLSEND_OPENAI_SERVICE_ACCOUNT_ID",
 		// The static key of a local run must not be expandable under any name.
 		"OPENAI_API_KEY",
+		// The GitLab CI/CD variable carrying the real key must stay runner-only.
+		"FULLSEND_OPENAI_API_KEY",
+		// The GitLab webhook fast-path credentials must stay runner-only.
+		"FULLSEND_TRIGGER_TOKEN",
+		"FULLSEND_WEBHOOK_SECRET",
 	}
 	for _, key := range expected {
 		assert.True(t, oidcDenyKeys[key], "oidcDenyKeys must include %s", key)
 	}
 	assert.Len(t, oidcDenyKeys, len(expected), "oidcDenyKeys must contain exactly %d keys", len(expected))
 	assert.False(t, oidcDenyKeys[workflowTokenEnv], "GH_WORKFLOW_TOKEN must stay expandable by provider credentials (#6649)")
+}
+
+// TestGitLabWebhookCredentials_RunnerOnly checks each webhook fast-path
+// credential independently: neither may reach host-side scripts, validation
+// commands, harness ${VAR} expansion, or sandbox injection, even if GitLab
+// injected the protected variable into the runner process.
+func TestGitLabWebhookCredentials_RunnerOnly(t *testing.T) {
+	for _, key := range []string{forge.SecretTriggerToken, forge.SecretWebhookSecret} {
+		t.Run(key, func(t *testing.T) {
+			const value = "webhook-credential-value"
+			t.Setenv(key, value)
+
+			assert.True(t, oidcDenyKeys[key])
+			assert.True(t, harnessExpansionDenied(key))
+			assert.True(t, reservedSandboxKeys[key], "env.sandbox must not inject %s", key)
+
+			for _, e := range childScriptEnv(map[string]string{key: value}, "") {
+				assert.False(t, strings.HasPrefix(e, key+"="), "childScriptEnv must strip %s from host-side scripts", key)
+			}
+			for _, e := range stripOIDCEnv(append(os.Environ(), key+"="+value)) {
+				assert.False(t, strings.HasPrefix(e, key+"="), "the validation environment must strip %s", key)
+			}
+
+			assert.Empty(t, harnessEnvExpand(key))
+			_, ok := harnessEnvLookup(key)
+			assert.False(t, ok, "harness validation must reject a reference to %s", key)
+			assert.NotContains(t, safeExpandEnv("prefix-${"+key+"}-suffix"), value)
+			assert.NotContains(t, shellSafeExpandEnv("prefix-${"+key+"}-suffix"), value)
+		})
+	}
 }
 
 func TestProviderOnlyKeys_WorkflowToken(t *testing.T) {
@@ -2587,6 +2762,28 @@ func TestRefreshOIDCToken_FetchSucceedsSCPFails(t *testing.T) {
 	err := refreshOIDCToken(context.Background(), "nonexistent-sandbox", srv.URL, "bearer test-auth")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "copying token to sandbox")
+}
+
+// Each refreshed token is masked in the Actions log before it is used.
+func TestRefreshOIDCToken_MasksTokenOnActions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"value":"refreshed-oidc-jwt"}`)
+	}))
+	defer srv.Close()
+
+	for _, actions := range []string{"true", "false"} {
+		t.Run("GITHUB_ACTIONS="+actions, func(t *testing.T) {
+			t.Setenv("GITHUB_ACTIONS", actions)
+			stderr := captureStderr(t, func() {
+				_ = refreshOIDCToken(context.Background(), "nonexistent-sandbox", srv.URL, "bearer test-auth")
+			})
+			if actions == "true" {
+				assert.Contains(t, stderr, "::add-mask::refreshed-oidc-jwt")
+			} else {
+				assert.NotContains(t, stderr, "::add-mask::")
+			}
+		})
+	}
 }
 
 func TestRefreshOIDCToken_HTTPError(t *testing.T) {
@@ -3796,6 +3993,62 @@ roles:
 	assert.Contains(t, err.Error(), "config.forge")
 	assert.Contains(t, err.Error(), "gihub")
 	assert.Contains(t, err.Error(), "not a valid forge platform")
+}
+
+func TestResolvePlaybackForgeClient_GitHubBuildsFromCurrentCredential(t *testing.T) {
+	// fallbackForgeClient is built once, early in Run, from the pre-mint
+	// token. resolvePlaybackForgeClient is called later, after the agent
+	// token has been minted and GH_TOKEN replaced (mintAgentTokenAtLevel).
+	// It must pick up the *current* GH_TOKEN rather than reusing the
+	// stale fallback -- otherwise tracking-comment reads/updates run with
+	// the pre-mint credential even though minting succeeded.
+	t.Setenv("GH_TOKEN", "runtime-mint-token")
+	t.Setenv("GITHUB_TOKEN", "")
+	fallback := gh.New("pre-mint-token")
+	printer := ui.New(io.Discard)
+
+	client := resolvePlaybackForgeClient("github", fallback, printer)
+	require.NotNil(t, client)
+	assert.NotSame(t, fallback, client, "must build a fresh client from the current credential, not reuse the pre-mint fallback")
+
+	// Empty forge platform defaults to the GitHub path too, matching
+	// dummy_playback.go's repoFromEnv default-to-GitHub convention.
+	client = resolvePlaybackForgeClient("", fallback, printer)
+	require.NotNil(t, client)
+	assert.NotSame(t, fallback, client)
+}
+
+func TestResolvePlaybackForgeClient_GitHubFallsBackWhenCredentialUnresolvable(t *testing.T) {
+	// If the current credential cannot be resolved at all (env vars unset
+	// and `gh auth token` unavailable), degrade to the pre-mint fallback
+	// client with a warning rather than losing tracking entirely.
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("PATH", "/nonexistent")
+	fallback := gh.New("pre-mint-token")
+	printer := ui.New(io.Discard)
+
+	client := resolvePlaybackForgeClient("github", fallback, printer)
+	assert.Same(t, fallback, client)
+}
+
+func TestResolvePlaybackForgeClient_GitLabBuildsFromEnv(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "glpat-test-token")
+	fallback := gh.New("token")
+	printer := ui.New(io.Discard)
+
+	client := resolvePlaybackForgeClient("gitlab", fallback, printer)
+	require.NotNil(t, client)
+	assert.NotSame(t, fallback, client)
+}
+
+func TestResolvePlaybackForgeClient_GitLabMissingTokenWarnsAndReturnsNil(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	fallback := gh.New("token")
+	printer := ui.New(io.Discard)
+
+	client := resolvePlaybackForgeClient("gitlab", fallback, printer)
+	assert.Nil(t, client)
 }
 
 func TestRunCommand_HasForgeFlag(t *testing.T) {
@@ -6931,8 +7184,7 @@ func TestRunAgent_MintTokenError(t *testing.T) {
 
 // TestRunAgent_GitLabSkipsMint verifies that mintAgentToken is not called
 // when --forge=gitlab. Minting is GitHub-only; on GitLab the registered
-// role credential (shared token while the migration gate is disabled)
-// serves as the push/API token. #6865 #7499.
+// role credential serves as the push/API token. #6865 #7499.
 func TestRunAgent_GitLabSkipsMint(t *testing.T) {
 	useFakeOpenshell(t)
 	dir := t.TempDir()
@@ -6966,7 +7218,9 @@ func TestRunAgent_GitLabSkipsMint(t *testing.T) {
 	t.Setenv("FULLSEND_MINT_URL", "https://mint.example.com")
 	t.Setenv("REPO_FULL_NAME", "org/my-repo")
 	t.Setenv(forge.SecretForgeToken, "glpat-test-shared")
-	t.Setenv(forge.VarGitLabRoleMigration, "")
+	t.Setenv(forge.SecretGitLabPollerToken, "glpat-test-poller")
+	t.Setenv(forge.SecretGitLabAnalystToken, "glpat-test-analyst")
+	t.Setenv(forge.SecretGitLabCoderToken, "glpat-test-coder")
 	t.Setenv(forge.VarGitLabRoleRegistry, "")
 
 	var buf bytes.Buffer
@@ -6983,15 +7237,10 @@ func TestRunAgent_GitLabSkipsMint(t *testing.T) {
 	assert.NotContains(t, buf.String(), "glpat-")
 }
 
-// TestRunAgent_GitLabMissingSharedFallsBackWhenDisabled verifies the
-// backward-compatibility fix from the review on PR #7510: before this PR,
-// `fullsend run --forge gitlab` was a no-op when migration is
-// disabled/rollback, leaving a directly-set GITLAB_TOKEN untouched. This
-// PR made GitLab credential routing unconditional, which broke that case
-// by hard-failing when FULLSEND_FORGE_TOKEN is absent even though
-// GITLAB_TOKEN is already set (the documented local-run workflow). The
-// fallback must restore the no-op so this keeps working.
-func TestRunAgent_GitLabMissingSharedFallsBackWhenDisabled(t *testing.T) {
+// TestRunAgent_GitLabMissingRoleFailsClosed verifies leftover disabled
+// gates no longer fall back to a directly-set GITLAB_TOKEN. Runtime
+// authentication requires the registered role secret.
+func TestRunAgent_GitLabMissingRoleFailsClosed(t *testing.T) {
 	useFakeOpenshell(t)
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "harness"), 0o755))
@@ -7015,7 +7264,6 @@ func TestRunAgent_GitLabMissingSharedFallsBackWhenDisabled(t *testing.T) {
 
 	t.Setenv("REPO_FULL_NAME", "org/my-repo")
 	t.Setenv(forge.SecretForgeToken, "")
-	t.Setenv(forge.VarGitLabRoleMigration, "")
 	t.Setenv(forge.VarGitLabRoleRegistry, "")
 	t.Setenv("GITLAB_TOKEN", "glpat-preset-by-user")
 
@@ -7025,12 +7273,11 @@ func TestRunAgent_GitLabMissingSharedFallsBackWhenDisabled(t *testing.T) {
 	repoDir := t.TempDir()
 	err := runAgent(context.Background(), "code", dir, "", repoDir, "", nil, false, "", "gitlab", "", rFlags, statusOpts{}, printer, false, runOverrideFlags{})
 
-	// Expect error from openshell (later in the run), not from GitLab
-	// credential resolution.
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "openshell")
-	assert.Contains(t, buf.String(), "FULLSEND_FORGE_TOKEN is not set")
-	assert.Equal(t, "glpat-preset-by-user", os.Getenv("GITLAB_TOKEN"), "a directly-set GITLAB_TOKEN must survive the fallback")
+	assert.ErrorIs(t, err, gitlabroles.ErrUnconfigured)
+	assert.Contains(t, err.Error(), forge.SecretGitLabCoderToken)
+	assert.NotContains(t, buf.String(), "FULLSEND_FORGE_TOKEN is not set")
+	assert.NotContains(t, err.Error(), "openshell")
 }
 
 // TestRunAgent_SetsEnvFromFlags verifies that run.go exports TARGET_REPO_DIR,
@@ -7136,77 +7383,6 @@ func TestRunAgent_StatusNotifierSetup(t *testing.T) {
 	assert.Contains(t, err.Error(), "openshell")
 }
 
-func TestResolveBackendFromConfigData_OrgConfig(t *testing.T) {
-	t.Parallel()
-
-	data := []byte(`version: "1"
-dispatch:
-  platform: github-actions
-defaults:
-  roles: [triage]
-  runtime: dummy
-repos:
-  widget:
-    enabled: true
-`)
-	backend, err := resolveBackendFromConfigData(data, "")
-	require.NoError(t, err)
-	assert.Equal(t, "dummy", backend.Runtime.Name())
-}
-
-func TestResolveBackendFromConfigData_PerRepoConfig(t *testing.T) {
-	t.Parallel()
-
-	cfg := config.NewPerRepoConfig(config.PerRepoDefaultRoles(), "acme/test-repo")
-	cfg.SetRuntime("dummy")
-	data, err := cfg.Marshal()
-	require.NoError(t, err)
-
-	backend, err := resolveBackendFromConfigData(data, "")
-	require.NoError(t, err)
-	assert.Equal(t, "dummy", backend.Runtime.Name())
-}
-
-func TestResolveBackendFromConfigData_Invalid(t *testing.T) {
-	t.Parallel()
-
-	_, err := resolveBackendFromConfigData([]byte("not: [valid: yaml"), "")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "parsing config for runtime selection")
-}
-
-func TestResolveBackendFromConfigData_UnknownRuntime(t *testing.T) {
-	t.Parallel()
-
-	data := []byte(`version: "1"
-dispatch:
-  platform: github-actions
-defaults:
-  roles: [triage]
-  runtime: nonexistent
-repos:
-  widget:
-    enabled: true
-`)
-	_, err := resolveBackendFromConfigData(data, "")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "resolving runtime")
-}
-
-func TestIsOrgConfigData(t *testing.T) {
-	t.Parallel()
-
-	perRepo := config.NewPerRepoConfig(config.PerRepoDefaultRoles(), "acme/test-repo")
-	perRepoData, err := perRepo.Marshal()
-	require.NoError(t, err)
-	assert.False(t, isOrgConfigData(perRepoData))
-
-	org := config.NewOrgConfig([]string{"widget"}, []string{"widget"}, config.DefaultAgentRoles(), "", "acme")
-	orgData, err := org.Marshal()
-	require.NoError(t, err)
-	assert.True(t, isOrgConfigData(orgData))
-}
-
 func TestBackendFromConfigFile_MissingUsesDefault(t *testing.T) {
 	t.Parallel()
 
@@ -7267,12 +7443,36 @@ func TestBackendFromConfigFile_ResolveError(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+	data := []byte("version: \"1\"\nroles: [triage]\nruntime: nonexistent\n")
+	path := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+
+	_, _, err := backendFromConfigFile(path, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolving runtime")
+}
+
+func TestBackendFromConfigFile_InvalidYAML(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("not: [valid: yaml"), 0o644))
+
+	_, _, err := backendFromConfigFile(path, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing config for runtime selection")
+}
+
+func TestBackendFromConfigFile_PerOrgConfigRejected(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
 	data := []byte(`version: "1"
 dispatch:
   platform: github-actions
 defaults:
   roles: [triage]
-  runtime: nonexistent
+  runtime: dummy
 repos:
   widget:
     enabled: true
@@ -7282,28 +7482,8 @@ repos:
 
 	_, _, err := backendFromConfigFile(path, "")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "resolving runtime")
-}
-
-func TestIsOrgConfigData_InvalidYAML(t *testing.T) {
-	t.Parallel()
-
-	assert.False(t, isOrgConfigData([]byte("not: [valid")))
-}
-
-func TestIsOrgConfigData_HeaderlessPerRepoByStructure(t *testing.T) {
-	t.Parallel()
-
-	// Hand-edited per-repo config without the header comment.
-	data := []byte("version: \"1\"\nroles:\n  - triage\n")
-	assert.False(t, isOrgConfigData(data))
-}
-
-func TestIsOrgConfigData_HeaderlessOrgByStructure(t *testing.T) {
-	t.Parallel()
-
-	data := []byte("version: \"1\"\ndefaults:\n  roles:\n    - triage\nrepos:\n  widget:\n    enabled: true\n")
-	assert.True(t, isOrgConfigData(data))
+	assert.Contains(t, err.Error(), "parsing config for runtime selection")
+	assert.Contains(t, err.Error(), "per-org configuration format")
 }
 
 func TestDefaultAllowlistCoversAgentsRepoFallback(t *testing.T) {

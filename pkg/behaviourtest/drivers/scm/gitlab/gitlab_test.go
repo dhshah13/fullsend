@@ -289,6 +289,49 @@ func TestSubmitPullRequestReview_CreateReviewError(t *testing.T) {
 	}
 }
 
+func TestListPullRequestReviews(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.PullRequestHeadSHA = "abc123"
+	d := New(fc)
+
+	if err := d.SubmitPullRequestReview(context.Background(), "owner", "repo", 1, "APPROVE"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	reviews, err := d.ListPullRequestReviews(context.Background(), "owner", "repo", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(reviews) != 1 || reviews[0].State != "APPROVE" {
+		t.Fatalf("expected 1 APPROVE review, got %+v", reviews)
+	}
+}
+
+func TestListPullRequestCommits(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.PRCommits = map[string][]string{"owner/repo/1": {"first", "second"}}
+	d := New(fc)
+
+	shas, err := d.ListPullRequestCommits(context.Background(), "owner", "repo", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(shas) != 2 || shas[0] != "first" || shas[1] != "second" {
+		t.Fatalf("expected [first second], got %v", shas)
+	}
+}
+
+func TestListPullRequestReviews_Error(t *testing.T) {
+	fc := forge.NewFakeClient()
+	fc.Errors["ListPullRequestReviews"] = errors.New("list failed")
+	d := New(fc)
+
+	_, err := d.ListPullRequestReviews(context.Background(), "owner", "repo", 1)
+	if err == nil {
+		t.Fatal("expected error when ListPullRequestReviews fails")
+	}
+}
+
 func TestParseRepo_Success(t *testing.T) {
 	owner, repo, err := ParseRepo("acme/widget")
 	if err != nil {
