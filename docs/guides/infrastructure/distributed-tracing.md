@@ -242,9 +242,9 @@ result whose call was never reported (its stream line was skipped) is a
 near-zero-duration span marked `fullsend.tool.unmatched`. Runtimes whose parsers
 emit no call ids (pi, codex) produce no `execute_tool` spans, and neither
 do server-side tools, whose result never arrives as a `tool_result`. Tool
-names and call ids pass through the output pipeline span content gets (Unicode
-normalization, then secret redaction; the collector's runner environment
-pass is not applied to them): a name is redacted in place and
+names and call ids get the redaction span content gets (runner environment
+and provider-only values, Unicode normalization, secret redaction, then
+those values again): a name is redacted in place and
 bounded to 256 bytes for the attribute and 128 for the span name; an id with
 any finding is dropped from the span. At most 1,024 `execute_tool`
 spans are recorded per iteration; calls past that are counted in

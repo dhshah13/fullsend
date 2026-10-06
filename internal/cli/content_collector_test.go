@@ -416,20 +416,20 @@ func TestContentCollector_ReplacesProviderOnlyValuesFromTheProcessEnv(t *testing
 	assert.Equal(t, 2, runnerEnvFindings(res), "counted like a runner env value")
 }
 
-func TestReplaceProviderOnlySecrets(t *testing.T) {
-	t.Setenv(workflowTokenEnv, "abcdefgh")
-	got, keys := replaceProviderOnlySecrets("x abcdefgh y")
-	assert.Equal(t, "x [REDACTED:"+workflowTokenEnv+"] y", got)
-	assert.Equal(t, []string{workflowTokenEnv}, keys)
-
-	got, keys = replaceProviderOnlySecrets("nothing here")
-	assert.Equal(t, "nothing here", got)
-	assert.Empty(t, keys, "a value absent from the text is not reported")
-
-	t.Setenv(workflowTokenEnv, "abcdefg") // under minRedactableSecretLen
-	got, keys = replaceProviderOnlySecrets("x abcdefg y")
-	assert.Equal(t, "x abcdefg y", got)
-	assert.Empty(t, keys)
+func TestContentCollector_SecretNamedChecksSeeNormalizedText(t *testing.T) {
+	// The key and the value are judged as the normalizer writes them: a
+	// fullwidth key names a secret once folded, and four ligatures are
+	// eight characters once folded.
+	for name, tc := range map[string]struct{ args, want string }{
+		"fullwidth key over an array": {`{"\uFF50\uFF41\uFF53\uFF53\uFF57\uFF4F\uFF52\uFF44":["opaque-credential-123"]}`, `{"password":["***"]}`},
+		"value folded past the floor": {`{"password":"\uFB01\uFB01\uFB01\uFB01"}`, `{"password":"***"}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(4096)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: tc.args})
+			assert.Contains(t, c.Result("stop").OutputMessages, `"arguments":`+tc.want)
+		})
+	}
 }
 
 func TestContentCollector_ReplacesBothValuesWhenRunnerEnvReusesAProviderOnlyName(t *testing.T) {

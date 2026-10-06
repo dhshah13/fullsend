@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"net/http"
 	"os"
@@ -2423,6 +2422,7 @@ func runAgent(ctx context.Context, agentName, fullsendDir, outputBase, targetRep
 		collector := newContentCollectorIfEnabled(h.RunnerEnv)
 		collector.attachInput(agentSpan, agentPrompt)
 		toolSpans := newToolSpanTracker(tracer, agentCtx)
+		toolSpans.runnerEnv = h.RunnerEnv
 		var metrics agentruntime.RunMetrics
 		hooksSettings := ""
 		if h.SecurityEnabled() {
@@ -3629,11 +3629,10 @@ const minRedactableSecretLen = 8
 // never passed through our env (a key baked into a fixture, a hook printing
 // its own).
 func redactFeedback(feedback string, runnerEnv map[string]string) string {
+	// Provider-only keys live in the process environment, not RunnerEnv;
+	// replaceEnvSecrets redacts their literals in the same pass so they
+	// cannot reach the agent prompt or the uploaded run directory (#6649).
 	feedback, _ = replaceEnvSecrets(feedback, runnerEnv)
-	// Provider-only keys live in the process environment, not RunnerEnv.
-	// Redact their literals the same way so they cannot reach the agent
-	// prompt or the uploaded run directory (#6649).
-	feedback, _ = replaceProviderOnlySecrets(feedback)
 	// ScanResult.Sanitized is empty when the scanner changed nothing, so the
 	// original text is the fallback — not an empty prompt.
 	if res := security.NewSecretRedactor().Scan(feedback); res.Sanitized != "" {
@@ -3643,38 +3642,35 @@ func redactFeedback(feedback string, runnerEnv map[string]string) string {
 }
 
 // replaceEnvSecrets is the literal pass: the value of each sensitive runner
-// env key, when it holds minRedactableSecretLen bytes or more and occurs in
-// text, becomes [REDACTED:<key>]. It returns the keys
-// it replaced. Longer values go first, then key order: a value that
-// contains another is replaced whole, and the text is the same on every run.
+// env key, and of each providerOnlyKeys entry in the process environment
+// (kept out of RunnerEnv, #6649), when it holds minRedactableSecretLen bytes
+// or more and occurs in text, becomes [REDACTED:<key>]. It returns the keys
+// it replaced. Both sources go in one pass, longer values first, then key
+// order: a value that contains another is replaced whole, whichever source
+// holds it, and the text is the same on every run.
 func replaceEnvSecrets(text string, runnerEnv map[string]string) (string, []string) {
-	var replaced []string
-	for _, key := range slices.SortedFunc(maps.Keys(runnerEnv), func(a, b string) int {
-		return cmp.Or(cmp.Compare(len(runnerEnv[b]), len(runnerEnv[a])), cmp.Compare(a, b))
-	}) {
-		value := runnerEnv[key]
-		if len(value) < minRedactableSecretLen || !sensitiveEnvKey(key) || !strings.Contains(text, value) {
-			continue
+	type literal struct{ key, value string }
+	var literals []literal
+	for key, value := range runnerEnv {
+		if len(value) >= minRedactableSecretLen && sensitiveEnvKey(key) {
+			literals = append(literals, literal{key, value})
 		}
-		text = strings.ReplaceAll(text, value, "[REDACTED:"+key+"]")
-		replaced = append(replaced, key)
 	}
-	return text, replaced
-}
-
-// replaceProviderOnlySecrets is the literal pass over providerOnlyKeys,
-// whose values live in the process environment, not RunnerEnv (#6649):
-// each value of minRedactableSecretLen bytes or more that occurs in text
-// becomes [REDACTED:<key>]. It returns the keys it replaced, in key order.
-func replaceProviderOnlySecrets(text string) (string, []string) {
+	for key := range providerOnlyKeys {
+		if value := os.Getenv(key); len(value) >= minRedactableSecretLen {
+			literals = append(literals, literal{key, value})
+		}
+	}
+	slices.SortFunc(literals, func(a, b literal) int {
+		return cmp.Or(cmp.Compare(len(b.value), len(a.value)), cmp.Compare(a.key, b.key), cmp.Compare(a.value, b.value))
+	})
 	var replaced []string
-	for _, key := range slices.Sorted(maps.Keys(providerOnlyKeys)) {
-		value := os.Getenv(key)
-		if len(value) < minRedactableSecretLen || !strings.Contains(text, value) {
+	for _, l := range literals {
+		if !strings.Contains(text, l.value) {
 			continue
 		}
-		text = strings.ReplaceAll(text, value, "[REDACTED:"+key+"]")
-		replaced = append(replaced, key)
+		text = strings.ReplaceAll(text, l.value, "[REDACTED:"+l.key+"]")
+		replaced = append(replaced, l.key)
 	}
 	return text, replaced
 }

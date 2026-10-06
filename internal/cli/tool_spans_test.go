@@ -82,6 +82,29 @@ func TestToolSpanTracker_PairEmitsExecuteToolChild(t *testing.T) {
 	assert.Empty(t, tr.open, "an answered call must not stay open (Finish would re-end it, and the map would grow per call)")
 }
 
+func TestToolSpanTracker_ReplacesRunnerEnvValuesInNamesAndDropsIDs(t *testing.T) {
+	const runnerValue, workflowValue = "runner-only-opaque-value", "workflow-only-opaque-value"
+	t.Setenv(workflowTokenEnv, workflowValue)
+	tr, rec, _ := toolSpanFixture(t)
+	tr.runnerEnv = map[string]string{"PUSH_TOKEN": runnerValue}
+
+	for _, value := range []string{runnerValue, workflowValue} {
+		tr.Handle(agentruntime.ToolUseEvent{ID: "toolu_" + value, Name: "mcp__x__" + value})
+		tr.Handle(agentruntime.ToolResultEvent{ID: "toolu_" + value, Result: "ok"})
+	}
+
+	spans := endedToolSpans(rec)
+	require.Len(t, spans, 2)
+	assert.Equal(t, "execute_tool mcp__x__[REDACTED:PUSH_TOKEN]", spans[0].Name)
+	assert.Equal(t, "execute_tool mcp__x__[REDACTED:"+workflowTokenEnv+"]", spans[1].Name)
+	for _, span := range spans {
+		for _, kv := range span.Attributes {
+			assert.NotContains(t, kv.Value.Emit(), runnerValue, string(kv.Key))
+			assert.NotContains(t, kv.Value.Emit(), workflowValue, string(kv.Key))
+		}
+	}
+}
+
 // Arguments are content and ride the gated message record; tool spans are
 // emitted with the gate off, so nothing of a call's arguments may reach one.
 func TestToolSpanTracker_ArgumentsStayOffTheSpan(t *testing.T) {

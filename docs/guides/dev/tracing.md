@@ -168,11 +168,11 @@ near-zero-duration span marked `fullsend.tool.unmatched=true`. Events without
 an id — pi and codex emit none — produce no span, so the child count can be
 below `fullsend.tool_calls`, which counts every reported call, id or not; a
 `server_tool_use` block on an `assistant` line produces no event at all (its
-result never arrives as a `tool_result`), so it appears in neither count. The name passes through `security.OutputPipeline()`
-— Unicode normalization, then secret redaction, the pipeline span content
-gets, without the collector's runner env literal pass — and is bounded to 256 bytes before it becomes the attribute; the
-span name keeps at most 128 bytes of it. The call id is scanned through the
-same pipeline and dropped from the span on any finding — never substituted,
+result never arrives as a `tool_result`), so it appears in neither count. The name passes through `redactText`
+— the runner env literal pass on both sides of `security.OutputPipeline()`,
+the redaction span content gets — and is bounded to 256 bytes before it becomes the attribute; the
+span name keeps at most 128 bytes of it. The call id goes through the
+same `redactText` and dropped from the span on any finding — never substituted,
 since a masked id could collide with another call's — while the raw bounded
 id still keys the open-call map, so correlation is unaffected.
 The tracker records at most `maxToolSpansPerIteration` (1,024) spans per
@@ -209,8 +209,8 @@ codex emit none of them,
 [#7414](https://github.com/fullsend-ai/fullsend/issues/7414); the schema's
 required result field is `response`), redacts every
 part — `security.OutputPipeline()`, with `replaceEnvSecrets` for the values
-of sensitive runner env keys, and `replaceProviderOnlySecrets` for
-`providerOnlyKeys`, on both sides of it — at assembly (redaction runs
+of sensitive runner env keys and of `providerOnlyKeys`, in one pass, on both
+sides of it (`redactText`) — at assembly (redaction runs
 before the size budget — truncating first could split a secret past
 recognition), enforces a 256 KiB ordered-suffix budget (the ending survives — the
 final answer is what consumers judge) plus an 8 KiB per-tool-result
@@ -282,8 +282,8 @@ stay within the proven size.
 `run-telemetry.jsonl`): parse the `gen_ai.output.messages` attribute as
 JSON; check `fullsend.content.truncated` / `fullsend.content.dropped_bytes`
 before treating content as complete; masked secrets appear as the
-redactor's mask tokens, or as `[REDACTED:<key>]` for a runner env value,
-and are counted in `fullsend.content.redactions`.
+redactor's mask tokens, or as `[REDACTED:<key>]` for a runner env or
+provider-only value, and are counted in `fullsend.content.redactions`.
 A `tool_call` part's `arguments`, when present, is a JSON value (an object
 for the tools seen so far); a `tool_call` part marked `fullsend.truncated`
 had arguments that were dropped whole — on that part type the marker

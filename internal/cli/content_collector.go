@@ -725,23 +725,29 @@ func encodedTail(s string, allow int) string {
 // all-invisible-bytes input), so an empty Sanitized WITH findings means
 // fully redacted, not unchanged.
 func (c *contentCollector) redact(text string, findings *[]security.Finding) string {
+	return redactText(c.pipeline, c.runnerEnv, text, findings)
+}
+
+// redactText is the redaction every Level 3 string and every execute_tool
+// name and id gets: the runner env literal pass (replaceEnvSecrets) on both
+// sides of pipeline. Ahead of it, on the text as the stream wrote it, so a
+// pattern does not mask part of a value and keep its first bytes. After
+// it, because the normalizer joins a value the stream split with an
+// invisible character or spelled in compatibility forms. Not covered: a
+// value written that way which a pattern also recognises — in an
+// assignment, an auth header, a secret-named field or a connection string,
+// or by its own prefix — is masked by that pattern, which shows what its
+// mask shows; and a value the normalizer itself rewrites is matched only as
+// the env has it. An empty result with findings means fully redacted.
+func redactText(pipeline *security.Pipeline, runnerEnv map[string]string, text string, findings *[]security.Finding) string {
 	if text == "" {
 		return text
 	}
-	// The literal pass runs on both sides of the pipeline. Ahead of it, on
-	// the text as the stream wrote it, so a pattern does not mask part of
-	// a value and keep its first bytes. After it, because the normalizer
-	// joins a value the stream split with an invisible character or
-	// spelled in compatibility forms. Not covered: a value written that way
-	// which a pattern also recognises — in an assignment, an auth header, a
-	// secret-named field or a connection string, or by its own prefix — is
-	// masked by that pattern, which shows what its mask shows; and a value
-	// the normalizer itself rewrites is matched only as the env has it.
-	text = c.replaceEnv(text, findings)
-	scanned := c.pipeline.Scan(text)
+	text = replaceEnv(runnerEnv, text, findings)
+	scanned := pipeline.Scan(text)
 	*findings = append(*findings, scanned.Findings...)
 	if scanned.Sanitized != "" {
-		return c.replaceEnv(scanned.Sanitized, findings)
+		return replaceEnv(runnerEnv, scanned.Sanitized, findings)
 	}
 	if len(scanned.Findings) > 0 {
 		return ""
@@ -838,14 +844,14 @@ func (c *contentCollector) redactValue(v any, under string, collided *bool) any 
 			if c.namesASecret(rk) {
 				member = rk
 			}
-			if _, dup := out[rk]; dup {
-				*collided = true
-			}
 			e := c.redactValue(t[k], member, collided)
 			if s, ok := e.(string); ok && member != rk && c.secretNamed(rk, s) {
 				// A single quote in the key can let the pattern match
 				// the pair even when the key names no secret.
 				e = "***"
+			}
+			if _, dup := out[rk]; dup {
+				*collided = true
 			}
 			out[rk] = e
 		}
@@ -892,13 +898,10 @@ func memberPair(key, value string) string {
 	return `"` + unquote.Replace(key) + `":"` + unquote.Replace(value) + `"`
 }
 
-// replaceEnv is redact's literal pass — replaceEnvSecrets over runnerEnv,
-// then replaceProviderOnlySecrets — with one finding for each key it
-// replaced.
-func (c *contentCollector) replaceEnv(text string, findings *[]security.Finding) string {
-	text, keys := replaceEnvSecrets(text, c.runnerEnv)
-	text, more := replaceProviderOnlySecrets(text)
-	keys = append(keys, more...)
+// replaceEnv is redactText's literal pass, with one finding for each key
+// it replaced.
+func replaceEnv(runnerEnv map[string]string, text string, findings *[]security.Finding) string {
+	text, keys := replaceEnvSecrets(text, runnerEnv)
 	for _, key := range keys {
 		*findings = append(*findings, security.Finding{Scanner: "runner_env", Name: key, Severity: "critical", Position: -1})
 	}
