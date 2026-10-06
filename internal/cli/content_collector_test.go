@@ -155,6 +155,40 @@ func TestContentCollector_RedactsSecretsInArguments(t *testing.T) {
 	}
 }
 
+func TestContentCollector_SecretNamedMembersReachTheirNestedValues(t *testing.T) {
+	// A value at any depth under a secret-named member is judged as if it
+	// were that member's own string value.
+	const opaque = "opaque-credential-123"
+	for name, tc := range map[string]struct{ args, want string }{
+		"array":           {`{"api_keys":["` + opaque + `"]}`, `{"api_keys":["***"]}`},
+		"object":          {`{"credentials":{"value":"` + opaque + `"}}`, `{"credentials":{"value":"***"}}`},
+		"array of object": {`{"tokens":[{"v":"` + opaque + `"}]}`, `{"tokens":[{"v":"***"}]}`},
+		"number":          {`{"password":31415926535}`, `{"password":"***"}`},
+		"nested number":   {`{"secrets":{"pin":31415926535}}`, `{"secrets":{"pin":"***"}}`},
+		// The member-name pattern wants eight bytes or more, as it does of
+		// a string member: short values and a token count stay.
+		"short values stay": {`{"max_tokens":4096,"api_keys":["ab",true,null]}`, `{"api_keys":["ab",true,null],"max_tokens":4096}`},
+		// No secret-named member above: nothing to judge against.
+		"plain nesting stays": {`{"edits":[{"value":"` + opaque + `"}]}`, `{"edits":[{"value":"` + opaque + `"}]}`},
+		// A quote in the key lets the pattern's single-quote form match
+		// across the pair: the member's own key is still checked.
+		"quote in a plain key": {`{"it's":"password': 'hunter2hunter2'"}`, `{"it's":"***"}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(4096)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: tc.args})
+
+			res := c.Result("stop")
+			assert.Contains(t, res.OutputMessages, `"arguments":`+tc.want)
+			if tc.want == tc.args || strings.Contains(name, "stay") {
+				assert.Empty(t, res.Findings)
+			} else {
+				assert.Len(t, res.Findings, 1, "one json_field finding")
+			}
+		})
+	}
+}
+
 func TestContentCollector_AKeyFindingLeavesTheValueAndCountsOnce(t *testing.T) {
 	for name, tc := range map[string]struct{ args, want string }{
 		"token":     {`{"ghp_` + strings.Repeat("r", 36) + `":"hello"}`, `{"ghp_...":"hello"}`},
@@ -364,6 +398,50 @@ func TestContentCollector_DropsTheSummaryWhenAPatternFoundTheSecret(t *testing.T
 	res := c.Result("stop")
 	assert.NotContains(t, res.OutputMessages, token[:20])
 	assert.Contains(t, res.OutputMessages, `"summary":"/docs/a.md"`, "a normalizer finding alone does not cost the summary")
+}
+
+func TestContentCollector_ReplacesProviderOnlyValuesFromTheProcessEnv(t *testing.T) {
+	// GH_WORKFLOW_TOKEN is kept out of RunnerEnv (#6649); the collector
+	// reads it where redactFeedback does.
+	const secret = "workflow-only-opaque-value"
+	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
+	t.Setenv(workflowTokenEnv, secret)
+	c := newContentCollectorIfEnabled(nil)
+	c.Handle(agentruntime.TextEvent{Text: "token " + secret})
+	c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: `{"command":"echo ` + secret + `"}`})
+
+	res := c.Result("stop")
+	assert.NotContains(t, res.OutputMessages, secret)
+	assert.Equal(t, 2, strings.Count(res.OutputMessages, "[REDACTED:"+workflowTokenEnv+"]"))
+	assert.Equal(t, 2, runnerEnvFindings(res), "counted like a runner env value")
+}
+
+func TestReplaceProviderOnlySecrets(t *testing.T) {
+	t.Setenv(workflowTokenEnv, "abcdefgh")
+	got, keys := replaceProviderOnlySecrets("x abcdefgh y")
+	assert.Equal(t, "x [REDACTED:"+workflowTokenEnv+"] y", got)
+	assert.Equal(t, []string{workflowTokenEnv}, keys)
+
+	got, keys = replaceProviderOnlySecrets("nothing here")
+	assert.Equal(t, "nothing here", got)
+	assert.Empty(t, keys, "a value absent from the text is not reported")
+
+	t.Setenv(workflowTokenEnv, "abcdefg") // under minRedactableSecretLen
+	got, keys = replaceProviderOnlySecrets("x abcdefg y")
+	assert.Equal(t, "x abcdefg y", got)
+	assert.Empty(t, keys)
+}
+
+func TestContentCollector_ReplacesBothValuesWhenRunnerEnvReusesAProviderOnlyName(t *testing.T) {
+	// Nothing refuses GH_WORKFLOW_TOKEN as a runner env key; the process
+	// value is still the one redactFeedback replaces.
+	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
+	t.Setenv(workflowTokenEnv, "from-the-process-env")
+	c := newContentCollectorIfEnabled(map[string]string{workflowTokenEnv: "from-the-runner-env"})
+	c.Handle(agentruntime.TextEvent{Text: "a from-the-process-env b from-the-runner-env"})
+
+	res := c.Result("stop")
+	assert.Contains(t, res.OutputMessages, `"a [REDACTED:`+workflowTokenEnv+`] b [REDACTED:`+workflowTokenEnv+`]"`)
 }
 
 func TestContentCollector_ReplacesARunnerEnvValueSentAsANumber(t *testing.T) {

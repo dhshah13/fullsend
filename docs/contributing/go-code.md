@@ -484,8 +484,9 @@ function in `internal/cli/run.go` is the canonical implementation.
    can't reach them, which means the `RunnerEnv` scan in invariant 1
    never sees them. Iterate `providerOnlyKeys`, read each value with
    `os.Getenv`, and replace it the same way (skipping values shorter
-   than `minRedactableSecretLen`). A future credential class kept out
-   of `RunnerEnv` for the same reason needs the same treatment here.
+   than `minRedactableSecretLen`). `replaceProviderOnlySecrets` is that
+   pass. A future credential class kept out of `RunnerEnv` for the same
+   reason needs the same treatment here.
 
 3. **Apply `security.SecretRedactor` as a fallback pass.**
    The `RunnerEnv` and `providerOnlyKeys` scans only catch credentials

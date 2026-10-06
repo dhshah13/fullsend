@@ -101,8 +101,9 @@ const maxToolArgumentsBytes = 8 * 1024
 // every call site, so the gate needs no second check.
 //
 // runnerEnv is the harness runner environment. The sandbox is not meant to
-// hold its credentials, but the record leaves the runner, so their values
-// get the same literal pass redactFeedback gives script output.
+// hold its credentials, but the record leaves the runner, so their values,
+// and the provider-only keys', get the same literal pass redactFeedback
+// gives script output.
 func newContentCollectorIfEnabled(runnerEnv map[string]string) *contentCollector {
 	if telemetry.ContentCaptureEnabled() {
 		c := newContentCollector(maxContentBytes)
@@ -783,7 +784,7 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 		return nil, false
 	}
 	collided := false
-	out, err := json.Marshal(c.redactValue(v, &collided))
+	out, err := json.Marshal(c.redactValue(v, "", &collided))
 	if err != nil {
 		return nil, false // decoded JSON values marshal unconditionally
 	}
@@ -797,42 +798,69 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 // redactValue redacts every string, number and object key under v; a
 // number that redacts becomes the redacted string. A pattern
 // keyed on a member name ("password": "...") cannot see the pair that
-// way, so each string member is scanned once more, already redacted,
-// beside its redacted key (secretNamed) and masked whole on a match.
+// way, so a string or number under a key that pattern names — the nearest
+// such enclosing key, under — is scanned once more, already redacted,
+// beside it and masked whole on a match (secretNamed); a direct string
+// member is also scanned beside its own key. A value in
+// an array or a nested object under a secret-named member is judged as
+// that member's own value would be.
 // Keys are walked in sorted order, so neither the findings nor a dropped
 // value's charge follow map order. *collided reports two keys of one
 // object that redact to the same string: keeping either member would
 // show a call the agent did not make.
-func (c *contentCollector) redactValue(v any, collided *bool) any {
+func (c *contentCollector) redactValue(v any, under string, collided *bool) any {
 	switch t := v.(type) {
 	case string:
-		return c.redact(t, &c.findings)
+		s := c.redact(t, &c.findings)
+		if under != "" && c.secretNamed(under, s) {
+			return "***"
+		}
+		return s
 	case json.Number:
 		// Digits can be a credential too; a number that redacts is
 		// recorded as the redacted string.
-		if s := c.redact(t.String(), &c.findings); s != t.String() {
+		s := c.redact(t.String(), &c.findings)
+		if under != "" && c.secretNamed(under, s) {
+			return "***"
+		}
+		if s != t.String() {
 			return s
 		}
 	case []any:
 		for i := range t {
-			t[i] = c.redactValue(t[i], collided)
+			t[i] = c.redactValue(t[i], under, collided)
 		}
 	case map[string]any:
 		out := make(map[string]any, len(t))
 		for _, k := range slices.Sorted(maps.Keys(t)) {
 			rk := c.redact(k, &c.findings)
-			e := c.redactValue(t[k], collided)
-			if s, ok := e.(string); ok && c.secretNamed(rk, s) {
-				e = "***"
+			member := under
+			if c.namesASecret(rk) {
+				member = rk
 			}
 			if _, dup := out[rk]; dup {
 				*collided = true
+			}
+			e := c.redactValue(t[k], member, collided)
+			if s, ok := e.(string); ok && member != rk && c.secretNamed(rk, s) {
+				// A single quote in the key can let the pattern match
+				// the pair even when the key names no secret.
+				e = "***"
 			}
 			out[rk] = e
 		}
 		return out
 	}
 	return v
+}
+
+// namesASecret reports whether the member-name pattern matches key with
+// any value long enough: a value placed under such a key is then judged
+// against it. It records no finding; secretNamed does, for a value that
+// matches.
+func (c *contentCollector) namesASecret(key string) bool {
+	return slices.ContainsFunc(c.secrets.Scan(memberPair(key, strings.Repeat("x", 8))).Findings,
+		func(f security.Finding) bool { return f.Name == "json_field" })
 }
 
 // secretNamed reports whether the redactor's member-name pattern
@@ -848,9 +876,7 @@ func (c *contentCollector) redactValue(v any, collided *bool) any {
 // pattern's token class, so it joins no two runs into a token that a
 // prefix pattern would mask ahead of the member-name pattern.
 func (c *contentCollector) secretNamed(key, value string) bool {
-	unquote := strings.NewReplacer(`"`, ",")
-	pair := `"` + unquote.Replace(key) + `":"` + unquote.Replace(value) + `"`
-	for _, f := range c.secrets.Scan(pair).Findings {
+	for _, f := range c.secrets.Scan(memberPair(key, value)).Findings {
 		if f.Name == "json_field" {
 			c.findings = append(c.findings, f)
 			return true
@@ -859,10 +885,20 @@ func (c *contentCollector) secretNamed(key, value string) bool {
 	return false
 }
 
-// replaceEnv is redact's literal pass (replaceEnvSecrets over runnerEnv),
-// with one finding for each key it replaced.
+// memberPair writes key and value as the JSON member secretNamed scans,
+// ',' standing in for a double quote.
+func memberPair(key, value string) string {
+	unquote := strings.NewReplacer(`"`, ",")
+	return `"` + unquote.Replace(key) + `":"` + unquote.Replace(value) + `"`
+}
+
+// replaceEnv is redact's literal pass — replaceEnvSecrets over runnerEnv,
+// then replaceProviderOnlySecrets — with one finding for each key it
+// replaced.
 func (c *contentCollector) replaceEnv(text string, findings *[]security.Finding) string {
 	text, keys := replaceEnvSecrets(text, c.runnerEnv)
+	text, more := replaceProviderOnlySecrets(text)
+	keys = append(keys, more...)
 	for _, key := range keys {
 		*findings = append(*findings, security.Finding{Scanner: "runner_env", Name: key, Severity: "critical", Position: -1})
 	}

@@ -3633,13 +3633,7 @@ func redactFeedback(feedback string, runnerEnv map[string]string) string {
 	// Provider-only keys live in the process environment, not RunnerEnv.
 	// Redact their literals the same way so they cannot reach the agent
 	// prompt or the uploaded run directory (#6649).
-	for key := range providerOnlyKeys {
-		value := os.Getenv(key)
-		if len(value) < minRedactableSecretLen {
-			continue
-		}
-		feedback = strings.ReplaceAll(feedback, value, "[REDACTED:"+key+"]")
-	}
+	feedback, _ = replaceProviderOnlySecrets(feedback)
 	// ScanResult.Sanitized is empty when the scanner changed nothing, so the
 	// original text is the fallback — not an empty prompt.
 	if res := security.NewSecretRedactor().Scan(feedback); res.Sanitized != "" {
@@ -3660,6 +3654,23 @@ func replaceEnvSecrets(text string, runnerEnv map[string]string) (string, []stri
 	}) {
 		value := runnerEnv[key]
 		if len(value) < minRedactableSecretLen || !sensitiveEnvKey(key) || !strings.Contains(text, value) {
+			continue
+		}
+		text = strings.ReplaceAll(text, value, "[REDACTED:"+key+"]")
+		replaced = append(replaced, key)
+	}
+	return text, replaced
+}
+
+// replaceProviderOnlySecrets is the literal pass over providerOnlyKeys,
+// whose values live in the process environment, not RunnerEnv (#6649):
+// each value of minRedactableSecretLen bytes or more that occurs in text
+// becomes [REDACTED:<key>]. It returns the keys it replaced, in key order.
+func replaceProviderOnlySecrets(text string) (string, []string) {
+	var replaced []string
+	for _, key := range slices.Sorted(maps.Keys(providerOnlyKeys)) {
+		value := os.Getenv(key)
+		if len(value) < minRedactableSecretLen || !strings.Contains(text, value) {
 			continue
 		}
 		text = strings.ReplaceAll(text, value, "[REDACTED:"+key+"]")

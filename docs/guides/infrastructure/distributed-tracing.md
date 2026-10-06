@@ -81,10 +81,11 @@ read from the stream, and goes through the same redaction. On both sides
 of the pipeline — on the text as written, and again on what the pipeline
 returns, since its normalization can join a value the stream split or
 spelled in compatibility characters — the value of each sensitive runner
-environment key (`env.runner`, or the deprecated `runner_env`; 8 bytes or
-longer) is replaced with `[REDACTED:<key>]`, the marker validation
-feedback uses. A key counts one redaction for each of the two passes that
-replaced it in a string, however often its value occurs there; in an
+environment key (`env.runner`, or the deprecated `runner_env`), and of each
+provider-only key the runner keeps out of it (`GH_WORKFLOW_TOKEN`), 8 bytes or
+longer, is replaced with `[REDACTED:<key>]`, the marker validation
+feedback uses. Each value replaced in a string counts one redaction per
+pass, however often it occurs there; in an
 assignment, an authorization header or a secret-named field the patterns
 then mask the marker as well and count again. Not covered: a value split
 or spelled that way which a pattern also recognises — in one of those

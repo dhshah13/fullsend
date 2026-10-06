@@ -209,7 +209,8 @@ codex emit none of them,
 [#7414](https://github.com/fullsend-ai/fullsend/issues/7414); the schema's
 required result field is `response`), redacts every
 part — `security.OutputPipeline()`, with `replaceEnvSecrets` for the values
-of sensitive runner env keys on both sides of it — at assembly (redaction runs
+of sensitive runner env keys, and `replaceProviderOnlySecrets` for
+`providerOnlyKeys`, on both sides of it — at assembly (redaction runs
 before the size budget — truncating first could split a secret past
 recognition), enforces a 256 KiB ordered-suffix budget (the ending survives — the
 final answer is what consumers judge) plus an 8 KiB per-tool-result
@@ -242,16 +243,17 @@ behind escaped quotes, and JSON nested in a string; Unicode folding can
 also turn a fullwidth quotation mark into one that closes the string.
 `toolArguments` decodes the value, redacts each string and object key on
 its own (a number as its digits; one that redacts becomes the redacted
-string), and encodes the result again. Each string member is also scanned
-once more, already redacted, beside its key, and masked whole when the
-member-name pattern (`json_field`) matches — a pattern keyed on a member
+string), and encodes the result again. Each string and number is also
+scanned once more, already redacted, beside the nearest enclosing key the
+member-name pattern (`json_field`) names, and masked whole when that pattern
+matches the pair — a pattern keyed on a member
 name has no other way to see the pair; that scan's other findings are
 discarded, since both strings were already scanned. It runs the pattern
 stage alone: the normalizer is not idempotent over escape sequences, and a
-second pass over the pair could strip the value or the key's keyword. It reaches string
-members only — a number that redacted is one by then: a
-secret-named member holding an array, an object or any other number is
-redacted leaf by leaf, as it would be in text. Arguments that are not
+second pass over the pair could strip the value or the key's keyword. A value in an
+array or a nested object under a secret-named member is judged as that
+member's own value would be — the pattern's eight-character floor included,
+so a short count stays; booleans and nulls are left as they are. Arguments that are not
 one JSON value cannot be walked that way: they are scanned as text — with
 the misses above — so their findings count, then dropped and charged. So
 are arguments in which two keys of one object redact to the same string,
