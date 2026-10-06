@@ -243,7 +243,21 @@ behind escaped quotes, and JSON nested in a string; Unicode folding can
 also turn a fullwidth quotation mark into one that closes the string.
 `toolArguments` decodes the value, redacts each string and object key on
 its own (a number as its digits; one that redacts becomes the redacted
-string), and encodes the result again. Each string and number is also
+string), and encodes the result again. A string value that holds one
+JSON object or array — as scanned, or as written when the scan left none,
+since folding or a mask can break one — is walked the same way as well
+(`heldSecret`): the string is scanned whole, since a secret can span a
+document's strings, but a secret-named member nested in it is out of the
+pattern's sight. The walk's output and its other findings are discarded,
+since a mask can match again; when it would mask a value or key under a
+secret-named member, the string is masked `***` whole, with that one
+finding. Not walked: documents held more than `maxHeldDepth` (4) deep —
+each level is scanned once more, so a document the scan breaks costs up to
+five scans of its text — a document in an object key, a member a later
+duplicate key replaces, a document whose structure folding or a mask
+changes while the text holding it still parses (a document held in it
+then breaks too), and structure in any other text (several documents,
+YAML, a document inside code). Each string and number is also
 scanned once more, already redacted, beside the nearest enclosing key the
 member-name pattern (`json_field`) names, and masked whole when that pattern
 matches the pair — a pattern keyed on a member

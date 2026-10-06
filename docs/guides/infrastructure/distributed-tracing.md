@@ -122,6 +122,11 @@ codex parsers emit none of the three yet
 `arguments` is the call's input decoded, redacted string by string (a
 number that redacts becomes the redacted string), and
 encoded again, so key order, spacing and escapes are not the stream's.
+A string value in it that holds one JSON object or array — a JSON file
+passed to `Write`, say — is masked `***` whole when that document nests a
+value or key under a secret-named member that redaction would otherwise
+leave; a string directly under such a member is masked in place, as
+anywhere else.
 
 On a retry iteration under `validation_loop.feedback_mode: append`, the
 prompt the runner composed — its fixed framing around the previous

@@ -96,6 +96,11 @@ const maxToolResultBytes = 8 * 1024
 // measured; a Write call carries the file body as an argument.
 const maxToolArgumentsBytes = 8 * 1024
 
+// maxHeldDepth bounds how deep heldSecret walks documents held in
+// strings: each level is scanned once more, and with \u escapes a
+// document can nest about the square root of its length deep.
+const maxHeldDepth = 4
+
 // newContentCollectorIfEnabled returns a live collector when the Level 3
 // gate is on and nil otherwise — nil is the off state and is inert at
 // every call site, so the gate needs no second check.
@@ -383,6 +388,9 @@ type contentCollector struct {
 	// Merged into the contentResult at Result so they count exactly like
 	// assembly-time ones.
 	findings []security.Finding
+	// held counts the documents held in strings that heldSecret is
+	// walking; see maxHeldDepth.
+	held int
 }
 
 func newContentCollector(maxBytes int) *contentCollector {
@@ -783,10 +791,8 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 		c.evicted += len(c.redact(args, &c.findings))
 		return nil, true
 	}
-	dec := json.NewDecoder(strings.NewReader(args))
-	dec.UseNumber() // float64 would rewrite integers past 2^53
-	var v any
-	if err := dec.Decode(&v); err != nil || v == nil {
+	v, err := decodeJSON(args)
+	if err != nil || v == nil {
 		return nil, false
 	}
 	collided := false
@@ -799,6 +805,60 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 		return nil, true
 	}
 	return out, false
+}
+
+// decodeJSON decodes one JSON value; float64 would rewrite integers past
+// 2^53, so numbers keep their digits.
+func decodeJSON(s string) (any, error) {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	err := dec.Decode(&v)
+	return v, err
+}
+
+// jsonDocument decodes s when it is one JSON object or array, after a
+// byte order mark: one with a BOM must parse as written, should folding
+// break it once the normalizer has stripped the BOM.
+func jsonDocument(s string) (any, bool) {
+	s = strings.TrimSpace(strings.TrimPrefix(s, "\uFEFF"))
+	if s == "" || (s[0] != '{' && s[0] != '[') || !json.Valid([]byte(s)) {
+		return nil, false
+	}
+	v, err := decodeJSON(s)
+	return v, err == nil
+}
+
+// heldSecret walks the JSON object or array a string holds — as scanned,
+// or as written when the scan left none (folding or a mask can break
+// one) — as the arguments are walked, and returns the member-name
+// finding of a value or key there under a secret-named member: the
+// pattern wants the value right after the key, so the text scan misses
+// one nested deeper. The walk's output and its other findings are
+// discarded — the string was scanned already, and a mask can match
+// again — so a string holding such a member is masked whole.
+func (c *contentCollector) heldSecret(scanned, written string) (security.Finding, bool) {
+	if c.held == maxHeldDepth {
+		return security.Finding{}, false
+	}
+	doc, ok := jsonDocument(scanned)
+	if !ok {
+		doc, ok = jsonDocument(written)
+	}
+	if !ok {
+		return security.Finding{}, false
+	}
+	mark := len(c.findings)
+	c.held++
+	c.redactValue(doc, "", new(bool))
+	c.held--
+	var f security.Finding
+	i := slices.IndexFunc(c.findings[mark:], func(f security.Finding) bool { return f.Name == "json_field" })
+	if i >= 0 {
+		f = c.findings[mark+i]
+	}
+	c.findings = c.findings[:mark]
+	return f, i >= 0
 }
 
 // redactValue redacts every string, number and object key under v; a
@@ -818,6 +878,10 @@ func (c *contentCollector) redactValue(v any, under string, collided *bool) any 
 	switch t := v.(type) {
 	case string:
 		s := c.redact(t, &c.findings)
+		if f, ok := c.heldSecret(s, t); ok {
+			c.findings = append(c.findings, f)
+			return "***"
+		}
 		if under != "" && c.secretNamed(under, s) {
 			return "***"
 		}
