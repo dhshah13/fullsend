@@ -154,7 +154,9 @@ oldest first.
 Truncation is marked via `fullsend.content.truncated` on the span and
 `fullsend.truncated` on each cut part. A tool result over its bound keeps
 its tail; arguments over theirs, not a complete JSON value, or with two
-keys of one object that redact to the same string, are dropped
+keys of one object that redact to the same string (two keys of eight
+characters or more under a secret-named member, such as `username` and
+`password` under `auth`, are both masked and so collide), are dropped
 whole — a cut object is not JSON — and the marked `tool_call` part keeps
 its `id`, name and summary — not the summary when redaction found a
 secret in the arguments. Arguments also go, charged and marked, when
@@ -313,7 +315,7 @@ The `agent` span's provider identity reflects only the parent run's serving endp
 | `gen_ai.input.messages` | `agent` | Level 3 only, on a retry iteration that carries validation feedback: the prompt the runner composed, as a JSON string (see Content capture) |
 | `gen_ai.output.messages` | `agent` | Level 3 only: the iteration's conversation content as a JSON string (see Content capture) |
 | `fullsend.content.truncated` | `agent` | Level 3 only: present (`true`) when the size budget cut or dropped content, a tool call lost its arguments, or a kept tool result is a parser-side fragment or an oversized line's empty stand-in (`fullsend.truncated` on the part; no byte count for the last two) |
-| `fullsend.content.dropped_bytes` | `agent` | Level 3 only: exact part bytes removed by the size budget — content, ids, dropped arguments (counted as re-encoded JSON — on a key collision, without the member the later key (in sorted key order, not stream order) replaced — or as redacted text when they were not a JSON value), and the fixed footprint of an errored-empty or oversized stand-in part — otherwise in raw bytes, whichever bound made the cut; the bytes of a skipped oversized line were never decoded and are not counted |
+| `fullsend.content.dropped_bytes` | `agent` | Level 3 only: exact part bytes removed by the size budget — content, ids, dropped arguments (counted as re-encoded JSON — on a key collision, without each member a later key (in sorted key order, not stream order) replaced — or as redacted text when they were not a JSON value), and the fixed footprint of an errored-empty or oversized stand-in part — otherwise in raw bytes, whichever bound made the cut; the bytes of a skipped oversized line were never decoded and are not counted |
 | `fullsend.content.redactions` | `agent` | Level 3 only: number of security findings raised while redacting content at assembly, the input message included (and findings from parts the size budget later dropped) |
 | `fullsend.tool.unmatched` | `execute_tool` | Present (`true`) when a result arrived for a call the stream never reported; the span has near-zero duration |
 | `fullsend.tool.result_oversized` | `execute_tool` | Present (`true`) when the result's stream line exceeded the parser's 1 MiB bound: the call was answered but nothing of the result was decoded, so the span has no status and no `error.type` |

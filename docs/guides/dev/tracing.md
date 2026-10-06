@@ -220,7 +220,7 @@ arguments are dropped whole and the part marked, since a cut object is not
 JSON), with exact dropped-byte
 accounting across content, tool names, summaries, responses, part
 ids, and dropped arguments (counted as re-encoded JSON, or as redacted
-text when they were not a JSON value; on a key collision the member the
+text when they were not a JSON value; on a key collision each member a
 later key (in sorted order) replaced is not counted), then holds the marshaled string to `maxEncodedContentBytes`
 (255,000 — just under the one size the pilot backend is proven to accept)
 by trimming the oldest content again, measured on the encoding itself and
@@ -253,7 +253,10 @@ stage alone: the normalizer is not idempotent over escape sequences, and a
 second pass over the pair could strip the value or the key's keyword. A value in an
 array or a nested object under a secret-named member is judged as that
 member's own value would be — the pattern's eight-character floor included,
-so a short count stays; booleans and nulls are left as they are. Arguments that are not
+so a short count stays; booleans and nulls are left as they are. Keys under
+such a member are judged the same way, since a credential can be the key: a
+key of eight characters or more is masked `***`, field names included, and
+two masked alike collide (below). Arguments that are not
 one JSON value cannot be walked that way: they are scanned as text — with
 the misses above — so their findings count, then dropped and charged. So
 are arguments in which two keys of one object redact to the same string,

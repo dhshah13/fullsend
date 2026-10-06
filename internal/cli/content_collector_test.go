@@ -173,6 +173,11 @@ func TestContentCollector_SecretNamedMembersReachTheirNestedValues(t *testing.T)
 		// A quote in the key lets the pattern's single-quote form match
 		// across the pair: the member's own key is still checked.
 		"quote in a plain key": {`{"it's":"password': 'hunter2hunter2'"}`, `{"it's":"***"}`},
+		// Keys are judged too: a credential can be the key.
+		"key under a secret-named member":    {`{"credentials":{"` + opaque + `":"user"}}`, `{"credentials":{"***":"user"}}`},
+		"key under a secret-named array":     {`{"api_keys":[{"` + opaque + `":"prod"}]}`, `{"api_keys":[{"***":"prod"}]}`},
+		"short keys stay":                    {`{"auth":{"user":"x"}}`, `{"auth":{"user":"x"}}`},
+		"keys with no secret-named ancestor": {`{"edits":{"` + opaque + `":"x"}}`, `{"edits":{"` + opaque + `":"x"}}`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := newContentCollector(4096)
@@ -414,6 +419,29 @@ func TestContentCollector_ReplacesProviderOnlyValuesFromTheProcessEnv(t *testing
 	assert.NotContains(t, res.OutputMessages, secret)
 	assert.Equal(t, 2, strings.Count(res.OutputMessages, "[REDACTED:"+workflowTokenEnv+"]"))
 	assert.Equal(t, 2, runnerEnvFindings(res), "counted like a runner env value")
+}
+
+func TestContentCollector_KeysMaskedAlikeDropTheArguments(t *testing.T) {
+	// Masked keys go the way of keys that redact alike: keeping either
+	// member would show a call the agent did not make. Field names of eight
+	// characters or more under a secret-named member are masked too, so an
+	// ordinary credentials object can cost the arguments.
+	for name, args := range map[string]string{
+		"two opaque keys":       `{"tokens":{"opaque-credential-123":"a","opaque-credential-456":"b"}}`,
+		"username and password": `{"auth":{"username":"alice","password":"hunter2hunter2"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(4096)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Summary: "s", Arguments: args})
+
+			res := c.Result("stop")
+			assert.NotContains(t, res.OutputMessages, "arguments")
+			assert.NotContains(t, res.OutputMessages, "opaque-credential")
+			assert.NotContains(t, res.OutputMessages, "hunter2")
+			assert.True(t, res.Truncated)
+			assert.Positive(t, res.DroppedBytes)
+		})
+	}
 }
 
 func TestContentCollector_SecretNamedChecksSeeNormalizedText(t *testing.T) {

@@ -809,7 +809,7 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 // beside it and masked whole on a match (secretNamed); a direct string
 // member is also scanned beside its own key. A value in
 // an array or a nested object under a secret-named member is judged as
-// that member's own value would be.
+// that member's own value would be, and so is a key there.
 // Keys are walked in sorted order, so neither the findings nor a dropped
 // value's charge follow map order. *collided reports two keys of one
 // object that redact to the same string: keeping either member would
@@ -849,6 +849,12 @@ func (c *contentCollector) redactValue(v any, under string, collided *bool) any 
 				// A single quote in the key can let the pattern match
 				// the pair even when the key names no secret.
 				e = "***"
+			}
+			if under != "" && c.secretNamed(under, rk) {
+				// A key under a secret-named member is judged like its
+				// values: a credential can be the key. Two masked alike
+				// take the collision path below.
+				rk = "***"
 			}
 			if _, dup := out[rk]; dup {
 				*collided = true
