@@ -507,8 +507,8 @@ slots:
 
 `run.go` step 8a (`hasAgentsMD()` / `injectClaudeMDPointer()`):
 
-1. If target repo has no AGENTS.md → inject org-level default from config repo,
-   add to `.git/info/exclude`
+1. If target repo has no AGENTS.md → inject the fallback `AGENTS.md` from the
+   configured fullsend content directory, add to `.git/info/exclude`
 2. If the runtime implements `ContextBridger` (Claude Code does), target
    repo has AGENTS.md but no CLAUDE.md → inject bridge CLAUDE.md pointing to
    AGENTS.md, add to `.git/info/exclude`

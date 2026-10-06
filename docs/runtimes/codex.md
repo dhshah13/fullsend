@@ -152,7 +152,7 @@ What a local codex run needs, beyond the guide:
   ([ADR 0027](../ADRs/0027-allowed-and-disallowed-tools-for-agents.md)).
 - **Reads the repo's root `AGENTS.md` through `$CODEX_HOME`.** Codex skips a project's own
   `AGENTS.md` while the project is untrusted, so the runner copies the repo's root `AGENTS.md` (or
-  the org-level one fullsend injects when the repo has none) to `$CODEX_HOME/AGENTS.md`, which codex
+  the fallback one fullsend injects when the repo has none) to `$CODEX_HOME/AGENTS.md`, which codex
   loads as instructions. Only the root file is read, cut at 32 KiB: nested `AGENTS.md` files and
   `AGENTS.override.md` are not, and a symlinked `AGENTS.md` is skipped. No `CLAUDE.md` bridge is
   injected.

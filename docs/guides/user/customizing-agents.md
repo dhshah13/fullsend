@@ -414,7 +414,7 @@ variables to protect sandbox operation.
 
 ### Adding a skill
 
-Create `skills/my-skill/SKILL.md` in your `.fullsend` config repo or agents repo:
+Create `.fullsend/skills/my-skill/SKILL.md` in the target repository, or `skills/my-skill/SKILL.md` in a shared agents repo:
 
 ```markdown
 # My Custom Skill

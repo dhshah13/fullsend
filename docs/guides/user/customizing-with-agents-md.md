@@ -125,8 +125,8 @@ takes precedence.
 
 ### Injection handling
 
-When the target repo has no AGENTS.md, fullsend injects an org-level default
-from the config repo. When the repo has AGENTS.md but no CLAUDE.md, fullsend
+When the target repo has no AGENTS.md, fullsend injects a fallback `AGENTS.md`
+from the configured fullsend content directory. When the repo has AGENTS.md but no CLAUDE.md, fullsend
 injects a bridge CLAUDE.md that points to AGENTS.md. Both injected files are
 hidden from git so agents don't accidentally commit them.
 

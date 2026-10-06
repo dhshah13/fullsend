@@ -99,4 +99,4 @@ fullsend github set <owner/repo> <key> <value>
 
 - [Configuring GitHub for fullsend](../guides/getting-started/configuring-github.md) — getting started guide
 - [Advanced setup](../guides/infrastructure/advanced-setup.md) — non-standard installation paths and setup flags
-- [Operations](../guides/getting-started/operations.md) — day-2 administration (enrollment, status, uninstall)
+- [Operations](../guides/getting-started/operations.md) — day-2 administration (configuration updates, workflow syncing, uninstall)

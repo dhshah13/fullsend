@@ -41,7 +41,7 @@ Forge-native infrastructure platform choice and configuration live in each
 target repository's **`.fullsend/`** directory. Per-repo installation is the
 sole supported installation model
 ([ADR 0033](ADRs/0033-per-repo-installation-mode.md)); the dedicated org-level
-`<org>/.fullsend` config repo is deprecated
+`<org>/.fullsend` config repo was removed with per-org installation
 ([ADR 0044](ADRs/0044-deprecate-per-org-installation-mode.md)).
 
 **Decided:**
@@ -609,44 +609,38 @@ Fullsend uses a three-tier configuration inheritance model for all configuration
   │                                                                  │
   │  Owned by: fullsend project maintainers                          │
   ├──────────────────────────────────────────────────────────────────┤
-  │  <org>/.fullsend                              (dedicated repo)   │
+  │  <org>/<repo>/.fullsend/config.base.yaml          (file in repo) │
   │                                                                  │
-  │  Org-wide configuration:                                         │
-  │    agents/            org agent definitions (.md)                │
-  │    skills/            org skills (shared across repos)           │
-  │    policies/          sandbox network/filesystem policies        │
-  │    harness/           per-agent harness configs (.yaml)          │
-  │    guardrails.yaml    org-wide guardrails (can only be tightened)│
-  │    config.yaml        intent repo, runtime, infrastructure       │
+  │  Shared baseline (read-through):                                 │
+  │    vendor preset or baseline shared across repos                 │
   │                                                                  │
-  │  Owned by: org platform team (CODEOWNERS, human-only)            │
+  │  Committed by: fullsend github setup --config                    │
   ├──────────────────────────────────────────────────────────────────┤
   │  <org>/<repo>                               (directory in repo)  │
   │                                                                  │
   │  Repo-specific overrides:                                        │
   │    AGENTS.md          per-repo agent instructions                │
   │    skills/            repo-specific skills (domain knowledge)    │
-  │    .fullsend/config   overrides -  adjust timeouts, prompts      │
+  │    .fullsend/config.yaml  overlay - adjust timeouts, agents      │
   │                                                                  │
   │  Owned by: repo maintainers (CODEOWNERS)                         │
   └──────────────────────────────────────────────────────────────────┘
 
-  Inheritance:  fullsend defaults  <  org .fullsend config  <  per-repo overrides
-                (base)                (extend/override)        (extend/tighten)
+  Inheritance:  fullsend defaults  <  config.base.yaml  <  config.yaml + repo files
+                (base)                (preset/baseline)    (extend/tighten)
 ```
 
-In per-repo installation the middle tier is replaced by files inside the
-target repo: `.fullsend/config.base.yaml` (vendor preset or baseline) and
-`.fullsend/config.yaml` (repo overlay), with code defaults below both. The
-org-tier box above describes the historical per-org model, now deprecated
+Per-repo installation is the only supported model. The dedicated
+`<org>/.fullsend` config repo tier from the original design was removed with
+per-org installation
 ([ADR 0044](ADRs/0044-deprecate-per-org-installation-mode.md),
 [ADR 0069](ADRs/0069-ready-made-configuration-presets.md)).
 
-Skills flow downward through this stack. A repo-level skill might encode domain knowledge ("this repo uses a custom ORM — here's how queries work"). An org-level skill might encode org conventions ("all services use structured logging via zerolog"). Upstream fullsend provides foundational skills (code implementation, triage coordination, testing conventions).
+Skills flow downward through this stack. A repo-level skill might encode domain knowledge ("this repo uses a custom ORM — here's how queries work"). Upstream fullsend provides foundational skills (code implementation, triage coordination, testing conventions).
 
-AGENTS.md files follow the same layering. A repo's `.fullsend/AGENTS.md` gives agents repo-specific instructions (build commands, test patterns, architectural constraints). The org's `.fullsend/agents/` directory provides role-specific agent definitions that apply across all enrolled repos.
+AGENTS.md files follow the same layering. A repo's `.fullsend/AGENTS.md` gives agents repo-specific instructions (build commands, test patterns, architectural constraints). Role-specific agent definitions come from upstream unless the repo registers custom agents in the `agents:` list of `.fullsend/config.yaml`.
 
-See [ADR 0003](ADRs/0003-org-config-repo-convention.md) for the config repo convention and [ADR 0024](ADRs/0024-harness-definitions.md) for harness definitions.
+See [ADR 0003](ADRs/0003-org-config-repo-convention.md) for the historical org config repo convention and [ADR 0024](ADRs/0024-harness-definitions.md) for harness definitions.
 
 **Decided:**
 
@@ -831,28 +825,28 @@ event ──► DISPATCHER
 The same wrapping structure, with each layer mapped to its concrete technology.
 
 ```
-GitHub event ──► SHIM WORKFLOW (fullsend.yml in enrolled repo)
+GitHub event ──► SHIM WORKFLOW (.github/workflows/fullsend.yaml in the repo)
                  Evaluates dispatch conditions (event type, labels, /slash commands).
-                 Calls workflow_call to .fullsend repo (dispatch.yml).
+                 Calls workflow_call to upstream reusable-dispatch.yml.
                        │
                        ▼
                  ╔═══════════════════════════════════════════════════════════════╗
-                 ║ DISPATCH WORKFLOW (.fullsend repo, dispatch.yml)              ║
+                 ║ DISPATCH WORKFLOW (upstream reusable-dispatch.yml)            ║
                  ║                                                               ║
-                 ║ Mints OIDC token → Cloud Function (token mint) → scoped       ║
-                 ║ GitHub App installation token per agent role.                 ║
-                 ║ Dispatches per-role agent workflows (code.yml, triage.yml).   ║
+                 ║ Routes the event to an agent stage and runs that stage as     ║
+                 ║ an inline job (route → triage / code / review / fix / ...).   ║
                  ╚═══════════════════════════════════════════════════════════════╝
                        │
                        ▼
                  ╔═══════════════════════════════════════════════════════════════╗
-                 ║ AGENT WORKFLOW (.fullsend repo, e.g. code.yml)                ║
+                 ║ AGENT JOB (reusable-dispatch.yml, e.g. the code job)          ║
                  ║                                                               ║
-                 ║ Validates source repo is enrolled in config.yaml.             ║
+                 ║ Mints OIDC token → token mint → scoped GitHub App             ║
+                 ║ installation token per agent role.                            ║
                  ║ Uses scoped GitHub App tokens:                                ║
                  ║   read-only token → enters sandbox (clone, read issues)       ║
                  ║   read-write token → stays on runner (push, create PR)        ║
-                 ║ Checks out .fullsend repo + target repo.                      ║
+                 ║ Checks out caller repo, upstream defaults + target repo.      ║
                  ║                                                               ║
                  ║ ┌───────────────────────────────────────────────────────────┐ ║
                  ║ │ FULLSEND CLI (fullsend run code)                          │ ║
@@ -929,7 +923,7 @@ GitHub event ──► SHIM WORKFLOW (fullsend.yml in enrolled repo)
 
 | Abstract layer | MVP technology | ADR |
 |---|---|---|
-| Dispatcher | Shim workflow (`fullsend.yml`) in enrolled repo → `workflow_call` to `.fullsend/dispatch.yml` → OIDC mint → per-role agent workflows (thin callers → upstream reusable workflows) | [ADR 0008](ADRs/0008-workflow-dispatch-for-cross-repo-dispatch.md), [ADR 0031](ADRs/0031-reusable-workflows-for-action-installed-distribution.md) |
+| Dispatcher | Shim workflow (`.github/workflows/fullsend.yaml`) in the repo → `workflow_call` to upstream `reusable-dispatch.yml` → inline agent job per stage → OIDC mint | [ADR 0031](ADRs/0031-reusable-workflows-for-action-installed-distribution.md), [ADR 0041](ADRs/0041-synchronous-workflow-call-event-dispatch.md) |
 | Agent runner | GitHub Actions job → `fullsend run` CLI (via `fullsend-ai/fullsend@<version>` composite action) | |
 | Harness store | YAML files in `.fullsend/harness/` (e.g. `code.yaml`, `triage.yaml`) | |
 | Sandbox | OpenShell with per-agent L7 network policies (endpoint + binary restrictions) | |

@@ -53,13 +53,6 @@ fullsend
 │   └── set          <owner/repo> <key> <value> # Update a config value
 ├── repos                                    # Manage per-repo installations via manifest
 │   ├── --gitlab-token <token>               #   GitLab access token (overrides GITLAB_TOKEN)
-│   ├── migrate      <org>                   # Migrate org from per-org to per-repo install
-│   │   ├── --project <id>                   #   GCP project ID for inference (required)
-│   │   ├── --repo <name>                    #   Filter to specific repos (repeatable, supports globs)
-│   │   ├── --dry-run                        #   Preview only
-│   │   ├── --direct                         #   Push scaffold to default branch (skip PR)
-│   │   ├── --concurrency <int>              #   Parallel limit (1-32, default: 4)
-│   │   └── -f, --manifest <path>            #   Output path for repos.yaml (default: repos.yaml)
 │   ├── install      [repos...]              # Converge repos to desired state (provision, repair drift, upgrade)
 │   │   ├── -f, --manifest <path>            #   Path or URL to repos.yaml (default: repos.yaml)
 │   │   ├── --dry-run                        #   Preview without making changes
@@ -597,7 +590,7 @@ After downloading files from the sandbox, `sanitizeDownload()` removes:
 
 ### Scaffold Architecture
 
-The fullsend binary embeds a complete `.fullsend` repo template using Go's `embed.FS`:
+The fullsend binary embeds the installation scaffold using Go's `embed.FS`:
 
 ```go
 //go:embed all:fullsend-repo
@@ -609,7 +602,7 @@ var content embed.FS
 ```
 fullsend-repo/                      (embedded template)
 ├── .github/
-│   ├── workflows/                  → Pushed to config repo
+│   ├── workflows/                  → Thin callers installed to target repo
 │   ├── actions/                    → Upstream-only (not installed)
 │   └── scripts/                    → Upstream-only (not installed)
 ├── agents/                         → Layered (runtime, not installed)
@@ -621,15 +614,15 @@ fullsend-repo/                      (embedded template)
 ├── scripts/                        → Layered (runtime, not installed)
 ├── env/                            → Layered (runtime, not installed)
 ├── templates/
-│   └── shim-per-repo.yaml          → Per-repo shim workflow template
-└── (other files)                   → Installed to config repo
+│   └── shim-per-repo.yaml          → Rendered to .github/workflows/fullsend.yaml
+└── (other files)                   → Not installed by per-repo installs
 ```
 
 **Four categories:**
 
 | Category | Installed? | Source | Purpose |
 |----------|-----------|--------|---------|
-| **Installed** | Yes | Scaffold → `.fullsend` repo | Workflows, configs, static files |
+| **Installed** | Yes | Scaffold → target repo | `fullsend.yaml` shim (from `templates/shim-per-repo.yaml`) and the `prioritize.yml` thin caller |
 | **Layered** | No (runtime) or yes with `--vendor` | Upstream `@main` sparse checkout, or vendored at install | agents/, skills/, harness/, plugins/, scripts/, schemas/, env/ |
 | **Built in** | No | Embedded in the `fullsend` binary; `fullsend run` resolves a bare provider name to it | providers/, profiles/ |
 | **Upstream-only** | No (layered) or yes with `--vendor` | Referenced directly or vendored at install | .github/actions/, .github/scripts/ |

@@ -1,6 +1,6 @@
 # Operations
 
-Day-2 administration for fullsend per-repo installations: configuration updates, workflow syncing, uninstall, and standalone commands for split-responsibility workflows. For per-org operations (enrollment, org-level status, org uninstall), see [Per-Org Mode](org-mode.md).
+Day-2 administration for fullsend per-repo installations: configuration updates, workflow syncing, uninstall, and standalone commands for split-responsibility workflows.
 
 ## Prerequisites
 

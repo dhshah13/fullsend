@@ -315,27 +315,9 @@ During installation, the GCF provisioner creates:
 
 > Individual values can be updated with `fullsend github set <owner/repo> <key> <value>`. See [Operations](../getting-started/operations.md#updating-configuration-values) for the full configuration management guide.
 
-Secrets and variables are deployed on the target repository. The CLI no longer installs per-org secrets and variables; the legacy per-org layout below is retained only as a historical reference for existing org-mode installations.
+Secrets and variables are deployed on the target repository.
 
-### Per-Org Mode Secrets/Variables (historical, removed from CLI installation)
-
-**Org-level variable:**
-- `FULLSEND_MINT_URL` — URL of the token mint Cloud Function
-
-**.fullsend repo variables (per role):**
-- `FULLSEND_{ROLE}_CLIENT_ID` — GitHub App client ID
-
-**.fullsend repo secrets (inference):**
-- `FULLSEND_GCP_PROJECT_ID` — GCP project for inference
-- `FULLSEND_GCP_WIF_PROVIDER` — WIF provider resource name
-
-**.fullsend repo variables (inference):**
-- `FULLSEND_GCP_REGION` — GCP region for inference (value drift is detected and repaired by convergence)
-
-**.fullsend repo variable (dot-repo fix):**
-- `FULLSEND_MINT_URL` — Duplicate of org variable (dot-prefixed repos can't read org-level variables)
-
-### Per-Repo Mode Secrets/Variables
+### Per-Repo Secrets/Variables
 
 #### GitHub
 

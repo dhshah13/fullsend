@@ -45,10 +45,9 @@ and provide them permissions to the repository you want to install Fullsend to.
 | retro | <https://github.com/apps/fullsend-ai-retro/installations/new> |
 | prioritize | <https://github.com/apps/fullsend-ai-prioritize/installations/new> |
 
-> **Note:** The `fullsend` dispatch app (`fullsend-ai-fullsend`) is only
-> required for [organization-mode](org-mode.md) installations. Per-repo
-> mode uses the repository's own shim workflow for dispatch and does not
-> need the `fullsend` app.
+> **Note:** You do not need the `fullsend` dispatch app
+> (`fullsend-ai-fullsend`). Each repository dispatches through its own shim
+> workflow.
 
 > **Note:** Installing a subset of GitHub Apps does **not** automatically
 > limit which agents are active. You must also pass the `--agents` flag

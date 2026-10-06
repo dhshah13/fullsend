@@ -142,11 +142,7 @@ func SkipErrorForTagNames(tags []string, w *world.World) error {
 	for _, tag := range tags {
 		name := strings.TrimPrefix(tag, "@")
 		switch {
-		case name == "skip:per-org" && w.Config.InstallMode == "per-org":
-			return godog.ErrSkip
 		case name == "skip:per-repo" && w.Config.InstallMode == "per-repo":
-			return godog.ErrSkip
-		case name == "requires:per-repo" && w.Config.InstallMode != "per-repo":
 			return godog.ErrSkip
 		case name == "skip:gitlab" && w.Config.SCM == "gitlab":
 			return godog.ErrSkip
