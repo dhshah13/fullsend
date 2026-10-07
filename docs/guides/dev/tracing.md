@@ -252,9 +252,9 @@ a secret only decoding spells out (an assignment that opens a string, a
 token or runner environment value written with an escape). So the
 document is walked the same way, its output and findings discarded; when
 the walk raises a finding — any but the normalizer's, save its removal of
-an ST-terminated escape sequence (OSC and its kin) or of tag characters,
-which can carry text no pattern sees; a secret the scan masked in place
-no longer shows — the string is
+an escape sequence or of tag characters, which can carry text no pattern
+sees (digits as a CSI parameter, a token inside an OSC sequence); a
+secret the scan masked in place no longer shows — the string is
 masked `***` whole, with one `held_document` finding. So is a document
 that cannot be judged: held more than `maxHeldDepth` (4) deep, each level
 being scanned once more; naming a member twice, since decoding keeps only
@@ -262,8 +262,9 @@ the last (RFC 7493 forbids it); or broken by the scan — text the scan
 changed, folding or masking it, that begins and ends like a document but
 no longer parses. That masks whole text with no secret left in it too —
 a document with a repeated name, one a pattern misreads once decoded (a
-notebook line `key = …`), text shaped like a document whose secret the
-scan masked (a Python dict) — and a mask the walk
+notebook line `key = …`), one holding an escaped terminal colour code,
+text shaped like a document whose secret the scan masked (a Python
+dict) — and a mask the walk
 matches again (a connection string's password of ten bytes or more, the
 runner environment marker in an assignment, a mask of eight bytes or more
 under a secret-named member) masks its string whole and counts its secret

@@ -91,9 +91,10 @@ then mask the marker as well and count again. Not covered: a value split
 or spelled that way which a pattern also recognises — in one of those
 contexts, in a connection string, or by its own prefix — is masked by
 that pattern, and shows what the pattern's mask shows. A tool call loses
-its `summary` when redaction found a secret in its arguments, or masked a
-document there it could not judge: the parser cut the summary out of them
-before anything scanned it, so the secret could be there as a beginning. Where a runtime reports a summary and no
+its `summary` when redaction found a secret in its arguments, stripped an
+escape sequence or tag characters from them, or masked a document there
+it could not judge: the parser cut the summary out of them before
+anything scanned it, so the secret could be there as a beginning. Where a runtime reports a summary and no
 arguments (pi, codex, OpenCode), its parser has already run the patterns
 over the summary and, for pi and codex, cut it: a value that straddles a
 cut stays in part, and one a pattern recognised stays as that pattern's
@@ -167,7 +168,8 @@ characters or more under a secret-named member, such as `username` and
 `password` under `auth`, are both masked and so collide), are dropped
 whole — a cut object is not JSON — and the marked `tool_call` part keeps
 its `id`, name and summary — not the summary when redaction found a
-secret in the arguments, or masked a document there it could not judge. Arguments also go, charged and marked, when
+secret in the arguments, stripped an escape sequence or tag characters
+from them, or masked a document there it could not judge. Arguments also go, charged and marked, when
 the call's name redacts to nothing; that part survives only if it has a
 summary. So `fullsend.truncated` means different things by part type: on a
 tool result, part of the response is kept; on a tool call, none of the

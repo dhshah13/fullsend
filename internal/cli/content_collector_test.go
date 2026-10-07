@@ -212,11 +212,12 @@ func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(
 		"key under credentials":     {`{"credentials":{"` + opaque + `":"user"}}`, "***", 1},
 		"document in a document":    {`{"inner":` + quote(`{"token":["`+opaque+`"]}`) + `}`, "***", 1},
 		// The scan sees the document's text; these only its strings.
-		"an assignment that opens a string":    {`{"command":"API_KEY=` + opaque + `"}`, "***", 1},
-		"an assignment after an escaped break": {`{"c":"cd x\nAPI_KEY=` + opaque + ` run"}`, "***", 1},
-		"a token spelled with an escape":       {`{"t":"ghp_\u0072` + token[5:] + `"}`, "***", 1},
-		"tag characters written with escapes":  {`{"t":"\uDB40\uDC67"}`, "***", 1},
-		"an escape sequence around a token":    {`{"n":"see \u001b]ghp_\u0072` + token[5:] + `\u0007"}`, "***", 1},
+		"an assignment that opens a string":       {`{"command":"API_KEY=` + opaque + `"}`, "***", 1},
+		"an assignment after an escaped break":    {`{"c":"cd x\nAPI_KEY=` + opaque + ` run"}`, "***", 1},
+		"a token spelled with an escape":          {`{"t":"ghp_\u0072` + token[5:] + `"}`, "***", 1},
+		"tag characters written with escapes":     {`{"t":"\uDB40\uDC67"}`, "***", 1},
+		"digits in an escape under a secret name": {`{"auth":{"pin":"\u001b[31415926535m"}}`, "***", 1},
+		"an escape sequence around a token":       {`{"n":"see \u001b]ghp_\u0072` + token[5:] + `\u0007"}`, "***", 1},
 		// Folding can make the document; a document the scan breaks,
 		// folding or masking it, cannot be judged.
 		"folded into a document":                     {"\uFF5B" + cred + "}", "***", 2},
@@ -274,6 +275,8 @@ func TestContentCollector_JSONInAStringIsAlsoScannedWhole(t *testing.T) {
 		"runner env value with structure":         {map[string]string{"DB_PASSWORD": `hunter22","port`}, `{"pw":"hunter22","port":5432}`, "hunter22", 2},
 		"runner env value that ends the document": {map[string]string{"DB_PASSWORD": `hunter22"}`}, `{"pw":"hunter22"}`, "hunter22", 2},
 		"and one behind a BOM":                    {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
+		"and one behind a space and a BOM":        {map[string]string{"DB_PASSWORD": `hunter22"}`}, " \uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
+		"and one behind a zero-width space":       {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\u200B{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
 		// Decoded, the literal pass sees it.
 		"runner env value spelled with an escape": {map[string]string{"DB_PASSWORD": "hunter2hunter2"}, `{"pw":"\u0068unter2hunter2"}`, "unter2hunter2", 1},
 	} {
@@ -560,6 +563,23 @@ func TestContentCollector_DropsTheSummaryWhenTheArgumentsHeldARunnerEnvValue(t *
 	assert.NotContains(t, res.OutputMessages, secret[:5])
 	assert.Contains(t, res.OutputMessages, `{"type":"tool_call","name":"Bash","arguments":{"command":"git push https://x:[REDACTED:PUSH_TOKEN]@host/repo"}}`)
 	assert.Contains(t, res.OutputMessages, `"summary":"ls"`, "a call whose arguments held no value keeps its summary")
+}
+
+func TestContentCollector_DropsTheSummaryWhenAnEscapeSequenceHidAToken(t *testing.T) {
+	// The normalizer strips the whole sequence from the arguments, token
+	// and all; the parser's cut summary lost the terminator, so nothing
+	// strips the beginning of the token there.
+	token := "ghp_" + strings.Repeat("r", 36)
+	c := newContentCollector(4096)
+	c.Handle(agentruntime.ToolUseEvent{
+		Name:      "Bash",
+		Summary:   "echo \x1b]" + token[:36],
+		Arguments: `{"command":"echo \u001b]` + token + `\u0007"}`,
+	})
+
+	res := c.Result("stop")
+	assert.NotContains(t, res.OutputMessages, token[:36])
+	assert.NotContains(t, res.OutputMessages, `"summary"`)
 }
 
 func TestContentCollector_DropsTheSummaryWhenAPatternFoundTheSecret(t *testing.T) {

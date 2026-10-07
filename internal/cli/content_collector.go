@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -84,8 +85,9 @@ const maxToolResultBytes = 8 * 1024
 // maxToolArgumentsBytes bounds one tool call's arguments, measured on
 // their redacted encoding. Arguments over it are dropped whole, not cut:
 // a cut object is not JSON, and the part keeps its id, name and summary
-// (not the summary when redaction found a secret in the arguments, or
-// masked a document there it could not judge; see Handle).
+// (not the summary when redaction found a secret in the arguments,
+// stripped an escape sequence or tag characters from them, or masked a
+// document there it could not judge; see Handle).
 // Like maxToolResultBytes it exists because the total above is small;
 // what blocks raising it is the same unproven backend ceiling named on
 // maxContentBytes.
@@ -420,12 +422,14 @@ func (c *contentCollector) Handle(evt agentruntime.AgentEvent) {
 			// appendPart then refuses.
 			scanned := len(c.findings)
 			p.Arguments, p.Truncated = c.toolArguments(e.Arguments)
-			if slices.ContainsFunc(c.findings[scanned:], func(f security.Finding) bool { return f.Scanner != "unicode_normalizer" }) {
+			if slices.ContainsFunc(c.findings[scanned:], revealing) {
 				// The parser cut the summary out of these arguments
 				// before anything scanned it, so a secret found in them,
-				// or in a document masked unjudged, can be in the summary
-				// as a beginning that neither the literal pass nor a
-				// pattern matches.
+				// stripped with an escape sequence or tag characters, or
+				// in a document masked unjudged, can be in the summary as
+				// a beginning that neither the literal pass nor a pattern
+				// matches, nor the normalizer strips once its terminator
+				// is cut.
 				p.Summary = ""
 			}
 		}
@@ -827,9 +831,11 @@ func jsonDocument(s string) (string, bool) {
 }
 
 // documentLike reports text that begins and ends as a JSON object or
-// array does, after a byte order mark.
+// array does, white space, control and format characters (a byte order
+// mark, a zero-width space) aside: the normalizer strips the latter from
+// the scanned text, not from the written one.
 func documentLike(s string) bool {
-	s = strings.TrimSpace(strings.TrimPrefix(s, "\uFEFF"))
+	s = strings.TrimFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) })
 	return len(s) >= 2 && (s[0] == '{' && s[len(s)-1] == '}' || s[0] == '[' && s[len(s)-1] == ']')
 }
 
@@ -906,13 +912,13 @@ func (c *contentCollector) heldSecret(scanned, written string) (string, bool) {
 	return "secret", found
 }
 
-// revealing reports a finding of heldSecret's walk that shows a secret in
-// the decoded document: any but the normalizer's, and its removal of an
-// ST-terminated escape sequence (OSC and its kin) or of tag characters,
-// which can carry text the patterns never see. A secret the scan masked in place is gone from the
+// revealing reports a finding that shows a secret was there: any but the
+// normalizer's, and its removal of an escape sequence or of tag
+// characters, which can carry text the patterns never see — digits as a
+// CSI parameter, a token inside an OSC sequence. A secret the scan masked in place is gone from the
 // document by then, but for a mask that matches again.
 func revealing(f security.Finding) bool {
-	return f.Scanner != "unicode_normalizer" || f.Name == "osc_escape" || f.Name == "tag_char"
+	return f.Scanner != "unicode_normalizer" || f.Name == "ansi_escape" || f.Name == "osc_escape" || f.Name == "tag_char"
 }
 
 // redactValue redacts every string, number and object key under v; a
