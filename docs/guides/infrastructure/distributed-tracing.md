@@ -127,8 +127,9 @@ A string value or key in it that holds one JSON object, array or string
 literal — a JSON file passed to `Write`, say — is masked `***` whole when that
 document, decoded, still shows a secret: a value or key nested under a secret-named
 member, or one only decoding spells out. So is one that cannot be judged:
-held more than four deep, naming a member twice, or broken by redaction
-— the [developer guide](../dev/tracing.md) lists what is not judged.
+held more than four deep, naming a member twice, or shaped like a
+document but not parsing (JSON with comments or trailing commas, an
+object literal) — the [developer guide](../dev/tracing.md) has the list.
 A string directly under a secret-named member is masked in place, as
 anywhere else.
 
