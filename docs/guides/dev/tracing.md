@@ -243,21 +243,37 @@ behind escaped quotes, and JSON nested in a string; Unicode folding can
 also turn a fullwidth quotation mark into one that closes the string.
 `toolArguments` decodes the value, redacts each string and object key on
 its own (a number as its digits; one that redacts becomes the redacted
-string), and encodes the result again. A string value that holds one
-JSON object or array — as scanned, or as written when the scan left none,
-since folding or a mask can break one — is walked the same way as well
-(`heldSecret`): the string is scanned whole, since a secret can span a
-document's strings, but a secret-named member nested in it is out of the
-pattern's sight. The walk's output and its other findings are discarded,
-since a mask can match again; when it would mask a value or key under a
-secret-named member, the string is masked `***` whole, with that one
-finding. Not walked: documents held more than `maxHeldDepth` (4) deep —
-each level is scanned once more, so a document the scan breaks costs up to
-five scans of its text — a document in an object key, a member a later
-duplicate key replaces, a document whose structure folding or a mask
-changes while the text holding it still parses (a document held in it
-then breaks too), and structure in any other text (several documents,
-YAML, a document inside code). Each string and number is also
+string), and encodes the result again. A string value or key that holds
+one JSON object or array once scanned — what is exported — is judged
+decoded as well (`heldSecret`). The scan reads the string whole, since a
+secret can span a document's strings, but as text: it misses a
+secret-named member nested deeper than the value right after the key, and
+a secret only decoding spells out (an assignment that opens a string, a
+token or runner environment value written with an escape). So the
+document is walked the same way, its output and findings discarded; when
+the walk raises a finding — any but the normalizer's, save its removal of
+an ST-terminated escape sequence (OSC and its kin) or of tag characters,
+which can carry text no pattern sees; a secret the scan masked in place
+no longer shows — the string is
+masked `***` whole, with one `held_document` finding. So is a document
+that cannot be judged: held more than `maxHeldDepth` (4) deep, each level
+being scanned once more; naming a member twice, since decoding keeps only
+the last (RFC 7493 forbids it); or broken by the scan — text the scan
+changed, folding or masking it, that begins and ends like a document but
+no longer parses. That masks whole text with no secret left in it too —
+a document with a repeated name, one a pattern misreads once decoded (a
+notebook line `key = …`), text shaped like a document whose secret the
+scan masked (a Python dict) — and a mask the walk
+matches again (a connection string's password of ten bytes or more, the
+runner environment marker in an assignment, a mask of eight bytes or more
+under a secret-named member) masks its string whole and counts its secret
+twice. Not judged: a document whose structure folding or a mask changes
+while the text holding it still parses (one held in it then breaks too);
+text that never parsed — JSON with comments or trailing commas, several
+documents, a raw control character — unless the scan changed it and it
+is shaped like a document, when it is masked whole as above; and
+structure in any other text (YAML, a document inside code). Each string
+and number is also
 scanned once more, already redacted, beside the nearest enclosing key the
 member-name pattern (`json_field`) names, and masked whole when that pattern
 matches the pair — a pattern keyed on a member

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"io"
 	"maps"
 	"slices"
 	"sort"
@@ -83,8 +84,8 @@ const maxToolResultBytes = 8 * 1024
 // maxToolArgumentsBytes bounds one tool call's arguments, measured on
 // their redacted encoding. Arguments over it are dropped whole, not cut:
 // a cut object is not JSON, and the part keeps its id, name and summary
-// (not the summary when redaction found a secret in the arguments; see
-// Handle).
+// (not the summary when redaction found a secret in the arguments, or
+// masked a document there it could not judge; see Handle).
 // Like maxToolResultBytes it exists because the total above is small;
 // what blocks raising it is the same unproven backend ceiling named on
 // maxContentBytes.
@@ -98,7 +99,8 @@ const maxToolArgumentsBytes = 8 * 1024
 
 // maxHeldDepth bounds how deep heldSecret walks documents held in
 // strings: each level is scanned once more, and with \u escapes a
-// document can nest about the square root of its length deep.
+// document can nest about the square root of its length deep. A string
+// holding one deeper is masked whole.
 const maxHeldDepth = 4
 
 // newContentCollectorIfEnabled returns a live collector when the Level 3
@@ -420,9 +422,10 @@ func (c *contentCollector) Handle(evt agentruntime.AgentEvent) {
 			p.Arguments, p.Truncated = c.toolArguments(e.Arguments)
 			if slices.ContainsFunc(c.findings[scanned:], func(f security.Finding) bool { return f.Scanner != "unicode_normalizer" }) {
 				// The parser cut the summary out of these arguments
-				// before anything scanned it, so a secret found in them
-				// can be in the summary as a beginning that neither the
-				// literal pass nor a pattern matches.
+				// before anything scanned it, so a secret found in them,
+				// or in a document masked unjudged, can be in the summary
+				// as a beginning that neither the literal pass nor a
+				// pattern matches.
 				p.Summary = ""
 			}
 		}
@@ -817,48 +820,99 @@ func decodeJSON(s string) (any, error) {
 	return v, err
 }
 
-// jsonDocument decodes s when it is one JSON object or array, after a
-// byte order mark: one with a BOM must parse as written, should folding
-// break it once the normalizer has stripped the BOM.
-func jsonDocument(s string) (any, bool) {
-	s = strings.TrimSpace(strings.TrimPrefix(s, "\uFEFF"))
-	if s == "" || (s[0] != '{' && s[0] != '[') || !json.Valid([]byte(s)) {
-		return nil, false
-	}
-	v, err := decodeJSON(s)
-	return v, err == nil
+// jsonDocument returns s trimmed when it is one JSON object or array.
+func jsonDocument(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	return s, s != "" && (s[0] == '{' || s[0] == '[') && json.Valid([]byte(s))
 }
 
-// heldSecret walks the JSON object or array a string holds — as scanned,
-// or as written when the scan left none (folding or a mask can break
-// one) — as the arguments are walked, and returns the member-name
-// finding of a value or key there under a secret-named member: the
-// pattern wants the value right after the key, so the text scan misses
-// one nested deeper. The walk's output and its other findings are
-// discarded — the string was scanned already, and a mask can match
-// again — so a string holding such a member is masked whole.
-func (c *contentCollector) heldSecret(scanned, written string) (security.Finding, bool) {
-	if c.held == maxHeldDepth {
-		return security.Finding{}, false
+// documentLike reports text that begins and ends as a JSON object or
+// array does, after a byte order mark.
+func documentLike(s string) bool {
+	s = strings.TrimSpace(strings.TrimPrefix(s, "\uFEFF"))
+	return len(s) >= 2 && (s[0] == '{' && s[len(s)-1] == '}' || s[0] == '[' && s[len(s)-1] == ']')
+}
+
+// duplicateName reports an object in the JSON document s that names a
+// member twice, the names compared decoded, as RFC 7493 does.
+func duplicateName(s string) bool {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()             // a number past float64 is valid JSON too
+	var names []map[string]bool // one set for each open object
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err != io.EOF // s is valid; fail closed all the same
+		}
+		switch tok {
+		case json.Delim('{'):
+			names = append(names, map[string]bool{})
+		case json.Delim('}'):
+			names = names[:len(names)-1]
+		default:
+			// A string a colon follows names a member of the innermost
+			// object open.
+			name, ok := tok.(string)
+			if !ok || !strings.HasPrefix(strings.TrimLeft(s[dec.InputOffset():], " \t\r\n"), ":") {
+				continue
+			}
+			if names[len(names)-1][name] {
+				return true
+			}
+			names[len(names)-1][name] = true
+		}
 	}
+}
+
+// maskHeld masks a string or an object key of the arguments whole, with
+// one held_document finding, when heldSecret finds against the document
+// its scanned text s holds; t is the text as written.
+func (c *contentCollector) maskHeld(s, t string) string {
+	if reason, ok := c.heldSecret(s, t); ok {
+		c.findings = append(c.findings, security.Finding{Scanner: "held_document", Name: reason, Severity: "high", Detail: "string holding a JSON document masked whole", Position: -1})
+		return "***"
+	}
+	return s
+}
+
+// heldSecret judges, decoded, the JSON object or array a string holds
+// once scanned — what is exported. The scan reads the document's text,
+// so it misses a secret-named member nested deeper than the value right
+// after the key, and a secret that only decoding spells out: an
+// assignment that opens a string, a token or runner env value written
+// with an escape. The document is walked as the arguments are, its
+// output and findings discarded; a revealing finding makes the reason
+// "secret". A document that cannot be judged makes it "uninspected":
+// one held deeper than maxHeldDepth, one naming a member twice —
+// decoding keeps the last — and one the scan broke: text the scan
+// changed, folding or masking it, that begins and ends like a document
+// but no longer parses. A level above records that mask as "secret": it
+// is a finding of that level's walk.
+func (c *contentCollector) heldSecret(scanned, written string) (string, bool) {
 	doc, ok := jsonDocument(scanned)
 	if !ok {
-		doc, ok = jsonDocument(written)
+		return "uninspected", scanned != written && (documentLike(scanned) || documentLike(written))
 	}
-	if !ok {
-		return security.Finding{}, false
+	if c.held == maxHeldDepth || duplicateName(doc) {
+		return "uninspected", true
 	}
+	v, _ := decodeJSON(doc) // a valid document decodes
 	mark := len(c.findings)
 	c.held++
-	c.redactValue(doc, "", new(bool))
+	c.redactValue(v, "", new(bool))
 	c.held--
-	var f security.Finding
-	i := slices.IndexFunc(c.findings[mark:], func(f security.Finding) bool { return f.Name == "json_field" })
-	if i >= 0 {
-		f = c.findings[mark+i]
-	}
+	found := slices.ContainsFunc(c.findings[mark:], revealing)
 	c.findings = c.findings[:mark]
-	return f, i >= 0
+	return "secret", found
+}
+
+// revealing reports a finding of heldSecret's walk that shows a secret in
+// the decoded document: any but the normalizer's, and its removal of an
+// ST-terminated escape sequence (OSC and its kin) or of tag characters,
+// which can carry text the patterns never see. A secret the scan masked in place is gone from the
+// document by then, but for a mask that matches again.
+func revealing(f security.Finding) bool {
+	return f.Scanner != "unicode_normalizer" || f.Name == "osc_escape" || f.Name == "tag_char"
 }
 
 // redactValue redacts every string, number and object key under v; a
@@ -877,11 +931,7 @@ func (c *contentCollector) heldSecret(scanned, written string) (security.Finding
 func (c *contentCollector) redactValue(v any, under string, collided *bool) any {
 	switch t := v.(type) {
 	case string:
-		s := c.redact(t, &c.findings)
-		if f, ok := c.heldSecret(s, t); ok {
-			c.findings = append(c.findings, f)
-			return "***"
-		}
+		s := c.maskHeld(c.redact(t, &c.findings), t)
 		if under != "" && c.secretNamed(under, s) {
 			return "***"
 		}
@@ -903,18 +953,20 @@ func (c *contentCollector) redactValue(v any, under string, collided *bool) any 
 	case map[string]any:
 		out := make(map[string]any, len(t))
 		for _, k := range slices.Sorted(maps.Keys(t)) {
-			rk := c.redact(k, &c.findings)
+			// The key as scanned names the secret, masked whole or not.
+			sk := c.redact(k, &c.findings)
+			rk := c.maskHeld(sk, k)
 			member := under
-			if c.namesASecret(rk) {
-				member = rk
+			if c.namesASecret(sk) {
+				member = sk
 			}
 			e := c.redactValue(t[k], member, collided)
-			if s, ok := e.(string); ok && member != rk && c.secretNamed(rk, s) {
+			if s, ok := e.(string); ok && member != sk && c.secretNamed(sk, s) {
 				// A single quote in the key can let the pattern match
 				// the pair even when the key names no secret.
 				e = "***"
 			}
-			if under != "" && c.secretNamed(under, rk) {
+			if under != "" && c.secretNamed(under, sk) {
 				// A key under a secret-named member is judged like its
 				// values: a credential can be the key. Two masked alike
 				// take the collision path below.

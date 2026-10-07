@@ -91,9 +91,9 @@ then mask the marker as well and count again. Not covered: a value split
 or spelled that way which a pattern also recognises — in one of those
 contexts, in a connection string, or by its own prefix — is masked by
 that pattern, and shows what the pattern's mask shows. A tool call loses
-its `summary` when redaction found a secret in its arguments: the parser
-cut the summary out of them before anything scanned it, so the secret
-could be there as a beginning. Where a runtime reports a summary and no
+its `summary` when redaction found a secret in its arguments, or masked a
+document there it could not judge: the parser cut the summary out of them
+before anything scanned it, so the secret could be there as a beginning. Where a runtime reports a summary and no
 arguments (pi, codex, OpenCode), its parser has already run the patterns
 over the summary and, for pi and codex, cut it: a value that straddles a
 cut stays in part, and one a pattern recognised stays as that pattern's
@@ -122,10 +122,13 @@ codex parsers emit none of the three yet
 `arguments` is the call's input decoded, redacted string by string (a
 number that redacts becomes the redacted string), and
 encoded again, so key order, spacing and escapes are not the stream's.
-A string value in it that holds one JSON object or array — a JSON file
-passed to `Write`, say — is masked `***` whole when that document nests a
-value or key under a secret-named member that redaction would otherwise
-leave; a string directly under such a member is masked in place, as
+A string value or key in it that holds one JSON object or array — a JSON
+file passed to `Write`, say — is masked `***` whole when that document,
+decoded, still shows a secret: a value or key nested under a secret-named
+member, or one only decoding spells out. So is one that cannot be judged:
+held more than four deep, naming a member twice, or broken by redaction
+— the [developer guide](../dev/tracing.md) lists what is not judged.
+A string directly under a secret-named member is masked in place, as
 anywhere else.
 
 On a retry iteration under `validation_loop.feedback_mode: append`, the
@@ -164,7 +167,7 @@ characters or more under a secret-named member, such as `username` and
 `password` under `auth`, are both masked and so collide), are dropped
 whole — a cut object is not JSON — and the marked `tool_call` part keeps
 its `id`, name and summary — not the summary when redaction found a
-secret in the arguments. Arguments also go, charged and marked, when
+secret in the arguments, or masked a document there it could not judge. Arguments also go, charged and marked, when
 the call's name redacts to nothing; that part survives only if it has a
 summary. So `fullsend.truncated` means different things by part type: on a
 tool result, part of the response is kept; on a tool call, none of the
