@@ -237,10 +237,20 @@ func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(
 		"a mask that matches again": {`{"db":"postgres://u:hunter2hunter2@db/x"}`, "***", 2},
 		"a notebook assignment":     {`{"cells":[{"source":["key = jax.random.PRNGKey(0)\n"]}]}`, "***", 1},
 		// Otherwise the string is kept as the scan left it.
-		"plain document":                        {`{ "b": "` + opaque + `", "a": 1 }`, `{ "b": "` + opaque + `", "a": 1 }`, 0},
-		"a pair stays masked in place":          {`{"password":"hunter2hunter2","n":1}`, `{"password":"hunt...","n":1}`, 1},
-		"a letter folded once decoded":          {`{"v":"\uFF21"}`, `{"v":"\uFF21"}`, 0},
-		"a control character the scan keeps":    {"{\"a\":\"x\x01y\"}", "{\"a\":\"x\x01y\"}", 0},
+		"plain document":               {`{ "b": "` + opaque + `", "a": 1 }`, `{ "b": "` + opaque + `", "a": 1 }`, 0},
+		"a pair stays masked in place": {`{"password":"hunter2hunter2","n":1}`, `{"password":"hunt...","n":1}`, 1},
+		"a letter folded once decoded": {`{"v":"\uFF21"}`, `{"v":"\uFF21"}`, 0},
+		// Document-shaped text that does not parse cannot be judged either:
+		// a raw control character, a trailing comma, a comment, an object
+		// literal. Masked whole, secret or none.
+		"a control character the scan keeps": {"{\"a\":\"x\x01y\"}", "***", 1},
+		"a trailing comma":                   {`{` + cred + `,}`, "***", 1},
+		"a trailing comma and no secret":     {`{ "a": 1, }`, "***", 1},
+		"a comment":                          {"{\n  // dev \n  " + cred + "\n}", "***", 1},
+		"an object literal":                  {`{ apiKey: "hunter2hunter2" }`, "***", 1},
+		// Shaped like one but quoting nothing: code, or a mask.
+		"an object literal quoting nothing":     {`{ apiKey: process.env.KEY }`, `{ apiKey: process.env.KEY }`, 0},
+		"a mask":                                {"-----BEGIN RSA PRIVATE " + "KEY-----\nQQQQQQQQ\n-----END RSA PRIVATE " + "KEY-----", "[REDACTED PRIVATE KEY]", 1},
 		"a number past float64":                 {`{"maximum":1e999}`, `{"maximum":1e999}`, 0},
 		"text like a document the scan changed": {`{'password': 'hunter2hunter2'}`, "***", 2},
 		"a command that opens a brace":          {`{ export API_KEY=` + opaque + `; } 2>/dev/null`, `{ export API_KEY=opaq...; } 2>/dev/null`, 1},

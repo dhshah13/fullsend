@@ -258,23 +258,21 @@ secret the scan masked in place no longer shows — the string is
 masked `***` whole, with one `held_document` finding. So is a document
 that cannot be judged: held more than `maxHeldDepth` (4) deep, each level
 being scanned once more; naming a member twice, since decoding keeps only
-the last (RFC 7493 forbids it); or broken by the scan — text the scan
-changed, folding or masking it, that begins and ends like a document but
-no longer parses. That masks whole text with no secret left in it too —
-a document with a repeated name, one a pattern misreads once decoded (a
-notebook line `key = …`), one holding an escaped terminal colour code,
-text shaped like a document whose secret the scan masked (a Python
-dict) — and a mask the walk
+the last (RFC 7493 forbids it); or shaped like a document — it begins
+and ends like one, white space and invisible characters aside, and
+quotes something — but not parsing, whether the scan broke it, folding
+or masking it, or it never parsed. That masks whole text with no secret in it too — a document with
+a repeated name, one a pattern misreads once decoded (a notebook line
+`key = …`), one holding an escaped terminal colour code, JSON with
+comments or trailing commas, an object literal or a Python dict with a
+quoted value, an `Edit` fragment shaped `{…}` with one — and a mask the walk
 matches again (a connection string's password of ten bytes or more, the
 runner environment marker in an assignment, a mask of eight bytes or more
 under a secret-named member) masks its string whole and counts its secret
 twice. Not judged: a document whose structure folding or a mask changes
-while the text holding it still parses (one held in it then breaks too);
-text that never parsed — JSON with comments or trailing commas, several
-documents, a raw control character — unless the scan changed it and it
-is shaped like a document, when it is masked whole as above; and
-structure in any other text (YAML, a document inside code). Each string
-and number is also
+while the text holding it still parses (one held in it then breaks too),
+and structure in text not shaped like a document (several documents,
+YAML, a document inside code). Each string and number is also
 scanned once more, already redacted, beside the nearest enclosing key the
 member-name pattern (`json_field`) names, and masked whole when that pattern
 matches the pair — a pattern keyed on a member

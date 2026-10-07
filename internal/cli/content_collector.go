@@ -832,12 +832,14 @@ func jsonDocument(s string) (string, bool) {
 }
 
 // documentLike reports text that begins and ends as a JSON object, array
-// or string literal does, white space, control and format characters (a
-// byte order mark, a zero-width space) aside: the normalizer strips the
-// latter from the scanned text, not from the written one.
+// or string literal does and holds a quoted token, white space, control
+// and format characters (a byte order mark, a zero-width space) aside:
+// the normalizer strips the latter from the scanned text, not from the
+// written one. A mask is bracketed too — [REDACTED PRIVATE KEY], the
+// runner env marker — but quotes nothing.
 func documentLike(s string) bool {
 	s = strings.TrimFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) })
-	return len(s) >= 2 && (s[0] == '{' && s[len(s)-1] == '}' || s[0] == '[' && s[len(s)-1] == ']' || s[0] == '"' && s[len(s)-1] == '"')
+	return len(s) >= 2 && (s[0] == '{' && s[len(s)-1] == '}' || s[0] == '[' && s[len(s)-1] == ']' || s[0] == '"' && s[len(s)-1] == '"') && strings.ContainsAny(s, `"'`)
 }
 
 // duplicateName reports an object in the JSON document s that names a
@@ -891,14 +893,14 @@ func (c *contentCollector) maskHeld(s, t string) string {
 // output and findings discarded; a revealing finding makes the reason
 // "secret". A document that cannot be judged makes it "uninspected":
 // one held deeper than maxHeldDepth, one naming a member twice —
-// decoding keeps the last — and one the scan broke: text the scan
-// changed, folding or masking it, that begins and ends like a document
-// but no longer parses. A level above records that mask as "secret": it
+// decoding keeps the last — and text shaped like a document that does
+// not parse: one the scan broke, folding or masking it, or one that
+// never parsed (a comment, a trailing comma, an object literal). A level above records that mask as "secret": it
 // is a finding of that level's walk.
 func (c *contentCollector) heldSecret(scanned, written string) (string, bool) {
 	doc, ok := jsonDocument(scanned)
 	if !ok {
-		return "uninspected", scanned != written && (documentLike(scanned) || documentLike(written))
+		return "uninspected", documentLike(scanned) || documentLike(written)
 	}
 	if c.held == maxHeldDepth || duplicateName(doc) {
 		return "uninspected", true
