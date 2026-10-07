@@ -244,6 +244,7 @@ func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(
 		"a number past float64":                 {`{"maximum":1e999}`, `{"maximum":1e999}`, 0},
 		"text like a document the scan changed": {`{'password': 'hunter2hunter2'}`, "***", 2},
 		"a command that opens a brace":          {`{ export API_KEY=` + opaque + `; } 2>/dev/null`, `{ export API_KEY=opaq...; } 2>/dev/null`, 1},
+		"a held string literal":                 {`"plain text"`, `"plain text"`, 0},
 		"a value naming a sibling":              {`{"name":"name","from":"to","to":"x"}`, `{"name":"name","from":"to","to":"x"}`, 0},
 		"names repeated in other objects":       {`[{"a":1},{"a":2},{"x":{"a":1},"y":{"a":2}},{"a":{"x":1},"x":2}]`, `[{"a":1},{"a":2},{"x":{"a":1},"y":{"a":2}},{"a":{"x":1},"x":2}]`, 0},
 	} {
@@ -277,8 +278,11 @@ func TestContentCollector_JSONInAStringIsAlsoScannedWhole(t *testing.T) {
 		"and one behind a BOM":                    {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
 		"and one behind a space and a BOM":        {map[string]string{"DB_PASSWORD": `hunter22"}`}, " \uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
 		"and one behind a zero-width space":       {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\u200B{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
-		// Decoded, the literal pass sees it.
-		"runner env value spelled with an escape": {map[string]string{"DB_PASSWORD": "hunter2hunter2"}, `{"pw":"\u0068unter2hunter2"}`, "unter2hunter2", 1},
+		// Decoded, the literal pass sees it — in a document, or in a
+		// string a held JSON string literal spells with escapes.
+		"runner env value spelled with an escape":   {map[string]string{"DB_PASSWORD": "hunter2hunter2"}, `{"pw":"\u0068unter2hunter2"}`, "unter2hunter2", 1},
+		"runner env value in a held string literal": {map[string]string{"DEPLOY_PASSWORD": "abcdefghijklmno"}, `"\u0061bcdefghijklmno"`, "bcdefghijklmno", 1},
+		"and in one the scan breaks":                {map[string]string{"DEPLOY_PASSWORD": "abcdefghijklmno"}, "\"\\u0061bcdefghijklmno\uFF02\"", "bcdefghijklmno", 2},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(telemetry.ContentCaptureEnvVar, "true")

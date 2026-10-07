@@ -123,9 +123,9 @@ codex parsers emit none of the three yet
 `arguments` is the call's input decoded, redacted string by string (a
 number that redacts becomes the redacted string), and
 encoded again, so key order, spacing and escapes are not the stream's.
-A string value or key in it that holds one JSON object or array — a JSON
-file passed to `Write`, say — is masked `***` whole when that document,
-decoded, still shows a secret: a value or key nested under a secret-named
+A string value or key in it that holds one JSON object, array or string
+literal — a JSON file passed to `Write`, say — is masked `***` whole when that
+document, decoded, still shows a secret: a value or key nested under a secret-named
 member, or one only decoding spells out. So is one that cannot be judged:
 held more than four deep, naming a member twice, or broken by redaction
 — the [developer guide](../dev/tracing.md) lists what is not judged.

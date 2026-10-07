@@ -824,19 +824,20 @@ func decodeJSON(s string) (any, error) {
 	return v, err
 }
 
-// jsonDocument returns s trimmed when it is one JSON object or array.
+// jsonDocument returns s trimmed when it is one JSON object, array or
+// string literal: a string literal can spell a secret with escapes too.
 func jsonDocument(s string) (string, bool) {
 	s = strings.TrimSpace(s)
-	return s, s != "" && (s[0] == '{' || s[0] == '[') && json.Valid([]byte(s))
+	return s, s != "" && strings.IndexByte(`{["`, s[0]) >= 0 && json.Valid([]byte(s))
 }
 
-// documentLike reports text that begins and ends as a JSON object or
-// array does, white space, control and format characters (a byte order
-// mark, a zero-width space) aside: the normalizer strips the latter from
-// the scanned text, not from the written one.
+// documentLike reports text that begins and ends as a JSON object, array
+// or string literal does, white space, control and format characters (a
+// byte order mark, a zero-width space) aside: the normalizer strips the
+// latter from the scanned text, not from the written one.
 func documentLike(s string) bool {
 	s = strings.TrimFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) })
-	return len(s) >= 2 && (s[0] == '{' && s[len(s)-1] == '}' || s[0] == '[' && s[len(s)-1] == ']')
+	return len(s) >= 2 && (s[0] == '{' && s[len(s)-1] == '}' || s[0] == '[' && s[len(s)-1] == ']' || s[0] == '"' && s[len(s)-1] == '"')
 }
 
 // duplicateName reports an object in the JSON document s that names a
@@ -881,8 +882,8 @@ func (c *contentCollector) maskHeld(s, t string) string {
 	return s
 }
 
-// heldSecret judges, decoded, the JSON object or array a string holds
-// once scanned — what is exported. The scan reads the document's text,
+// heldSecret judges, decoded, the JSON object, array or string literal a
+// string holds once scanned — what is exported. The scan reads the document's text,
 // so it misses a secret-named member nested deeper than the value right
 // after the key, and a secret that only decoding spells out: an
 // assignment that opens a string, a token or runner env value written

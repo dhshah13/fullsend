@@ -244,8 +244,8 @@ also turn a fullwidth quotation mark into one that closes the string.
 `toolArguments` decodes the value, redacts each string and object key on
 its own (a number as its digits; one that redacts becomes the redacted
 string), and encodes the result again. A string value or key that holds
-one JSON object or array once scanned — what is exported — is judged
-decoded as well (`heldSecret`). The scan reads the string whole, since a
+one JSON object, array or string literal once scanned — what is exported
+— is judged decoded as well (`heldSecret`). The scan reads the string whole, since a
 secret can span a document's strings, but as text: it misses a
 secret-named member nested deeper than the value right after the key, and
 a secret only decoding spells out (an assignment that opens a string, a
