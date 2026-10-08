@@ -465,6 +465,10 @@ func TestContentCollector_AKeyMaskedWholeNamesASecret(t *testing.T) {
 		"an unfinished colour code the fold completes": {`{"\u001b[` + password + `":"` + opaque + `"}`, `{"***":"***"}`},
 		"and the values nested under it":               {`{"\u001b[0m` + password + `":{"v":["` + opaque + `"]}}`, `{"***":{"v":["***"]}}`},
 		"a colour code alone":                          {`{"\u001b[0mnote":"` + opaque + `"}`, `{"***":"***"}`},
+		// Masked whole as a document it holds, with a name only decoding
+		// spells: no keyword to read in the key itself.
+		"a key holding a document naming a secret": {`{"{\"\\u0070assword\":{\"v\":\"opaque-inner-value\"}}":"` + opaque + `"}`, `{"***":"***"}`},
+		"and the values nested under that":         {`{"{\"\\u0070assword\":{\"v\":\"opaque-inner-value\"}}":{"v":["` + opaque + `"]}}`, `{"***":{"v":["***"]}}`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := newContentCollector(4096)

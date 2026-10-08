@@ -1170,11 +1170,11 @@ func (c *contentCollector) redactValue(v any, under string, collided *bool) any 
 			member := under
 			// Named as scanned, or as written: the normalizer can strip
 			// the name's first letter with a colour code, and the value
-			// under it is still that name's. A key masked whole names a
-			// secret whatever it was called: its name is not to be had
-			// from its mask, and stripping can eat the first letter of
-			// one that folding spells.
-			named := sk == "***" || c.namesASecret(sk) || c.namesASecret(k)
+			// under it is still that name's. A key masked whole — by the
+			// scan, or as a document it holds — names a secret whatever
+			// it was called: its name is not to be had from its mask, and
+			// a document can name one in a spelling only decoding reads.
+			named := rk == "***" || c.namesASecret(sk) || c.namesASecret(k)
 			if named {
 				// Decided once for the member: the pattern reads any
 				// name it matches alike, so a stand-in judges the values
