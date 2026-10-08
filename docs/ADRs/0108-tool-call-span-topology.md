@@ -125,9 +125,10 @@ convention bump.
 ## Annotations
 
 **2026-09-18 — Tool arguments on the message record:** the Decision's "full
-arguments next" is in place up to a per-call bound: `tool_call` parts on the
-`agent` span's `gen_ai.output.messages` record carry the call's redacted
-arguments where the runtime's stream provides them, Claude Code today. The
-bound and the drop rules are in the
+arguments next" is in place for the members that name what was called:
+`tool_call` parts on the `agent` span's `gen_ai.output.messages` record
+carry the call's path, pattern, command and the like, redacted, where the
+runtime's stream provides them, Claude Code today; a file body, an edit or
+a prompt is not recorded. The list, the bound and the drop rules are in the
 [reference](../guides/infrastructure/distributed-tracing.md#content-capture-level-3).
 `execute_tool` spans still carry metadata only.

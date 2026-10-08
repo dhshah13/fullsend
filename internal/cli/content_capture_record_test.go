@@ -76,10 +76,11 @@ func TestContentCapture_SecretsAcrossArgumentsNeverReachTheRecord(t *testing.T) 
 	// The record that leaves the runner, run-telemetry.jsonl, written
 	// through the real event handler, collector, tool span tracker and
 	// file sink with Level 3 on: a private key over the lines of a
-	// notebook cell passed as arguments, a credential that folding moves
-	// between members of a held document, and a token a colour code hides
-	// the first letter of are not in it; the clean call's arguments and
-	// every call's name are; and the markers say what was dropped.
+	// notebook cell passed as arguments, a credential in a file body
+	// folding would move between members, and a token a colour code
+	// hides the first letter of are not in it; the listed members of
+	// every call and every call's name are; and the markers say what was
+	// dropped.
 	for _, k := range []string{"OTEL_SDK_DISABLED", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", "OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT"} {
 		t.Setenv(k, "")
 	}
@@ -132,10 +133,11 @@ func TestContentCapture_SecretsAcrossArgumentsNeverReachTheRecord(t *testing.T) 
 		}
 	}
 	require.Len(t, calls, 4, "every call is in the record, arguments or not")
-	assert.NotContains(t, calls["NotebookEdit"], "arguments", "a private key over the cell's lines drops the arguments")
+	assert.Equal(t, map[string]any{"notebook_path": "notes.ipynb"}, calls["NotebookEdit"]["arguments"], "the cells are not recorded; the path is")
 	assert.Equal(t, true, calls["NotebookEdit"]["fullsend.truncated"])
-	assert.NotContains(t, calls["NotebookEdit"], "summary", "a secret in the arguments costs the summary")
-	assert.Equal(t, map[string]any{"file_path": "cfg.json", "content": "***"}, calls["Write"]["arguments"], "the held document folding changes is masked whole")
+	assert.NotContains(t, calls["NotebookEdit"], "summary", "a secret in the dropped cells still costs the summary")
+	assert.Equal(t, map[string]any{"file_path": "cfg.json"}, calls["Write"]["arguments"], "the file body is not recorded; the path is")
+	assert.Equal(t, "cfg.json", calls["Write"]["summary"], "no secret was found in it")
 	assert.Equal(t, map[string]any{"command": "***"}, calls["Bash"]["arguments"], "the string the colour code was stripped from is masked whole")
 	assert.Equal(t, map[string]any{"file_path": "README.md"}, calls["Read"]["arguments"], "the clean call's arguments are recorded")
 	assert.Equal(t, "README.md", calls["Read"]["summary"])

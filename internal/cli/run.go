@@ -3665,8 +3665,8 @@ func replaceEnvSecrets(text string, runnerEnv map[string]string) (string, []stri
 type envLiteral struct{ key, value string }
 
 // envLiterals lists the values replaceEnvSecrets replaces — longer values
-// first, then key order — for it and for a caller that must find one
-// where no replacement can mask it (the collector's spanning).
+// first, then key order, so a value that contains another is replaced
+// whole whichever source holds it.
 func envLiterals(runnerEnv map[string]string) []envLiteral {
 	var literals []envLiteral
 	for key, value := range runnerEnv {

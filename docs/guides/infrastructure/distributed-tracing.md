@@ -91,10 +91,10 @@ then mask the marker as well and count again. Not covered: a value split
 or spelled that way which a pattern also recognises — in one of those
 contexts, in a connection string, or by its own prefix — is masked by
 that pattern, and shows what the pattern's mask shows. A tool call loses
-its `summary` when redaction found a secret in its arguments, stripped an
-escape sequence or tag characters from them, or masked a document there
-it could not judge: the parser cut the summary out of them before
-anything scanned it, so the secret could be there as a beginning. Where a runtime reports a summary and no
+its `summary` when redaction found a secret in its arguments, the dropped
+members included, or stripped an escape sequence or tag characters from
+them: the parser cut the summary out of them before anything scanned it,
+so the secret could be there as a beginning. Where a runtime reports a summary and no
 arguments (pi, codex, OpenCode), its parser has already run the patterns
 over the summary and, for pi and codex, cut it: a value that straddles a
 cut stays in part, and one a pattern recognised stays as that pattern's
@@ -120,27 +120,19 @@ with a `finish_reason` of `stop` or `error`. Tool arguments, tool results, and t
 only when the runtime's stream provides them: Claude runs do; the pi and
 codex parsers emit none of the three yet
 ([#7414](https://github.com/fullsend-ai/fullsend/issues/7414)).
-`arguments` is the call's input decoded, redacted string by string (a
-number that redacts becomes the redacted string), and
-encoded again, so key order, spacing and escapes are not the stream's.
-A string value in it that holds one JSON object, array or string
-literal — a JSON file passed to `Write`, say — is judged the same way,
-decoded, and recorded encoded again, so its layout is the encoder's and a
-secret nested in it is masked in place. It is masked `***` whole when it
-cannot be judged: held more than four deep, shaped like a document but
-not parsing (JSON with comments or trailing commas, an object literal),
-holding a runner environment or runtime secret value across its
-structure, or changed at all by Unicode normalization, since
-folding can make or break a document or spell a secret-named pair into a
-key — the [developer guide](../dev/tracing.md) has the list. A key that
-holds a document is masked whole. A secret that runs across the strings
-of the arguments, or of a held document, in the order written — a private
-key over the lines of an array, a runner environment value over them —
-can be masked nowhere but whole: the arguments are dropped. A private
-key inside one string drops them as well. A string a terminal escape sequence was stripped from is masked
-whole too, since the stripping can leave most of a token. A string
-directly under a secret-named member is masked in place, as anywhere
-else.
+`arguments` holds the members of the call's input that name what was
+called, each redacted as text: `file_path`, `notebook_path`, `path`,
+`pattern`, `glob`, `command`, `description`, `url`, `output_mode`,
+`model`, `subagent_type`, `skill`, `cell_id`, `cell_type`, `edit_mode`,
+`replace_all`, `multiline`, `type`, `limit`, `offset`, `head_limit`,
+`timeout`, `context`, `-A`, `-B`, `-C`, `-i`, `-n`. Nothing else of the
+input is recorded: a file body, an edit, a prompt, a notebook source, a
+todo list, and any member whose value is an object or an array are
+dropped — scanned first, so a secret in them still counts — and the part
+is marked `fullsend.truncated`. The kept members are decoded, redacted
+one by one and encoded again, so key order, spacing and escapes are not
+the stream's; a string a terminal escape sequence was stripped from is
+masked whole, since the stripping can leave most of a token.
 
 On a retry iteration under `validation_loop.feedback_mode: append`, the
 prompt the runner composed — its fixed framing around the previous
@@ -173,18 +165,17 @@ and up to six times on escape-dense content — a record over that is trimmed ag
 oldest first.
 Truncation is marked via `fullsend.content.truncated` on the span and
 `fullsend.truncated` on each cut part. A tool result over its bound keeps
-its tail; arguments over theirs, not a complete JSON value, or with two
-keys of one object that redact to the same string (two keys of eight
-characters or more under a secret-named member, such as `username` and
-`password` under `auth`, are both masked and so collide), are dropped
-whole — a cut object is not JSON — and the marked `tool_call` part keeps
-its `id`, name and summary — not the summary when redaction found a
-secret in the arguments, stripped an escape sequence or tag characters
-from them, or masked a document there it could not judge. Arguments also go, charged and marked, when
-the call's name redacts to nothing; that part survives only if it has a
-summary. So `fullsend.truncated` means different things by part type: on a
-tool result, part of the response is kept; on a tool call, none of the
-arguments is. Read it together with the part's `type`. The input message is not cut at this stage:
+its tail; arguments over theirs, or not a complete JSON object, are
+dropped whole — a cut object is not JSON — and the marked `tool_call`
+part keeps its `id`, name and summary — not the summary when redaction
+found a secret in the arguments or stripped an escape sequence or tag
+characters from them. A member outside the recorded list (above) is
+dropped and the part marked the same way, its listed members kept.
+Arguments also go, charged and marked, when the call's name redacts to
+nothing; that part survives only if it has a summary. So
+`fullsend.truncated` means different things by part type: on a tool
+result, part of the response is kept; on a tool call, some or all of the
+input is not. Read it together with the part's `type`. The input message is not cut at this stage:
 the validation output inside it is cut at 10 KiB when the prompt is
 composed (the prompt then says `[truncated]`), and the two markers above
 do not describe it. The recorded copy is the redacted one, so it can

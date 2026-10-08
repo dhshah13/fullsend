@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"slices"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
@@ -16,7 +14,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	agentruntime "github.com/fullsend-ai/fullsend/internal/runtime"
-	"github.com/fullsend-ai/fullsend/internal/security"
 	"github.com/fullsend-ai/fullsend/internal/telemetry"
 )
 
@@ -116,33 +113,26 @@ func TestContentCollector_ToolCallPartCarriesArguments(t *testing.T) {
 }
 
 func TestContentCollector_RedactsSecretsInArguments(t *testing.T) {
+	// A kept string goes through the text pipeline on its own, decoded:
+	// the patterns are written for plain text, and over serialised JSON
+	// they miss an assignment that opens a string or follows an escaped
+	// newline, and a value behind escaped quotes.
 	const secret = "s3cr3tvalue99xyz"
 	pat := "ghp_" + strings.Repeat("m", 36)
 	for name, args := range map[string]string{
 		"leading assignment":       `{"command":"DEPLOY_TOKEN=` + secret + ` make"}`,
 		"assignment after newline": `{"command":"cd x\nAPI_KEY=` + secret + ` run"}`,
 		"assignment in quotes":     `{"command":"export GH_TOKEN=\"` + secret + `\""}`,
-		"json inside a string":     `{"content":"{\"password\": \"` + secret + `\"}"}`,
-		"secret-named member":      `{"password":"` + secret + `"}`,
-		"nested member":            `{"edits":[{"headers":{"api_key":"` + secret + `"}}]}`,
 		"token prefix":             `{"command":"curl -u x:` + pat + ` h"}`,
-		"token as a key":           `{"` + pat + `":"v"}`,
-		// A secret-named member whose value raises a finding of its own
-		// (Unicode or another secret) is still scanned beside its key.
-		"secret-named, zero width":    `{"password":"s3cr3tva\u200Blue99xyz"}`,
-		"secret-named, folded":        `{"password":"` + secret + `\uFF01"}`,
-		"secret-named, two secrets":   `{"password":"` + secret + ` ` + pat + `"}`,
-		"secret-named, early quote":   `{"password":"ab\"` + secret + `"}`,
-		"quote in a secret-named key": `{"api\"key":"` + secret + `"}`,
-		// Joined by the probe's stand-in for the quote, the two runs must
-		// not become one token a prefix pattern masks ahead of the
-		// member-name pattern.
-		"quote inside a token run": `{"api_key":"sk-abc\"` + secret + `"}`,
-		// The normalizer is not idempotent over escape sequences: run a
-		// second time over the pair, it strips one the first pass left
-		// open and takes the value, or the key's keyword, with it.
-		"escape sequence closed by the pair, value": `{"password":"\u001b]\u001b]x\u0007` + secret + `\u0007"}`,
-		"escape sequence closed by the pair, key":   `{"password\u001b]":"ab\u0007` + secret + `"}`,
+		"two secrets":              `{"command":"TOKEN=` + secret + ` ` + pat + `"}`,
+		// The normalizer joins what a zero-width character split and
+		// folds what was spelled in compatibility forms before the
+		// patterns run.
+		"zero width": `{"command":"TOKEN=s3cr3tva​lue99xyz"}`,
+		"folded":     `{"command":"TOKEN=` + secret + `！"}`,
+		// An escape sequence the normalizer strips can carry the value
+		// the patterns never see: such a string is masked whole.
+		"inside an escape sequence": `{"command":"\u001b]\u001b]x\u0007` + secret + `\u0007"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := newContentCollector(4096)
@@ -158,251 +148,85 @@ func TestContentCollector_RedactsSecretsInArguments(t *testing.T) {
 	}
 }
 
-func TestContentCollector_SecretNamedMembersReachTheirNestedValues(t *testing.T) {
-	// A value at any depth under a secret-named member is judged as if it
-	// were that member's own string value.
+func TestContentCollector_RecordsOnlyListedArguments(t *testing.T) {
+	// The record keeps the members recordedArguments names — paths,
+	// patterns, commands, modes and bounds — and nothing else of a call's
+	// input: a file body, an edit, a prompt, a notebook source or a todo
+	// list is dropped, charged and marked, with no finding and the
+	// summary kept, since nothing found a secret.
 	const opaque = "opaque-credential-123"
-	for name, tc := range map[string]struct{ args, want string }{
-		"array":           {`{"api_keys":["` + opaque + `"]}`, `{"api_keys":["***"]}`},
-		"object":          {`{"credentials":{"value":"` + opaque + `"}}`, `{"credentials":{"value":"***"}}`},
-		"array of object": {`{"tokens":[{"v":"` + opaque + `"}]}`, `{"tokens":[{"v":"***"}]}`},
-		"number":          {`{"password":31415926535}`, `{"password":"***"}`},
-		"nested number":   {`{"secrets":{"pin":31415926535}}`, `{"secrets":{"pin":"***"}}`},
-		// The member-name pattern wants eight bytes or more, as it does of
-		// a string member: short values and a token count stay.
-		"short values stay": {`{"max_tokens":4096,"api_keys":["ab",true,null]}`, `{"api_keys":["ab",true,null],"max_tokens":4096}`},
-		// No secret-named member above: nothing to judge against.
-		"plain nesting stays": {`{"edits":[{"value":"` + opaque + `"}]}`, `{"edits":[{"value":"` + opaque + `"}]}`},
-		// A quote in the key lets the pattern's single-quote form match
-		// across the pair: the member's own key is still checked.
-		"quote in a plain key": {`{"it's":"password': 'hunter2hunter2'"}`, `{"it's":"***"}`},
-		// Keys are judged too: a credential can be the key.
-		"key under a secret-named member":    {`{"credentials":{"` + opaque + `":"user"}}`, `{"credentials":{"***":"user"}}`},
-		"key under a secret-named array":     {`{"api_keys":[{"` + opaque + `":"prod"}]}`, `{"api_keys":[{"***":"prod"}]}`},
-		"short keys stay":                    {`{"auth":{"user":"x"}}`, `{"auth":{"user":"x"}}`},
-		"keys with no secret-named ancestor": {`{"edits":{"` + opaque + `":"x"}}`, `{"edits":{"` + opaque + `":"x"}}`},
+	for name, tc := range map[string]struct {
+		args, want string
+		dropped    bool
+	}{
+		"Write keeps the path":              {`{"file_path":"/x/a.json","content":"{\"credentials\":{\"value\":\"` + opaque + `\"}}"}`, `{"file_path":"/x/a.json"}`, true},
+		"Edit keeps the path":               {`{"file_path":"/x/a.go","old_string":"` + opaque + `","new_string":"x","replace_all":true}`, `{"file_path":"/x/a.go","replace_all":true}`, true},
+		"MultiEdit keeps the path":          {`{"file_path":"/x/a.go","edits":[{"old_string":"` + opaque + `","new_string":"x"}]}`, `{"file_path":"/x/a.go"}`, true},
+		"NotebookEdit keeps the path":       {`{"notebook_path":"n.ipynb","cell_id":"c1","new_source":"print('` + opaque + `')"}`, `{"cell_id":"c1","notebook_path":"n.ipynb"}`, true},
+		"Agent keeps its description":       {`{"description":"scan","prompt":"the token is ` + opaque + `","model":"sonnet","subagent_type":"Explore"}`, `{"description":"scan","model":"sonnet","subagent_type":"Explore"}`, true},
+		"Grep keeps everything":             {`{"pattern":"TODO","path":"src","output_mode":"content","-n":true,"context":2}`, `{"-n":true,"context":2,"output_mode":"content","path":"src","pattern":"TODO"}`, false},
+		"Read keeps everything":             {`{"file_path":"/x","offset":10,"limit":50}`, `{"file_path":"/x","limit":50,"offset":10}`, false},
+		"a listed member holding an object": {`{"path":{"dir":"` + opaque + `"},"pattern":"x"}`, `{"pattern":"x"}`, true},
+		"a listed member holding an array":  {`{"pattern":["` + opaque + `"],"path":"src"}`, `{"path":"src"}`, true},
+		"no members":                        {`{}`, `{}`, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: tc.args})
+			c.Handle(agentruntime.ToolUseEvent{Name: "Tool", Summary: "s", Arguments: tc.args})
 
 			res := c.Result("stop")
 			assert.Contains(t, res.OutputMessages, `"arguments":`+tc.want)
-			if tc.want == tc.args || strings.Contains(name, "stay") {
-				assert.Empty(t, res.Findings)
-			} else {
-				assert.Len(t, res.Findings, 1, "one json_field finding")
-			}
+			assert.NotContains(t, res.OutputMessages, opaque)
+			assert.Contains(t, res.OutputMessages, `"summary":"s"`, "nothing found a secret")
+			assert.Empty(t, res.Findings)
+			assert.Equal(t, tc.dropped, res.Truncated)
+			assert.Equal(t, tc.dropped, strings.Contains(res.OutputMessages, `"fullsend.truncated":true`))
+			assert.Equal(t, tc.dropped, res.DroppedBytes > 0, "a dropped member is charged")
 		})
 	}
-}
-
-func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(t *testing.T) {
-	// A string holding a document is judged as the arguments are: decoded,
-	// walked and encoded again, so a secret-named member nested in it, or
-	// a secret only decoding spells out, is masked in place; what cannot
-	// be judged is masked whole.
-	const opaque = "opaque-credential-123"
-	cred := `"credentials":{"value":"` + opaque + `"}`
-	token := "ghp_" + strings.Repeat("r", 36)
-	quote := func(s string) string { b, _ := json.Marshal(s); return string(b) }
-	for name, tc := range map[string]struct {
-		content, want string
-		findings      int
-	}{
-		"object under credentials":  {`{` + cred + `}`, `{"credentials":{"value":"***"}}`, 1},
-		"array under password":      {`{"password":["` + opaque + `"]}`, `{"password":["***"]}`, 1},
-		"document that is an array": {`[{"token":{"v":"` + opaque + `"}}]`, `[{"token":{"v":"***"}}]`, 1},
-		"key under credentials":     {`{"credentials":{"` + opaque + `":"user"}}`, `{"credentials":{"***":"user"}}`, 1},
-		"document in a document":    {`{"inner":` + quote(`{"token":["`+opaque+`"]}`) + `}`, `{"inner":` + quote(`{"token":["***"]}`) + `}`, 1},
-		// Decoded, each string is judged on its own.
-		"an assignment that opens a string":       {`{"command":"API_KEY=` + opaque + `"}`, `{"command":"API_KEY=opaq..."}`, 1},
-		"an assignment after an escaped break":    {`{"c":"cd x\nAPI_KEY=` + opaque + ` run"}`, `{"c":"cd x\nAPI_KEY=opaq... run"}`, 1},
-		"a token spelled with an escape":          {`{"t":"ghp_\u0072` + token[5:] + `"}`, `{"t":"ghp_..."}`, 1},
-		"tag characters written with escapes":     {`{"t":"\uDB40\uDC67"}`, `{"t":"***"}`, 1},
-		"digits in an escape under a secret name": {`{"auth":{"pin":"\u001b[31415926535m"}}`, `{"auth":{"pin":"***"}}`, 1},
-		"an escape sequence around a token":       {`{"n":"see \u001b]ghp_\u0072` + token[5:] + `\u0007"}`, `{"n":"***"}`, 1},
-		// A document the normalizer changes at all is masked whole: folding
-		// can make a document, break one, or spell a pair into a key.
-		"folded into a document":                     {"\uFF5B" + cred + "}", "***", 1},
-		"folding breaks a document":                  {"{\"note\":\"\uFF02\"," + cred + "}", "***", 1},
-		"a BOM and folding that breaks a document":   {"\uFEFF{\"note\":\"\uFF02\"," + cred + "}", "***", 1},
-		"a fold that makes and breaks a document":    {"\uFF5B\"note\":\"\uFF02\"," + cred + "}", "***", 1},
-		"an escape before a document folding breaks": {"\x1b[0m{\"note\":\"\uFF02\"," + cred + "}", "***", 1},
-		"a mask breaks a document":                   {`{"token":"abcdefgh\\\"x",` + cred + `}`, `{"credentials":{"value":"***"},"token":"***"}`, 2},
-		// Folding that moves a value out of its secret-named member, or
-		// moves nothing, alike.
-		"folding that moves a value between members": {"{\"credentials\":{\"value\":\"\uFF02},\uFF02note\uFF02:{\uFF02value\uFF02:\uFF02" + opaque + "\"}}", "***", 1},
-		"folding that moves nothing":                 {"{\"name\":\"Widget\u2122\"}", "***", 1},
-		// Decoding keeps the last of two members of one name, and the
-		// record keeps what was decoded.
-		"a repeated name":                  {`{` + cred + `,"credentials":{}}`, `{"credentials":{}}`, 0},
-		"a name repeated with an escape":   {`{` + cred + `,"\u0063redentials":{}}`, `{"credentials":{}}`, 0},
-		"a name repeated in an array item": {`[{"token":{"v":"` + opaque + `"},"token":{}}]`, `[{"token":{}}]`, 0},
-		"a repeated name and no secret":    {`{"a":1,"a":2}`, `{"a":2}`, 0},
-		// A pattern's mask in a decoded string, and a false positive of
-		// one, stay in place.
-		"a mask that matches again": {`{"db":"postgres://u:hunter2hunter2@db/x"}`, `{"db":"postgres://u:hunt...@db/x"}`, 1},
-		"a notebook assignment":     {`{"cells":[{"source":["key = jax.random.PRNGKey(0)\n"]}]}`, `{"cells":[{"source":["key = jax....)\n"]}]}`, 1},
-		// Otherwise the document is kept, encoded again: the encoder's key
-		// order, spacing and escapes.
-		"plain document":               {`{ "b": "` + opaque + `", "a": 1 }`, `{"a":1,"b":"` + opaque + `"}`, 0},
-		"a pair stays masked in place": {`{"password":"hunter2hunter2","n":1}`, `{"n":1,"password":"***"}`, 1},
-		"a letter folded once decoded": {`{"v":"\uFF21"}`, `{"v":"A"}`, 1},
-		// Document-shaped text that does not parse cannot be judged either:
-		// a raw control character, a trailing comma, a comment, an object
-		// literal. Masked whole, secret or none.
-		"a control character the scan keeps": {"{\"a\":\"x\x01y\"}", "***", 1},
-		"a trailing comma":                   {`{` + cred + `,}`, "***", 1},
-		"a trailing comma and no secret":     {`{ "a": 1, }`, "***", 1},
-		"a comment":                          {"{\n  // dev \n  " + cred + "\n}", "***", 1},
-		"an object literal":                  {`{ apiKey: "hunter2hunter2" }`, "***", 1},
-		// Shaped like one but quoting nothing: code, or a mask.
-		"an object literal quoting nothing":     {`{ apiKey: process.env.KEY }`, `{ apiKey: process.env.KEY }`, 0},
-		"a number past float64":                 {`{"maximum":1e999}`, `{"maximum":1e999}`, 0},
-		"text like a document the scan changed": {`{'password': 'hunter2hunter2'}`, "***", 1},
-		"a command that opens a brace":          {`{ export API_KEY=` + opaque + `; } 2>/dev/null`, `{ export API_KEY=opaq...; } 2>/dev/null`, 1},
-		"a held string literal":                 {`"plain text"`, `"plain text"`, 0},
-		"a value naming a sibling":              {`{"name":"name","from":"to","to":"x"}`, `{"from":"to","name":"name","to":"x"}`, 0},
-		"names repeated in other objects":       {`[{"a":1},{"a":2},{"x":{"a":1},"y":{"a":2}},{"a":{"x":1},"x":2}]`, `[{"a":1},{"a":2},{"x":{"a":1},"y":{"a":2}},{"a":{"x":1},"x":2}]`, 0},
-	} {
-		t.Run(name, func(t *testing.T) {
-			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "kept", Arguments: `{"content":` + quote(tc.content) + `}`})
-
-			res := c.Result("stop")
-			assert.Contains(t, res.OutputMessages, `"arguments":{"content":`+quote(tc.want)+`}`)
-			assert.Len(t, res.Findings, tc.findings)
-			assert.Equal(t, strings.Contains(tc.want, "***") || strings.Contains(tc.want, "..."), !strings.Contains(res.OutputMessages, `"summary"`), "a secret drops the summary")
-		})
-	}
-}
-
-func TestContentCollector_JSONInAStringIsAlsoScannedWhole(t *testing.T) {
-	// A secret can span the document's strings: a notebook keeps each line
-	// of a cell in its own string, and a runner env value can hold quotes.
-	// A private key over the lines drops the arguments; an exact value
-	// over the document's structure masks it whole.
-	begin, end := "-----BEGIN RSA PRIVATE "+"KEY-----", "-----END RSA PRIVATE "+"KEY-----"
-	body := strings.Repeat("Q", 40)
-	notebook, _ := json.Marshal(map[string]any{"cells": []any{map[string]any{"source": []string{begin + "\n", body + "\n", end + "\n"}}}})
-	security.RegisterRuntimeSecret("rtline1\nrtline2x")
-	for name, tc := range map[string]struct {
-		env           map[string]string
-		content, gone string
-		findings      int
-	}{
-		"key over a cell's lines": {nil, string(notebook), body, 1},
-		// Its strings in order, as written: the scan masks the block's last
-		// line as a member's value before the block's pattern runs.
-		"key from a member name into its value": {nil, `{"` + begin + `\n` + body[:20] + `":"` + body[20:] + `\n` + end + `"}`, body[:20], 2},
-		"a runtime value over two strings":      {nil, `{"lines":["rtline1","rtline2x"]}`, "rtline2x", 1},
-		// An exact value over the document's structure.
-		"runner env value with structure":         {map[string]string{"DB_PASSWORD": `hunter22","port`}, `{"pw":"hunter22","port":5432}`, "hunter22", 1},
-		"runner env value that ends the document": {map[string]string{"DB_PASSWORD": `hunter22"}`}, `{"pw":"hunter22"}`, "hunter22", 1},
-		"and one behind a BOM":                    {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 1},
-		"and one behind a space and a BOM":        {map[string]string{"DB_PASSWORD": `hunter22"}`}, " \uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 1},
-		"and one behind a zero-width space":       {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\u200B{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 1},
-		// Decoded, the literal pass sees it — in a document, or in a
-		// string a held JSON string literal spells with escapes.
-		"runner env value spelled with an escape":   {map[string]string{"DB_PASSWORD": "hunter2hunter2"}, `{"pw":"\u0068unter2hunter2"}`, "unter2hunter2", 1},
-		"runner env value in a held string literal": {map[string]string{"DEPLOY_PASSWORD": "abcdefghijklmno"}, `"\u0061bcdefghijklmno"`, "bcdefghijklmno", 1},
-		"and in one the scan breaks":                {map[string]string{"DEPLOY_PASSWORD": "abcdefghijklmno"}, "\"\\u0061bcdefghijklmno\uFF02\"", "bcdefghijklmno", 1},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Setenv(telemetry.ContentCaptureEnvVar, "true")
-			c := newContentCollectorIfEnabled(tc.env)
-			args, _ := json.Marshal(map[string]string{"content": tc.content})
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: string(args)})
-
-			res := c.Result("stop")
-			assert.NotContains(t, res.OutputMessages, tc.gone)
-			assert.Len(t, res.Findings, tc.findings)
-		})
-	}
-}
-
-func TestContentCollector_SecretsSpanningTheArgumentsStrings(t *testing.T) {
-	// Each key, string and number is judged on its own, and the level as a
-	// reader of them in the order written sees them: a private key over
-	// the lines of an array or over a key and a value, a runtime value
-	// over the lines of one. A secret found that way can be masked
-	// nowhere but the level whole: the arguments are dropped and charged
-	// as encoded; a private key block inside one string drops them as
-	// well. (An assignment or a header whose value is the next
-	// string is not judged: its secret stops at white space.)
-	begin, end := "-----BEGIN RSA PRIVATE "+"KEY-----", "-----END RSA PRIVATE "+"KEY-----"
-	body := strings.Repeat("Q", 40)
-	security.RegisterRuntimeSecret("rtline1\nrtline2x")
-	for name, tc := range map[string]struct {
-		args, gone string
-		findings   int
-	}{
-		"a private key over the lines of a cell":          {`{"cells":[{"source":["` + begin + `\n","` + body + `\n","` + end + `\n"]}]}`, body, 1},
-		"a private key over members against key order":    {`{"b":"` + begin + `\n` + body[:20] + `","a":"` + body[20:] + `\n` + end + `"}`, body[:20], 1},
-		"a private key over a key and a value":            {`{"` + begin + `\n` + body[:20] + `":"` + body[20:] + `\n` + end + `"}`, body[:20], 2},
-		"a runtime value over two strings":                {`{"lines":["rtline1","rtline2x"]}`, "rtline2x", 1},
-		"and over two lines keeping their breaks":         {`{"lines":["rtline1\n","rtline2x"]}`, "rtline2x", 1},
-		"and over two lines keeping a Windows break":      {`{"lines":["rtline1\r\n","rtline2x"]}`, "rtline2x", 1},
-		"a marker inside an escape the normalizer strips": {`{"lines":["\u001b]0;` + begin + `\u0007\n","` + body + `\n","` + end + `\n"]}`, body, 2},
-		"a marker folded":                                 {`{"lines":["\uFF0D\uFF0D\uFF0D\uFF0D\uFF0DBEGIN RSA PRIVATE ` + `KEY-----\n","` + body + `\n","` + end + `\n"]}`, body, 2},
-	} {
-		t.Run(name, func(t *testing.T) {
-			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: tc.args})
-
-			res := c.Result("stop")
-			part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
-			assert.NotContains(t, part, "arguments")
-			assert.NotContains(t, part, "summary")
-			assert.Equal(t, true, part["fullsend.truncated"])
-			assert.NotContains(t, res.OutputMessages, tc.gone)
-			assert.Len(t, res.Findings, tc.findings)
-		})
-	}
-	t.Run("a private key in one string drops the arguments too", func(t *testing.T) {
+	t.Run("nothing listed records no arguments", func(t *testing.T) {
 		c := newContentCollector(4096)
-		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: `{"content":"` + begin + `\n` + body + `\n` + end + `","file_path":"k.pem"}`})
+		c.Handle(agentruntime.ToolUseEvent{Name: "TodoWrite", Summary: "s", Arguments: `{"todos":[{"content":"` + opaque + `","status":"pending"}]}`})
 
 		res := c.Result("stop")
 		part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
 		assert.NotContains(t, part, "arguments")
+		assert.Equal(t, "s", part["summary"])
 		assert.Equal(t, true, part["fullsend.truncated"])
-		assert.NotContains(t, res.OutputMessages, body)
-		assert.Len(t, res.Findings, 2)
-	})
-	t.Run("dropped arguments are charged as encoded", func(t *testing.T) {
-		c := newContentCollector(4096)
-		args := `{"lines": ["` + begin + `", "` + body + `", "` + end + `"]}`
-		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: args})
-		assert.Equal(t, len(args)-3*len(" "), c.Result("stop").DroppedBytes)
+		assert.NotContains(t, res.OutputMessages, opaque)
 	})
 }
 
-func TestContentCollector_JoinedNeighboursMakeNoSecret(t *testing.T) {
-	// Judged in order, two strings with no secret between them must not
-	// make one: a token stops at the end of its string, and so does a
-	// connection string's user.
-	for name, args := range map[string]string{
-		"a database URL beside an address":         `{"DATABASE_URL":"postgres://localhost:5432/dev","SMTP_FROM":"noreply@acme.io"}`,
-		"an empty assignment beside a description": `{"command":"export NPM_TOKEN=","description":"Configure npm auth"}`,
-		"names that run into a token's prefix":     `{"service":"task-scheduler","namespace":"production_workloads"}`,
-		"a command's flags":                        `{"command":["flask","--app","hello","run","--no-reload"]}`,
-		"apostrophes of two strings":               `{"old_string":"print(key + ': ' + str(cfg[key]))","new_string":"print(key + ': ' + str(cfg[key]))\nlog.debug('dumped')"}`,
-		"a connection string with no host":         `{"pattern":"postgres://user:pass@","path":"src","output_mode":"files_with_matches"}`,
-		"a database URL before a remote":           `{"database":"postgres://localhost/app","remote":"git+ssh://git@github.com/org/app.git"}`,
-		"and before a registry, nested":            `{"environment":{"REDIS_URL":"redis://redis","NPM_CONFIG_REGISTRY":"https://npm.pkg.github.com/@acme"}}`,
+func TestContentCollector_DroppedArgumentsAreScannedAndCharged(t *testing.T) {
+	// Discarded content is redacted first, so a secret in a member that
+	// is not recorded still counts — and costs the summary, as a secret
+	// found anywhere in the arguments does — and the member is charged as
+	// the redacted text it was scanned as.
+	token := "ghp_" + strings.Repeat("r", 36)
+	for name, tc := range map[string]struct {
+		args    string
+		charged int
+	}{
+		"a file body":                       {`{"file_path":"/x","content":"echo ` + token + `"}`, len("echo ghp_...")},
+		"a listed member holding an object": {`{"file_path":"/x","path":{"t":"` + token + `"}}`, len(`{"t":"ghp_..."}`)},
+		"a number outside the list":         {`{"file_path":"/x","pin":12345678}`, len("12345678")},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: args})
+			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "/x", Arguments: tc.args})
 
 			res := c.Result("stop")
-			var want, got any
-			require.NoError(t, json.Unmarshal([]byte(args), &want))
-			got = partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)["arguments"]
-			assert.Equal(t, want, got)
-			assert.Empty(t, res.Findings)
+			assert.NotContains(t, res.OutputMessages, token[4:])
+			assert.Contains(t, res.OutputMessages, `"arguments":{"file_path":"/x"}`)
+			assert.Equal(t, tc.charged, res.DroppedBytes)
+			assert.True(t, res.Truncated)
+			if strings.Contains(name, "number") {
+				assert.Empty(t, res.Findings)
+				assert.Contains(t, res.OutputMessages, `"summary":"/x"`)
+			} else {
+				assert.Len(t, res.Findings, 1)
+				assert.NotContains(t, res.OutputMessages, `"summary"`)
+			}
 		})
 	}
 }
@@ -411,16 +235,15 @@ func TestContentCollector_AStringTheNormalizerStrippedIsMaskedWhole(t *testing.T
 	// The normalizer strips a terminal escape sequence or tag characters
 	// before the patterns run, and the stripping can take the first
 	// letter of a token (a CSI sequence ends at the next letter) or a
-	// whole payload the patterns never see: such a string, a value or a
-	// key, is masked whole.
+	// whole payload the patterns never see: such a string is masked
+	// whole, and the summary goes with it.
 	token := "ghp_" + strings.Repeat("r", 36)
 	for name, tc := range map[string]struct {
 		args, want, gone string
 	}{
-		"a colour code that eats a token's first letter": {`{"n":"\u001b[` + token + `"}`, `{"n":"***"}`, token[1:]},
+		"a colour code that eats a token's first letter": {`{"command":"\u001b[` + token + `"}`, `{"command":"***"}`, token[1:]},
 		"a token inside a title code":                    {`{"command":"echo \u001b]` + token + `\u0007"}`, `{"command":"***"}`, token[4:]},
-		"tag characters":                                 {`{"t":"x\uDB40\uDC67y"}`, `{"t":"***"}`, "xy"},
-		"a key":                                          {`{"\u001b[0mpassword":"hunter2hunter2"}`, `{"***":"***"}`, "hunter2"},
+		"tag characters":                                 {`{"command":"x󠁧y"}`, `{"command":"***"}`, "xy"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := newContentCollector(4096)
@@ -432,220 +255,6 @@ func TestContentCollector_AStringTheNormalizerStrippedIsMaskedWhole(t *testing.T
 			assert.NotContains(t, res.OutputMessages, `"summary"`)
 		})
 	}
-	t.Run("two keys masked alike collide", func(t *testing.T) {
-		c := newContentCollector(4096)
-		c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: `{"\u001b[0ma":1,"\u001b[1mb":2}`})
-		assert.NotContains(t, c.Result("stop").OutputMessages, `"arguments"`)
-	})
-}
-
-func TestContentCollector_ACollisionStillCountsASecretAcrossTheStrings(t *testing.T) {
-	// Two keys folding alike drop the arguments on their own; the level is
-	// still judged across its strings, since the secret found there is
-	// what costs the call its summary — the parser cut it from these
-	// arguments, and a private key's first line can be in it.
-	begin, end := "-----BEGIN RSA PRIVATE "+"KEY-----", "-----END RSA PRIVATE "+"KEY-----"
-	body := strings.Repeat("Q", 40)
-	c := newContentCollector(4096)
-	c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Summary: begin + "\n" + body, Arguments: `{"a":"x","\uFF41":"y","command":"` + begin + `\n` + body + `","description":"` + end + `"}`})
-
-	res := c.Result("stop")
-	part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
-	assert.NotContains(t, part, "arguments")
-	assert.NotContains(t, part, "summary", "the secret across the strings costs the summary")
-	assert.NotContains(t, res.OutputMessages, body)
-	assert.True(t, slices.ContainsFunc(res.Findings, func(f security.Finding) bool { return f.Name == "private_key" }), "the spanning secret is recorded")
-}
-
-func TestContentCollector_AKeyMaskedWholeNamesASecret(t *testing.T) {
-	// A key the normalizer stripped an escape sequence from is masked
-	// whole, and its name is then not to be had from its mask, nor from
-	// its spelling when that is in compatibility forms the pattern does
-	// not read, nor from the normalizer's rendering when the stripping ate
-	// the name's first letter: the values under such a key are judged as
-	// a secret-named member's, whatever it was called.
-	const opaque = "opaque-credential-123"
-	password := "\uFF50\uFF41\uFF53\uFF53\uFF57\uFF4F\uFF52\uFF44" // fullwidth
-	for name, tc := range map[string]struct{ args, want string }{
-		"a colour code before a fullwidth name":        {`{"\u001b[0m` + password + `":"` + opaque + `"}`, `{"***":"***"}`},
-		"an unfinished colour code the fold completes": {`{"\u001b[` + password + `":"` + opaque + `"}`, `{"***":"***"}`},
-		"and the values nested under it":               {`{"\u001b[0m` + password + `":{"v":["` + opaque + `"]}}`, `{"***":{"v":["***"]}}`},
-		"a colour code alone":                          {`{"\u001b[0mnote":"` + opaque + `"}`, `{"***":"***"}`},
-		// Masked whole as a document it holds, with a name only decoding
-		// spells: no keyword to read in the key itself.
-		"a key holding a document naming a secret": {`{"{\"\\u0070assword\":{\"v\":\"opaque-inner-value\"}}":"` + opaque + `"}`, `{"***":"***"}`},
-		"and the values nested under that":         {`{"{\"\\u0070assword\":{\"v\":\"opaque-inner-value\"}}":{"v":["` + opaque + `"]}}`, `{"***":{"v":["***"]}}`},
-	} {
-		t.Run(name, func(t *testing.T) {
-			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: tc.args})
-
-			res := c.Result("stop")
-			assert.Contains(t, res.OutputMessages, `"arguments":`+tc.want)
-			assert.NotContains(t, res.OutputMessages, opaque)
-		})
-	}
-}
-
-func TestContentCollector_ARunnerEnvValueOverTheLinesOfAnArray(t *testing.T) {
-	// A runner env value can hold a line break; written over two strings
-	// of an array, no string holds it whole and the literal pass sees no
-	// part of it. Judged across the strings it is found, the lines of a
-	// held document read as lines: the arguments are dropped.
-	// Each line of a notebook cell keeps its own line break, a Windows
-	// one or a trailing space: an exact value is sought in the strings in
-	// order, white space aside.
-	env := map[string]string{"DEPLOY_SECRET": "opaque-line-one\nopaque-line-two"}
-	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
-	for name, lines := range map[string]string{
-		"lines":                         `["opaque-line-one","opaque-line-two"]`,
-		"lines keeping the break":       `["opaque-line-one\n","opaque-line-two"]`,
-		"lines keeping a Windows break": `["opaque-line-one\r\n","opaque-line-two"]`,
-		"a line ending in a space":      `["opaque-line-one \n","opaque-line-two"]`,
-		"a value split mid-word":        `["opaque-li","ne-one\nopaque-line-two"]`,
-	} {
-		t.Run(name+", arguments", func(t *testing.T) {
-			c := newContentCollectorIfEnabled(env)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: `{"lines":` + lines + `}`})
-
-			res := c.Result("stop")
-			part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
-			assert.NotContains(t, part, "arguments")
-			assert.NotContains(t, part, "summary")
-			assert.NotContains(t, res.OutputMessages, "opaque-line")
-			assert.True(t, slices.ContainsFunc(res.Findings, func(f security.Finding) bool { return f.Scanner == "runner_env" && f.Name == "DEPLOY_SECRET" }))
-		})
-		t.Run(name+", held", func(t *testing.T) {
-			c := newContentCollectorIfEnabled(env)
-			content, _ := json.Marshal(`{"lines":` + lines + `}`)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"content":` + string(content) + `}`})
-
-			res := c.Result("stop")
-			part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
-			assert.NotContains(t, part, "arguments")
-			assert.Equal(t, true, part["fullsend.truncated"])
-			assert.NotContains(t, res.OutputMessages, "opaque-line")
-		})
-	}
-}
-
-func TestContentCollector_JSONHeldPastTheBoundIsMaskedWhole(t *testing.T) {
-	// Documents are walked down to maxHeldDepth, each encoded again with
-	// its masks; one held deeper is masked whole, the levels above kept.
-	held := func(doc string, depth int) string {
-		for range depth - 1 {
-			b, _ := json.Marshal(map[string]string{"d": doc})
-			doc = string(b)
-		}
-		b, _ := json.Marshal(map[string]string{"content": doc})
-		return string(b)
-	}
-	run := func(args string) contentResult {
-		c := newContentCollector(4096)
-		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: args})
-		return c.Result("stop")
-	}
-	const secret, plain = `{"credentials":{"value":"opaque-credential-123"}}`, `{"v":"plain"}`
-
-	res := run(held(secret, maxHeldDepth))
-	assert.Contains(t, res.OutputMessages, `"arguments":`+held(`{"credentials":{"value":"***"}}`, maxHeldDepth))
-	assert.Len(t, res.Findings, 1)
-
-	res = run(held(plain, maxHeldDepth))
-	assert.Contains(t, res.OutputMessages, `"arguments":`+held(plain, maxHeldDepth))
-	assert.Empty(t, res.Findings)
-
-	for _, doc := range []string{plain, secret} {
-		res = run(held(doc, maxHeldDepth+1))
-		assert.Contains(t, res.OutputMessages, `"arguments":`+held("***", maxHeldDepth+1))
-		assert.NotContains(t, res.OutputMessages, "opaque-credential")
-		assert.Len(t, res.Findings, 1)
-	}
-}
-
-func TestContentCollector_AKeyHoldingADocumentIsJudgedLikeAValue(t *testing.T) {
-	quote := func(s string) string { b, _ := json.Marshal(s); return string(b) }
-	doc := quote(`{"credentials":{"value":"opaque-credential-123"}}`)
-	for name, tc := range map[string]struct {
-		args, want string
-		findings   int
-	}{
-		"key":                    {`{` + doc + `:"x"}`, `{"***":"x"}`, 1},
-		"key of a nested object": {`{"files":{` + doc + `:"x"}}`, `{"files":{"***":"x"}}`, 1},
-		"key in a held document": {`{"content":` + quote(`{`+doc+`:"x"}`) + `}`, `{"content":` + quote(`{"***":"x"}`) + `}`, 1},
-		// Masked whole, the key still names a secret as scanned: its
-		// value is judged against it.
-		"a value under it":              {`{` + doc + `:"opaque-credential-456"}`, `{"***":"***"}`, 2},
-		"an object under it":            {`{` + doc + `:{"u":"opaque-credential-456"}}`, `{"***":{"u":"***"}}`, 2},
-		"a value under a repeated name": {`{` + quote(`{"auth":1,"auth":2}`) + `:"opaque-credential-456"}`, `{"***":"***"}`, 2},
-	} {
-		t.Run(name, func(t *testing.T) {
-			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: tc.args})
-
-			res := c.Result("stop")
-			assert.Contains(t, res.OutputMessages, `"arguments":`+tc.want)
-			assert.NotContains(t, res.OutputMessages, "opaque-credential-")
-			assert.Len(t, res.Findings, tc.findings)
-		})
-	}
-
-	// Two such keys are masked alike: the arguments go, as for any collision.
-	c := newContentCollector(4096)
-	c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{` + doc + `:"x",` + quote(`{"token":["opaque-credential-456"]}`) + `:"y"}`})
-	res := c.Result("stop")
-	part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
-	assert.NotContains(t, part, "arguments")
-	assert.Equal(t, true, part["fullsend.truncated"])
-}
-
-func TestContentCollector_JSONInASecretNamedStringIsMaskedWholeOnce(t *testing.T) {
-	// A document under a secret-named member is walked under that member:
-	// its values are judged by the member's name, one finding each.
-	c := newContentCollector(4096)
-	c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"credentials":"{\"value\":\"opaque-credential-123\"}"}`})
-
-	res := c.Result("stop")
-	assert.Contains(t, res.OutputMessages, `"arguments":{"credentials":"{\"value\":\"***\"}"}`)
-	assert.Len(t, res.Findings, 1)
-}
-
-func TestContentCollector_AKeyFindingLeavesTheValueAndCountsOnce(t *testing.T) {
-	for name, tc := range map[string]struct{ args, want string }{
-		"token":     {`{"ghp_` + strings.Repeat("r", 36) + `":"hello"}`, `{"ghp_...":"hello"}`},
-		"fullwidth": {`{"\uFF50ath":"/tmp/x"}`, `{"path":"/tmp/x"}`},
-	} {
-		t.Run(name, func(t *testing.T) {
-			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Read", Arguments: tc.args})
-
-			res := c.Result("stop")
-			assert.Contains(t, res.OutputMessages, `"arguments":`+tc.want)
-			assert.Len(t, res.Findings, 1)
-		})
-	}
-}
-
-func TestContentCollector_KeysThatRedactAlikeDropTheArguments(t *testing.T) {
-	// Folding makes the two keys one; keeping either member would show a
-	// call the agent did not make, and which one would follow map order.
-	const args = `{"command":"rm -rf /","\uFF43ommand":"ls"}`
-	var first contentResult
-	for i := 0; i < 100; i++ {
-		c := newContentCollector(4096)
-		c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Summary: "rm -rf /", Arguments: args})
-		res := c.Result("stop")
-		if i == 0 {
-			first = res
-		}
-		require.Equal(t, first.OutputMessages, res.OutputMessages)
-		require.Equal(t, first.DroppedBytes, res.DroppedBytes)
-	}
-	part := partAt(t, decodeOutputMessages(t, first.OutputMessages), 0)
-	assert.NotContains(t, part, "arguments")
-	assert.Equal(t, true, part["fullsend.truncated"])
-	assert.True(t, first.Truncated)
-	assert.Positive(t, first.DroppedBytes)
 }
 
 func TestContentCollector_NamelessCallCarriesNoArgumentsAndNoCharge(t *testing.T) {
@@ -854,45 +463,6 @@ func TestContentCollector_ReplacesProviderOnlyValuesFromTheProcessEnv(t *testing
 	assert.Equal(t, 2, runnerEnvFindings(res), "counted like a runner env value")
 }
 
-func TestContentCollector_KeysMaskedAlikeDropTheArguments(t *testing.T) {
-	// Masked keys go the way of keys that redact alike: keeping either
-	// member would show a call the agent did not make. Field names of eight
-	// characters or more under a secret-named member are masked too, so an
-	// ordinary credentials object can cost the arguments.
-	for name, args := range map[string]string{
-		"two opaque keys":       `{"tokens":{"opaque-credential-123":"a","opaque-credential-456":"b"}}`,
-		"username and password": `{"auth":{"username":"alice","password":"hunter2hunter2"}}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Summary: "s", Arguments: args})
-
-			res := c.Result("stop")
-			assert.NotContains(t, res.OutputMessages, "arguments")
-			assert.NotContains(t, res.OutputMessages, "opaque-credential")
-			assert.NotContains(t, res.OutputMessages, "hunter2")
-			assert.True(t, res.Truncated)
-			assert.Positive(t, res.DroppedBytes)
-		})
-	}
-}
-
-func TestContentCollector_SecretNamedChecksSeeNormalizedText(t *testing.T) {
-	// The key and the value are judged as the normalizer writes them: a
-	// fullwidth key names a secret once folded, and four ligatures are
-	// eight characters once folded.
-	for name, tc := range map[string]struct{ args, want string }{
-		"fullwidth key over an array": {`{"\uFF50\uFF41\uFF53\uFF53\uFF57\uFF4F\uFF52\uFF44":["opaque-credential-123"]}`, `{"password":["***"]}`},
-		"value folded past the floor": {`{"password":"\uFB01\uFB01\uFB01\uFB01"}`, `{"password":"***"}`},
-	} {
-		t.Run(name, func(t *testing.T) {
-			c := newContentCollector(4096)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: tc.args})
-			assert.Contains(t, c.Result("stop").OutputMessages, `"arguments":`+tc.want)
-		})
-	}
-}
-
 func TestContentCollector_ReplacesBothValuesWhenRunnerEnvReusesAProviderOnlyName(t *testing.T) {
 	// Nothing refuses GH_WORKFLOW_TOKEN as a runner env key; the process
 	// value is still the one redactFeedback replaces.
@@ -906,17 +476,22 @@ func TestContentCollector_ReplacesBothValuesWhenRunnerEnvReusesAProviderOnlyName
 }
 
 func TestContentCollector_ReplacesARunnerEnvValueSentAsANumber(t *testing.T) {
+	// A number outside the list is scanned as its digits before it is
+	// dropped, so the literal pass still counts it.
 	digits := strings.Repeat("7", minRedactableSecretLen)
 	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
 	c := newContentCollectorIfEnabled(map[string]string{"DEPLOY_PASSWORD": digits})
-	c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: `{"pin":` + digits + `,"n":42}`})
+	c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: `{"pin":` + digits + `,"timeout":42}`})
 
 	res := c.Result("stop")
-	assert.Contains(t, res.OutputMessages, `"arguments":{"n":42,"pin":"[REDACTED:DEPLOY_PASSWORD]"}`)
+	assert.Contains(t, res.OutputMessages, `"arguments":{"timeout":42}`)
+	assert.NotContains(t, res.OutputMessages, digits)
+	assert.Equal(t, 1, runnerEnvFindings(res))
+	assert.Equal(t, len("[REDACTED:DEPLOY_PASSWORD]"), res.DroppedBytes)
 }
 
 func TestContentCollector_ANameRedactedAwayTakesItsArgumentsAlong(t *testing.T) {
-	const args = `{"a":1}`
+	const args = `{"command":"ls"}`
 	c := newContentCollector(4096)
 	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "\u200B", Arguments: args})
 
@@ -987,10 +562,10 @@ func TestContentCollector_FullwidthQuotesCannotAddAMember(t *testing.T) {
 	// NFKC folds a fullwidth quotation mark to '"'. Folded inside the
 	// serialised text it would close the string and add a member.
 	c := newContentCollector(4096)
-	c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"content":"a\uFF02,\uFF02injected\uFF02:\uFF02b"}`})
+	c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: `{"command":"a\uFF02,\uFF02injected\uFF02:\uFF02b"}`})
 
 	part := partAt(t, decodeOutputMessages(t, c.Result("stop").OutputMessages), 0)
-	assert.Equal(t, map[string]any{"content": `a","injected":"b`}, part["arguments"])
+	assert.Equal(t, map[string]any{"command": `a","injected":"b`}, part["arguments"])
 }
 
 func TestContentCollector_IncompleteArgumentsAreDroppedAndMarked(t *testing.T) {
@@ -1018,7 +593,7 @@ func TestContentCollector_IncompleteArgumentsAreDroppedAndMarked(t *testing.T) {
 func TestContentCollector_OverBoundArgumentsAreDroppedWholeAndMarked(t *testing.T) {
 	body := strings.Repeat("x", maxToolArgumentsBytes)
 	c := newContentCollector(maxContentBytes)
-	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "Write", Summary: "/x", Arguments: `{"content": "` + body + `"}`})
+	c.Handle(agentruntime.ToolUseEvent{ID: "toolu_01", Name: "Bash", Summary: "/x", Arguments: `{"command": "` + body + `"}`})
 
 	res := c.Result("stop")
 	part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
@@ -1027,14 +602,14 @@ func TestContentCollector_OverBoundArgumentsAreDroppedWholeAndMarked(t *testing.
 	assert.Equal(t, "toolu_01", part["id"])
 	assert.Equal(t, true, part["fullsend.truncated"])
 	assert.True(t, res.Truncated)
-	assert.Equal(t, len(`{"content":"`+body+`"}`), res.DroppedBytes, "charged as re-encoded")
+	assert.Equal(t, len(`{"command":"`+body+`"}`), res.DroppedBytes, "charged as re-encoded")
 }
 
 func TestContentCollector_ArgumentsAtTheBoundAreKept(t *testing.T) {
-	args := `{"content":"` + strings.Repeat("x", maxToolArgumentsBytes-len(`{"content":""}`)) + `"}`
+	args := `{"command":"` + strings.Repeat("x", maxToolArgumentsBytes-len(`{"command":""}`)) + `"}`
 	require.Len(t, args, maxToolArgumentsBytes)
 	c := newContentCollector(maxContentBytes)
-	c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: args})
+	c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: args})
 
 	res := c.Result("stop")
 	assert.Contains(t, res.OutputMessages, args)
@@ -1055,68 +630,6 @@ func TestContentCollector_ArgumentsBoundAppliesAfterRedaction(t *testing.T) {
 	assert.NotContains(t, partAt(t, msgs, 1), "arguments")
 	assert.Len(t, res.Findings, 2)
 	assert.NotContains(t, res.OutputMessages, "qqqq")
-}
-
-func TestContentCollector_ArgumentsFarOverTheBoundAreDroppedUnjudged(t *testing.T) {
-	// Redaction can bring arguments under the bound, but not from far
-	// over it, and the walk must do no work the bound does not limit: a
-	// secret-named key over an array once cost the key's length for each
-	// element. Over four times the bound as written, the arguments are
-	// scanned as text, so a secret still counts, then dropped and charged.
-	for name, tc := range map[string]struct {
-		args     string
-		findings int
-		summary  bool
-	}{
-		"a long secret-named key over an array": {`{"password` + strings.Repeat("a", 32<<10) + `":[` + strings.Repeat("0,", 1999) + `0]}`, 0, true},
-		"a token in a value":                    {`{"command":"echo ghp_` + strings.Repeat("q", 36) + ` ` + strings.Repeat("x", maxRawToolArgumentsBytes) + `"}`, 1, false},
-		"spacing the encoder would drop":        {`{"content": "` + strings.Repeat("x", maxRawToolArgumentsBytes) + `"}`, 0, true},
-	} {
-		t.Run(name, func(t *testing.T) {
-			c := newContentCollector(maxContentBytes)
-			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "/x", Arguments: tc.args})
-
-			res := c.Result("stop")
-			part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
-			assert.NotContains(t, part, "arguments")
-			assert.Equal(t, tc.summary, part["summary"] != nil)
-			assert.Equal(t, true, part["fullsend.truncated"])
-			assert.Len(t, res.Findings, tc.findings)
-			assert.NotContains(t, res.OutputMessages, "qqqq")
-			assert.Equal(t, len(c.redact(tc.args, new([]security.Finding))), res.DroppedBytes, "charged as redacted text, like arguments that are not JSON")
-		})
-	}
-	t.Run("at four times the bound, redaction still brings them under it", func(t *testing.T) {
-		args := `{"command":"echo ghp_` + strings.Repeat("q", maxRawToolArgumentsBytes-len(`{"command":"echo ghp_"}`)) + `"}`
-		require.Len(t, args, maxRawToolArgumentsBytes)
-		c := newContentCollector(maxContentBytes)
-		c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: args})
-
-		part := partAt(t, decodeOutputMessages(t, c.Result("stop").OutputMessages), 0)
-		assert.Equal(t, map[string]any{"command": "echo ghp_..."}, part["arguments"])
-	})
-}
-
-func TestContentCollector_ASecretNamedKeyIsJudgedOnceForItsValues(t *testing.T) {
-	// The values under a secret-named member are judged beside a stand-in
-	// name decided once for the member, so each scan costs the value's
-	// length, not the key's: a long key over a thousand values must cost
-	// about what a short one does. A ratio, not an absolute time, so load
-	// cannot flake it.
-	values := `[` + strings.Repeat(`"12345678",`, 999) + `"12345678"]`
-	handle := func(key string) (time.Duration, contentResult) {
-		c := newContentCollector(maxContentBytes)
-		entry := time.Now()
-		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"` + key + `":` + values + `}`})
-		return time.Since(entry), c.Result("stop")
-	}
-	short, res := handle("password")
-	require.Len(t, res.Findings, 1000, "every value is judged beside the name")
-	assert.NotContains(t, res.OutputMessages, "12345678")
-	long, res := handle("password" + strings.Repeat("a", 16<<10))
-	require.Len(t, res.Findings, 1000)
-	assert.NotContains(t, res.OutputMessages, "12345678")
-	assert.Less(t, long, 20*short, "the key's length must not multiply the cost of its values")
 }
 
 func TestContentCollector_NullArgumentsAreOmitted(t *testing.T) {

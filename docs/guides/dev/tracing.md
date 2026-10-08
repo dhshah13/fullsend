@@ -238,88 +238,35 @@ content and its marker attributes on the span before either
 `finalizeAgentSpan` path can end it, so failed iterations keep their
 content.
 
-Arguments that parse as JSON are not redacted as one serialized text. The
-redactor's patterns are written for plain text, and over JSON they miss an
-assignment that opens a string or follows an escaped newline, a value
-behind escaped quotes, and JSON nested in a string; Unicode folding can
-also turn a fullwidth quotation mark into one that closes the string.
-`toolArguments` decodes the value, redacts each string and object key on
-its own (a number as its digits; one that redacts becomes the redacted
-string), and encodes the result again. A string value or key that holds
-one JSON object, array or string literal is judged as the arguments are
-(`redactHeld`): decoded from the string as written, walked the same way
-under the same member, and encoded again, so the structure a reader
-decodes from the exported string is the structure that was judged — a
-fold or an escape is inside the encoder's quoting — at the cost of the
-document's layout (the encoder's key order, spacing and escapes). A
-document that cannot be judged is masked `***` whole, with one
-`held_document` finding: one the normalizer changes at all, as written,
-since folding can make a document of text that is none as written, break
-one, or spell a member-name pair into a key (fullwidth braces and
-quotation marks); one held more than `maxHeldDepth` (4) deep, each level
-being decoded and encoded once more; one in which two keys redact alike;
-text shaped like a document — it begins and ends like one, white space
-and invisible characters aside, and quotes something — that does not
-parse (a comment, a trailing comma, an object literal, a Python dict with
-a quoted value); and one whose text holds an exact value (a runtime
-secret, a runner environment value) with structure of its own, which can
-run over the document's (`valueAcross` over the text alone). Of two
-members of one name decoding keeps the last, and the record keeps what
-was decoded. That masks whole text with no secret in it too — a document
-with a compatibility character (™, a fullwidth letter), JSON with
-comments or trailing commas, an `Edit` fragment shaped `{…}` with a
-quoted value. A key holding a document is masked whole as well. A string
-the normalizer stripped an escape sequence or tag characters from — a
-value or a key — is masked `***` whole: a colour code ends at the next
-letter, so the stripping can take a token's first letter and leave the
-rest, and a title code's payload is text no pattern sees. A member is
-named as written as well as as scanned, and a key masked whole names a
-secret whatever it was called — its name is not to be had from its mask
-— so the values under it are judged as a secret-named member's. The
-arguments are also judged across their keys, strings and numbers
-(`atoms`: decoded, in the order written, a held document's in its place,
-so the lines of a notebook cell held in a `Write`'s content are read as
-lines) for a secret that can hold a line break, which no one of them can
-mask. The private key block is sought in them joined by a line break, as
-decoded and as the normalizer renders them (`blockAcross`): over the
-lines of an array, over a key and a value, and inside one string as
-well, which drops the arguments rather than masking the block in place.
-An exact value is sought in them in order with white space set aside —
-however a line ends and wherever the value was cut — an occurrence
-within one atom being the literal pass's to replace; one holding
-structure of its own (a credentials document in an env value) is sought
-in the text as written too (`valueAcross`). The arguments are then
-dropped and charged as encoded. Every other pattern's secret stops at
-white space or at a quote, so a match over the break has only run its
-context into the next string, which is left unjudged. Not judged:
-structure in text not shaped like a document (several documents, YAML, a
-document inside code); an assignment, a header or a connection string
-whose value begins in the next string or number; a token split in pieces
-between strings, or an exact value whose pieces other strings separate
-or a string's escape spells; a member-name pair in single quotes over
-two strings' apostrophes, or one a string's own quote opens or closes. Each string and number is also
-scanned once more, already redacted, beside the nearest enclosing key the
-member-name pattern (`json_field`) names, and masked whole when that pattern
-matches the pair — a pattern keyed on a member
-name has no other way to see the pair; that scan's other findings are
-discarded, since both strings were already scanned. It runs the pattern
-stage alone: the normalizer is not idempotent over escape sequences, and a
-second pass over the pair could strip the value or the key's keyword. A value in an
-array or a nested object under a secret-named member is judged as that
-member's own value would be — the pattern's eight-character floor included,
-so a short count stays; booleans and nulls are left as they are. Keys under
-such a member are judged the same way, since a credential can be the key: a
-key of eight characters or more is masked `***`, field names included, and
-two masked alike collide (below). Arguments that are not
-one JSON value cannot be walked that way: they are scanned as text — with
-the misses above — so their findings count, then dropped and charged. So
-are arguments in which two keys of one object redact to the same string,
-where keeping either member would misreport the call. A call the stream
-reports without a name carries no arguments. This happens once, when the
-event is handled; eviction and `Result` do not rescan it. A name that
-redacts to nothing at `Result` takes the arguments with it: they are
-charged to the dropped bytes, and the part — kept only when it has a
-summary — is marked.
+`toolArguments` records the members of a call's input that
+`recordedArguments` names — paths, patterns, commands, modes and bounds:
+`file_path`, `pattern`, `path`, `command`, `description`, `url`, the
+notebook and bound members, the Grep flags — and nothing else: a file
+body, an edit, a prompt, a notebook source or a todo list, and any member
+whose value is an object or an array, is dropped, charged as the redacted
+text it was scanned as, and the part marked `fullsend.truncated`. The
+guarantee is one sentence: the record holds these members of a call, each
+redacted as text, and nothing else of its input. The input is decoded
+(numbers keep their digits) and each kept string goes through the text
+pipeline on its own, since the redactor's patterns are written for plain
+text and over serialised JSON miss an assignment that opens a string or
+follows an escaped newline, and a value behind escaped quotes; the result
+is encoded again, so key order, spacing and escapes are the encoder's. A
+string the normalizer stripped an escape sequence or tag characters from
+is masked `***` whole: a colour code ends at the next letter, so the
+stripping can take a token's first letter and leave the rest, and a title
+code's payload is text no pattern sees. Discarded content is redacted
+first, here as everywhere: a dropped member is scanned as text — the
+decoded string, or the compact encoding of an object or an array — so a
+secret in a file body still counts, and costs the summary as a secret
+found anywhere in the arguments does. Arguments that are not one JSON
+object are scanned as text and dropped whole, charged; so are kept
+members whose encoding exceeds `maxToolArgumentsBytes`, charged as
+encoded. A call the stream reports without a name carries no arguments.
+This happens once, when the event is handled; eviction and `Result` do
+not rescan it. A name that redacts to nothing at `Result` takes the
+arguments with it: they are charged to the dropped bytes, and the part —
+kept only when it has a summary — is marked.
 
 The input message does not come from the stream. When `runAgent` composes
 a retry prompt (`buildFeedbackPrompt`, under `feedback_mode: append`),

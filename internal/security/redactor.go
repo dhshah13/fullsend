@@ -39,10 +39,6 @@ func RegisterRuntimeSecret(value string) bool {
 	return true
 }
 
-// RuntimeSecrets returns the registered values, for a caller that must
-// find one where no scan can mask it.
-func RuntimeSecrets() []string { return runtimeSecretSnapshot() }
-
 func runtimeSecretSnapshot() []string {
 	runtimeSecretsMu.RLock()
 	defer runtimeSecretsMu.RUnlock()
@@ -185,43 +181,6 @@ func (s *SecretRedactor) Scan(text string) ScanResult {
 	}
 
 	return result
-}
-
-// Match locates one secret in a text — a runtime value, or a pattern's
-// whole match, the pair for a member-name one. Matches reports them
-// without masking, over the text as given, for a caller that judges
-// text it does not export: a scan would mask one match ahead of the
-// next, and a mask can match a pattern again.
-type Match struct {
-	Start, End int
-	Name       string
-}
-
-// Matches reports every secret in text; see Match.
-func (s *SecretRedactor) Matches(text string) []Match {
-	var out []Match
-	for _, secret := range runtimeSecretSnapshot() {
-		for i := 0; ; {
-			j := strings.Index(text[i:], secret)
-			if j < 0 {
-				break
-			}
-			out = append(out, Match{i + j, i + j + len(secret), "runtime_secret"})
-			i += j + len(secret)
-		}
-	}
-	add := func(p secretPattern) {
-		for _, loc := range p.regex.FindAllStringIndex(text, -1) {
-			out = append(out, Match{loc[0], loc[1], p.name})
-		}
-	}
-	for _, p := range s.prefixPatterns {
-		add(p)
-	}
-	for _, p := range s.structuralPatterns {
-		add(p)
-	}
-	return out
 }
 
 func mask(value string) string {
