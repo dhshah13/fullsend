@@ -39,6 +39,10 @@ func RegisterRuntimeSecret(value string) bool {
 	return true
 }
 
+// RuntimeSecrets returns the registered values, for a caller that must
+// find one where no scan can mask it.
+func RuntimeSecrets() []string { return runtimeSecretSnapshot() }
+
 func runtimeSecretSnapshot() []string {
 	runtimeSecretsMu.RLock()
 	defer runtimeSecretsMu.RUnlock()

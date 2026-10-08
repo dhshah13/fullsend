@@ -985,21 +985,25 @@ func (c *contentCollector) normalized(s string) string {
 // spanning reports, and records as one critical finding, a secret that
 // runs across the keys, strings and numbers of raw, one valid JSON value,
 // as a reader of them in the order written sees them: a private key over
-// the lines of an array or over a key and a value, a runtime value over
+// the lines of an array or over a key and a value, an exact value over
 // the lines of one. Each is judged on its own (redactValue); here they
-// are joined by a line break, and by nothing — a line of a notebook
-// cell keeps its own line break — each as decoded and as the normalizer
-// renders it — the one can hold a marker inside an escape sequence the
-// normalizer strips, the other a marker folding spells — before any is
-// masked, since a string masked whole can take a secret's first or last
-// line with it. Only a secret that can hold a line break is judged
-// across them: the private key block, and an exact value — a runtime
-// secret, or a runner env value the literal pass replaces. Every
+// are judged together, each as decoded and as the normalizer renders it
+// — the one can hold a marker inside an escape sequence the normalizer
+// strips, the other a marker folding spells — before any is masked,
+// since a string masked whole can take a secret's first or last line
+// with it. Only a secret that can hold a line break is judged across
+// them. The private key block is sought in the strings joined by a line
+// break, which its pattern reads over. An exact value — a runtime
+// secret, a runner env value the literal pass replaces — is sought in
+// the strings in order with white space set aside, so however a line
+// ends (its own line break, a Windows one, a space) and wherever the
+// value was cut, it is read as a reader of the lines reads it. Every
 // other pattern's secret stops at white space or at a quote, so a match
-// of one over the break has only run its context into the next string
-// (an assignment whose value is the next string, a pair in single quotes
+// of one over a break has only run its context into the next string (an
+// assignment whose value is the next string, a pair in single quotes
 // over two strings' apostrophes), which is left unjudged, as a token
-// split between two strings is.
+// split between two strings is. A match within one key, string or
+// number is that one's own.
 func (c *contentCollector) spanning(raw string) bool {
 	var decoded, normalized []string
 	for _, sp := range atomSpans(raw) {
@@ -1010,43 +1014,84 @@ func (c *contentCollector) spanning(raw string) bool {
 		decoded = append(decoded, a)
 		normalized = append(normalized, c.normalized(a))
 	}
-	// Joined by a line break, and joined by nothing: a line of a
-	// notebook cell keeps its own line break, so an exact value over two
-	// such lines is whole only in the second text.
+	found := func(scanner, name string) bool {
+		c.findings = append(c.findings, security.Finding{Scanner: scanner, Name: name, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
+		return true
+	}
 	for _, atoms := range [][]string{decoded, normalized} {
-		for _, sep := range []string{"\n", ""} {
-			text := strings.Join(atoms, sep)
-			starts := make([]int, len(atoms)) // where each atom begins in text
-			for n := 1; n < len(atoms); n++ {
-				starts[n] = starts[n-1] + len(atoms[n-1]) + len(sep)
+		lines, bounds := joined(atoms, "\n", plain)
+		for _, m := range c.secrets.Matches(lines) {
+			if m.Name == "private_key" && !bounds.within(m.Start, m.End) {
+				return found("secret_redactor", m.Name)
 			}
-			within := func(start, end int) bool { // one key, string or number holds it: its own
-				n := sort.Search(len(starts), func(n int) bool { return starts[n] > start }) - 1
-				return end <= starts[n]+len(atoms[n])
+		}
+		dense, bounds := joined(atoms, "", unspaced)
+		for _, v := range security.RuntimeSecrets() {
+			if bounds.holds(dense, unspaced(v)) {
+				return found("secret_redactor", "runtime_secret")
 			}
-			for _, m := range c.secrets.Matches(text) {
-				if m.Name != "private_key" && m.Name != "runtime_secret" || within(m.Start, m.End) {
-					continue
-				}
-				c.findings = append(c.findings, security.Finding{Scanner: "secret_redactor", Name: m.Name, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
-				return true
-			}
-			for _, l := range envLiterals(c.runnerEnv) {
-				for i := 0; ; {
-					j := strings.Index(text[i:], l.value)
-					if j < 0 {
-						break
-					}
-					if i += j; !within(i, i+len(l.value)) {
-						c.findings = append(c.findings, security.Finding{Scanner: "runner_env", Name: l.key, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
-						return true
-					}
-					i += len(l.value)
-				}
+		}
+		for _, l := range envLiterals(c.runnerEnv) {
+			if bounds.holds(dense, unspaced(l.value)) {
+				return found("runner_env", l.key)
 			}
 		}
 	}
 	return false
+}
+
+// atomBounds is where each atom begins and ends in a text joined of them.
+type atomBounds [][2]int
+
+// joined writes atoms as render renders them, sep between, and where
+// each is in the text.
+func joined(atoms []string, sep string, render func(string) string) (string, atomBounds) {
+	var b strings.Builder
+	bounds := make(atomBounds, len(atoms))
+	for n, a := range atoms {
+		if n > 0 {
+			b.WriteString(sep)
+		}
+		bounds[n][0] = b.Len()
+		b.WriteString(render(a))
+		bounds[n][1] = b.Len()
+	}
+	return b.String(), bounds
+}
+
+// within reports whether one atom holds text[start:end] whole.
+func (bounds atomBounds) within(start, end int) bool {
+	n := sort.Search(len(bounds), func(n int) bool { return bounds[n][0] > start }) - 1
+	return n >= 0 && end <= bounds[n][1]
+}
+
+// holds reports whether text holds value other than within one atom.
+func (bounds atomBounds) holds(text, value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; ; {
+		j := strings.Index(text[i:], value)
+		if j < 0 {
+			return false
+		}
+		if i += j; !bounds.within(i, i+len(value)) {
+			return true
+		}
+		i += len(value)
+	}
+}
+
+// plain renders a string as it is; unspaced without its white space.
+func plain(s string) string { return s }
+
+func unspaced(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // atomSpans lists where raw, a valid JSON value, spells each string

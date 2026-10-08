@@ -340,6 +340,7 @@ func TestContentCollector_SecretsSpanningTheArgumentsStrings(t *testing.T) {
 		"a private key over a key and a value":            {`{"` + begin + `\n` + body[:20] + `":"` + body[20:] + `\n` + end + `"}`, body[:20], 2},
 		"a runtime value over two strings":                {`{"lines":["rtline1","rtline2x"]}`, "rtline2x", 1},
 		"and over two lines keeping their breaks":         {`{"lines":["rtline1\n","rtline2x"]}`, "rtline2x", 1},
+		"and over two lines keeping a Windows break":      {`{"lines":["rtline1\r\n","rtline2x"]}`, "rtline2x", 1},
 		"a marker inside an escape the normalizer strips": {`{"lines":["\u001b]0;` + begin + `\u0007\n","` + body + `\n","` + end + `\n"]}`, body, 2},
 		"a marker folded":                                 {`{"lines":["\uFF0D\uFF0D\uFF0D\uFF0D\uFF0DBEGIN RSA PRIVATE ` + `KEY-----\n","` + body + `\n","` + end + `\n"]}`, body, 2},
 	} {
@@ -481,13 +482,17 @@ func TestContentCollector_ARunnerEnvValueOverTheLinesOfAnArray(t *testing.T) {
 	// of an array, no string holds it whole and the literal pass sees no
 	// part of it. Judged across the strings it is found: the arguments
 	// are dropped, a held document masked whole.
-	// Each line of a notebook cell keeps its own line break: the strings
-	// are judged joined end to end as well.
+	// Each line of a notebook cell keeps its own line break, a Windows
+	// one or a trailing space: an exact value is sought in the strings in
+	// order, white space aside.
 	env := map[string]string{"DEPLOY_SECRET": "opaque-line-one\nopaque-line-two"}
 	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
 	for name, lines := range map[string]string{
-		"lines":                   `["opaque-line-one","opaque-line-two"]`,
-		"lines keeping the break": `["opaque-line-one\n","opaque-line-two"]`,
+		"lines":                         `["opaque-line-one","opaque-line-two"]`,
+		"lines keeping the break":       `["opaque-line-one\n","opaque-line-two"]`,
+		"lines keeping a Windows break": `["opaque-line-one\r\n","opaque-line-two"]`,
+		"a line ending in a space":      `["opaque-line-one \n","opaque-line-two"]`,
+		"a value split mid-word":        `["opaque-li","ne-one\nopaque-line-two"]`,
 	} {
 		t.Run(name+", arguments", func(t *testing.T) {
 			c := newContentCollectorIfEnabled(env)

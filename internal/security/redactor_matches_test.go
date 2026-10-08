@@ -27,3 +27,16 @@ func TestSecretRedactor_Matches(t *testing.T) {
 	}, got)
 	assert.Empty(t, NewSecretRedactor().Matches("nothing here"))
 }
+
+func TestRuntimeSecrets(t *testing.T) {
+	// The registered values, for a caller that must find one where no scan
+	// can mask it; a copy, so the caller cannot change the registry.
+	t.Cleanup(resetRuntimeSecrets)
+	resetRuntimeSecrets()
+	assert.Empty(t, RuntimeSecrets())
+	RegisterRuntimeSecret("runtime-opaque-value-42")
+	got := RuntimeSecrets()
+	assert.Equal(t, []string{"runtime-opaque-value-42"}, got)
+	got[0] = "changed"
+	assert.Equal(t, []string{"runtime-opaque-value-42"}, RuntimeSecrets())
+}
