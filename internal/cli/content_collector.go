@@ -820,7 +820,10 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 	if err != nil {
 		return nil, false // decoded JSON values marshal unconditionally
 	}
-	if collided || c.spanning(args) || len(out) > maxToolArgumentsBytes {
+	// Judged across its strings whatever else drops it: the secret found
+	// there is a finding of the call, and costs it its summary.
+	spanning := c.spanning(args)
+	if collided || spanning || len(out) > maxToolArgumentsBytes {
 		c.evicted += len(out)
 		return nil, true
 	}
@@ -989,7 +992,8 @@ func (c *contentCollector) normalized(s string) string {
 // normalizer strips, the other a marker folding spells — before any is
 // masked, since a string masked whole can take a secret's first or last
 // line with it. Only a secret that can hold a line break is judged
-// across them: the private key block, and an exact runtime value. Every
+// across them: the private key block, and an exact value — a runtime
+// secret, or a runner env value the literal pass replaces. Every
 // other pattern's secret stops at white space or at a quote, so a match
 // of one over the break has only run its context into the next string
 // (an assignment whose value is the next string, a pair in single quotes
@@ -1011,13 +1015,29 @@ func (c *contentCollector) spanning(raw string) bool {
 		for n := 1; n < len(atoms); n++ {
 			starts[n] = starts[n-1] + len(atoms[n-1]) + 1
 		}
+		within := func(start, end int) bool { // one key, string or number holds it: its own
+			n := sort.Search(len(starts), func(n int) bool { return starts[n] > start }) - 1
+			return end <= starts[n]+len(atoms[n])
+		}
 		for _, m := range c.secrets.Matches(text) {
-			n := sort.Search(len(starts), func(n int) bool { return starts[n] > m.Start }) - 1
-			if m.Name != "private_key" && m.Name != "runtime_secret" || m.End <= starts[n]+len(atoms[n]) {
-				continue // within one key, string or number: its own
+			if m.Name != "private_key" && m.Name != "runtime_secret" || within(m.Start, m.End) {
+				continue
 			}
 			c.findings = append(c.findings, security.Finding{Scanner: "secret_redactor", Name: m.Name, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
 			return true
+		}
+		for _, l := range envLiterals(c.runnerEnv) {
+			for i := 0; ; {
+				j := strings.Index(text[i:], l.value)
+				if j < 0 {
+					break
+				}
+				if i += j; !within(i, i+len(l.value)) {
+					c.findings = append(c.findings, security.Finding{Scanner: "runner_env", Name: l.key, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
+					return true
+				}
+				i += len(l.value)
+			}
 		}
 	}
 	return false
@@ -1098,9 +1118,12 @@ func (c *contentCollector) redactValue(v any, under string, collided *bool) any 
 			rk := c.maskHeld(sk, k)
 			member := under
 			// Named as scanned, or as written: the normalizer can strip
-			// the name's first letter with a colour code, or mask the key
-			// whole, and the value under it is still that name's.
-			named := c.namesASecret(sk) || c.namesASecret(k)
+			// the name's first letter with a colour code, and the value
+			// under it is still that name's. A key masked whole names a
+			// secret whatever it was called: its name is not to be had
+			// from its mask, and stripping can eat the first letter of
+			// one that folding spells.
+			named := sk == "***" || c.namesASecret(sk) || c.namesASecret(k)
 			if named {
 				// Decided once for the member: the pattern reads any
 				// name it matches alike, so a stand-in judges the values

@@ -278,14 +278,16 @@ twice. A string the normalizer stripped an escape sequence or tag
 characters from — a value or a key — is masked `***` whole: a colour code
 ends at the next letter, so the stripping can take a token's first letter
 and leave the rest, and a title code's payload is text no pattern sees. A
-member is named as written as well as as scanned, so a key so masked
-still names the values under it. Each level — the arguments, and each
+member is named as written as well as as scanned, and a key masked whole
+names a secret whatever it was called — its name is not to be had from
+its mask, and stripping can eat the first letter of one folding spells —
+so the values under it are judged as a secret-named member's. Each level — the arguments, and each
 held document — is also judged as a reader of its keys, strings and
 numbers in the order written sees them (`spanning`): joined by a line
 break, each as decoded and as the normalizer renders it, before any is
 masked, for a secret that can hold a line break — the private key block
-over the lines of an array or over a key and a value, an exact runtime
-value over the lines of one. The arguments are then dropped and charged
+over the lines of an array or over a key and a value, an exact value (a
+runtime secret, a runner environment value) over the lines of one. The arguments are then dropped and charged
 as encoded; a held document is masked whole (its text was scanned whole
 first, so a block that scan masked in place stays in place). Every other
 pattern's secret stops at white space or at a quote, so a match over the

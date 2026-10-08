@@ -3649,23 +3649,8 @@ func redactFeedback(feedback string, runnerEnv map[string]string) string {
 // order: a value that contains another is replaced whole, whichever source
 // holds it, and the text is the same on every run.
 func replaceEnvSecrets(text string, runnerEnv map[string]string) (string, []string) {
-	type literal struct{ key, value string }
-	var literals []literal
-	for key, value := range runnerEnv {
-		if len(value) >= minRedactableSecretLen && sensitiveEnvKey(key) {
-			literals = append(literals, literal{key, value})
-		}
-	}
-	for key := range providerOnlyKeys {
-		if value := os.Getenv(key); len(value) >= minRedactableSecretLen {
-			literals = append(literals, literal{key, value})
-		}
-	}
-	slices.SortFunc(literals, func(a, b literal) int {
-		return cmp.Or(cmp.Compare(len(b.value), len(a.value)), cmp.Compare(a.key, b.key), cmp.Compare(a.value, b.value))
-	})
 	var replaced []string
-	for _, l := range literals {
+	for _, l := range envLiterals(runnerEnv) {
 		if !strings.Contains(text, l.value) {
 			continue
 		}
@@ -3673,6 +3658,31 @@ func replaceEnvSecrets(text string, runnerEnv map[string]string) (string, []stri
 		replaced = append(replaced, l.key)
 	}
 	return text, replaced
+}
+
+// envLiteral is one value the literal pass replaces, with the key it
+// names in the mask.
+type envLiteral struct{ key, value string }
+
+// envLiterals lists the values replaceEnvSecrets replaces — longer values
+// first, then key order — for it and for a caller that must find one
+// where no replacement can mask it (the collector's spanning).
+func envLiterals(runnerEnv map[string]string) []envLiteral {
+	var literals []envLiteral
+	for key, value := range runnerEnv {
+		if len(value) >= minRedactableSecretLen && sensitiveEnvKey(key) {
+			literals = append(literals, envLiteral{key, value})
+		}
+	}
+	for key := range providerOnlyKeys {
+		if value := os.Getenv(key); len(value) >= minRedactableSecretLen {
+			literals = append(literals, envLiteral{key, value})
+		}
+	}
+	slices.SortFunc(literals, func(a, b envLiteral) int {
+		return cmp.Or(cmp.Compare(len(b.value), len(a.value)), cmp.Compare(a.key, b.key), cmp.Compare(a.value, b.value))
+	})
+	return literals
 }
 
 // writeValidationFeedback writes the validation failure output to a file in

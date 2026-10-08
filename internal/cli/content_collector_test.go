@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -427,6 +428,78 @@ func TestContentCollector_AStringTheNormalizerStrippedIsMaskedWhole(t *testing.T
 		c := newContentCollector(4096)
 		c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: `{"\u001b[0ma":1,"\u001b[1mb":2}`})
 		assert.NotContains(t, c.Result("stop").OutputMessages, `"arguments"`)
+	})
+}
+
+func TestContentCollector_ACollisionStillCountsASecretAcrossTheStrings(t *testing.T) {
+	// Two keys folding alike drop the arguments on their own; the level is
+	// still judged across its strings, since the secret found there is
+	// what costs the call its summary — the parser cut it from these
+	// arguments, and a private key's first line can be in it.
+	begin, end := "-----BEGIN RSA PRIVATE "+"KEY-----", "-----END RSA PRIVATE "+"KEY-----"
+	body := strings.Repeat("Q", 40)
+	c := newContentCollector(4096)
+	c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Summary: begin + "\n" + body, Arguments: `{"a":"x","\uFF41":"y","command":"` + begin + `\n` + body + `","description":"` + end + `"}`})
+
+	res := c.Result("stop")
+	part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
+	assert.NotContains(t, part, "arguments")
+	assert.NotContains(t, part, "summary", "the secret across the strings costs the summary")
+	assert.NotContains(t, res.OutputMessages, body)
+	assert.True(t, slices.ContainsFunc(res.Findings, func(f security.Finding) bool { return f.Name == "private_key" }), "the spanning secret is recorded")
+}
+
+func TestContentCollector_AKeyMaskedWholeNamesASecret(t *testing.T) {
+	// A key the normalizer stripped an escape sequence from is masked
+	// whole, and its name is then not to be had from its mask, nor from
+	// its spelling when that is in compatibility forms the pattern does
+	// not read, nor from the normalizer's rendering when the stripping ate
+	// the name's first letter: the values under such a key are judged as
+	// a secret-named member's, whatever it was called.
+	const opaque = "opaque-credential-123"
+	password := "\uFF50\uFF41\uFF53\uFF53\uFF57\uFF4F\uFF52\uFF44" // fullwidth
+	for name, tc := range map[string]struct{ args, want string }{
+		"a colour code before a fullwidth name":        {`{"\u001b[0m` + password + `":"` + opaque + `"}`, `{"***":"***"}`},
+		"an unfinished colour code the fold completes": {`{"\u001b[` + password + `":"` + opaque + `"}`, `{"***":"***"}`},
+		"and the values nested under it":               {`{"\u001b[0m` + password + `":{"v":["` + opaque + `"]}}`, `{"***":{"v":["***"]}}`},
+		"a colour code alone":                          {`{"\u001b[0mnote":"` + opaque + `"}`, `{"***":"***"}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(4096)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: tc.args})
+
+			res := c.Result("stop")
+			assert.Contains(t, res.OutputMessages, `"arguments":`+tc.want)
+			assert.NotContains(t, res.OutputMessages, opaque)
+		})
+	}
+}
+
+func TestContentCollector_ARunnerEnvValueOverTheLinesOfAnArray(t *testing.T) {
+	// A runner env value can hold a line break; written over two strings
+	// of an array, no string holds it whole and the literal pass sees no
+	// part of it. Judged across the strings it is found: the arguments
+	// are dropped, a held document masked whole.
+	env := map[string]string{"DEPLOY_SECRET": "opaque-line-one\nopaque-line-two"}
+	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
+	t.Run("arguments", func(t *testing.T) {
+		c := newContentCollectorIfEnabled(env)
+		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: `{"lines":["opaque-line-one","opaque-line-two"]}`})
+
+		res := c.Result("stop")
+		part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
+		assert.NotContains(t, part, "arguments")
+		assert.NotContains(t, part, "summary")
+		assert.NotContains(t, res.OutputMessages, "opaque-line")
+		assert.True(t, slices.ContainsFunc(res.Findings, func(f security.Finding) bool { return f.Scanner == "runner_env" && f.Name == "DEPLOY_SECRET" }))
+	})
+	t.Run("held", func(t *testing.T) {
+		c := newContentCollectorIfEnabled(env)
+		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"content":"{\"lines\":[\"opaque-line-one\",\"opaque-line-two\"]}"}`})
+
+		res := c.Result("stop")
+		assert.Contains(t, res.OutputMessages, `"arguments":{"content":"***"}`)
+		assert.NotContains(t, res.OutputMessages, "opaque-line")
 	})
 }
 
