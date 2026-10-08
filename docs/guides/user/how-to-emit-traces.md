@@ -125,8 +125,9 @@ runtime's stream provides them; Claude runs do — to each `agent` span, in the
 local file and
 at the endpoint. A retry that carries validation feedback also records the
 prompt the runner composed. Content is redacted for secrets and bounded per iteration,
-but may still contain proprietary code or PII — tool arguments include the
-commands an agent ran and the file contents it wrote — so make sure your backend's
+but may still contain proprietary code or PII — tool arguments carry the
+commands an agent ran and the paths and patterns it used, never a file body
+or an edit — so make sure your backend's
 access controls fit before enabling it.
 
 ```bash

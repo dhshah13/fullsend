@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"maps"
 	"slices"
 	"sort"
@@ -793,9 +795,12 @@ var recordedArguments = map[string]bool{
 // JSON they miss an assignment that opens a string or follows an escaped
 // newline, and a value behind escaped quotes. The result is encoded
 // again — key order, spacing and escapes are the encoder's, not the
-// wire's — and a number keeps its digits. Text that is not one JSON
-// object (see ToolUseEvent.Arguments) cannot be walked that way: it is
-// scanned as text so its findings count, then dropped whole and charged.
+// wire's. A kept number is scanned as its digits — a runner env value
+// can be sent as one — and stays a number when nothing was replaced.
+// Text that is not one JSON object (see ToolUseEvent.Arguments), or
+// carries anything but white space after it, cannot be walked that way:
+// it is scanned as text so its findings count, then dropped whole and
+// charged.
 // So are arguments whose encoding exceeds maxToolArgumentsBytes, charged
 // as encoded. A dropped member is charged as the redacted text it was
 // scanned as.
@@ -824,7 +829,17 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 		case map[string]any, []any:
 			enc, _ := json.Marshal(t) // decoded JSON values marshal unconditionally
 			c.evicted += len(c.redact(string(enc), &c.findings))
-		default: // a number, a boolean, null
+		case json.Number:
+			if recordedArguments[k] {
+				if r := c.scanLeaf(string(t)); r != string(t) {
+					out[k] = r // the mask, as the string it is
+				} else {
+					out[k] = t
+				}
+				continue
+			}
+			c.evicted += len(c.redact(string(t), &c.findings))
+		default: // a boolean, null
 			if recordedArguments[k] {
 				out[k] = t
 				continue
@@ -848,14 +863,21 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 	return enc, dropped
 }
 
-// decodeJSON decodes one JSON value; float64 would rewrite integers past
-// 2^53, so numbers keep their digits.
+var errTrailingInput = errors.New("trailing input after the JSON value")
+
+// decodeJSON decodes one JSON value, with white space at most after it;
+// float64 would rewrite integers past 2^53, so numbers keep their digits.
 func decodeJSON(s string) (any, error) {
 	dec := json.NewDecoder(strings.NewReader(s))
 	dec.UseNumber()
 	var v any
-	err := dec.Decode(&v)
-	return v, err
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errTrailingInput
+	}
+	return v, nil
 }
 
 // revealing reports a finding that shows a secret was there: any but the

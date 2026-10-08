@@ -257,6 +257,66 @@ func TestContentCollector_AStringTheNormalizerStrippedIsMaskedWhole(t *testing.T
 	}
 }
 
+func TestContentCollector_ANumberUnderAListedMemberIsScanned(t *testing.T) {
+	// A number under a listed member is kept, and scanned as its digits
+	// first like every kept string: a runner env value sent as a number
+	// is replaced, and the mask is exported as a string, so a reader that
+	// gets an integer back got the real one. A clean number stays a
+	// number.
+	digits := strings.Repeat("7", minRedactableSecretLen)
+	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
+	c := newContentCollectorIfEnabled(map[string]string{"DEPLOY_PASSWORD": digits})
+	c.Handle(agentruntime.ToolUseEvent{Name: "Read", Arguments: `{"file_path":"/x","limit":50,"offset":` + digits + `}`})
+
+	res := c.Result("stop")
+	assert.Contains(t, res.OutputMessages, `"arguments":{"file_path":"/x","limit":50,"offset":"[REDACTED:DEPLOY_PASSWORD]"}`)
+	assert.NotContains(t, res.OutputMessages, digits)
+	assert.Equal(t, 1, runnerEnvFindings(res))
+	assert.False(t, res.Truncated)
+	assert.Zero(t, res.DroppedBytes)
+}
+
+func TestContentCollector_ArgumentsWithTrailingInputAreDropped(t *testing.T) {
+	// One JSON value, then white space at most. Anything after it is not
+	// the object the record would describe, so the text is scanned — a
+	// secret in the tail counts, and costs the summary — then dropped
+	// whole and charged as the redacted text.
+	token := "ghp_" + strings.Repeat("r", 36)
+	for name, tc := range map[string]struct {
+		args    string
+		charged int
+		found   int
+	}{
+		"text after the object": {`{"command":"ls"} garbage`, len(`{"command":"ls"} garbage`), 0},
+		"a second value":        {`{"command":"ls"}{"command":"rm"}`, len(`{"command":"ls"}{"command":"rm"}`), 0},
+		"text after null":       {`null x`, len(`null x`), 0},
+		"a token in the tail":   {`{"command":"ls"} ` + token, len(`{"command":"ls"} ghp_...`), 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(4096)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Summary: "ls", Arguments: tc.args})
+
+			res := c.Result("stop")
+			assert.NotContains(t, res.OutputMessages, "arguments")
+			assert.NotContains(t, res.OutputMessages, token[4:])
+			assert.True(t, res.Truncated)
+			assert.Equal(t, tc.charged, res.DroppedBytes)
+			assert.Len(t, res.Findings, tc.found)
+			if tc.found == 0 {
+				assert.Contains(t, res.OutputMessages, `"summary":"ls"`)
+			} else {
+				assert.NotContains(t, res.OutputMessages, `"summary"`)
+			}
+		})
+	}
+
+	c := newContentCollector(4096)
+	c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: "{\"command\":\"ls\"} \n"})
+	res := c.Result("stop")
+	assert.Contains(t, res.OutputMessages, `"arguments":{"command":"ls"}`, "white space after the value is not trailing input")
+	assert.False(t, res.Truncated)
+}
+
 func TestContentCollector_NamelessCallCarriesNoArgumentsAndNoCharge(t *testing.T) {
 	// The schema requires a name on a tool_call part. A nameless call is
 	// refused; its arguments must not survive alone, nor charge a part

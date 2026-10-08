@@ -217,13 +217,11 @@ final answer is what consumers judge) plus an 8 KiB per-tool-result
 bound (tail-kept, redacted before the cut, the part marked
 `fullsend.truncated`) and an 8 KiB per-call arguments bound (over it the
 arguments are dropped whole and the part marked, since a cut object is not
-JSON; over four times it as written they are dropped before they are
-decoded, so no walk does work the bound does not limit), with exact dropped-byte
+JSON), with exact dropped-byte
 accounting across content, tool names, summaries, responses, part
-ids, and dropped arguments (counted as re-encoded JSON, or as redacted
-text when they were not a JSON value or were dropped before they were
-decoded; on a key collision each member a
-later key (in sorted order) replaced is not counted), then holds the marshaled string to `maxEncodedContentBytes`
+ids, and dropped arguments (charged as the kept encoding when the bound
+drops them, otherwise as the redacted text they were scanned as, and as
+written when the call's name redacts away), then holds the marshaled string to `maxEncodedContentBytes`
 (255,000 — just under the one size the pilot backend is proven to accept)
 by trimming the oldest content again, measured on the encoding itself and
 still charged in raw bytes (a separate, earlier boundary — the parser's 1 MiB
@@ -247,7 +245,8 @@ whose value is an object or an array, is dropped, charged as the redacted
 text it was scanned as, and the part marked `fullsend.truncated`. The
 guarantee is one sentence: the record holds these members of a call, each
 redacted as text, and nothing else of its input. The input is decoded
-(numbers keep their digits) and each kept string goes through the text
+(one JSON object, white space at most after it) and each kept string, and
+each kept number as its digits, goes through the text
 pipeline on its own, since the redactor's patterns are written for plain
 text and over serialised JSON miss an assignment that opens a string or
 follows an escaped newline, and a value behind escaped quotes; the result
