@@ -339,6 +339,7 @@ func TestContentCollector_SecretsSpanningTheArgumentsStrings(t *testing.T) {
 		"a private key over members against key order":    {`{"b":"` + begin + `\n` + body[:20] + `","a":"` + body[20:] + `\n` + end + `"}`, body[:20], 1},
 		"a private key over a key and a value":            {`{"` + begin + `\n` + body[:20] + `":"` + body[20:] + `\n` + end + `"}`, body[:20], 2},
 		"a runtime value over two strings":                {`{"lines":["rtline1","rtline2x"]}`, "rtline2x", 1},
+		"and over two lines keeping their breaks":         {`{"lines":["rtline1\n","rtline2x"]}`, "rtline2x", 1},
 		"a marker inside an escape the normalizer strips": {`{"lines":["\u001b]0;` + begin + `\u0007\n","` + body + `\n","` + end + `\n"]}`, body, 2},
 		"a marker folded":                                 {`{"lines":["\uFF0D\uFF0D\uFF0D\uFF0D\uFF0DBEGIN RSA PRIVATE ` + `KEY-----\n","` + body + `\n","` + end + `\n"]}`, body, 2},
 	} {
@@ -480,27 +481,35 @@ func TestContentCollector_ARunnerEnvValueOverTheLinesOfAnArray(t *testing.T) {
 	// of an array, no string holds it whole and the literal pass sees no
 	// part of it. Judged across the strings it is found: the arguments
 	// are dropped, a held document masked whole.
+	// Each line of a notebook cell keeps its own line break: the strings
+	// are judged joined end to end as well.
 	env := map[string]string{"DEPLOY_SECRET": "opaque-line-one\nopaque-line-two"}
 	t.Setenv(telemetry.ContentCaptureEnvVar, "true")
-	t.Run("arguments", func(t *testing.T) {
-		c := newContentCollectorIfEnabled(env)
-		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: `{"lines":["opaque-line-one","opaque-line-two"]}`})
+	for name, lines := range map[string]string{
+		"lines":                   `["opaque-line-one","opaque-line-two"]`,
+		"lines keeping the break": `["opaque-line-one\n","opaque-line-two"]`,
+	} {
+		t.Run(name+", arguments", func(t *testing.T) {
+			c := newContentCollectorIfEnabled(env)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: `{"lines":` + lines + `}`})
 
-		res := c.Result("stop")
-		part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
-		assert.NotContains(t, part, "arguments")
-		assert.NotContains(t, part, "summary")
-		assert.NotContains(t, res.OutputMessages, "opaque-line")
-		assert.True(t, slices.ContainsFunc(res.Findings, func(f security.Finding) bool { return f.Scanner == "runner_env" && f.Name == "DEPLOY_SECRET" }))
-	})
-	t.Run("held", func(t *testing.T) {
-		c := newContentCollectorIfEnabled(env)
-		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"content":"{\"lines\":[\"opaque-line-one\",\"opaque-line-two\"]}"}`})
+			res := c.Result("stop")
+			part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
+			assert.NotContains(t, part, "arguments")
+			assert.NotContains(t, part, "summary")
+			assert.NotContains(t, res.OutputMessages, "opaque-line")
+			assert.True(t, slices.ContainsFunc(res.Findings, func(f security.Finding) bool { return f.Scanner == "runner_env" && f.Name == "DEPLOY_SECRET" }))
+		})
+		t.Run(name+", held", func(t *testing.T) {
+			c := newContentCollectorIfEnabled(env)
+			content, _ := json.Marshal(`{"lines":` + lines + `}`)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"content":` + string(content) + `}`})
 
-		res := c.Result("stop")
-		assert.Contains(t, res.OutputMessages, `"arguments":{"content":"***"}`)
-		assert.NotContains(t, res.OutputMessages, "opaque-line")
-	})
+			res := c.Result("stop")
+			assert.Contains(t, res.OutputMessages, `"arguments":{"content":"***"}`)
+			assert.NotContains(t, res.OutputMessages, "opaque-line")
+		})
+	}
 }
 
 func TestContentCollector_JSONHeldPastTheBoundIsMaskedWhole(t *testing.T) {

@@ -987,7 +987,8 @@ func (c *contentCollector) normalized(s string) string {
 // as a reader of them in the order written sees them: a private key over
 // the lines of an array or over a key and a value, a runtime value over
 // the lines of one. Each is judged on its own (redactValue); here they
-// are joined by a line break, each as decoded and as the normalizer
+// are joined by a line break, and by nothing — a line of a notebook
+// cell keeps its own line break — each as decoded and as the normalizer
 // renders it — the one can hold a marker inside an escape sequence the
 // normalizer strips, the other a marker folding spells — before any is
 // masked, since a string masked whole can take a secret's first or last
@@ -1009,34 +1010,39 @@ func (c *contentCollector) spanning(raw string) bool {
 		decoded = append(decoded, a)
 		normalized = append(normalized, c.normalized(a))
 	}
+	// Joined by a line break, and joined by nothing: a line of a
+	// notebook cell keeps its own line break, so an exact value over two
+	// such lines is whole only in the second text.
 	for _, atoms := range [][]string{decoded, normalized} {
-		text := strings.Join(atoms, "\n")
-		starts := make([]int, len(atoms)) // where each atom begins in text
-		for n := 1; n < len(atoms); n++ {
-			starts[n] = starts[n-1] + len(atoms[n-1]) + 1
-		}
-		within := func(start, end int) bool { // one key, string or number holds it: its own
-			n := sort.Search(len(starts), func(n int) bool { return starts[n] > start }) - 1
-			return end <= starts[n]+len(atoms[n])
-		}
-		for _, m := range c.secrets.Matches(text) {
-			if m.Name != "private_key" && m.Name != "runtime_secret" || within(m.Start, m.End) {
-				continue
+		for _, sep := range []string{"\n", ""} {
+			text := strings.Join(atoms, sep)
+			starts := make([]int, len(atoms)) // where each atom begins in text
+			for n := 1; n < len(atoms); n++ {
+				starts[n] = starts[n-1] + len(atoms[n-1]) + len(sep)
 			}
-			c.findings = append(c.findings, security.Finding{Scanner: "secret_redactor", Name: m.Name, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
-			return true
-		}
-		for _, l := range envLiterals(c.runnerEnv) {
-			for i := 0; ; {
-				j := strings.Index(text[i:], l.value)
-				if j < 0 {
-					break
+			within := func(start, end int) bool { // one key, string or number holds it: its own
+				n := sort.Search(len(starts), func(n int) bool { return starts[n] > start }) - 1
+				return end <= starts[n]+len(atoms[n])
+			}
+			for _, m := range c.secrets.Matches(text) {
+				if m.Name != "private_key" && m.Name != "runtime_secret" || within(m.Start, m.End) {
+					continue
 				}
-				if i += j; !within(i, i+len(l.value)) {
-					c.findings = append(c.findings, security.Finding{Scanner: "runner_env", Name: l.key, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
-					return true
+				c.findings = append(c.findings, security.Finding{Scanner: "secret_redactor", Name: m.Name, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
+				return true
+			}
+			for _, l := range envLiterals(c.runnerEnv) {
+				for i := 0; ; {
+					j := strings.Index(text[i:], l.value)
+					if j < 0 {
+						break
+					}
+					if i += j; !within(i, i+len(l.value)) {
+						c.findings = append(c.findings, security.Finding{Scanner: "runner_env", Name: l.key, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
+						return true
+					}
+					i += len(l.value)
 				}
-				i += len(l.value)
 			}
 		}
 	}
