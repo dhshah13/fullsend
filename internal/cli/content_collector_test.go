@@ -226,8 +226,13 @@ func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(
 		"folding breaks a document":                  {"{\"note\":\"\uFF02\"," + cred + "}", "***", 2},
 		"a BOM and folding that breaks a document":   {"\uFEFF{\"note\":\"\uFF02\"," + cred + "}", "***", 3},
 		"a fold that makes and breaks a document":    {"\uFF5B\"note\":\"\uFF02\"," + cred + "}", "***", 2},
-		"an escape before a document folding breaks": {"\x1b[0m{\"note\":\"\uFF02\"," + cred + "}", "***", 3},
+		"an escape before a document folding breaks": {"\x1b[0m{\"note\":\"\uFF02\"," + cred + "}", "***", 2},
 		"a mask breaks a document":                   {`{"token":"abcdefgh\\\"x",` + cred + `}`, "***", 2},
+		// Folding can move a value out of its secret-named member while the
+		// document still parses; a document the normalizer changes at all
+		// is not judged.
+		"folding that moves a value between members": {"{\"credentials\":{\"value\":\"\uFF02},\uFF02note\uFF02:{\uFF02value\uFF02:\uFF02" + opaque + "\"}}", "***", 2},
+		"folding that moves nothing":                 {"{\"name\":\"Widget\u2122\"}", "***", 2},
 		// Decoding keeps the last of two members of one name; the string
 		// keeps both, so a repeated name cannot be judged either.
 		"a repeated name":                  {`{` + cred + `,"credentials":{}}`, "***", 1},
@@ -278,12 +283,17 @@ func TestContentCollector_JSONInAStringIsAlsoScannedWhole(t *testing.T) {
 	begin, end := "-----BEGIN RSA PRIVATE "+"KEY-----", "-----END RSA PRIVATE "+"KEY-----"
 	body := strings.Repeat("Q", 40)
 	notebook, _ := json.Marshal(map[string]any{"cells": []any{map[string]any{"source": []string{begin + "\n", body + "\n", end + "\n"}}}})
+	security.RegisterRuntimeSecret("rtline1\nrtline2x")
 	for name, tc := range map[string]struct {
 		env           map[string]string
 		content, gone string
 		findings      int
 	}{
-		"key over a cell's lines": {nil, string(notebook), body, 1},
+		"key over a cell's lines": {nil, string(notebook), body, 2},
+		// Its strings in order, as written: the scan masks the block's last
+		// line as a member's value before the block's pattern runs.
+		"key from a member name into its value": {nil, `{"` + begin + `\n` + body[:20] + `":"` + body[20:] + `\n` + end + `"}`, body[:20], 2},
+		"a runtime value over two strings":      {nil, `{"lines":["rtline1","rtline2x"]}`, "rtline2x", 1},
 		// Its marker breaks the document, which cannot then be judged.
 		"runner env value with structure":         {map[string]string{"DB_PASSWORD": `hunter22","port`}, `{"pw":"hunter22","port":5432}`, "hunter22", 2},
 		"runner env value that ends the document": {map[string]string{"DB_PASSWORD": `hunter22"}`}, `{"pw":"hunter22"}`, "hunter22", 2},
@@ -307,6 +317,117 @@ func TestContentCollector_JSONInAStringIsAlsoScannedWhole(t *testing.T) {
 			assert.Len(t, res.Findings, tc.findings)
 		})
 	}
+}
+
+func TestContentCollector_SecretsSpanningTheArgumentsStrings(t *testing.T) {
+	// Each key, string and number is judged on its own, and the level as a
+	// reader of them in the order written sees them: a private key over
+	// the lines of an array or over a key and a value, a runtime value
+	// over the lines of one. A secret found that way can be masked
+	// nowhere but the level whole: the arguments are dropped and charged
+	// as encoded. (An assignment or a header whose value is the next
+	// string is not judged: its secret stops at white space.)
+	begin, end := "-----BEGIN RSA PRIVATE "+"KEY-----", "-----END RSA PRIVATE "+"KEY-----"
+	body := strings.Repeat("Q", 40)
+	security.RegisterRuntimeSecret("rtline1\nrtline2x")
+	for name, tc := range map[string]struct {
+		args, gone string
+		findings   int
+	}{
+		"a private key over the lines of a cell":          {`{"cells":[{"source":["` + begin + `\n","` + body + `\n","` + end + `\n"]}]}`, body, 1},
+		"a private key over members against key order":    {`{"b":"` + begin + `\n` + body[:20] + `","a":"` + body[20:] + `\n` + end + `"}`, body[:20], 1},
+		"a private key over a key and a value":            {`{"` + begin + `\n` + body[:20] + `":"` + body[20:] + `\n` + end + `"}`, body[:20], 2},
+		"a runtime value over two strings":                {`{"lines":["rtline1","rtline2x"]}`, "rtline2x", 1},
+		"a marker inside an escape the normalizer strips": {`{"lines":["\u001b]0;` + begin + `\u0007\n","` + body + `\n","` + end + `\n"]}`, body, 2},
+		"a marker folded":                                 {`{"lines":["\uFF0D\uFF0D\uFF0D\uFF0D\uFF0DBEGIN RSA PRIVATE ` + `KEY-----\n","` + body + `\n","` + end + `\n"]}`, body, 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(4096)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: tc.args})
+
+			res := c.Result("stop")
+			part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
+			assert.NotContains(t, part, "arguments")
+			assert.NotContains(t, part, "summary")
+			assert.Equal(t, true, part["fullsend.truncated"])
+			assert.NotContains(t, res.OutputMessages, tc.gone)
+			assert.Len(t, res.Findings, tc.findings)
+		})
+	}
+	t.Run("a private key in one string is that string's own", func(t *testing.T) {
+		c := newContentCollector(4096)
+		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: `{"content":"` + begin + `\n` + body + `\n` + end + `","file_path":"k.pem"}`})
+
+		res := c.Result("stop")
+		assert.Contains(t, res.OutputMessages, `"arguments":{"content":"[REDACTED PRIVATE KEY]","file_path":"k.pem"}`)
+		assert.Len(t, res.Findings, 1)
+	})
+	t.Run("dropped arguments are charged as encoded", func(t *testing.T) {
+		c := newContentCollector(4096)
+		args := `{"lines": ["` + begin + `", "` + body + `", "` + end + `"]}`
+		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: args})
+		assert.Equal(t, len(args)-3*len(" "), c.Result("stop").DroppedBytes)
+	})
+}
+
+func TestContentCollector_JoinedNeighboursMakeNoSecret(t *testing.T) {
+	// Judged in order, two strings with no secret between them must not
+	// make one: a token stops at the end of its string, and so does a
+	// connection string's user.
+	for name, args := range map[string]string{
+		"a database URL beside an address":         `{"DATABASE_URL":"postgres://localhost:5432/dev","SMTP_FROM":"noreply@acme.io"}`,
+		"an empty assignment beside a description": `{"command":"export NPM_TOKEN=","description":"Configure npm auth"}`,
+		"names that run into a token's prefix":     `{"service":"task-scheduler","namespace":"production_workloads"}`,
+		"a command's flags":                        `{"command":["flask","--app","hello","run","--no-reload"]}`,
+		"apostrophes of two strings":               `{"old_string":"print(key + ': ' + str(cfg[key]))","new_string":"print(key + ': ' + str(cfg[key]))\nlog.debug('dumped')"}`,
+		"a connection string with no host":         `{"pattern":"postgres://user:pass@","path":"src","output_mode":"files_with_matches"}`,
+		"a database URL before a remote":           `{"database":"postgres://localhost/app","remote":"git+ssh://git@github.com/org/app.git"}`,
+		"and before a registry, nested":            `{"environment":{"REDIS_URL":"redis://redis","NPM_CONFIG_REGISTRY":"https://npm.pkg.github.com/@acme"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(4096)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: args})
+
+			res := c.Result("stop")
+			var want, got any
+			require.NoError(t, json.Unmarshal([]byte(args), &want))
+			got = partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)["arguments"]
+			assert.Equal(t, want, got)
+			assert.Empty(t, res.Findings)
+		})
+	}
+}
+
+func TestContentCollector_AStringTheNormalizerStrippedIsMaskedWhole(t *testing.T) {
+	// The normalizer strips a terminal escape sequence or tag characters
+	// before the patterns run, and the stripping can take the first
+	// letter of a token (a CSI sequence ends at the next letter) or a
+	// whole payload the patterns never see: such a string, a value or a
+	// key, is masked whole.
+	token := "ghp_" + strings.Repeat("r", 36)
+	for name, tc := range map[string]struct {
+		args, want, gone string
+	}{
+		"a colour code that eats a token's first letter": {`{"n":"\u001b[` + token + `"}`, `{"n":"***"}`, token[1:]},
+		"a token inside a title code":                    {`{"command":"echo \u001b]` + token + `\u0007"}`, `{"command":"***"}`, token[4:]},
+		"tag characters":                                 {`{"t":"x\uDB40\uDC67y"}`, `{"t":"***"}`, "xy"},
+		"a key":                                          {`{"\u001b[0mpassword":"hunter2hunter2"}`, `{"***":"***"}`, "hunter2"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(4096)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Summary: "s", Arguments: tc.args})
+
+			res := c.Result("stop")
+			assert.Contains(t, res.OutputMessages, `"arguments":`+tc.want)
+			assert.NotContains(t, res.OutputMessages, tc.gone)
+			assert.NotContains(t, res.OutputMessages, `"summary"`)
+		})
+	}
+	t.Run("two keys masked alike collide", func(t *testing.T) {
+		c := newContentCollector(4096)
+		c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: `{"\u001b[0ma":1,"\u001b[1mb":2}`})
+		assert.NotContains(t, c.Result("stop").OutputMessages, `"arguments"`)
+	})
 }
 
 func TestContentCollector_JSONHeldPastTheBoundIsMaskedWhole(t *testing.T) {

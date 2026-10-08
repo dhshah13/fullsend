@@ -263,7 +263,10 @@ being scanned once more; naming a member twice, since decoding keeps only
 the last (RFC 7493 forbids it); or shaped like a document — it begins
 and ends like one, white space and invisible characters aside, and
 quotes something — but not parsing, whether the scan broke it, folding
-or masking it, or it never parsed. That masks whole text with no secret in it too — a document with
+or masking it, or it never parsed; or one the normalizer changes at all,
+as written: folding can move a value out of its secret-named member while
+the document still parses (fullwidth quotation marks), so structure the
+normalizer makes, or moves, is not trusted. That masks whole text with no secret in it too — a document with
 a repeated name, one a pattern misreads once decoded (a notebook line
 `key = …`), one holding an escaped terminal colour code, JSON with
 comments or trailing commas, an object literal or a Python dict with a
@@ -271,10 +274,27 @@ quoted value, an `Edit` fragment shaped `{…}` with one — and a mask the walk
 matches again (a connection string's password of ten bytes or more, the
 runner environment marker in an assignment, a mask of eight bytes or more
 under a secret-named member) masks its string whole and counts its secret
-twice. Not judged: a document whose structure folding or a mask changes
-while the text holding it still parses (one held in it then breaks too),
-and structure in text not shaped like a document (several documents,
-YAML, a document inside code). Each string and number is also
+twice. A string the normalizer stripped an escape sequence or tag
+characters from — a value or a key — is masked `***` whole: a colour code
+ends at the next letter, so the stripping can take a token's first letter
+and leave the rest, and a title code's payload is text no pattern sees. A
+member is named as written as well as as scanned, so a key so masked
+still names the values under it. Each level — the arguments, and each
+held document — is also judged as a reader of its keys, strings and
+numbers in the order written sees them (`spanning`): joined by a line
+break, each as decoded and as the normalizer renders it, before any is
+masked, for a secret that can hold a line break — the private key block
+over the lines of an array or over a key and a value, an exact runtime
+value over the lines of one. The arguments are then dropped and charged
+as encoded; a held document is masked whole (its text was scanned whole
+first, so a block that scan masked in place stays in place). Every other
+pattern's secret stops at white space or at a quote, so a match over the
+break has only run its context into the next string, which is left
+unjudged. Not judged: structure in text not shaped like a document
+(several documents, YAML, a document inside code); an assignment, a
+header or a connection string whose value begins in the next string; a
+token or an exact value split into pieces between strings; a member-name
+pair in single quotes over two strings' apostrophes. Each string and number is also
 scanned once more, already redacted, beside the nearest enclosing key the
 member-name pattern (`json_field`) names, and masked whole when that pattern
 matches the pair — a pattern keyed on a member

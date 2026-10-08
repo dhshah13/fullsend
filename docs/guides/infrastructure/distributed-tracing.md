@@ -129,9 +129,16 @@ document, decoded, still shows a secret: a value or key nested under a secret-na
 member, or one only decoding spells out. So is one that cannot be judged:
 held more than four deep, naming a member twice, or shaped like a
 document but not parsing (JSON with comments or trailing commas, an
-object literal) — the [developer guide](../dev/tracing.md) has the list.
-A string directly under a secret-named member is masked in place, as
-anywhere else.
+object literal), or one that Unicode normalization changes at all, since
+folding can move a value between members — the
+[developer guide](../dev/tracing.md) has the list. A secret that runs
+across the strings of the arguments, or of a held document, in the order
+written — a private key over the lines of an array — can be masked
+nowhere but whole: the arguments are dropped, the held string masked
+`***`. A string a terminal escape sequence was stripped from is masked
+whole too, since the stripping can leave most of a token. A string
+directly under a secret-named member is masked in place, as anywhere
+else.
 
 On a retry iteration under `validation_loop.feedback_mode: append`, the
 prompt the runner composed — its fixed framing around the previous
