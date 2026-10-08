@@ -738,7 +738,11 @@ func TestCodexExtractTranscripts_NamesChildrenByRole(t *testing.T) {
 		{day + "rollout-2026-09-29T15-46-46-0005.jsonl", `{"type":"response_item","payload":{}}` + "\n" + child("0005", `"security"`)},
 		// Not a rollout at all: discarded.
 		{day + "rollout-2026-09-29T15-46-48-0006.jsonl", "not a rollout\n"},
-		{day + "rollout-2026-09-29T15-46-50-0007.jsonl", child("0007", `"default"`)}, // reserved name
+		{day + "rollout-2026-09-29T15-46-50-0007.jsonl", child("0007", `"default"`)},                       // reserved name
+		{day + "rollout-2026-09-29T15-46-52-0008.jsonl", child("0008", `"sk-abcdefghijklmnopqrstuvwxyz"`)}, // credential-shaped
+		// A crafted basename equal to a child name, listed after that child
+		// was saved: skipped, so the saved transcript is not truncated.
+		{day + "sub1-correctness.jsonl", meta(`"id":"planted"`)},
 	})
 
 	outDir := filepath.Join(t.TempDir(), "transcripts")
@@ -758,13 +762,36 @@ func TestCodexExtractTranscripts_NamesChildrenByRole(t *testing.T) {
 		"review-sub4-generic.jsonl",
 		"review-rollout-2026-09-29T15-46-46-0005.jsonl",
 		"review-sub5-generic.jsonl",
+		"review-sub6-generic.jsonl",
 	}, names, "the root keeps its basename; children are numbered in basename order and named by their validated role, generic otherwise")
-	assert.Equal(t, 8, strings.Count(readFileString(t, logPath), " download "),
-		"every listed rollout is fetched; naming happens after validation, not before the download")
+	assert.Equal(t, 9, strings.Count(readFileString(t, logPath), " download "),
+		"every listed rollout is fetched, except one whose name was already saved; naming happens after validation, not before the download")
 
 	got, err := os.ReadFile(filepath.Join(outDir, "review-sub1-correctness.jsonl"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(got), codexTestSecret, "a child rollout is redacted like the root's")
 	assert.Contains(t, string(got), `"parent_thread_id"`, "the whole rollout is saved, not only renamed")
 	assert.Contains(t, string(got), `"id":"0001"`, "sub1 is the earliest child")
+}
+
+// TestCodexExtractTranscripts_ChildNameRejected covers a child name the
+// output root refuses: the child is skipped and nothing in outputDir changes.
+func TestCodexExtractTranscripts_ChildNameRejected(t *testing.T) {
+	r := CodexRuntime{}
+	day := r.codexSessionsDir() + "/2026/09/29/"
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	fakeOpenshellCodexRollouts(t, logPath, []codexFakeRollout{
+		{day + "rollout-2026-09-29T15-46-38-0001.jsonl",
+			`{"type":"session_meta","payload":{"id":"0001","parent_thread_id":"root","agent_role":"correctness"}}` + "\n"},
+	})
+	outDir := filepath.Join(t.TempDir(), "transcripts")
+	blocker := filepath.Join(outDir, "review-sub1-correctness.jsonl")
+	require.NoError(t, os.MkdirAll(blocker, 0o755))
+
+	require.NoError(t, r.ExtractTranscripts("sb", "review", outDir))
+
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.True(t, entries[0].IsDir(), "the directory at the child name is untouched and nothing else was saved")
 }

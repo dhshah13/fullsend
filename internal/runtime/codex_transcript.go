@@ -65,6 +65,7 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 	paths := strings.Split(trimmed, "\n")
 	slices.SortFunc(paths, func(a, b string) int { return strings.Compare(filepath.Base(a), filepath.Base(b)) })
 	children := 0
+	saved := map[string]bool{}
 	for _, remotePath := range paths {
 		remotePath = strings.TrimSpace(remotePath)
 		if remotePath == "" {
@@ -83,6 +84,12 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 			continue
 		}
 		localName := fmt.Sprintf("%s-%s", agentLabel, filepath.Base(remotePath))
+		// A name this extraction already saved is never truncated or removed
+		// for a later rollout, whichever of the two was listed first.
+		if saved[localName] {
+			fmt.Fprintf(os.Stderr, "  [%s] Skipping %s: already saved\n", agentLabel, localName)
+			continue
+		}
 		f, createErr := root.Create(localName)
 		if createErr != nil {
 			fmt.Fprintf(os.Stderr, "  [%s] Skipping (path rejected): %s: %v\n", agentLabel, localName, createErr)
@@ -112,16 +119,21 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 			continue
 		}
 		// A rollout whose first line names a parent thread is a child's. Its
-		// role enters the file name only as a legal persona name; anything
-		// else is codexGenericRole. The child name gets the same os.Root
-		// check as the root's.
+		// role enters the file name only as a legal persona name that the
+		// redactor leaves alone; anything else is codexGenericRole. The child
+		// name gets the same os.Root check as the root's.
 		isChild := false
 		if meta, metaErr := codexReadSessionMeta(stagePath); metaErr == nil && meta.ParentThreadID != "" {
-			role := codexGenericRole
-			if config.ValidSubagentKey(meta.AgentRole) && !slices.Contains(config.ReservedSubagentKeys(), meta.AgentRole) {
-				role = meta.AgentRole
+			role := meta.AgentRole
+			if !config.ValidSubagentKey(role) || slices.Contains(config.ReservedSubagentKeys(), role) || redactSummary(role) != role {
+				role = codexGenericRole
 			}
 			childName := codexChildTranscriptName(agentLabel, children+1, role)
+			if saved[childName] {
+				fmt.Fprintf(os.Stderr, "  [%s] Skipping %s: already saved\n", agentLabel, childName)
+				os.Remove(stagePath)
+				continue
+			}
 			cf, createErr := root.Create(childName)
 			if createErr != nil {
 				fmt.Fprintf(os.Stderr, "  [%s] Skipping (path rejected): %s: %v\n", agentLabel, childName, createErr)
@@ -151,6 +163,7 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 		if isChild {
 			children++
 		}
+		saved[localName] = true
 		fmt.Fprintf(os.Stderr, "  [%s] Saved transcript: %s\n", agentLabel, localName)
 	}
 	return nil
@@ -199,7 +212,7 @@ func codexValidSessionPath(sessionsDir, path string) error {
 }
 
 // codexGenericRole names a child transcript whose rollout carries no usable
-// role: a null role, or one that is not a legal persona name.
+// role: null, reserved, not a legal persona name, or credential-shaped.
 const codexGenericRole = "generic"
 
 // codexChildTranscriptName renders <agentLabel>-sub<seq>-<role>.jsonl, the
