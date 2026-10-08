@@ -151,11 +151,12 @@ which sees the runtime's stream, not its API requests.
 (runner environment values, Unicode normalization, secret masking, then
 runner environment values again) before reaching the span.
 Content is bounded at 256 KiB per iteration — each tool result at 8 KiB,
-each call's arguments at 8 KiB —
+each call's arguments at 8 KiB, and at four times that as written, before
+they are decoded —
 kept as an ordered suffix; overflow drops the oldest content first. Those
 bounds count raw bytes, except that arguments count as the
 re-encoded JSON described above, against their own bound and against the
-total. That encoding writes `<`, `>` and `&` as six bytes each, so
+total (as redacted text when they were dropped before they were decoded). That encoding writes `<`, `>` and `&` as six bytes each, so
 arguments dense in those characters reach their bound at about a sixth of
 that size on the stream. The exported JSON string is bounded as well, at
 255,000 bytes, because encoding adds 8–10% at these bounds on real runs

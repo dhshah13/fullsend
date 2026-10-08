@@ -217,10 +217,12 @@ final answer is what consumers judge) plus an 8 KiB per-tool-result
 bound (tail-kept, redacted before the cut, the part marked
 `fullsend.truncated`) and an 8 KiB per-call arguments bound (over it the
 arguments are dropped whole and the part marked, since a cut object is not
-JSON), with exact dropped-byte
+JSON; over four times it as written they are dropped before they are
+decoded, so no walk does work the bound does not limit), with exact dropped-byte
 accounting across content, tool names, summaries, responses, part
 ids, and dropped arguments (counted as re-encoded JSON, or as redacted
-text when they were not a JSON value; on a key collision each member a
+text when they were not a JSON value or were dropped before they were
+decoded; on a key collision each member a
 later key (in sorted order) replaced is not counted), then holds the marshaled string to `maxEncodedContentBytes`
 (255,000 — just under the one size the pilot backend is proven to accept)
 by trimming the oldest content again, measured on the encoding itself and

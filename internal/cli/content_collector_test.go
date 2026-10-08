@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
@@ -14,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	agentruntime "github.com/fullsend-ai/fullsend/internal/runtime"
+	"github.com/fullsend-ai/fullsend/internal/security"
 	"github.com/fullsend-ai/fullsend/internal/telemetry"
 )
 
@@ -832,6 +834,68 @@ func TestContentCollector_ArgumentsBoundAppliesAfterRedaction(t *testing.T) {
 	assert.NotContains(t, partAt(t, msgs, 1), "arguments")
 	assert.Len(t, res.Findings, 2)
 	assert.NotContains(t, res.OutputMessages, "qqqq")
+}
+
+func TestContentCollector_ArgumentsFarOverTheBoundAreDroppedUnjudged(t *testing.T) {
+	// Redaction can bring arguments under the bound, but not from far
+	// over it, and the walk must do no work the bound does not limit: a
+	// secret-named key over an array once cost the key's length for each
+	// element. Over four times the bound as written, the arguments are
+	// scanned as text, so a secret still counts, then dropped and charged.
+	for name, tc := range map[string]struct {
+		args     string
+		findings int
+		summary  bool
+	}{
+		"a long secret-named key over an array": {`{"password` + strings.Repeat("a", 32<<10) + `":[` + strings.Repeat("0,", 1999) + `0]}`, 0, true},
+		"a token in a value":                    {`{"command":"echo ghp_` + strings.Repeat("q", 36) + ` ` + strings.Repeat("x", maxRawToolArgumentsBytes) + `"}`, 1, false},
+		"spacing the encoder would drop":        {`{"content": "` + strings.Repeat("x", maxRawToolArgumentsBytes) + `"}`, 0, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newContentCollector(maxContentBytes)
+			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "/x", Arguments: tc.args})
+
+			res := c.Result("stop")
+			part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
+			assert.NotContains(t, part, "arguments")
+			assert.Equal(t, tc.summary, part["summary"] != nil)
+			assert.Equal(t, true, part["fullsend.truncated"])
+			assert.Len(t, res.Findings, tc.findings)
+			assert.NotContains(t, res.OutputMessages, "qqqq")
+			assert.Equal(t, len(c.redact(tc.args, new([]security.Finding))), res.DroppedBytes, "charged as redacted text, like arguments that are not JSON")
+		})
+	}
+	t.Run("at four times the bound, redaction still brings them under it", func(t *testing.T) {
+		args := `{"command":"echo ghp_` + strings.Repeat("q", maxRawToolArgumentsBytes-len(`{"command":"echo ghp_"}`)) + `"}`
+		require.Len(t, args, maxRawToolArgumentsBytes)
+		c := newContentCollector(maxContentBytes)
+		c.Handle(agentruntime.ToolUseEvent{Name: "Bash", Arguments: args})
+
+		part := partAt(t, decodeOutputMessages(t, c.Result("stop").OutputMessages), 0)
+		assert.Equal(t, map[string]any{"command": "echo ghp_..."}, part["arguments"])
+	})
+}
+
+func TestContentCollector_ASecretNamedKeyIsJudgedOnceForItsValues(t *testing.T) {
+	// The values under a secret-named member are judged beside a stand-in
+	// name decided once for the member, so each scan costs the value's
+	// length, not the key's: a long key over a thousand values must cost
+	// about what a short one does. A ratio, not an absolute time, so load
+	// cannot flake it.
+	values := `[` + strings.Repeat(`"12345678",`, 999) + `"12345678"]`
+	handle := func(key string) (time.Duration, contentResult) {
+		c := newContentCollector(maxContentBytes)
+		entry := time.Now()
+		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"` + key + `":` + values + `}`})
+		return time.Since(entry), c.Result("stop")
+	}
+	short, res := handle("password")
+	require.Len(t, res.Findings, 1000, "every value is judged beside the name")
+	assert.NotContains(t, res.OutputMessages, "12345678")
+	long, res := handle("password" + strings.Repeat("a", 16<<10))
+	require.Len(t, res.Findings, 1000)
+	assert.NotContains(t, res.OutputMessages, "12345678")
+	assert.Less(t, long, 20*short, "the key's length must not multiply the cost of its values")
 }
 
 func TestContentCollector_NullArgumentsAreOmitted(t *testing.T) {

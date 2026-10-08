@@ -99,6 +99,13 @@ const maxToolResultBytes = 8 * 1024
 // measured; a Write call carries the file body as an argument.
 const maxToolArgumentsBytes = 8 * 1024
 
+// maxRawToolArgumentsBytes bounds the arguments as written, before they
+// are decoded. Redaction can bring them under maxToolArgumentsBytes (a
+// token masks to seven bytes), but not from far over it, and the walk
+// must do no work that bound does not limit. Over it they are scanned
+// as text, so their findings count, then dropped and charged.
+const maxRawToolArgumentsBytes = 4 * maxToolArgumentsBytes
+
 // maxHeldDepth bounds how deep heldSecret walks documents held in
 // strings: each level is scanned once more, and with \u escapes a
 // document can nest about the square root of its length deep. A string
@@ -783,7 +790,8 @@ func redactText(pipeline *security.Pipeline, runnerEnv map[string]string, text s
 // key order, spacing and escapes are the encoder's, not the wire's.
 //
 // Text that is not one JSON value (see ToolUseEvent.Arguments) cannot be
-// redacted that way. It is scanned as text so its findings count, then
+// redacted that way, and text over maxRawToolArgumentsBytes is not
+// decoded at all. Either is scanned as text so its findings count, then
 // dropped and charged like any other discarded content. Arguments whose
 // redacted encoding exceeds maxToolArgumentsBytes, or in which two keys
 // of one object redact to the same string, are dropped the same way and
@@ -794,7 +802,7 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 	if args == "" {
 		return nil, false
 	}
-	if !json.Valid([]byte(args)) {
+	if len(args) > maxRawToolArgumentsBytes || !json.Valid([]byte(args)) {
 		c.evicted += len(c.redact(args, &c.findings))
 		return nil, true
 	}
@@ -928,9 +936,10 @@ func revealing(f security.Finding) bool {
 // number that redacts becomes the redacted string. A pattern
 // keyed on a member name ("password": "...") cannot see the pair that
 // way, so a string or number under a key that pattern names — the nearest
-// such enclosing key, under — is scanned once more, already redacted,
-// beside it and masked whole on a match (secretNamed); a direct string
-// member is also scanned beside its own key. A value in
+// such enclosing key, under, which a stand-in name represents — is scanned
+// once more, already redacted, beside it and masked whole on a match
+// (secretNamed); a direct string member is also scanned beside its own
+// key. A value in
 // an array or a nested object under a secret-named member is judged as
 // that member's own value would be, and so is a key there.
 // Keys are walked in sorted order, so neither the findings nor a dropped
@@ -966,11 +975,15 @@ func (c *contentCollector) redactValue(v any, under string, collided *bool) any 
 			sk := c.redact(k, &c.findings)
 			rk := c.maskHeld(sk, k)
 			member := under
-			if c.namesASecret(sk) {
-				member = sk
+			named := c.namesASecret(sk)
+			if named {
+				// Decided once for the member: the pattern reads any
+				// name it matches alike, so a stand-in judges the values
+				// under it at a cost the key's length does not multiply.
+				member = "secret"
 			}
 			e := c.redactValue(t[k], member, collided)
-			if s, ok := e.(string); ok && member != sk && c.secretNamed(sk, s) {
+			if s, ok := e.(string); ok && !named && c.secretNamed(sk, s) {
 				// A single quote in the key can let the pattern match
 				// the pair even when the key names no secret.
 				e = "***"
