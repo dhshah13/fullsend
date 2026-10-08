@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/harness"
 	"github.com/fullsend-ai/fullsend/internal/sandbox"
 	"github.com/fullsend-ai/fullsend/internal/security"
@@ -723,6 +724,8 @@ func TestCodexExtractTranscripts_NamesChildrenByRole(t *testing.T) {
 			`{"type":"response_item","payload":{"output":"token ` + codexTestSecret + `"}}` + "\n"
 	}
 	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	require.True(t, config.ValidSubagentKey("sk-abcdefghijklmnopqrstuvwxyz"),
+		"the credential-shaped role passes the key check, so only the redactor turns it generic")
 	// Listed out of basename order on purpose: `find` prints directory
 	// order, and <seq> must follow the rollout's start time, which leads
 	// the basename.
@@ -794,4 +797,27 @@ func TestCodexExtractTranscripts_ChildNameRejected(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.True(t, entries[0].IsDir(), "the directory at the child name is untouched and nothing else was saved")
+}
+
+// TestCodexExtractTranscripts_DownloadLandingNameSaved covers the download's
+// landing path: a file lands at outputDir/<remote basename> before it is
+// renamed to the staging name, so a remote basename equal to a saved name
+// must be skipped before the download, or the saved transcript is lost.
+func TestCodexExtractTranscripts_DownloadLandingNameSaved(t *testing.T) {
+	r := CodexRuntime{}
+	day := r.codexSessionsDir() + "/2026/09/29/"
+	logPath := filepath.Join(t.TempDir(), "openshell.log")
+	fakeOpenshellCodexRollouts(t, logPath, []codexFakeRollout{
+		{day + "rollout-2026-09-29T15-46-38-0001.jsonl",
+			`{"type":"session_meta","payload":{"id":"0001","parent_thread_id":"root","agent_role":"correctness"}}` + "\n"},
+		// Sorts after the rollout, so it is listed once the child is saved.
+		{day + "triage-sub1-correctness.jsonl", "not a rollout\n"},
+	})
+	outDir := filepath.Join(t.TempDir(), "transcripts")
+	require.NoError(t, r.ExtractTranscripts("sb", "triage", outDir))
+
+	got, err := os.ReadFile(filepath.Join(outDir, "triage-sub1-correctness.jsonl"))
+	require.NoError(t, err, "the saved child survives a later file whose basename is its name")
+	assert.Contains(t, string(got), `"id":"0001"`)
+	assert.Equal(t, 1, strings.Count(readFileString(t, logPath), " download "), "the colliding file is skipped before the download")
 }

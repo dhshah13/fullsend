@@ -85,8 +85,10 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 		}
 		localName := fmt.Sprintf("%s-%s", agentLabel, filepath.Base(remotePath))
 		// A name this extraction already saved is never truncated or removed
-		// for a later rollout, whichever of the two was listed first.
-		if saved[localName] {
+		// for a later rollout, whichever of the two was listed first. The
+		// download lands at outputDir/<basename> before the rename, so that
+		// name counts too.
+		if saved[localName] || saved[filepath.Base(remotePath)] {
 			fmt.Fprintf(os.Stderr, "  [%s] Skipping %s: already saved\n", agentLabel, localName)
 			continue
 		}
