@@ -738,6 +738,7 @@ func TestCodexExtractTranscripts_NamesChildrenByRole(t *testing.T) {
 		{day + "rollout-2026-09-29T15-46-46-0005.jsonl", `{"type":"response_item","payload":{}}` + "\n" + child("0005", `"security"`)},
 		// Not a rollout at all: discarded.
 		{day + "rollout-2026-09-29T15-46-48-0006.jsonl", "not a rollout\n"},
+		{day + "rollout-2026-09-29T15-46-50-0007.jsonl", child("0007", `"default"`)}, // reserved name
 	})
 
 	outDir := filepath.Join(t.TempDir(), "transcripts")
@@ -756,8 +757,9 @@ func TestCodexExtractTranscripts_NamesChildrenByRole(t *testing.T) {
 		"review-sub3-generic.jsonl",
 		"review-sub4-generic.jsonl",
 		"review-rollout-2026-09-29T15-46-46-0005.jsonl",
+		"review-sub5-generic.jsonl",
 	}, names, "the root keeps its basename; children are numbered in basename order and named by their validated role, generic otherwise")
-	assert.Equal(t, 7, strings.Count(readFileString(t, logPath), " download "),
+	assert.Equal(t, 8, strings.Count(readFileString(t, logPath), " download "),
 		"every listed rollout is fetched; naming happens after validation, not before the download")
 
 	got, err := os.ReadFile(filepath.Join(outDir, "review-sub1-correctness.jsonl"))

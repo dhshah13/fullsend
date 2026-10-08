@@ -23,7 +23,7 @@ import (
 // thread's (its session_meta names a parent_thread_id) as
 // <agentLabel>-sub<seq>-<role>.jsonl, where seq counts the kept child
 // rollouts in ascending basename order and role is the child's agent_role
-// when it is a valid persona key, else codexGenericRole.
+// when it is a legal persona name, else codexGenericRole.
 //
 // Only `.jsonl` is collected. codex writes the running session's rollout
 // uncompressed and compresses older ones in place
@@ -112,13 +112,13 @@ func (r CodexRuntime) ExtractTranscripts(sandboxName, agentLabel, outputDir stri
 			continue
 		}
 		// A rollout whose first line names a parent thread is a child's. Its
-		// role enters the file name only as a valid persona key; anything
+		// role enters the file name only as a legal persona name; anything
 		// else is codexGenericRole. The child name gets the same os.Root
 		// check as the root's.
 		isChild := false
 		if meta, metaErr := codexReadSessionMeta(stagePath); metaErr == nil && meta.ParentThreadID != "" {
 			role := codexGenericRole
-			if config.ValidSubagentKey(meta.AgentRole) {
+			if config.ValidSubagentKey(meta.AgentRole) && !slices.Contains(config.ReservedSubagentKeys(), meta.AgentRole) {
 				role = meta.AgentRole
 			}
 			childName := codexChildTranscriptName(agentLabel, children+1, role)
@@ -199,7 +199,7 @@ func codexValidSessionPath(sessionsDir, path string) error {
 }
 
 // codexGenericRole names a child transcript whose rollout carries no usable
-// role: a null role, or one that is not a valid persona key.
+// role: a null role, or one that is not a legal persona name.
 const codexGenericRole = "generic"
 
 // codexChildTranscriptName renders <agentLabel>-sub<seq>-<role>.jsonl, the
