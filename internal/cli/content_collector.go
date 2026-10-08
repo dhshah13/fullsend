@@ -2,7 +2,6 @@ package cli
 
 import (
 	"encoding/json"
-	"io"
 	"maps"
 	"slices"
 	"sort"
@@ -106,10 +105,10 @@ const maxToolArgumentsBytes = 8 * 1024
 // as text, so their findings count, then dropped and charged.
 const maxRawToolArgumentsBytes = 4 * maxToolArgumentsBytes
 
-// maxHeldDepth bounds how deep heldSecret walks documents held in
-// strings: each level is scanned once more, and with \u escapes a
-// document can nest about the square root of its length deep. A string
-// holding one deeper is masked whole.
+// maxHeldDepth bounds how deep redactHeld walks documents held in
+// strings: each level is decoded and encoded once more, and with \u
+// escapes a document can nest about the square root of its length deep.
+// A string holding one deeper is masked whole.
 const maxHeldDepth = 4
 
 // newContentCollectorIfEnabled returns a live collector when the Level 3
@@ -378,8 +377,8 @@ type contentCollector struct {
 	maxEncoded int
 	pipeline   *security.Pipeline
 	// secrets is the pipeline's pattern stage alone, for secretNamed and
-	// spanning; normalizer its first stage alone, for the detection copies
-	// heldSecret and spanning judge.
+	// blockAcross; normalizer its first stage alone, for the detection
+	// copies holdsDocument and blockAcross judge.
 	secrets    *security.SecretRedactor
 	normalizer *security.UnicodeNormalizer
 	// runnerEnv feeds redact's literal pass; see newContentCollectorIfEnabled.
@@ -402,7 +401,7 @@ type contentCollector struct {
 	// Merged into the contentResult at Result so they count exactly like
 	// assembly-time ones.
 	findings []security.Finding
-	// held counts the documents held in strings that heldSecret is
+	// held counts the documents held in strings that redactHeld is
 	// walking; see maxHeldDepth.
 	held int
 }
@@ -798,11 +797,12 @@ func redactText(pipeline *security.Pipeline, runnerEnv map[string]string, text s
 // dropped and charged like any other discarded content. Arguments whose
 // redacted encoding exceeds maxToolArgumentsBytes, in which two keys of
 // one object redact to the same string, or across whose keys, strings
-// and numbers a secret runs (spanning: a private key over the lines of
-// an array), which no one of them can mask, are dropped the same way
-// and charged as encoded. On a collision that is the encoding after the
-// later key (in sorted order) replaced the earlier member, so the
-// replaced member is not counted.
+// and numbers a secret runs — a private key block over the lines of an
+// array (blockAcross), an exact value over them (valueAcross) — which
+// no one of them can mask, are dropped the same way and charged as
+// encoded. On a collision that is the encoding after the later key (in
+// sorted order) replaced the earlier member, so the replaced member is
+// not counted.
 func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 	if args == "" {
 		return nil, false
@@ -820,10 +820,11 @@ func (c *contentCollector) toolArguments(args string) (json.RawMessage, bool) {
 	if err != nil {
 		return nil, false // decoded JSON values marshal unconditionally
 	}
-	// Judged across its strings whatever else drops it: the secret found
+	// Judged across its atoms whatever else drops it: the secret found
 	// there is a finding of the call, and costs it its summary.
-	spanning := c.spanning(args)
-	if collided || spanning || len(out) > maxToolArgumentsBytes {
+	as := atoms(args, 0)
+	across := c.blockAcross(as) || c.valueAcross(as, args)
+	if collided || across || len(out) > maxToolArgumentsBytes {
 		c.evicted += len(out)
 		return nil, true
 	}
@@ -858,101 +859,61 @@ func documentLike(s string) bool {
 	return len(s) >= 2 && (s[0] == '{' && s[len(s)-1] == '}' || s[0] == '[' && s[len(s)-1] == ']' || s[0] == '"' && s[len(s)-1] == '"') && strings.ContainsAny(s, `"'`)
 }
 
-// duplicateName reports an object in the JSON document s that names a
-// member twice, the names compared decoded, as RFC 7493 does.
-func duplicateName(s string) bool {
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.UseNumber()             // a number past float64 is valid JSON too
-	var names []map[string]bool // one set for each open object
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return err != io.EOF // s is valid; fail closed all the same
-		}
-		switch tok {
-		case json.Delim('{'):
-			names = append(names, map[string]bool{})
-		case json.Delim('}'):
-			names = names[:len(names)-1]
-		default:
-			// A string a colon follows names a member of the innermost
-			// object open.
-			name, ok := tok.(string)
-			if !ok || !strings.HasPrefix(strings.TrimLeft(s[dec.InputOffset():], " \t\r\n"), ":") {
-				continue
-			}
-			if names[len(names)-1][name] {
-				return true
-			}
-			names[len(names)-1][name] = true
-		}
-	}
+// heldFinding is the finding for a string holding a JSON document that
+// is masked whole, for reason.
+func heldFinding(reason string) security.Finding {
+	return security.Finding{Scanner: "held_document", Name: reason, Severity: "high", Detail: "string holding a JSON document masked whole", Position: -1}
 }
 
-// maskHeld masks a string or an object key of the arguments whole, with
-// one held_document finding, when heldSecret finds against the document
-// its scanned text s holds; t is the text as written.
-func (c *contentCollector) maskHeld(s, t string) string {
-	if s == "***" {
-		return s // masked whole already: nothing left to judge
-	}
-	if reason, ok := c.heldSecret(s, t); ok {
-		c.findings = append(c.findings, security.Finding{Scanner: "held_document", Name: reason, Severity: "high", Detail: "string holding a JSON document masked whole", Position: -1})
+// redactHeld redacts the JSON object, array or string literal doc that a
+// string of the arguments holds, as the arguments are redacted: decoded,
+// walked (redactValue, under the same member), and encoded again. The
+// structure a reader decodes from the string is then the structure that
+// was judged — a fold or an escape is inside the encoder's quoting, and
+// moves no value between members — at the cost of the document's layout.
+// Of two members of one name decoding keeps the last, and the record
+// keeps what was decoded. A document that cannot be judged is masked
+// whole: one held deeper than maxHeldDepth, and one in which two keys
+// redact alike.
+func (c *contentCollector) redactHeld(doc, under string) string {
+	if c.held == maxHeldDepth {
+		c.findings = append(c.findings, heldFinding("uninspected"))
 		return "***"
 	}
-	return s
-}
-
-// heldSecret judges, decoded, the JSON object, array or string literal a
-// string holds once scanned — what is exported. The scan reads the document's text,
-// so it misses a secret-named member nested deeper than the value right
-// after the key, and a secret that only decoding spells out: an
-// assignment that opens a string, a token or runner env value written
-// with an escape. The document is walked as the arguments are, its
-// output and findings discarded; a revealing finding makes the reason
-// "secret". A document that cannot be judged makes it "uninspected":
-// one held deeper than maxHeldDepth, one naming a member twice —
-// decoding keeps the last — and text shaped like a document that does
-// not parse: one the scan broke, folding or masking it, or one that
-// never parsed (a comment, a trailing comma, an object literal) — and
-// one the normalizer changes at all, as written: folding can move a
-// value out of its secret-named member while the document still parses,
-// so structure the normalizer makes, or moves, is not trusted. A secret
-// across the strings of the document as written (spanning: a private key
-// over the lines of an array, an exact value over them) makes the reason
-// "secret" as well — as written, since the scan can mask a block's last
-// line as a member's value before the block's own pattern runs, and
-// leave its first line in the key. A level above records that mask as
-// "secret": it is a finding of that level's walk.
-func (c *contentCollector) heldSecret(scanned, written string) (string, bool) {
-	doc, ok := jsonDocument(scanned)
-	if !ok {
-		return "uninspected", documentLike(scanned) || documentLike(written)
-	}
-	raw, _ := jsonDocument(written)
-	if c.held == maxHeldDepth || duplicateName(doc) || c.normalized(raw) != raw || !json.Valid([]byte(raw)) {
-		return "uninspected", true
-	}
-	mark := len(c.findings)
-	if c.spanning(raw) {
-		c.findings = c.findings[:mark]
-		return "secret", true
-	}
 	v, _ := decodeJSON(doc) // a valid document decodes
+	collided := false
 	c.held++
-	c.redactValue(v, "", new(bool))
+	e := c.redactValue(v, under, &collided)
 	c.held--
-	found := slices.ContainsFunc(c.findings[mark:], revealing)
-	c.findings = c.findings[:mark]
-	return "secret", found
+	if collided {
+		c.findings = append(c.findings, heldFinding("collision"))
+		return "***"
+	}
+	b, _ := json.Marshal(e) // decoded JSON values marshal unconditionally
+	return string(b)
 }
 
 // revealing reports a finding that shows a secret was there: any but the
-// normalizer's, and the normalizer's stripping of content. A secret the
-// scan masked in place is gone from the document by then, but for a mask
-// that matches again.
+// normalizer's, and the normalizer's stripping of content.
 func revealing(f security.Finding) bool {
 	return f.Scanner != "unicode_normalizer" || stripped(f)
+}
+
+// holdsDocument returns the JSON document s holds and can be judged,
+// or whether s is shaped like one that cannot (like): a document the
+// normalizer changes at all — folding can spell a member-name pair
+// into a key, or make a document of text that is none as written (a
+// fullwidth brace or quotation mark) — and text shaped like a document
+// (documentLike) as written or as rendered.
+func (c *contentCollector) holdsDocument(s string) (doc string, ok, like bool) {
+	n := c.normalized(s)
+	if doc, ok = jsonDocument(s); ok {
+		return doc, n == s, n != s
+	}
+	if _, ok = jsonDocument(n); ok {
+		return "", false, true
+	}
+	return "", false, documentLike(s) || documentLike(n)
 }
 
 // stripped reports the normalizer's removal of an escape sequence or of
@@ -982,109 +943,101 @@ func (c *contentCollector) normalized(s string) string {
 	return c.normalizer.Scan(s).Sanitized
 }
 
-// spanning reports, and records as one critical finding, a secret that
-// runs across the keys, strings and numbers of raw, one valid JSON value,
-// as a reader of them in the order written sees them: a private key over
-// the lines of an array or over a key and a value, an exact value over
-// the lines of one. Each is judged on its own (redactValue); here they
-// are judged together, each as decoded and as the normalizer renders it
-// — the one can hold a marker inside an escape sequence the normalizer
-// strips, the other a marker folding spells — before any is masked,
-// since a string masked whole can take a secret's first or last line
-// with it. Only a secret that can hold a line break is judged across
-// them. The private key block is sought in the strings joined by a line
-// break, which its pattern reads over. An exact value — a runtime
-// secret, a runner env value the literal pass replaces — is sought in
-// the strings in order with white space set aside, so however a line
-// ends (its own line break, a Windows one, a space) and wherever the
-// value was cut, it is read as a reader of the lines reads it. Every
-// other pattern's secret stops at white space or at a quote, so a match
-// of one over a break has only run its context into the next string (an
-// assignment whose value is the next string, a pair in single quotes
-// over two strings' apostrophes), which is left unjudged, as a token
-// split between two strings is. A match within one key, string or
-// number is that one's own.
-func (c *contentCollector) spanning(raw string) bool {
-	var decoded, normalized []string
-	for _, sp := range atomSpans(raw) {
-		a := raw[sp[0]:sp[1]]
-		if sp[0] > 0 && raw[sp[0]-1] == '"' {
-			_ = json.Unmarshal([]byte(`"`+a+`"`), &a) // a string's escapes, decoded
+// atoms lists the strings and numbers of raw, one valid JSON value,
+// decoded, in the order written — as a reader of the arguments reads
+// them, whatever order the encoder gives the keys. A string holding a
+// document (to maxHeldDepth) gives the document's atoms in its place, so
+// the lines of a notebook cell held in a Write's content are read as
+// lines.
+func atoms(raw string, depth int) []string {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var out []string
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return out // io.EOF: raw is valid
 		}
-		decoded = append(decoded, a)
-		normalized = append(normalized, c.normalized(a))
-	}
-	found := func(scanner, name string) bool {
-		c.findings = append(c.findings, security.Finding{Scanner: scanner, Name: name, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
-		return true
-	}
-	for _, atoms := range [][]string{decoded, normalized} {
-		lines, bounds := joined(atoms, "\n", plain)
-		for _, m := range c.secrets.Matches(lines) {
-			if m.Name == "private_key" && !bounds.within(m.Start, m.End) {
-				return found("secret_redactor", m.Name)
+		switch t := tok.(type) {
+		case string:
+			if doc, ok := jsonDocument(t); ok && depth < maxHeldDepth {
+				out = append(out, atoms(doc, depth+1)...)
+			} else {
+				out = append(out, t)
 			}
+		case json.Number:
+			out = append(out, t.String())
 		}
-		dense, bounds := joined(atoms, "", unspaced)
-		for _, v := range security.RuntimeSecrets() {
-			if bounds.holds(dense, unspaced(v)) {
-				return found("secret_redactor", "runtime_secret")
-			}
-		}
-		for _, l := range envLiterals(c.runnerEnv) {
-			if bounds.holds(dense, unspaced(l.value)) {
-				return found("runner_env", l.key)
+	}
+}
+
+// blockAcross reports, and records as one critical finding, a private
+// key block in the atoms of the arguments — over the lines of an array,
+// over a key and a value, over the lines of a held document — which no
+// one of them can mask: its pattern reads over a line break, so the
+// atoms are judged joined by one, as decoded and as the normalizer
+// renders them, since a marker can be folded. A block inside one atom
+// drops the arguments as well: coarser than the mask in place the atom
+// gets, and nothing left to judge.
+func (c *contentCollector) blockAcross(atoms []string) bool {
+	lines := strings.Join(atoms, "\n")
+	for _, text := range []string{lines, c.normalized(lines)} {
+		for _, m := range c.secrets.Matches(text) {
+			if m.Name == "private_key" {
+				c.findings = append(c.findings, security.Finding{Scanner: "secret_redactor", Name: m.Name, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
+				return true
 			}
 		}
 	}
 	return false
 }
 
-// atomBounds is where each atom begins and ends in a text joined of them.
-type atomBounds [][2]int
-
-// joined writes atoms as render renders them, sep between, and where
-// each is in the text.
-func joined(atoms []string, sep string, render func(string) string) (string, atomBounds) {
-	var b strings.Builder
-	bounds := make(atomBounds, len(atoms))
-	for n, a := range atoms {
-		if n > 0 {
-			b.WriteString(sep)
+// valueAcross reports, and records as one critical finding, an exact
+// value — a runtime secret, a runner env value the literal pass replaces
+// — that runs across the atoms of the arguments, in the order written,
+// with white space set aside: however a line ends (its own line break,
+// a Windows one, a space) and wherever the value was cut, it is read as
+// a reader of the lines reads it. An occurrence within one atom is the
+// literal pass's to replace, and is set aside first. A value holding
+// structure of its own — a quote, a comma, a colon, a bracket, as a
+// credentials document in an env value does — is sought in the text as
+// written as well, where it can run over the structure between the
+// atoms.
+func (c *contentCollector) valueAcross(atoms []string, raw string) bool {
+	for _, l := range exactValues(c.runnerEnv) {
+		v := unspaced(l.value)
+		if v == "" {
+			continue
 		}
-		bounds[n][0] = b.Len()
-		b.WriteString(render(a))
-		bounds[n][1] = b.Len()
-	}
-	return b.String(), bounds
-}
-
-// within reports whether one atom holds text[start:end] whole.
-func (bounds atomBounds) within(start, end int) bool {
-	n := sort.Search(len(bounds), func(n int) bool { return bounds[n][0] > start }) - 1
-	return n >= 0 && end <= bounds[n][1]
-}
-
-// holds reports whether text holds value other than within one atom.
-func (bounds atomBounds) holds(text, value string) bool {
-	if value == "" {
-		return false
-	}
-	for i := 0; ; {
-		j := strings.Index(text[i:], value)
-		if j < 0 {
-			return false
+		var b strings.Builder
+		for _, a := range atoms {
+			b.WriteString(strings.ReplaceAll(unspaced(a), v, ""))
 		}
-		if i += j; !bounds.within(i, i+len(value)) {
+		if strings.Contains(b.String(), v) || strings.ContainsAny(v, `",:{}[]`) && strings.Contains(unspaced(raw), v) {
+			c.findings = append(c.findings, security.Finding{Scanner: l.scanner, Name: l.key, Severity: "critical", Detail: "secret spanning keys, strings or numbers", Position: -1})
 			return true
 		}
-		i += len(value)
 	}
+	return false
 }
 
-// plain renders a string as it is; unspaced without its white space.
-func plain(s string) string { return s }
+// exactValue is a value sought exactly, and how a finding names it.
+type exactValue struct{ scanner, key, value string }
 
+// exactValues lists the runtime secrets and the runner env values the
+// literal pass replaces.
+func exactValues(runnerEnv map[string]string) []exactValue {
+	var out []exactValue
+	for _, v := range security.RuntimeSecrets() {
+		out = append(out, exactValue{"secret_redactor", "runtime_secret", v})
+	}
+	for _, l := range envLiterals(runnerEnv) {
+		out = append(out, exactValue{"runner_env", l.key, l.value})
+	}
+	return out
+}
+
+// unspaced renders s without its white space.
 func unspaced(s string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) {
@@ -1094,39 +1047,10 @@ func unspaced(s string) string {
 	}, s)
 }
 
-// atomSpans lists where raw, a valid JSON value, spells each string
-// (between its quotes) and each number, true, false and null, in order.
-func atomSpans(raw string) [][2]int {
-	const structure = "{}[],: \t\r\n"
-	var spans [][2]int
-	for i := 0; i < len(raw); {
-		switch {
-		case raw[i] == '"':
-			j := i + 1
-			for raw[j] != '"' {
-				if raw[j] == '\\' {
-					j++
-				}
-				j++
-			}
-			spans = append(spans, [2]int{i + 1, j})
-			i = j + 1
-		case strings.IndexByte(structure, raw[i]) >= 0:
-			i++
-		default:
-			j := i
-			for j < len(raw) && strings.IndexByte(structure+`"`, raw[j]) < 0 {
-				j++
-			}
-			spans = append(spans, [2]int{i, j})
-			i = j
-		}
-	}
-	return spans
-}
-
 // redactValue redacts every string, number and object key under v; a
-// number that redacts becomes the redacted string. A pattern
+// number that redacts becomes the redacted string, and a string holding
+// a JSON document is judged as the arguments are and encoded again
+// (redactHeld), or masked whole when it cannot be judged. A pattern
 // keyed on a member name ("password": "...") cannot see the pair that
 // way, so a string or number under a key that pattern names — the nearest
 // such enclosing key, under, which a stand-in name represents — is scanned
@@ -1142,7 +1066,25 @@ func atomSpans(raw string) [][2]int {
 func (c *contentCollector) redactValue(v any, under string, collided *bool) any {
 	switch t := v.(type) {
 	case string:
-		s := c.maskHeld(c.scanLeaf(t), t)
+		doc, ok, like := c.holdsDocument(t)
+		if ok {
+			if c.valueAcross(nil, t) {
+				// An exact value holding structure of its own can run
+				// over the document's, which no leaf of the walk holds.
+				return "***"
+			}
+			return c.redactHeld(doc, under)
+		}
+		if like {
+			// A document that cannot be judged: one the normalizer
+			// changes, or text shaped like one that does not parse — a
+			// comment, a trailing comma, an object literal — holding
+			// whatever it nests under a secret-named member, which
+			// neither the patterns nor a walk can see.
+			c.findings = append(c.findings, heldFinding("uninspected"))
+			return "***"
+		}
+		s := c.scanLeaf(t)
 		if under != "" && c.secretNamed(under, s) {
 			return "***"
 		}
@@ -1166,14 +1108,20 @@ func (c *contentCollector) redactValue(v any, under string, collided *bool) any 
 		for _, k := range slices.Sorted(maps.Keys(t)) {
 			// The key as scanned names the secret, masked whole or not.
 			sk := c.scanLeaf(k)
-			rk := c.maskHeld(sk, k)
+			rk := sk
+			if _, ok, like := c.holdsDocument(k); ok || like {
+				// A key holding a document is masked whole: a reader
+				// decodes nothing from a key, and a document can name a
+				// secret in a spelling only decoding reads.
+				c.findings = append(c.findings, heldFinding("key"))
+				rk = "***"
+			}
 			member := under
 			// Named as scanned, or as written: the normalizer can strip
 			// the name's first letter with a colour code, and the value
 			// under it is still that name's. A key masked whole — by the
 			// scan, or as a document it holds — names a secret whatever
-			// it was called: its name is not to be had from its mask, and
-			// a document can name one in a spelling only decoding reads.
+			// it was called: its name is not to be had from its mask.
 			named := rk == "***" || c.namesASecret(sk) || c.namesASecret(k)
 			if named {
 				// Decided once for the member: the pattern reads any

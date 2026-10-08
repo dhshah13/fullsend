@@ -246,59 +246,58 @@ also turn a fullwidth quotation mark into one that closes the string.
 `toolArguments` decodes the value, redacts each string and object key on
 its own (a number as its digits; one that redacts becomes the redacted
 string), and encodes the result again. A string value or key that holds
-one JSON object, array or string literal once scanned — what is exported
-— is judged decoded as well (`heldSecret`). The scan reads the string whole, since a
-secret can span a document's strings, but as text: it misses a
-secret-named member nested deeper than the value right after the key, and
-a secret only decoding spells out (an assignment that opens a string, a
-token or runner environment value written with an escape). So the
-document is walked the same way, its output and findings discarded; when
-the walk raises a finding — any but the normalizer's, save its removal of
-an escape sequence or of tag characters, which can carry text no pattern
-sees (digits as a CSI parameter, a token inside an OSC sequence); a
-secret the scan masked in place no longer shows — the string is
-masked `***` whole, with one `held_document` finding. So is a document
-that cannot be judged: held more than `maxHeldDepth` (4) deep, each level
-being scanned once more; naming a member twice, since decoding keeps only
-the last (RFC 7493 forbids it); or shaped like a document — it begins
-and ends like one, white space and invisible characters aside, and
-quotes something — but not parsing, whether the scan broke it, folding
-or masking it, or it never parsed; or one the normalizer changes at all,
-as written: folding can move a value out of its secret-named member while
-the document still parses (fullwidth quotation marks), so structure the
-normalizer makes, or moves, is not trusted. That masks whole text with no secret in it too — a document with
-a repeated name, one a pattern misreads once decoded (a notebook line
-`key = …`), one holding an escaped terminal colour code, JSON with
-comments or trailing commas, an object literal or a Python dict with a
-quoted value, an `Edit` fragment shaped `{…}` with one — and a mask the walk
-matches again (a connection string's password of ten bytes or more, the
-runner environment marker in an assignment, a mask of eight bytes or more
-under a secret-named member) masks its string whole and counts its secret
-twice. A string the normalizer stripped an escape sequence or tag
-characters from — a value or a key — is masked `***` whole: a colour code
-ends at the next letter, so the stripping can take a token's first letter
-and leave the rest, and a title code's payload is text no pattern sees. A
-member is named as written as well as as scanned, and a key masked whole
-names a secret whatever it was called — its name is not to be had from
-its mask, and stripping can eat the first letter of one folding spells —
-so the values under it are judged as a secret-named member's. Each level — the arguments, and each
-held document — is also judged as a reader of its keys, strings and
-numbers in the order written sees them (`spanning`), each as decoded and
-as the normalizer renders it, before any is masked, for a secret that
-can hold a line break: the private key block, sought in them joined by
-a line break (over the lines of an array, over a key and a value), and
-an exact value (a runtime secret, a runner environment value), sought in
-them in order with white space set aside — however a line ends and
-wherever the value was cut. The arguments are then dropped and charged
-as encoded; a held document is masked whole (its text was scanned whole
-first, so a block that scan masked in place stays in place). Every other
-pattern's secret stops at white space or at a quote, so a match over the
-break has only run its context into the next string, which is left
-unjudged. Not judged: structure in text not shaped like a document
-(several documents, YAML, a document inside code); an assignment, a
-header or a connection string whose value begins in the next string; a
-token or an exact value split into pieces between strings; a member-name
-pair in single quotes over two strings' apostrophes. Each string and number is also
+one JSON object, array or string literal is judged as the arguments are
+(`redactHeld`): decoded from the string as written, walked the same way
+under the same member, and encoded again, so the structure a reader
+decodes from the exported string is the structure that was judged — a
+fold or an escape is inside the encoder's quoting — at the cost of the
+document's layout (the encoder's key order, spacing and escapes). A
+document that cannot be judged is masked `***` whole, with one
+`held_document` finding: one the normalizer changes at all, as written,
+since folding can make a document of text that is none as written, break
+one, or spell a member-name pair into a key (fullwidth braces and
+quotation marks); one held more than `maxHeldDepth` (4) deep, each level
+being decoded and encoded once more; one in which two keys redact alike;
+text shaped like a document — it begins and ends like one, white space
+and invisible characters aside, and quotes something — that does not
+parse (a comment, a trailing comma, an object literal, a Python dict with
+a quoted value); and one whose text holds an exact value (a runtime
+secret, a runner environment value) with structure of its own, which can
+run over the document's (`valueAcross` over the text alone). Of two
+members of one name decoding keeps the last, and the record keeps what
+was decoded. That masks whole text with no secret in it too — a document
+with a compatibility character (™, a fullwidth letter), JSON with
+comments or trailing commas, an `Edit` fragment shaped `{…}` with a
+quoted value. A key holding a document is masked whole as well. A string
+the normalizer stripped an escape sequence or tag characters from — a
+value or a key — is masked `***` whole: a colour code ends at the next
+letter, so the stripping can take a token's first letter and leave the
+rest, and a title code's payload is text no pattern sees. A member is
+named as written as well as as scanned, and a key masked whole names a
+secret whatever it was called — its name is not to be had from its mask
+— so the values under it are judged as a secret-named member's. The
+arguments are also judged across their keys, strings and numbers
+(`atoms`: decoded, in the order written, a held document's in its place,
+so the lines of a notebook cell held in a `Write`'s content are read as
+lines) for a secret that can hold a line break, which no one of them can
+mask. The private key block is sought in them joined by a line break, as
+decoded and as the normalizer renders them (`blockAcross`): over the
+lines of an array, over a key and a value, and inside one string as
+well, which drops the arguments rather than masking the block in place.
+An exact value is sought in them in order with white space set aside —
+however a line ends and wherever the value was cut — an occurrence
+within one atom being the literal pass's to replace; one holding
+structure of its own (a credentials document in an env value) is sought
+in the text as written too (`valueAcross`). The arguments are then
+dropped and charged as encoded. Every other pattern's secret stops at
+white space or at a quote, so a match over the break has only run its
+context into the next string, which is left unjudged. Not judged:
+structure in text not shaped like a document (several documents, YAML, a
+document inside code); an assignment, a header or a connection string
+whose value begins in the next string or number; a token split in pieces
+between strings, or an exact value whose pieces other strings separate
+or a string's escape spells; a member-name pair in single quotes over
+two strings' apostrophes, or one a string's own quote opens or closes. Each string and number is also
 scanned once more, already redacted, beside the nearest enclosing key the
 member-name pattern (`json_field`) names, and masked whole when that pattern
 matches the pair — a pattern keyed on a member

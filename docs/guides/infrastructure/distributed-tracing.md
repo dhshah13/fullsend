@@ -123,19 +123,21 @@ codex parsers emit none of the three yet
 `arguments` is the call's input decoded, redacted string by string (a
 number that redacts becomes the redacted string), and
 encoded again, so key order, spacing and escapes are not the stream's.
-A string value or key in it that holds one JSON object, array or string
-literal — a JSON file passed to `Write`, say — is masked `***` whole when that
-document, decoded, still shows a secret: a value or key nested under a secret-named
-member, or one only decoding spells out. So is one that cannot be judged:
-held more than four deep, naming a member twice, or shaped like a
-document but not parsing (JSON with comments or trailing commas, an
-object literal), or one that Unicode normalization changes at all, since
-folding can move a value between members — the
-[developer guide](../dev/tracing.md) has the list. A secret that runs
-across the strings of the arguments, or of a held document, in the order
-written — a private key over the lines of an array — can be masked
-nowhere but whole: the arguments are dropped, the held string masked
-`***`. A string a terminal escape sequence was stripped from is masked
+A string value in it that holds one JSON object, array or string
+literal — a JSON file passed to `Write`, say — is judged the same way,
+decoded, and recorded encoded again, so its layout is the encoder's and a
+secret nested in it is masked in place. It is masked `***` whole when it
+cannot be judged: held more than four deep, shaped like a document but
+not parsing (JSON with comments or trailing commas, an object literal),
+holding a runner environment or runtime secret value across its
+structure, or changed at all by Unicode normalization, since
+folding can make or break a document or spell a secret-named pair into a
+key — the [developer guide](../dev/tracing.md) has the list. A key that
+holds a document is masked whole. A secret that runs across the strings
+of the arguments, or of a held document, in the order written — a private
+key over the lines of an array, a runner environment value over them —
+can be masked nowhere but whole: the arguments are dropped. A private
+key inside one string drops them as well. A string a terminal escape sequence was stripped from is masked
 whole too, since the stripping can leave most of a token. A string
 directly under a secret-named member is masked in place, as anywhere
 else.

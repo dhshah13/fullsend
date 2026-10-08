@@ -198,9 +198,10 @@ func TestContentCollector_SecretNamedMembersReachTheirNestedValues(t *testing.T)
 }
 
 func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(t *testing.T) {
-	// The exported string is judged as decoded too: a secret-named member
-	// nested in the document it holds, or a secret only decoding spells
-	// out, masks the string whole.
+	// A string holding a document is judged as the arguments are: decoded,
+	// walked and encoded again, so a secret-named member nested in it, or
+	// a secret only decoding spells out, is masked in place; what cannot
+	// be judged is masked whole.
 	const opaque = "opaque-credential-123"
 	cred := `"credentials":{"value":"` + opaque + `"}`
 	token := "ghp_" + strings.Repeat("r", 36)
@@ -209,45 +210,45 @@ func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(
 		content, want string
 		findings      int
 	}{
-		"object under credentials":  {`{` + cred + `}`, "***", 1},
-		"array under password":      {`{"password":["` + opaque + `"]}`, "***", 1},
-		"document that is an array": {`[{"token":{"v":"` + opaque + `"}}]`, "***", 1},
-		"key under credentials":     {`{"credentials":{"` + opaque + `":"user"}}`, "***", 1},
-		"document in a document":    {`{"inner":` + quote(`{"token":["`+opaque+`"]}`) + `}`, "***", 1},
-		// The scan sees the document's text; these only its strings.
-		"an assignment that opens a string":       {`{"command":"API_KEY=` + opaque + `"}`, "***", 1},
-		"an assignment after an escaped break":    {`{"c":"cd x\nAPI_KEY=` + opaque + ` run"}`, "***", 1},
-		"a token spelled with an escape":          {`{"t":"ghp_\u0072` + token[5:] + `"}`, "***", 1},
-		"tag characters written with escapes":     {`{"t":"\uDB40\uDC67"}`, "***", 1},
-		"digits in an escape under a secret name": {`{"auth":{"pin":"\u001b[31415926535m"}}`, "***", 1},
-		"an escape sequence around a token":       {`{"n":"see \u001b]ghp_\u0072` + token[5:] + `\u0007"}`, "***", 1},
-		// Folding can make the document; a document the scan breaks,
-		// folding or masking it, cannot be judged.
-		"folded into a document":                     {"\uFF5B" + cred + "}", "***", 2},
-		"folding breaks a document":                  {"{\"note\":\"\uFF02\"," + cred + "}", "***", 2},
-		"a BOM and folding that breaks a document":   {"\uFEFF{\"note\":\"\uFF02\"," + cred + "}", "***", 3},
-		"a fold that makes and breaks a document":    {"\uFF5B\"note\":\"\uFF02\"," + cred + "}", "***", 2},
-		"an escape before a document folding breaks": {"\x1b[0m{\"note\":\"\uFF02\"," + cred + "}", "***", 2},
-		"a mask breaks a document":                   {`{"token":"abcdefgh\\\"x",` + cred + `}`, "***", 2},
-		// Folding can move a value out of its secret-named member while the
-		// document still parses; a document the normalizer changes at all
-		// is not judged.
-		"folding that moves a value between members": {"{\"credentials\":{\"value\":\"\uFF02},\uFF02note\uFF02:{\uFF02value\uFF02:\uFF02" + opaque + "\"}}", "***", 2},
-		"folding that moves nothing":                 {"{\"name\":\"Widget\u2122\"}", "***", 2},
-		// Decoding keeps the last of two members of one name; the string
-		// keeps both, so a repeated name cannot be judged either.
-		"a repeated name":                  {`{` + cred + `,"credentials":{}}`, "***", 1},
-		"a name repeated with an escape":   {`{` + cred + `,"\u0063redentials":{}}`, "***", 1},
-		"a name repeated in an array item": {`[{"token":{"v":"` + opaque + `"},"token":{}}]`, "***", 1},
-		"a repeated name and no secret":    {`{"a":1,"a":2}`, "***", 1},
-		// A mask the walk matches again, and a pattern's false positive in
-		// a decoded string, mask it whole as well.
-		"a mask that matches again": {`{"db":"postgres://u:hunter2hunter2@db/x"}`, "***", 2},
-		"a notebook assignment":     {`{"cells":[{"source":["key = jax.random.PRNGKey(0)\n"]}]}`, "***", 1},
-		// Otherwise the string is kept as the scan left it.
-		"plain document":               {`{ "b": "` + opaque + `", "a": 1 }`, `{ "b": "` + opaque + `", "a": 1 }`, 0},
-		"a pair stays masked in place": {`{"password":"hunter2hunter2","n":1}`, `{"password":"hunt...","n":1}`, 1},
-		"a letter folded once decoded": {`{"v":"\uFF21"}`, `{"v":"\uFF21"}`, 0},
+		"object under credentials":  {`{` + cred + `}`, `{"credentials":{"value":"***"}}`, 1},
+		"array under password":      {`{"password":["` + opaque + `"]}`, `{"password":["***"]}`, 1},
+		"document that is an array": {`[{"token":{"v":"` + opaque + `"}}]`, `[{"token":{"v":"***"}}]`, 1},
+		"key under credentials":     {`{"credentials":{"` + opaque + `":"user"}}`, `{"credentials":{"***":"user"}}`, 1},
+		"document in a document":    {`{"inner":` + quote(`{"token":["`+opaque+`"]}`) + `}`, `{"inner":` + quote(`{"token":["***"]}`) + `}`, 1},
+		// Decoded, each string is judged on its own.
+		"an assignment that opens a string":       {`{"command":"API_KEY=` + opaque + `"}`, `{"command":"API_KEY=opaq..."}`, 1},
+		"an assignment after an escaped break":    {`{"c":"cd x\nAPI_KEY=` + opaque + ` run"}`, `{"c":"cd x\nAPI_KEY=opaq... run"}`, 1},
+		"a token spelled with an escape":          {`{"t":"ghp_\u0072` + token[5:] + `"}`, `{"t":"ghp_..."}`, 1},
+		"tag characters written with escapes":     {`{"t":"\uDB40\uDC67"}`, `{"t":"***"}`, 1},
+		"digits in an escape under a secret name": {`{"auth":{"pin":"\u001b[31415926535m"}}`, `{"auth":{"pin":"***"}}`, 1},
+		"an escape sequence around a token":       {`{"n":"see \u001b]ghp_\u0072` + token[5:] + `\u0007"}`, `{"n":"***"}`, 1},
+		// A document the normalizer changes at all is masked whole: folding
+		// can make a document, break one, or spell a pair into a key.
+		"folded into a document":                     {"\uFF5B" + cred + "}", "***", 1},
+		"folding breaks a document":                  {"{\"note\":\"\uFF02\"," + cred + "}", "***", 1},
+		"a BOM and folding that breaks a document":   {"\uFEFF{\"note\":\"\uFF02\"," + cred + "}", "***", 1},
+		"a fold that makes and breaks a document":    {"\uFF5B\"note\":\"\uFF02\"," + cred + "}", "***", 1},
+		"an escape before a document folding breaks": {"\x1b[0m{\"note\":\"\uFF02\"," + cred + "}", "***", 1},
+		"a mask breaks a document":                   {`{"token":"abcdefgh\\\"x",` + cred + `}`, `{"credentials":{"value":"***"},"token":"***"}`, 2},
+		// Folding that moves a value out of its secret-named member, or
+		// moves nothing, alike.
+		"folding that moves a value between members": {"{\"credentials\":{\"value\":\"\uFF02},\uFF02note\uFF02:{\uFF02value\uFF02:\uFF02" + opaque + "\"}}", "***", 1},
+		"folding that moves nothing":                 {"{\"name\":\"Widget\u2122\"}", "***", 1},
+		// Decoding keeps the last of two members of one name, and the
+		// record keeps what was decoded.
+		"a repeated name":                  {`{` + cred + `,"credentials":{}}`, `{"credentials":{}}`, 0},
+		"a name repeated with an escape":   {`{` + cred + `,"\u0063redentials":{}}`, `{"credentials":{}}`, 0},
+		"a name repeated in an array item": {`[{"token":{"v":"` + opaque + `"},"token":{}}]`, `[{"token":{}}]`, 0},
+		"a repeated name and no secret":    {`{"a":1,"a":2}`, `{"a":2}`, 0},
+		// A pattern's mask in a decoded string, and a false positive of
+		// one, stay in place.
+		"a mask that matches again": {`{"db":"postgres://u:hunter2hunter2@db/x"}`, `{"db":"postgres://u:hunt...@db/x"}`, 1},
+		"a notebook assignment":     {`{"cells":[{"source":["key = jax.random.PRNGKey(0)\n"]}]}`, `{"cells":[{"source":["key = jax....)\n"]}]}`, 1},
+		// Otherwise the document is kept, encoded again: the encoder's key
+		// order, spacing and escapes.
+		"plain document":               {`{ "b": "` + opaque + `", "a": 1 }`, `{"a":1,"b":"` + opaque + `"}`, 0},
+		"a pair stays masked in place": {`{"password":"hunter2hunter2","n":1}`, `{"n":1,"password":"***"}`, 1},
+		"a letter folded once decoded": {`{"v":"\uFF21"}`, `{"v":"A"}`, 1},
 		// Document-shaped text that does not parse cannot be judged either:
 		// a raw control character, a trailing comma, a comment, an object
 		// literal. Masked whole, secret or none.
@@ -258,12 +259,11 @@ func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(
 		"an object literal":                  {`{ apiKey: "hunter2hunter2" }`, "***", 1},
 		// Shaped like one but quoting nothing: code, or a mask.
 		"an object literal quoting nothing":     {`{ apiKey: process.env.KEY }`, `{ apiKey: process.env.KEY }`, 0},
-		"a mask":                                {"-----BEGIN RSA PRIVATE " + "KEY-----\nQQQQQQQQ\n-----END RSA PRIVATE " + "KEY-----", "[REDACTED PRIVATE KEY]", 1},
 		"a number past float64":                 {`{"maximum":1e999}`, `{"maximum":1e999}`, 0},
-		"text like a document the scan changed": {`{'password': 'hunter2hunter2'}`, "***", 2},
+		"text like a document the scan changed": {`{'password': 'hunter2hunter2'}`, "***", 1},
 		"a command that opens a brace":          {`{ export API_KEY=` + opaque + `; } 2>/dev/null`, `{ export API_KEY=opaq...; } 2>/dev/null`, 1},
 		"a held string literal":                 {`"plain text"`, `"plain text"`, 0},
-		"a value naming a sibling":              {`{"name":"name","from":"to","to":"x"}`, `{"name":"name","from":"to","to":"x"}`, 0},
+		"a value naming a sibling":              {`{"name":"name","from":"to","to":"x"}`, `{"from":"to","name":"name","to":"x"}`, 0},
 		"names repeated in other objects":       {`[{"a":1},{"a":2},{"x":{"a":1},"y":{"a":2}},{"a":{"x":1},"x":2}]`, `[{"a":1},{"a":2},{"x":{"a":1},"y":{"a":2}},{"a":{"x":1},"x":2}]`, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -273,7 +273,7 @@ func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(
 			res := c.Result("stop")
 			assert.Contains(t, res.OutputMessages, `"arguments":{"content":`+quote(tc.want)+`}`)
 			assert.Len(t, res.Findings, tc.findings)
-			assert.Equal(t, tc.findings > 0 && tc.want != tc.content, !strings.Contains(res.OutputMessages, `"summary"`), "a secret drops the summary")
+			assert.Equal(t, strings.Contains(tc.want, "***") || strings.Contains(tc.want, "..."), !strings.Contains(res.OutputMessages, `"summary"`), "a secret drops the summary")
 		})
 	}
 }
@@ -281,6 +281,8 @@ func TestContentCollector_JSONInAStringIsMaskedWholeWhenItsDocumentHoldsASecret(
 func TestContentCollector_JSONInAStringIsAlsoScannedWhole(t *testing.T) {
 	// A secret can span the document's strings: a notebook keeps each line
 	// of a cell in its own string, and a runner env value can hold quotes.
+	// A private key over the lines drops the arguments; an exact value
+	// over the document's structure masks it whole.
 	begin, end := "-----BEGIN RSA PRIVATE "+"KEY-----", "-----END RSA PRIVATE "+"KEY-----"
 	body := strings.Repeat("Q", 40)
 	notebook, _ := json.Marshal(map[string]any{"cells": []any{map[string]any{"source": []string{begin + "\n", body + "\n", end + "\n"}}}})
@@ -290,22 +292,22 @@ func TestContentCollector_JSONInAStringIsAlsoScannedWhole(t *testing.T) {
 		content, gone string
 		findings      int
 	}{
-		"key over a cell's lines": {nil, string(notebook), body, 2},
+		"key over a cell's lines": {nil, string(notebook), body, 1},
 		// Its strings in order, as written: the scan masks the block's last
 		// line as a member's value before the block's pattern runs.
 		"key from a member name into its value": {nil, `{"` + begin + `\n` + body[:20] + `":"` + body[20:] + `\n` + end + `"}`, body[:20], 2},
 		"a runtime value over two strings":      {nil, `{"lines":["rtline1","rtline2x"]}`, "rtline2x", 1},
-		// Its marker breaks the document, which cannot then be judged.
-		"runner env value with structure":         {map[string]string{"DB_PASSWORD": `hunter22","port`}, `{"pw":"hunter22","port":5432}`, "hunter22", 2},
-		"runner env value that ends the document": {map[string]string{"DB_PASSWORD": `hunter22"}`}, `{"pw":"hunter22"}`, "hunter22", 2},
-		"and one behind a BOM":                    {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
-		"and one behind a space and a BOM":        {map[string]string{"DB_PASSWORD": `hunter22"}`}, " \uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
-		"and one behind a zero-width space":       {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\u200B{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 3},
+		// An exact value over the document's structure.
+		"runner env value with structure":         {map[string]string{"DB_PASSWORD": `hunter22","port`}, `{"pw":"hunter22","port":5432}`, "hunter22", 1},
+		"runner env value that ends the document": {map[string]string{"DB_PASSWORD": `hunter22"}`}, `{"pw":"hunter22"}`, "hunter22", 1},
+		"and one behind a BOM":                    {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 1},
+		"and one behind a space and a BOM":        {map[string]string{"DB_PASSWORD": `hunter22"}`}, " \uFEFF{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 1},
+		"and one behind a zero-width space":       {map[string]string{"DB_PASSWORD": `hunter22"}`}, "\u200B{\"credentials\":{\"value\":\"opaque-credential-123\"},\"pw\":\"hunter22\"}", "opaque-credential-123", 1},
 		// Decoded, the literal pass sees it — in a document, or in a
 		// string a held JSON string literal spells with escapes.
 		"runner env value spelled with an escape":   {map[string]string{"DB_PASSWORD": "hunter2hunter2"}, `{"pw":"\u0068unter2hunter2"}`, "unter2hunter2", 1},
 		"runner env value in a held string literal": {map[string]string{"DEPLOY_PASSWORD": "abcdefghijklmno"}, `"\u0061bcdefghijklmno"`, "bcdefghijklmno", 1},
-		"and in one the scan breaks":                {map[string]string{"DEPLOY_PASSWORD": "abcdefghijklmno"}, "\"\\u0061bcdefghijklmno\uFF02\"", "bcdefghijklmno", 2},
+		"and in one the scan breaks":                {map[string]string{"DEPLOY_PASSWORD": "abcdefghijklmno"}, "\"\\u0061bcdefghijklmno\uFF02\"", "bcdefghijklmno", 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(telemetry.ContentCaptureEnvVar, "true")
@@ -326,7 +328,8 @@ func TestContentCollector_SecretsSpanningTheArgumentsStrings(t *testing.T) {
 	// the lines of an array or over a key and a value, a runtime value
 	// over the lines of one. A secret found that way can be masked
 	// nowhere but the level whole: the arguments are dropped and charged
-	// as encoded. (An assignment or a header whose value is the next
+	// as encoded; a private key block inside one string drops them as
+	// well. (An assignment or a header whose value is the next
 	// string is not judged: its secret stops at white space.)
 	begin, end := "-----BEGIN RSA PRIVATE "+"KEY-----", "-----END RSA PRIVATE "+"KEY-----"
 	body := strings.Repeat("Q", 40)
@@ -357,13 +360,16 @@ func TestContentCollector_SecretsSpanningTheArgumentsStrings(t *testing.T) {
 			assert.Len(t, res.Findings, tc.findings)
 		})
 	}
-	t.Run("a private key in one string is that string's own", func(t *testing.T) {
+	t.Run("a private key in one string drops the arguments too", func(t *testing.T) {
 		c := newContentCollector(4096)
 		c.Handle(agentruntime.ToolUseEvent{Name: "Write", Summary: "s", Arguments: `{"content":"` + begin + `\n` + body + `\n` + end + `","file_path":"k.pem"}`})
 
 		res := c.Result("stop")
-		assert.Contains(t, res.OutputMessages, `"arguments":{"content":"[REDACTED PRIVATE KEY]","file_path":"k.pem"}`)
-		assert.Len(t, res.Findings, 1)
+		part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
+		assert.NotContains(t, part, "arguments")
+		assert.Equal(t, true, part["fullsend.truncated"])
+		assert.NotContains(t, res.OutputMessages, body)
+		assert.Len(t, res.Findings, 2)
 	})
 	t.Run("dropped arguments are charged as encoded", func(t *testing.T) {
 		c := newContentCollector(4096)
@@ -484,8 +490,8 @@ func TestContentCollector_AKeyMaskedWholeNamesASecret(t *testing.T) {
 func TestContentCollector_ARunnerEnvValueOverTheLinesOfAnArray(t *testing.T) {
 	// A runner env value can hold a line break; written over two strings
 	// of an array, no string holds it whole and the literal pass sees no
-	// part of it. Judged across the strings it is found: the arguments
-	// are dropped, a held document masked whole.
+	// part of it. Judged across the strings it is found, the lines of a
+	// held document read as lines: the arguments are dropped.
 	// Each line of a notebook cell keeps its own line break, a Windows
 	// one or a trailing space: an exact value is sought in the strings in
 	// order, white space aside.
@@ -515,15 +521,17 @@ func TestContentCollector_ARunnerEnvValueOverTheLinesOfAnArray(t *testing.T) {
 			c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"content":` + string(content) + `}`})
 
 			res := c.Result("stop")
-			assert.Contains(t, res.OutputMessages, `"arguments":{"content":"***"}`)
+			part := partAt(t, decodeOutputMessages(t, res.OutputMessages), 0)
+			assert.NotContains(t, part, "arguments")
+			assert.Equal(t, true, part["fullsend.truncated"])
 			assert.NotContains(t, res.OutputMessages, "opaque-line")
 		})
 	}
 }
 
 func TestContentCollector_JSONHeldPastTheBoundIsMaskedWhole(t *testing.T) {
-	// Each level is scanned once more, so documents are walked down to
-	// maxHeldDepth; one held deeper cannot be judged.
+	// Documents are walked down to maxHeldDepth, each encoded again with
+	// its masks; one held deeper is masked whole, the levels above kept.
 	held := func(doc string, depth int) string {
 		for range depth - 1 {
 			b, _ := json.Marshal(map[string]string{"d": doc})
@@ -540,7 +548,7 @@ func TestContentCollector_JSONHeldPastTheBoundIsMaskedWhole(t *testing.T) {
 	const secret, plain = `{"credentials":{"value":"opaque-credential-123"}}`, `{"v":"plain"}`
 
 	res := run(held(secret, maxHeldDepth))
-	assert.Contains(t, res.OutputMessages, `"arguments":{"content":"***"}`)
+	assert.Contains(t, res.OutputMessages, `"arguments":`+held(`{"credentials":{"value":"***"}}`, maxHeldDepth))
 	assert.Len(t, res.Findings, 1)
 
 	res = run(held(plain, maxHeldDepth))
@@ -549,7 +557,8 @@ func TestContentCollector_JSONHeldPastTheBoundIsMaskedWhole(t *testing.T) {
 
 	for _, doc := range []string{plain, secret} {
 		res = run(held(doc, maxHeldDepth+1))
-		assert.Contains(t, res.OutputMessages, `"arguments":{"content":"***"}`)
+		assert.Contains(t, res.OutputMessages, `"arguments":`+held("***", maxHeldDepth+1))
+		assert.NotContains(t, res.OutputMessages, "opaque-credential")
 		assert.Len(t, res.Findings, 1)
 	}
 }
@@ -563,7 +572,7 @@ func TestContentCollector_AKeyHoldingADocumentIsJudgedLikeAValue(t *testing.T) {
 	}{
 		"key":                    {`{` + doc + `:"x"}`, `{"***":"x"}`, 1},
 		"key of a nested object": {`{"files":{` + doc + `:"x"}}`, `{"files":{"***":"x"}}`, 1},
-		"key in a held document": {`{"content":` + quote(`{`+doc+`:"x"}`) + `}`, `{"content":"***"}`, 1},
+		"key in a held document": {`{"content":` + quote(`{`+doc+`:"x"}`) + `}`, `{"content":` + quote(`{"***":"x"}`) + `}`, 1},
 		// Masked whole, the key still names a secret as scanned: its
 		// value is judged against it.
 		"a value under it":              {`{` + doc + `:"opaque-credential-456"}`, `{"***":"***"}`, 2},
@@ -591,13 +600,13 @@ func TestContentCollector_AKeyHoldingADocumentIsJudgedLikeAValue(t *testing.T) {
 }
 
 func TestContentCollector_JSONInASecretNamedStringIsMaskedWholeOnce(t *testing.T) {
-	// The member-name pattern takes any string of eight bytes or more under
-	// the member, a document's encoding too: one finding, not one per value.
+	// A document under a secret-named member is walked under that member:
+	// its values are judged by the member's name, one finding each.
 	c := newContentCollector(4096)
 	c.Handle(agentruntime.ToolUseEvent{Name: "Write", Arguments: `{"credentials":"{\"value\":\"opaque-credential-123\"}"}`})
 
 	res := c.Result("stop")
-	assert.Contains(t, res.OutputMessages, `"arguments":{"credentials":"***"}`)
+	assert.Contains(t, res.OutputMessages, `"arguments":{"credentials":"{\"value\":\"***\"}"}`)
 	assert.Len(t, res.Findings, 1)
 }
 
