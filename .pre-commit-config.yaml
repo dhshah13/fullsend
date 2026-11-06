@@ -34,10 +34,9 @@ repos:
     hooks:
       - id: ty
         name: ty check
-        entry: uvx ty check . --ignore unresolved-import --ignore unresolved-attribute
+        entry: uvx ty check --ignore import-not-found --ignore unresolved-attribute
         language: system
         types: [python]
-        pass_filenames: false
 
   - repo: https://github.com/PyCQA/bandit
     rev: "1.9.4"
@@ -81,6 +80,7 @@ repos:
             \.github/workflows/
             |internal/scaffold/fullsend-repo/\.github/workflows/
             |internal/scaffold/fullsend-repo/templates/
+            |docs/guides/infrastructure/examples/inference-gateway/gateway-check\.yml$
           )
         args:
           - -ignore
@@ -118,6 +118,13 @@ repos:
         files: ^(internal/mint/|internal/mintcore/|internal/dispatch/gcf/mintsrc/)
         pass_filenames: false
 
+      - id: lint-interface-doc-sync
+        name: lint interface doc sync
+        entry: ./hack/lint-interface-doc-sync
+        language: script
+        files: ^(pkg/behaviourtest/drivers/ci/driver\.go|docs/guides/dev/behaviour-drivers\.md)$
+        pass_filenames: false
+
       - id: lint-adr-status
         name: lint ADR statuses
         entry: ./hack/lint-adr-status
@@ -140,6 +147,17 @@ repos:
         files: ^docs/ADRs/.*\.md$
         pass_filenames: false
 
+      # Validates the agentgateway config blocks in the inference gateway
+      # operator guide with agentgateway itself. Needs docker or podman, or
+      # AGENTGATEWAY_BIN set to an agentgateway binary of the page's version.
+      - id: check-gateway-doc-configs
+        name: check gateway doc configs
+        entry: ./hack/check-gateway-doc-configs
+        language: python
+        additional_dependencies: ["pyyaml>=6.0"]
+        files: ^(docs/guides/infrastructure/inference-gateway-operator\.md|docs/guides/infrastructure/examples/inference-gateway/|hack/check-gateway-doc-configs$)
+        pass_filenames: false
+
       - id: lint-broken-symlinks
         name: lint broken symlinks
         entry: ./hack/lint-broken-symlinks
@@ -156,10 +174,11 @@ repos:
 
       - id: lint-md-links
         name: lint markdown links
-        entry: lychee --offline --no-progress --include-fragments --exclude-path node_modules --exclude-path experiments '**/*.md'
+        entry: lychee --offline --no-progress --include-fragments --exclude-path node_modules --exclude-path experiments --exclude-path docs/archived-roadmaps/2026-07.md
         language: system
-        pass_filenames: false
-        always_run: true
+        files: '\.md$'
+        exclude: '^\.'
+        pass_filenames: true
 
       - id: lint-workflow-size
         name: lint workflow file size
@@ -168,16 +187,10 @@ repos:
         files: ^internal/scaffold/fullsend-repo/(\.github/workflows/|templates/)
         pass_filenames: false
 
-      - id: lint-agent-docs
-        name: lint agent doc references
-        entry: ./hack/lint-agent-docs
-        language: script
-        files: ^(internal/scaffold/fullsend-repo/harness/|docs/agents/)
-        pass_filenames: false
 
       - id: lint-staged
         name: lint-staged (web)
         entry: npx lint-staged --allow-empty
         language: system
-        files: ^web/(admin|docs)/src/
+        files: ^docs/\.vitepress/
         pass_filenames: false

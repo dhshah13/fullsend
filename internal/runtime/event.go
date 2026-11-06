@@ -1,0 +1,265 @@
+package runtime
+
+// streamBufSize is the bufio.Reader buffer size used by every NDJSON stream
+// parser (Claude, pi, codex, OpenCode). Lines exceeding this size are
+// skipped; the Claude parser still reports an oversized tool_result line's
+// call id (ToolResultEvent.Oversized).
+const streamBufSize = 1024 * 1024 // 1 MiB
+
+// AgentEvent is the normalized event interface for runtime-agnostic rendering.
+// Each concrete event type implements this with a no-op marker method.
+type AgentEvent interface {
+	agentEvent()
+}
+
+// InitEvent is emitted once at stream start with runtime metadata.
+type InitEvent struct {
+	Model   string
+	Version string
+	// SessionID is the runtime's session id when the stream reports one
+	// (Claude Code's init event); empty otherwise.
+	SessionID string
+}
+
+func (InitEvent) agentEvent() {}
+
+// ThinkingEvent carries an incremental thinking text delta.
+type ThinkingEvent struct {
+	Text string
+}
+
+func (ThinkingEvent) agentEvent() {}
+
+// TextEvent carries an incremental assistant text delta.
+type TextEvent struct {
+	Text string
+}
+
+func (TextEvent) agentEvent() {}
+
+// ToolUseEvent reports a tool call. The Claude Code parser emits it when
+// it reads the line carrying the call's complete arguments (written ahead
+// of the call's result; the tool may already be running by then); the pi,
+// codex and OpenCode parsers emit it when the call has finished — codex
+// once per changed path of a file_change item, so one apply_patch can
+// yield several. Not every call yields one: a Claude Code server_tool_use
+// block on an assistant line (the path production takes) and a tool_use
+// line beyond streamBufSize emit nothing.
+// ID is the tool call identifier from the runtime stream; it is empty
+// when the parser passes none through — pi and codex (#7414), OpenCode,
+// and a Claude Code server-side tool reported from stream_event blocks,
+// whose result never arrives as a tool_result.
+// Name is the raw tool name from the runtime stream.
+// Summary is a one-line context string from extractSafeContext; it is
+// empty for tools not recognized by that function.
+// Arguments is the call's input as the stream carried it: JSON text,
+// unredacted, for the Level 3 content collector only — the renderer does
+// not print it. It is not checked here: input assembled from stream_event
+// deltas stops growing at maxToolInputSize and can be incomplete JSON.
+// Empty when the wire carried no input, and from the pi and codex
+// parsers (#7414) and the OpenCode parser.
+type ToolUseEvent struct {
+	ID        string
+	Name      string
+	Summary   string
+	Arguments string
+}
+
+func (ToolUseEvent) agentEvent() {}
+
+// ToolResultEvent carries the result of a completed tool invocation.
+// ID is the tool call identifier from the runtime stream (matches
+// ToolUseEvent.ID); Result is the raw result text; IsError reports a
+// failed call, as set on the wire; Partial reports that non-text
+// content (for example image blocks) was skipped while flattening, so
+// Result is a fragment of what the wire carried; Oversized reports that
+// the result's stream line exceeded streamBufSize and was skipped, so
+// only ID is known — Result is empty and IsError is unknown, not false.
+// Only the Claude runtime emits it today — see the runtime support
+// matrix in docs/runtimes.md.
+type ToolResultEvent struct {
+	ID        string
+	Result    string
+	IsError   bool
+	Partial   bool
+	Oversized bool
+}
+
+func (ToolResultEvent) agentEvent() {}
+
+// TokensEvent carries incremental token usage counters.
+type TokensEvent struct {
+	InputTokens     int
+	OutputTokens    int
+	ReasoningTokens int
+	CacheRead       int
+	CacheWrite      int
+}
+
+func (TokensEvent) agentEvent() {}
+
+// ResultEvent is emitted once at stream end with final metrics.
+type ResultEvent struct {
+	NumTurns                 int
+	TotalCostUSD             float64
+	IsError                  bool
+	ErrorMessage             string
+	Subtype                  string
+	InputTokens              int
+	OutputTokens             int
+	ReasoningTokens          int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
+	// PerModelUsage breaks the token totals and cost down by model id.
+	// Only the claude parser fills it (from the result's modelUsage); it is
+	// nil otherwise.
+	PerModelUsage map[string]ModelUsage
+}
+
+func (ResultEvent) agentEvent() {}
+
+// ErrorEvent is emitted when the runtime reports an error.
+type ErrorEvent struct {
+	ErrorType string
+	Message   string
+}
+
+func (ErrorEvent) agentEvent() {}
+
+// RetryEvent is emitted when the runtime retries an API call.
+type RetryEvent struct {
+	Attempt    int
+	MaxRetries int
+	DelayMs    int
+	Error      string
+}
+
+func (RetryEvent) agentEvent() {}
+
+// ModelFallbackEvent reports that the runtime itself switched models
+// mid-session: Claude Code's --fallback-model chain answering for a model
+// that failed. From is the model that failed, To the one that took over.
+type ModelFallbackEvent struct {
+	From    string
+	To      string
+	Trigger string
+}
+
+func (ModelFallbackEvent) agentEvent() {}
+
+// PluginErrorEvent reports a plugin the runtime failed to load at startup.
+// Only the Claude parser emits it, once per entry of the init event's
+// plugin_errors. Type is the runtime's error category (an open set);
+// Path is empty when the runtime does not name a directory (Claude Code
+// before 2.1.283, or an entry that is not a --plugin-dir load failure).
+type PluginErrorEvent struct {
+	Plugin  string
+	Type    string
+	Path    string
+	Message string
+}
+
+func (PluginErrorEvent) agentEvent() {}
+
+// TaskState describes task/agent progress, not validated business completion.
+type TaskState string
+
+const (
+	TaskPending   TaskState = "pending"
+	TaskPaused    TaskState = "paused"
+	TaskRunning   TaskState = "running"
+	TaskCompleted TaskState = "completed"
+	TaskFailed    TaskState = "failed"
+	TaskStopped   TaskState = "stopped"
+	TaskQueued    TaskState = "queued"
+	TaskRetrying  TaskState = "retrying"
+	TaskSkipped   TaskState = "skipped"
+)
+
+// TaskProgressEvent carries live background task or Workflow agent metadata.
+// An empty AgentID and zero AgentIndex describe the task itself. A positive
+// AgentIndex is the stable Workflow row identity within a task/run; AgentID
+// is optional display attribution and is the identity fallback only when
+// index is absent. Learning an ID alone is not a new display transition.
+// Phase is agent attribution, never an inventory of declared phases.
+// Progress does not update token/cost accounting and carries no prompts or
+// tool result bodies.
+// Consumers receive repeated snapshots and partial patches, not reconciled
+// transitions. A display reconciler merges snapshots after caller-specific
+// credential redaction; custom OnEvent consumers must reconcile their own
+// state. Nonempty values are supplied values; the Set flags distinguish an
+// explicitly empty string/false flag from absent optional metadata. Agent
+// error/blocked/cached fields are state-relative: omitted values survive
+// repeated snapshots of the same state, but not a state transition.
+type TaskProgressEvent struct {
+	TaskID     string
+	RunID      string
+	AgentID    string
+	AgentIndex int
+	Label      string
+	Phase      string
+	State      TaskState
+	// AgentState preserves the Workflow producer's four-value lifecycle
+	// (start/progress/done/error). State is a per-snapshot approximation;
+	// renderers reconcile optional metadata before deriving display state.
+	AgentState  string
+	Skipped     bool
+	SkippedSet  bool
+	ToolName    string
+	ToolSummary string
+	Summary     string
+	Detail      string
+	Blocked     bool
+	Cached      bool
+	// Workflow attempts are one-based. Timestamps are producer epoch-ms
+	// metadata used only for lifecycle reconciliation, never usage accounting.
+	Attempt              int
+	LastAttemptReason    string
+	QueuedAt             float64
+	StartedAt            float64
+	AttemptSet           bool
+	LastAttemptReasonSet bool
+	QueuedAtSet          bool
+	StartedAtSet         bool
+	// Update is a task lifecycle patch; it retains prior tool context.
+	// Label/Detail/ToolName/ToolSummary Set flags apply to task and agent
+	// metadata; SummarySet applies to task snapshots. Phase/Blocked/Cached/
+	// Skipped Set flags apply only to agents. Started is task-level.
+	Update         bool
+	LabelSet       bool
+	DetailSet      bool
+	PhaseSet       bool
+	ToolNameSet    bool
+	SummarySet     bool
+	ToolSummarySet bool
+	BlockedSet     bool
+	CachedSet      bool
+	Started        bool
+	Hidden         bool
+}
+
+func (TaskProgressEvent) agentEvent() {}
+
+// StatusProgressEvent is advisory runtime display metadata. It carries no
+// tool output, prompts, result bodies, or authoritative run/usage outcomes.
+type StatusProgressEvent struct {
+	Kind   string
+	ID     string
+	Label  string
+	State  string
+	Detail string
+	// Subject/Context attribute a status, such as a hook name and event.
+	// Set flags permit clearing; omitted fields retain sanitized prior values.
+	Subject    string
+	Context    string
+	SubjectSet bool
+	ContextSet bool
+	// Clear resets the row silently. Recovery is displayed only after a
+	// prior status, avoiding a routine initial "allowed" rate-limit message.
+	Clear    bool
+	Recovery bool
+	// Occurrence is an unkeyed one-off message, not a state snapshot.
+	Occurrence bool
+}
+
+func (StatusProgressEvent) agentEvent() {}

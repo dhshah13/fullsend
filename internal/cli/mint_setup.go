@@ -14,7 +14,6 @@ import (
 	"golang.org/x/term"
 
 	"github.com/fullsend-ai/fullsend/internal/appsetup"
-	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/dispatch/gcf"
 	"github.com/fullsend-ai/fullsend/internal/forge"
 	gh "github.com/fullsend-ai/fullsend/internal/forge/github"
@@ -204,7 +203,7 @@ func validateMintSetupRole(role string) (string, error) {
 	}
 	canonical := resolveRole(role)
 	if !mintcore.HasRole(canonical) {
-		return "", fmt.Errorf("unsupported role %q: must be one of %s", canonical, strings.Join(config.ValidRoles(), ", "))
+		return "", fmt.Errorf("unsupported role %q: must be one of %s", canonical, strings.Join(mintcore.BuiltInRoles(), ", "))
 	}
 	return canonical, nil
 }

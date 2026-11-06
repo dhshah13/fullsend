@@ -1,5 +1,5 @@
 ---
-name: Filing GitHub Issues
+name: filing-issues
 description: >
   File well-crafted GitHub issues. Use when the user wants to report a bug,
   request a feature, propose a change, or file any GitHub issue. Searches for
@@ -23,7 +23,27 @@ Follow these steps in order. Do not skip steps.
 Determine which repository should receive this issue:
 
 - If the user specifies a repo, use it.
-- If the current working directory is a git repo, default to its `origin` remote.
+- **fullsend-ai/experiments vs fullsend-ai/fullsend:** These are sibling
+  repositories. `experiments/` in a fullsend checkout is a git submodule of
+  [`fullsend-ai/experiments`](https://github.com/fullsend-ai/experiments).
+  Choose the tracker by what would change, not by the current working
+  directory:
+
+  | File in `fullsend-ai/experiments` | File in `fullsend-ai/fullsend` |
+  |-----------------------------------|--------------------------------|
+  | Experiment source, conventions, lint scripts, CI, or config **inside** the experiments repository | Submodule integration: `.gitmodules`, CODEOWNERS for `experiments`, Renovate bump PRs, `docs/experiments` symlink, ignore rules, docs-site wiring |
+  | New spikes and prototypes that live as experiment directories | Fullsend product or platform work that cites an experiment as research or evidence |
+
+  When the current directory is the experiments submodule or a clone of
+  `fullsend-ai/experiments`, still apply this table — submodule-integration
+  work belongs in fullsend even if you are standing in the submodule.
+  Canonical policy: [CONTRIBUTING.md](../../CONTRIBUTING.md#where-to-file-experiments-related-issues).
+- If the item is experiments-related but the table above does not decide a
+  single tracker, file in `fullsend-ai/fullsend` and link the
+  [experiments issue tracker](https://github.com/fullsend-ai/experiments/issues)
+  in the body.
+- If the current working directory is a git repo and the table above does not
+  apply, default to its `origin` remote.
 - If neither applies, ask.
 
 Run `gh repo view` to confirm you have access and note the repo's full `owner/name`.
@@ -39,6 +59,10 @@ gh issue list --repo <owner/name> --state all --search "<key terms>"
 Try at least two different search queries using different terms from the user's
 description. Search broadly — use core nouns and verbs, not the user's exact
 phrasing.
+
+If the topic mentions experiments, spikes, or the `experiments/` submodule,
+search **both** `fullsend-ai/fullsend` and `fullsend-ai/experiments`. The same
+work may already be tracked in the other repository.
 
 **If you find related issues:**
 
@@ -56,7 +80,7 @@ the problem from multiple angles:
 - **What triggers it?** Specific actions, configurations, timing, data shapes?
 - **Where does it manifest?** Which component, service, environment, platform?
 - **When did it start?** Always been this way, or a regression? What changed?
-- **What is the severity?** Workaround available? Blocks other work?
+- **What is the impact?** Workaround available? Blocks other work?
 - **What is the scope?** Isolated incident or pattern? How many people hit this?
 - **What has been tried?** Prior debugging, workarounds, related PRs?
 - **What context would a stranger need?** Version numbers, error messages, logs,
@@ -159,5 +183,11 @@ Do this **after** each `gh issue create` succeeds; then return all issue URLs.
   numbers, error messages, or reproduction steps.
 - **Respect the repo's conventions.** If existing issues use a template or
   follow a pattern, match it. Check `.github/ISSUE_TEMPLATE/` if it exists.
+- **No labels at filing time.** Never include `--label` flags in
+  `gh issue create`. Labels are applied by the triage pipeline, not at
+  filing time.
+- **No priority classification.** Do not ask the user for priority or
+  severity levels, and do not include priority labels. Triage handles
+  classification.
 - **Sub-issues:** If there is a parent/child hierarchy, use GitHub’s sub-issue
   API after creation; do not rely on body mentions alone.

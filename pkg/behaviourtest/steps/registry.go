@@ -1,0 +1,32 @@
+package steps
+
+import (
+	"github.com/cucumber/godog"
+)
+
+// Register binds all step definitions. Steps retrieve their per-scenario
+// World from the godog context via world.FromContext.
+func Register(sc *godog.ScenarioContext) {
+	registerDummyAgentSteps(sc)
+	registerRuntimeSteps(sc)
+	registerTriageSteps(sc)
+	registerDispatchSteps(sc)
+	registerDispatchCountSteps(sc)
+	registerPreScriptSkipSteps(sc)
+	registerURLDispatchSteps(sc)
+	registerBaseDispatchSteps(sc)
+	registerForkSteps(sc)
+	registerJiraPollSteps(sc)
+	registerBranchSteps(sc)
+	registerReactionSteps(sc)
+	registerActorSteps(sc)
+	registerBotActorSteps(sc)
+	registerForgeStateSteps(sc)
+	registerOwnersSteps(sc)
+	registerPlaybackSteps(sc)
+	registerGatewaySteps(sc)
+	registerRunnerSecretSteps(sc)
+	registerMintProbeSteps(sc)
+	registerMintStatusSteps(sc)
+	registerBotRoleProbeSteps(sc)
+}

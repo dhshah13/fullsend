@@ -113,7 +113,7 @@ The agent determines the target branch from the issue context and writes
 ### Post-script policy gate
 
 Replace the `TARGET_BRANCH="${TARGET_BRANCH:-main}"` line in `post-code.sh`
-with branch resolution logic:
+(now in `fullsend-ai/agents`) with branch resolution logic:
 
 1. Read `target_branch` from `code-result.json` (agent's choice).
 2. Auto-detect the repo's default branch via `gh api`.

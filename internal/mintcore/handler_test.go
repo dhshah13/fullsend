@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -47,15 +48,9 @@ func (f *fakeOIDCVerifier) Verify(_ context.Context, _ string) (*Claims, error) 
 	return f.claims, f.err
 }
 
-func testAllowedOrgs() []string {
-	var orgs []string
-	for _, entry := range strings.Split(os.Getenv("ALLOWED_ORGS"), ",") {
-		if trimmed := strings.TrimSpace(entry); trimmed != "" {
-			orgs = append(orgs, trimmed)
-		}
-	}
-	return orgs
-}
+// Authorization config (PER_REPO_WIF_REPOS, WORKFLOW_HOST_REPOS,
+// ALLOWED_WORKFLOW_FILES) is read from the environment by NewHandler.
+// Tests set it via t.Setenv before constructing the handler.
 
 func (f *fakePEMAccessor) AccessPEM(_ context.Context, role string) ([]byte, error) {
 	if f.err != nil {
@@ -66,7 +61,8 @@ func (f *fakePEMAccessor) AccessPEM(_ context.Context, role string) ([]byte, err
 	if !ok {
 		return nil, fmt.Errorf("PEM not found for %s", key)
 	}
-	return data, nil
+	cp := append([]byte(nil), data...)
+	return cp, nil
 }
 
 func mustNewHandler(t *testing.T, pemAccessor PEMAccessor, verifier OIDCVerifier) *Handler {
@@ -76,6 +72,23 @@ func mustNewHandler(t *testing.T, pemAccessor PEMAccessor, verifier OIDCVerifier
 		t.Fatalf("NewHandler: %v", err)
 	}
 	return h
+}
+
+// seedRepoForeignGrants pre-populates the handler's repo-level FOREIGN
+// allowlist cache so that caller is authorized on each of repos in
+// targetOrg for role. Same-org requests for more than the caller's own
+// repository require repo-level FOREIGN grants; tests that exercise mint
+// behavior for multi-repo lists use this to satisfy that check without
+// mocking the policy-token and variable round trips.
+func seedRepoForeignGrants(h *Handler, targetOrg, role, caller string, repos ...string) {
+	h.foreignCacheMu.Lock()
+	defer h.foreignCacheMu.Unlock()
+	for _, repo := range repos {
+		h.foreignCache[repoForeignCacheKey(targetOrg, repo, role)] = foreignCacheEntry{
+			allowlist: []string{caller},
+			fetchedAt: time.Now(),
+		}
+	}
 }
 
 // testOIDCEnv sets up a mock OIDC server and returns a handler with the
@@ -122,19 +135,13 @@ func newTestOIDCEnv(t *testing.T, pemAccessor PEMAccessor) *testOIDCEnv {
 	t.Cleanup(env.server.Close)
 	env.issuerURL = env.server.URL
 
-	var allowedOrgs []string
-	for _, entry := range strings.Split(os.Getenv("ALLOWED_ORGS"), ",") {
-		if trimmed := strings.TrimSpace(entry); trimmed != "" {
-			allowedOrgs = append(allowedOrgs, trimmed)
-		}
-	}
-
-	verifier := NewJWKSVerifier(JWKSVerifierConfig{
-		IssuerURL:            env.server.URL,
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		AllowedOrgs:          allowedOrgs,
-		AllowedWorkflowFiles: []string{"*"},
+	issuerURL := env.server.URL
+	verifier, err := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: issuerURL,
 	})
+	if err != nil {
+		t.Fatalf("creating JWKS verifier: %v", err)
+	}
 	h, err := NewHandler(pemAccessor, verifier)
 	if err != nil {
 		t.Fatalf("creating handler: %v", err)
@@ -148,13 +155,17 @@ func (e *testOIDCEnv) signToken(t *testing.T, claimsOverrides map[string]interfa
 	header, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT", "kid": e.kid})
 	now := time.Now()
 	claims := map[string]interface{}{
-		"iss":              e.issuerURL,
-		"aud":              "fullsend-mint",
-		"iat":              now.Unix(),
-		"exp":              now.Add(10 * time.Minute).Unix(),
-		"repository":       "test-org/.fullsend",
+		"iss": e.issuerURL,
+		"aud": "fullsend-mint",
+		"iat": now.Unix(),
+		"exp": now.Add(10 * time.Minute).Unix(),
+		// Default claim matches common ["test-repo"] mint bodies so tests
+		// exercise requesting-repo-only scope (compat off) unless overridden.
+		// job_workflow_ref points at the upstream workflow host, which is
+		// always trusted, so workflow-ref checks pass.
+		"repository":       "test-org/test-repo",
 		"repository_owner": "test-org",
-		"job_workflow_ref": "test-org/.fullsend/.github/workflows/code.yml@refs/heads/main",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
 	}
 	for k, v := range claimsOverrides {
 		if v == nil {
@@ -186,9 +197,55 @@ func TestHandler_HealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestHandler_HealthEndpoint_IncludesVersion(t *testing.T) {
+	Version = "1.2.3"
+	Commit = "abc123def456"
+	t.Cleanup(func() { Version = ""; Commit = "" })
+	h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /health: expected 200, got %d", rec.Code)
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode health response: %v", err)
+	}
+	if resp["status"] != "ok" {
+		t.Fatalf("expected status ok, got %q", resp["status"])
+	}
+	if resp["version"] != "1.2.3" {
+		t.Fatalf("expected version 1.2.3, got %q", resp["version"])
+	}
+	if resp["commit"] != "abc123def456" {
+		t.Fatalf("expected commit abc123def456, got %q", resp["commit"])
+	}
+}
+
+func TestHandler_HealthEndpoint_OmitsEmptyVersion(t *testing.T) {
+	Version = ""
+	Commit = ""
+	h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /health: expected 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "version") {
+		t.Fatalf("health response should omit version when empty: %s", body)
+	}
+	if strings.Contains(body, "commit") {
+		t.Fatalf("health response should omit commit when empty: %s", body)
+	}
+}
+
 func TestHandler_StatusEndpoint(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"triage":"100","coder":"200"}`)
-	t.Setenv("ALLOWED_ORGS", "test-org")
 
 	env := newTestOIDCEnv(t, &fakePEMAccessor{})
 	rec := httptest.NewRecorder()
@@ -234,6 +291,35 @@ func TestHandler_StatusEndpoint(t *testing.T) {
 	// Verify response does not list all orgs.
 	if strings.Contains(body, "orgs") {
 		t.Fatalf("status response should not contain orgs array: %s", body)
+	}
+
+}
+
+func TestHandler_StatusEndpoint_IncludesVersion(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"triage":"100","coder":"200"}`)
+	Version = "0.27.0"
+	Commit = "1e7877ae"
+	t.Cleanup(func() { Version = ""; Commit = "" })
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+env.signToken(t, nil))
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var resp statusResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode status response: %v", err)
+	}
+	if resp.Version != "0.27.0" {
+		t.Fatalf("expected version 0.27.0, got %q", resp.Version)
+	}
+	if resp.Commit != "1e7877ae" {
+		t.Fatalf("expected commit 1e7877ae, got %q", resp.Commit)
 	}
 }
 
@@ -337,7 +423,6 @@ func TestHandler_HealthEndpoint_LegacyOnlyRoleAppIDs(t *testing.T) {
 
 func TestHandler_StatusEndpoint_MixedCaseOrgClaim(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200","triage":"100"}`)
-	t.Setenv("ALLOWED_ORGS", "Test-Org")
 
 	env := newTestOIDCEnv(t, &fakePEMAccessor{})
 	rec := httptest.NewRecorder()
@@ -548,9 +633,9 @@ func TestHandler_InvalidRepoName(t *testing.T) {
 	}
 }
 
-func TestHandler_EmptyRepos(t *testing.T) {
-	t.Setenv("ALLOWED_ROLES", "coder")
+func TestHandler_EmptyRepos_FullOrgToken(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
 	h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{})
 
 	body := `{"role":"coder"}`
@@ -560,12 +645,422 @@ func TestHandler_EmptyRepos(t *testing.T) {
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", rec.Code)
+		t.Fatalf("expected 400 for omitted repos, got %d: %s", rec.Code, rec.Body.String())
 	}
 	var resp map[string]string
-	json.NewDecoder(rec.Body).Decode(&resp)
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
 	if !strings.Contains(resp["error"], "repos is required") {
-		t.Fatalf("expected repos required error, got: %s", resp["error"])
+		t.Fatalf("unexpected error: %s", resp["error"])
+	}
+}
+
+func TestHandler_EmptyReposList_Rejected(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{})
+
+	body := `{"role":"coder","repos":[]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty repos list, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp["error"], "repos is required") {
+		t.Fatalf("unexpected error: %s", resp["error"])
+	}
+}
+
+func TestHandler_StarRepos_SameOrgDenied(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	body := `{"role":"coder","repos":["*"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for same-org * repos, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_EmptyRepos_CrossOrgRejected(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{})
+
+	body := `{"role":"e2e","target_org":"pool-org"}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for cross-org omitted repos, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp["error"], "repos is required") {
+		t.Fatalf("unexpected error: %s", resp["error"])
+	}
+}
+
+func TestHandler_EmptyRepos_CrossOrgStarAlias(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"e2e": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/e2e.yml@refs/heads/main",
+	})
+
+	var tokenCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/orgs/pool-org/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 999, Account: struct {
+					Login string `json:"login"`
+				}{Login: "pool-org"},
+			})
+		case r.URL.Path == "/app/installations/999/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body)
+			if tokenCalls == 1 {
+				w.WriteHeader(http.StatusCreated)
+				json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_policy_token"})
+				return
+			}
+			if _, ok := body["repositories"]; ok {
+				t.Error("expected installation token request to omit repositories")
+			}
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:               "ghs_e2e_star",
+				ExpiresAt:           "2026-05-06T12:00:00Z",
+				Permissions:         map[string]string{"contents": "write", "metadata": "read"},
+				RepositorySelection: "all",
+			})
+		case r.URL.Path == "/orgs/pool-org/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_E2E_REPOS",
+				Value: "fullsend-ai/fullsend",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"e2e","target_org":"pool-org","repos":["*"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp mintResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Token != "ghs_e2e_star" {
+		t.Fatalf("expected token=ghs_e2e_star, got %s", resp.Token)
+	}
+}
+
+// TestHandler_ReposScope_LegacyEnrolledShapesDenied verifies that the
+// legacy per-org "enrolled-fullsend" / "enrolled-pair" repos shapes
+// (requesting the org's .fullsend repo alongside or instead of the caller's
+// own repo) are no longer accepted. A per-repo caller may only request its
+// own repository unless repo-level FOREIGN grants authorize more.
+func TestHandler_ReposScope_LegacyEnrolledShapesDenied(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/api")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "test-org/api",
+		"repository_owner": "test-org",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/installation") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_ok",
+				ExpiresAt: "2026-05-06T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	// Legacy org-mode shapes are denied (no repo-level FOREIGN grants exist:
+	// the fake GitHub returns 404 for repo variable lookups).
+	for _, repos := range []string{`[".fullsend"]`, `["api",".fullsend"]`, `[".fullsend","api"]`, `["other"]`} {
+		body := `{"role":"coder","repos":` + repos + `}`
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		env.handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("repos=%s: expected 403, got %d: %s", repos, rec.Code, rec.Body.String())
+		}
+	}
+
+	// The caller's own repository is still allowed.
+	body := `{"role":"coder","repos":["api"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("repos=[api]: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_ReposScope_PerRepoDenied(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	// Per-repo callers can only request their own repository.
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/test-repo")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	// Use upstream workflow ref so workflow host validation passes;
+	// the test exercises repos scope denial, not workflow host denial.
+	token := env.signToken(t, map[string]interface{}{
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
+	})
+
+	body := `{"role":"coder","repos":["api"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for per-repo caller requesting different repo, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandler_AllowedOrgs_NoLongerAuthorizes verifies that ALLOWED_ORGS
+// is ignored: an org listed there (or "*") no longer authorizes callers
+// whose repository is not in PER_REPO_WIF_REPOS, and no longer widens the
+// repos scope of enrolled callers to the legacy per-org shapes.
+func TestHandler_AllowedOrgs_NoLongerAuthorizes(t *testing.T) {
+	for _, allowedOrgs := range []string{"test-org", "*"} {
+		t.Run("ALLOWED_ORGS="+allowedOrgs, func(t *testing.T) {
+			t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+			t.Setenv("PER_REPO_WIF_REPOS", "test-org/test-repo")
+			// Deliberately set: ALLOWED_ORGS must have no effect.
+			t.Setenv("ALLOWED_ORGS", allowedOrgs)
+
+			pemData, err := generateTestRSAKey()
+			if err != nil {
+				t.Fatalf("generating test key: %v", err)
+			}
+
+			env := newTestOIDCEnv(t, &fakePEMAccessor{
+				pems: map[string][]byte{"coder": pemData},
+			})
+
+			github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.Contains(r.URL.Path, "/installation") && r.Method == http.MethodGet:
+					json.NewEncoder(w).Encode(installationResponse{
+						ID: 1, Account: struct {
+							Login string `json:"login"`
+						}{Login: "test-org"},
+					})
+				case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+					w.WriteHeader(http.StatusCreated)
+					json.NewEncoder(w).Encode(installationTokenResponse{
+						Token:     "ghs_enrolled",
+						ExpiresAt: "2026-08-04T12:00:00Z",
+					})
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer github.Close()
+			env.handler.githubBaseURL = github.URL
+
+			post := func(token, repos string) *httptest.ResponseRecorder {
+				body := `{"role":"coder","repos":` + repos + `}`
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+				req.Header.Set("Authorization", "Bearer "+token)
+				env.handler.ServeHTTP(rec, req)
+				return rec
+			}
+
+			// Callers in an ALLOWED_ORGS org but not enrolled per-repo are
+			// rejected, including the legacy per-org {org}/.fullsend caller.
+			for _, repo := range []string{"test-org/other-repo", "test-org/.fullsend"} {
+				token := env.signToken(t, map[string]interface{}{"repository": repo})
+				if rec := post(token, `["*"]`); rec.Code != http.StatusUnauthorized {
+					t.Fatalf("caller %s: expected 401, got %d: %s", repo, rec.Code, rec.Body.String())
+				}
+			}
+
+			// Enrolled caller: legacy org-mode shapes are denied.
+			token := env.signToken(t, nil) // test-org/test-repo
+			for _, repos := range []string{`[".fullsend"]`, `["test-repo",".fullsend"]`, `["other"]`} {
+				if rec := post(token, repos); rec.Code != http.StatusForbidden {
+					t.Fatalf("repos=%s: expected 403, got %d: %s", repos, rec.Code, rec.Body.String())
+				}
+			}
+
+			// Enrolled caller requesting only its own repo succeeds.
+			if rec := post(token, `["test-repo"]`); rec.Code != http.StatusOK {
+				t.Fatalf("repos=[test-repo]: expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestHandler_WorkflowRef_LegacyOrgConfigRepoDenied verifies that the
+// legacy per-org {org}/.fullsend config repo is no longer a trusted
+// workflow host: only upstream and WORKFLOW_HOST_REPOS are accepted.
+func TestHandler_WorkflowRef_LegacyOrgConfigRepoDenied(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/test-repo")
+	t.Setenv("WORKFLOW_HOST_REPOS", "test-org/custom-workflows")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/installation") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_dual_wf",
+				ExpiresAt: "2026-08-05T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+
+	tests := []struct {
+		name        string
+		workflowRef string
+		wantOK      bool
+	}{
+		{
+			"legacy per-org source: .fullsend repo rejected",
+			"test-org/.fullsend/.github/workflows/code.yml@refs/heads/main",
+			false,
+		},
+		{
+			"per-repo source: workflow host repo",
+			"test-org/custom-workflows/.github/workflows/code.yml@refs/heads/main",
+			true,
+		},
+		{
+			"upstream always accepted",
+			"fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
+			true,
+		},
+		{
+			"unlisted repo rejected",
+			"test-org/random-repo/.github/workflows/code.yml@refs/heads/main",
+			false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestOIDCEnv(t, &fakePEMAccessor{
+				pems: map[string][]byte{"coder": pemData},
+			})
+			env.handler.workflowHostRepos = map[string]bool{"test-org/custom-workflows": true}
+			env.handler.githubBaseURL = github.URL
+
+			token := env.signToken(t, map[string]interface{}{
+				"job_workflow_ref": tc.workflowRef,
+			})
+
+			body := `{"role":"coder","repos":["test-repo"]}`
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			env.handler.ServeHTTP(rec, req)
+
+			if tc.wantOK {
+				if rec.Code != http.StatusOK {
+					t.Fatalf("expected 200 for enrolled caller with %s, got %d: %s",
+						tc.name, rec.Code, rec.Body.String())
+				}
+			} else {
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("expected 401 for enrolled caller with %s, got %d: %s",
+						tc.name, rec.Code, rec.Body.String())
+				}
+			}
+		})
 	}
 }
 
@@ -600,10 +1095,11 @@ func TestHandler_TooManyRepos(t *testing.T) {
 
 func TestHandler_OIDCVerification_WrongOrg(t *testing.T) {
 	env := newTestOIDCEnv(t, &fakePEMAccessor{})
+	// Upstream workflow ref is trusted, so the 401 comes from the caller
+	// repository not being enrolled in PER_REPO_WIF_REPOS.
 	token := env.signToken(t, map[string]interface{}{
 		"repository_owner": "evil-org",
-		"repository":       "evil-org/.fullsend",
-		"job_workflow_ref": "evil-org/.fullsend/.github/workflows/code.yml@refs/heads/main",
+		"repository":       "evil-org/test-repo",
 	})
 
 	body := `{"role":"coder","repos":["test-repo"]}`
@@ -619,8 +1115,9 @@ func TestHandler_OIDCVerification_WrongOrg(t *testing.T) {
 
 func TestHandler_OIDCVerification_BadWorkflowRef(t *testing.T) {
 	env := newTestOIDCEnv(t, &fakePEMAccessor{})
+	// Caller is enrolled (default test-org/test-repo); the workflow ref
+	// points at an untrusted host repo.
 	token := env.signToken(t, map[string]interface{}{
-		"repository":       "test-org/some-repo",
 		"job_workflow_ref": "test-org/some-repo/.github/workflows/malicious.yml@refs/heads/main",
 	})
 
@@ -849,6 +1346,7 @@ func TestHandler_FullFlowGrantedScopeAll(t *testing.T) {
 
 func TestHandler_FullFlowWithRepos(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/my-repo")
 
 	pemData, err := generateTestRSAKey()
 	if err != nil {
@@ -858,12 +1356,22 @@ func TestHandler_FullFlowWithRepos(t *testing.T) {
 	env := newTestOIDCEnv(t, &fakePEMAccessor{
 		pems: map[string][]byte{"coder": pemData},
 	})
-	token := env.signToken(t, nil)
+	// A multi-repo list requires repo-level FOREIGN grants on each repo.
+	seedRepoForeignGrants(env.handler, "test-org", "coder", "test-org/my-repo", "my-repo", "other-repo")
+	token := env.signToken(t, map[string]interface{}{
+		"repository": "test-org/my-repo",
+	})
 
 	var capturedTokenReq map[string]interface{}
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/repos/test-org/my-repo/installation":
+		case r.URL.Path == "/repos/test-org/my-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/repos/test-org/other-repo/installation" && r.Method == http.MethodGet:
 			json.NewEncoder(w).Encode(installationResponse{
 				ID: 1, Account: struct {
 					Login string `json:"login"`
@@ -878,13 +1386,14 @@ func TestHandler_FullFlowWithRepos(t *testing.T) {
 				ExpiresAt: "2026-05-06T12:00:00Z",
 			})
 		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer github.Close()
 	env.handler.githubBaseURL = github.URL
 
-	body := `{"role":"coder","repos":["my-repo","other-repo"]}`
+	body := `{"role":"coder","level":"write","repos":["my-repo","other-repo"]}`
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -907,7 +1416,421 @@ func TestHandler_FullFlowWithRepos(t *testing.T) {
 		t.Fatal("expected permissions in token request")
 	}
 	if perms["contents"] != "write" {
-		t.Fatalf("expected contents:write for coder role, got %v", perms["contents"])
+		t.Fatalf("expected contents:write for coder role at write level, got %v", perms["contents"])
+	}
+}
+
+func TestHandler_SingleRepoInstallationNotCovered(t *testing.T) {
+	// When a single repo returns 404 from the installation lookup,
+	// the handler should return 422 with a clear "not covered" error
+	// (consistent with the repos[1:] handling) instead of a generic 502.
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/uncovered-repo")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	token := env.signToken(t, map[string]interface{}{
+		"repository": "test-org/uncovered-repo",
+	})
+
+	var tokenCreateCalled bool
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/uncovered-repo/installation" && r.Method == http.MethodGet:
+			// Repo not covered by the installation → 404.
+			w.WriteHeader(http.StatusNotFound)
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			tokenCreateCalled = true
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_should_not_reach",
+				ExpiresAt: "2099-01-01T00:00:00Z",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","repos":["uncovered-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !strings.Contains(resp["error"], "uncovered-repo") {
+		t.Fatalf("error should name the uncovered repo, got: %s", resp["error"])
+	}
+	if !strings.Contains(resp["error"], "not covered") {
+		t.Fatalf("error should indicate the repo is not covered, got: %s", resp["error"])
+	}
+	if tokenCreateCalled {
+		t.Fatal("CreateInstallationToken should not be called when repo is not covered")
+	}
+}
+
+func TestHandler_MultiRepoInstallationGap(t *testing.T) {
+	// When the GitHub App uses selected-repository installation mode,
+	// repos not in the selection return 404. Verify that mintToken
+	// detects this and returns a clear error naming the uncovered repo,
+	// instead of letting CreateInstallationToken fail with a confusing 422.
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/covered-repo")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	// A multi-repo list requires repo-level FOREIGN grants on each repo.
+	seedRepoForeignGrants(env.handler, "test-org", "coder", "test-org/covered-repo", "covered-repo", "uncovered-repo")
+	token := env.signToken(t, map[string]interface{}{
+		"repository": "test-org/covered-repo",
+	})
+
+	var tokenCreateCalled bool
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/covered-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 42, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/repos/test-org/uncovered-repo/installation" && r.Method == http.MethodGet:
+			// Repo not covered by the installation → 404.
+			w.WriteHeader(http.StatusNotFound)
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			tokenCreateCalled = true
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_should_not_reach",
+				ExpiresAt: "2099-01-01T00:00:00Z",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","repos":["covered-repo","uncovered-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !strings.Contains(resp["error"], "uncovered-repo") {
+		t.Fatalf("error should name the uncovered repo, got: %s", resp["error"])
+	}
+	if !strings.Contains(resp["error"], "not covered") {
+		t.Fatalf("error should indicate the repo is not covered, got: %s", resp["error"])
+	}
+	if tokenCreateCalled {
+		t.Fatal("CreateInstallationToken should not be called when repos are not covered")
+	}
+}
+
+func TestHandler_MultiRepoInstallationMismatch(t *testing.T) {
+	// When repos return different installation IDs (shouldn't happen
+	// normally, but guard against it), the handler should reject the
+	// request rather than silently using the first repo's installation.
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/repo-a")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	seedRepoForeignGrants(env.handler, "test-org", "coder", "test-org/repo-a", "repo-a", "repo-b")
+	token := env.signToken(t, map[string]interface{}{
+		"repository": "test-org/repo-a",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/repo-a/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 100, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/repos/test-org/repo-b/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 200, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","repos":["repo-a","repo-b"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !strings.Contains(resp["error"], "repo-b") {
+		t.Fatalf("error should name the mismatched repo, got: %s", resp["error"])
+	}
+	if !strings.Contains(resp["error"], "different GitHub App installation") {
+		t.Fatalf("error should indicate different installation, got: %s", resp["error"])
+	}
+}
+
+func TestHandler_MultiRepoInstallationTransientError(t *testing.T) {
+	// When FindInstallation for repos[1] fails with a transient error
+	// (e.g. GitHub returns 500), the handler should propagate it as 502
+	// (bad gateway) — matching the repos[0] error path — instead of
+	// misclassifying it as 422 "not covered."
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/repo-ok")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	seedRepoForeignGrants(env.handler, "test-org", "coder", "test-org/repo-ok", "repo-ok", "repo-flaky")
+	token := env.signToken(t, map[string]interface{}{
+		"repository": "test-org/repo-ok",
+	})
+
+	var tokenCreateCalled bool
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/repo-ok/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 42, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/repos/test-org/repo-flaky/installation" && r.Method == http.MethodGet:
+			// Transient GitHub failure → 500.
+			w.WriteHeader(http.StatusInternalServerError)
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			tokenCreateCalled = true
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_should_not_reach",
+				ExpiresAt: "2099-01-01T00:00:00Z",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","repos":["repo-ok","repo-flaky"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	// Transient errors should produce 502, not 422.
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 for transient GitHub failure on repos[1], got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	// The error should NOT say "not covered" — it's a transient failure.
+	if strings.Contains(resp["error"], "not covered") {
+		t.Fatalf("transient error should not be misclassified as 'not covered', got: %s", resp["error"])
+	}
+	if tokenCreateCalled {
+		t.Fatal("CreateInstallationToken should not be called when installation lookup fails")
+	}
+}
+
+func TestHandler_FullFlowWithRepos_Retro(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"retro":"600"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"retro": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	var capturedTokenReq map[string]interface{}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation":
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			reqBody, _ := io.ReadAll(r.Body)
+			json.Unmarshal(reqBody, &capturedTokenReq)
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_retro_token",
+				ExpiresAt: "2026-05-06T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"retro","level":"write","repos":["test-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	perms, ok := capturedTokenReq["permissions"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected permissions in token request")
+	}
+	if perms["actions"] != "read" {
+		t.Fatalf("expected actions:read for retro role, got %v", perms["actions"])
+	}
+	if perms["contents"] != "read" {
+		t.Fatalf("expected contents:read for retro role, got %v", perms["contents"])
+	}
+	if perms["pull_requests"] != "write" {
+		t.Fatalf("expected pull_requests:write for retro role at write level, got %v", perms["pull_requests"])
+	}
+	if perms["issues"] != "write" {
+		t.Fatalf("expected issues:write for retro role at write level, got %v", perms["issues"])
+	}
+	if perms["metadata"] != "read" {
+		t.Fatalf("expected metadata:read for retro role, got %v", perms["metadata"])
+	}
+	if len(perms) != 5 {
+		t.Fatalf("expected exactly 5 permissions for retro role, got %d: %v", len(perms), perms)
+	}
+}
+
+func TestHandler_FullFlowWithRepos_Prioritize(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"prioritize":"700"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"prioritize": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	var capturedTokenReq map[string]interface{}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation":
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			reqBody, _ := io.ReadAll(r.Body)
+			json.Unmarshal(reqBody, &capturedTokenReq)
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_prioritize_token",
+				ExpiresAt: "2026-05-06T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"prioritize","level":"write","repos":["test-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	perms, ok := capturedTokenReq["permissions"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected permissions in token request")
+	}
+	if perms["contents"] != "read" {
+		t.Fatalf("expected contents:read for prioritize role, got %v", perms["contents"])
+	}
+	if perms["issues"] != "write" {
+		t.Fatalf("expected issues:write for prioritize role at write level, got %v", perms["issues"])
+	}
+	if perms["organization_projects"] != "write" {
+		t.Fatalf("expected organization_projects:write for prioritize role at write level, got %v", perms["organization_projects"])
+	}
+	if perms["metadata"] != "read" {
+		t.Fatalf("expected metadata:read for prioritize role, got %v", perms["metadata"])
+	}
+	if len(perms) != 4 {
+		t.Fatalf("expected exactly 4 permissions for prioritize role, got %d: %v", len(perms), perms)
 	}
 }
 
@@ -937,14 +1860,17 @@ func TestHandler_InstallationNotFound(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	env.handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	// A 404 from FindInstallation means the repo is not covered by the
+	// GitHub App installation. The handler returns 422 with a clear
+	// user-facing message (consistent with repos[1:] handling).
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	var resp map[string]string
 	json.NewDecoder(rec.Body).Decode(&resp)
-	if resp["error"] != "mint failed" {
-		t.Fatalf("expected 'mint failed', got: %s", resp["error"])
+	if !strings.Contains(resp["error"], "not covered") {
+		t.Fatalf("expected 'not covered' message, got: %s", resp["error"])
 	}
 }
 
@@ -1052,9 +1978,8 @@ func TestWriteError(t *testing.T) {
 }
 
 func TestHandler_MultiOrg_FullFlow(t *testing.T) {
-	t.Setenv("ALLOWED_ORGS", "test-org,other-org")
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/test-repo,other-org/test-repo")
 	t.Setenv("GCP_PROJECT_NUMBER", "123456")
-	t.Setenv("OIDC_AUDIENCE", "fullsend-mint")
 	t.Setenv("ROLE_APP_IDS", `{"triage":"100","coder":"200","review":"300","fix":"400","fullsend":"500"}`)
 
 	pemData, err := generateTestRSAKey()
@@ -1066,9 +1991,8 @@ func TestHandler_MultiOrg_FullFlow(t *testing.T) {
 		pems: map[string][]byte{"coder": pemData},
 	})
 	token := env.signToken(t, map[string]interface{}{
-		"repository":       "other-org/.fullsend",
+		"repository":       "other-org/test-repo",
 		"repository_owner": "other-org",
-		"job_workflow_ref": "other-org/.fullsend/.github/workflows/code.yml@refs/heads/main",
 	})
 
 	var gotInstallationPath string
@@ -1117,9 +2041,8 @@ func TestHandler_MultiOrg_FullFlow(t *testing.T) {
 }
 
 func TestHandler_CrossOrgInstallationMismatch(t *testing.T) {
-	t.Setenv("ALLOWED_ORGS", "org-a,org-b")
+	t.Setenv("PER_REPO_WIF_REPOS", "org-a/seshi")
 	t.Setenv("GCP_PROJECT_NUMBER", "123456")
-	t.Setenv("OIDC_AUDIENCE", "fullsend-mint")
 	t.Setenv("ROLE_APP_IDS", `{"retro":"999"}`)
 	t.Setenv("ALLOWED_WORKFLOW_FILES", "*")
 
@@ -1132,9 +2055,9 @@ func TestHandler_CrossOrgInstallationMismatch(t *testing.T) {
 		pems: map[string][]byte{"retro": pemData},
 	})
 	token := env.signToken(t, map[string]interface{}{
-		"repository":       "org-a/.fullsend",
+		"repository":       "org-a/seshi",
 		"repository_owner": "org-a",
-		"job_workflow_ref": "org-a/.fullsend/.github/workflows/retro.yml@refs/heads/main",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/retro.yml@refs/heads/main",
 	})
 
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1176,8 +2099,7 @@ func TestHandler_CrossOrgInstallationMismatch(t *testing.T) {
 }
 
 func TestHandler_STSVerifier_Integration(t *testing.T) {
-	t.Setenv("ALLOWED_ORGS", "test-org")
-	t.Setenv("OIDC_AUDIENCE", "fullsend-mint")
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/my-repo")
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
 
 	pemData, err := generateTestRSAKey()
@@ -1203,16 +2125,15 @@ func TestHandler_STSVerifier_Integration(t *testing.T) {
 	}))
 	defer stsServer.Close()
 
-	verifier := NewSTSVerifier(STSVerifierConfig{
-		HTTPClient:         stsServer.Client(),
+	verifier, vErr := NewSTSVerifier(STSVerifierConfig{
 		STSURL:             stsServer.URL,
 		GCPProjectNum:      "123456",
 		WIFPoolName:        "fullsend-pool",
 		DefaultWIFProvider: "github-oidc",
-		AllowedOrgs:        []string{"test-org"},
-		AllowedWorkflows:   []string{"*"},
-		OIDCAudience:       "fullsend-mint",
 	})
+	if vErr != nil {
+		t.Fatalf("NewSTSVerifier: %v", vErr)
+	}
 	h := mustNewHandler(t, pemAccessor, verifier)
 
 	// Build a minimal valid OIDC token with the correct claims.
@@ -1224,9 +2145,9 @@ func TestHandler_STSVerifier_Integration(t *testing.T) {
 		"aud":              "fullsend-mint",
 		"iat":              now.Unix(),
 		"exp":              now.Add(10 * time.Minute).Unix(),
-		"repository":       "test-org/.fullsend",
+		"repository":       "test-org/my-repo",
 		"repository_owner": "test-org",
-		"job_workflow_ref": "test-org/.fullsend/.github/workflows/code.yml@refs/heads/main",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
 	}
 	claimsJSON, _ := json.Marshal(claims)
 	hB64 := base64.RawURLEncoding.EncodeToString(header)
@@ -1274,8 +2195,7 @@ func TestHandler_STSVerifier_Integration(t *testing.T) {
 }
 
 func TestHandler_STSVerifier_RestrictedWorkflows(t *testing.T) {
-	t.Setenv("ALLOWED_ORGS", "test-org")
-	t.Setenv("OIDC_AUDIENCE", "fullsend-mint")
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/my-repo")
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
 
 	pemData, err := generateTestRSAKey()
@@ -1296,19 +2216,19 @@ func TestHandler_STSVerifier_RestrictedWorkflows(t *testing.T) {
 	}))
 	defer stsServer.Close()
 
-	verifier := NewSTSVerifier(STSVerifierConfig{
-		HTTPClient:         stsServer.Client(),
+	verifier2, vErr2 := NewSTSVerifier(STSVerifierConfig{
 		STSURL:             stsServer.URL,
 		GCPProjectNum:      "123456",
 		WIFPoolName:        "fullsend-pool",
 		DefaultWIFProvider: "github-oidc",
-		AllowedOrgs:        []string{"test-org"},
-		AllowedWorkflows:   []string{"dispatch.yml"},
-		OIDCAudience:       "fullsend-mint",
 	})
+	if vErr2 != nil {
+		t.Fatalf("NewSTSVerifier: %v", vErr2)
+	}
 	h := mustNewHandler(t, &fakePEMAccessor{
 		pems: map[string][]byte{"coder": pemData},
-	}, verifier)
+	}, verifier2)
+	h.allowedWorkflowFiles = []string{"dispatch.yml"}
 
 	buildToken := func(workflowRef string) string {
 		now := time.Now()
@@ -1318,7 +2238,7 @@ func TestHandler_STSVerifier_RestrictedWorkflows(t *testing.T) {
 			"aud":              "fullsend-mint",
 			"iat":              now.Unix(),
 			"exp":              now.Add(10 * time.Minute).Unix(),
-			"repository":       "test-org/.fullsend",
+			"repository":       "test-org/my-repo",
 			"repository_owner": "test-org",
 			"job_workflow_ref": workflowRef,
 		}
@@ -1354,7 +2274,7 @@ func TestHandler_STSVerifier_RestrictedWorkflows(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/token",
 		strings.NewReader(`{"role":"coder","repos":["my-repo"]}`))
 	req.Header.Set("Authorization", "Bearer "+buildToken(
-		"test-org/.fullsend/.github/workflows/dispatch.yml@refs/heads/main"))
+		"fullsend-ai/fullsend/.github/workflows/dispatch.yml@refs/heads/main"))
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -1366,7 +2286,7 @@ func TestHandler_STSVerifier_RestrictedWorkflows(t *testing.T) {
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/token",
 		strings.NewReader(`{"role":"coder","repos":["my-repo"]}`))
 	req2.Header.Set("Authorization", "Bearer "+buildToken(
-		"test-org/.fullsend/.github/workflows/evil.yml@refs/heads/main"))
+		"fullsend-ai/fullsend/.github/workflows/evil.yml@refs/heads/main"))
 	h.ServeHTTP(rec2, req2)
 
 	if rec2.Code != http.StatusUnauthorized {
@@ -1375,9 +2295,8 @@ func TestHandler_STSVerifier_RestrictedWorkflows(t *testing.T) {
 }
 
 func TestHandler_CrossOrgInstallation_SameOrgPasses(t *testing.T) {
-	t.Setenv("ALLOWED_ORGS", "org-a,org-b")
+	t.Setenv("PER_REPO_WIF_REPOS", "org-a/seshi")
 	t.Setenv("GCP_PROJECT_NUMBER", "123456")
-	t.Setenv("OIDC_AUDIENCE", "fullsend-mint")
 	t.Setenv("ROLE_APP_IDS", `{"retro":"999"}`)
 	t.Setenv("ALLOWED_WORKFLOW_FILES", "*")
 
@@ -1390,9 +2309,9 @@ func TestHandler_CrossOrgInstallation_SameOrgPasses(t *testing.T) {
 		pems: map[string][]byte{"retro": pemData},
 	})
 	token := env.signToken(t, map[string]interface{}{
-		"repository":       "org-a/.fullsend",
+		"repository":       "org-a/seshi",
 		"repository_owner": "org-a",
-		"job_workflow_ref": "org-a/.fullsend/.github/workflows/retro.yml@refs/heads/main",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/retro.yml@refs/heads/main",
 	})
 
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1458,7 +2377,6 @@ func TestHandler_ErrorMessageLeak(t *testing.T) {
 
 func TestHandler_RestrictedWorkflowFiles(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
-	t.Setenv("ALLOWED_ORGS", "test-org")
 	t.Setenv("ALLOWED_WORKFLOW_FILES", "dispatch.yml")
 
 	pemData, err := generateTestRSAKey()
@@ -1496,13 +2414,14 @@ func TestHandler_RestrictedWorkflowFiles(t *testing.T) {
 	server = httptest.NewServer(mux)
 	defer server.Close()
 
-	verifier := NewJWKSVerifier(JWKSVerifierConfig{
-		IssuerURL:            server.URL,
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		AllowedOrgs:          []string{os.Getenv("ALLOWED_ORGS")},
-		AllowedWorkflowFiles: []string{"dispatch.yml"},
+	verifier, vErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: server.URL,
 	})
+	if vErr != nil {
+		t.Fatalf("NewJWKSVerifier: %v", vErr)
+	}
 	h := mustNewHandler(t, pemAccessor, verifier)
+	h.allowedWorkflowFiles = []string{"dispatch.yml"}
 
 	signToken := func(workflowRef string) string {
 		now := time.Now()
@@ -1512,7 +2431,7 @@ func TestHandler_RestrictedWorkflowFiles(t *testing.T) {
 			"aud":              "fullsend-mint",
 			"iat":              now.Unix(),
 			"exp":              now.Add(10 * time.Minute).Unix(),
-			"repository":       "test-org/.fullsend",
+			"repository":       "test-org/test-repo",
 			"repository_owner": "test-org",
 			"job_workflow_ref": workflowRef,
 		}
@@ -1526,7 +2445,7 @@ func TestHandler_RestrictedWorkflowFiles(t *testing.T) {
 	}
 
 	// Allowed workflow should succeed at OIDC level (will fail at GitHub API since no mock)
-	allowedToken := signToken("test-org/.fullsend/.github/workflows/dispatch.yml@refs/heads/main")
+	allowedToken := signToken("fullsend-ai/fullsend/.github/workflows/dispatch.yml@refs/heads/main")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
 	req.Header.Set("Authorization", "Bearer "+allowedToken)
@@ -1537,7 +2456,7 @@ func TestHandler_RestrictedWorkflowFiles(t *testing.T) {
 	}
 
 	// Disallowed workflow should be rejected
-	disallowedToken := signToken("test-org/.fullsend/.github/workflows/evil.yml@refs/heads/main")
+	disallowedToken := signToken("fullsend-ai/fullsend/.github/workflows/evil.yml@refs/heads/main")
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
 	req2.Header.Set("Authorization", "Bearer "+disallowedToken)
@@ -1549,7 +2468,7 @@ func TestHandler_RestrictedWorkflowFiles(t *testing.T) {
 
 func TestHandler_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
-	t.Setenv("ALLOWED_ORGS", "test-org")
+	// This test exercises per-repo workflow host validation.
 	t.Setenv("PER_REPO_WIF_REPOS", "test-org/custom-repo")
 
 	pemData, err := generateTestRSAKey()
@@ -1561,17 +2480,20 @@ func TestHandler_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 		pems: map[string][]byte{"coder": pemData},
 	})
 
-	env.handler.oidcVerifier = NewJWKSVerifier(JWKSVerifierConfig{
-		IssuerURL:            env.issuerURL,
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		AllowedOrgs:          testAllowedOrgs(),
-		AllowedWorkflowFiles: []string{"ci.yml", "dispatch.yml"},
-		PerRepoWIFRepos:      map[string]bool{"test-org/custom-repo": true},
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
 	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"ci.yml", "dispatch.yml"}
+	env.handler.perRepoWIFRepos = map[string]bool{"test-org/custom-repo": true}
+	env.handler.workflowHostRepos = map[string]bool{"test-org/custom-repo": true}
 
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/repos/test-org/test-repo/installation":
+		case r.URL.Path == "/repos/test-org/custom-repo/installation":
 			json.NewEncoder(w).Encode(installationResponse{
 				ID: 55555, Account: struct {
 					Login string `json:"login"`
@@ -1597,7 +2519,7 @@ func TestHandler_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 		"job_workflow_ref": "test-org/custom-repo/.github/workflows/ci.yml@refs/heads/main",
 	})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["custom-repo"]}`))
 	req.Header.Set("Authorization", "Bearer "+allowedToken)
 	env.handler.ServeHTTP(rec, req)
 
@@ -1617,7 +2539,7 @@ func TestHandler_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 		"job_workflow_ref": "test-org/custom-repo/.github/workflows/evil.yml@refs/heads/main",
 	})
 	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["custom-repo"]}`))
 	req2.Header.Set("Authorization", "Bearer "+disallowedToken)
 	env.handler.ServeHTTP(rec2, req2)
 
@@ -1628,7 +2550,7 @@ func TestHandler_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 
 func TestHandler_UpstreamWorkflowRef(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
-	t.Setenv("ALLOWED_ORGS", "test-org")
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/some-repo")
 
 	pemData, err := generateTestRSAKey()
 	if err != nil {
@@ -1639,16 +2561,18 @@ func TestHandler_UpstreamWorkflowRef(t *testing.T) {
 		pems: map[string][]byte{"coder": pemData},
 	})
 
-	env.handler.oidcVerifier = NewJWKSVerifier(JWKSVerifierConfig{
-		IssuerURL:            env.issuerURL,
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		AllowedOrgs:          testAllowedOrgs(),
-		AllowedWorkflowFiles: []string{"dispatch.yml"},
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
 	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"dispatch.yml"}
 
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/repos/test-org/test-repo/installation":
+		case r.URL.Path == "/repos/test-org/some-repo/installation":
 			json.NewEncoder(w).Encode(installationResponse{
 				ID: 55555, Account: struct {
 					Login string `json:"login"`
@@ -1674,7 +2598,7 @@ func TestHandler_UpstreamWorkflowRef(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/token",
-		strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+		strings.NewReader(`{"role":"coder","repos":["some-repo"]}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	env.handler.ServeHTTP(rec, req)
 
@@ -1683,19 +2607,148 @@ func TestHandler_UpstreamWorkflowRef(t *testing.T) {
 	}
 }
 
-func TestHandler_PerRepoCrossRepoRef(t *testing.T) {
+func TestHandler_PublicMintMode(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
-	t.Setenv("ALLOWED_ORGS", "test-org")
+	// Public mode is now * in PER_REPO_WIF_REPOS.
+	// Public mode uses the same per-repo path with workflowHostRepos
+	// and basename allowlist (ADR 0082 §2 revised 2026-08-05).
+	t.Setenv("PER_REPO_WIF_REPOS", "*")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
+	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"dispatch.yml"}
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/other-org/some-repo/installation":
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 66666, Account: struct {
+					Login string `json:"login"`
+				}{Login: "other-org"},
+			})
+		case strings.HasPrefix(r.URL.Path, "/app/installations/66666/access_tokens"):
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_public_mint_token",
+				ExpiresAt: "2026-06-02T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	// Use dispatch.yml which is in the allowed workflow files list;
+	// public mode now enforces the basename allowlist.
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "other-org/some-repo",
+		"repository_owner": "other-org",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/dispatch.yml@refs/tags/v1.0.0",
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token",
+		strings.NewReader(`{"role":"coder","repos":["some-repo"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for public mint upstream workflow, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_PublicMintRejectsLegacyFullsendRef(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "*")
 
 	env := newTestOIDCEnv(t, &fakePEMAccessor{})
 
-	env.handler.oidcVerifier = NewJWKSVerifier(JWKSVerifierConfig{
-		IssuerURL:            env.issuerURL,
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		AllowedOrgs:          testAllowedOrgs(),
-		AllowedWorkflowFiles: []string{"dispatch.yml"},
-		PerRepoWIFRepos:      map[string]bool{"test-org/repo-a": true},
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
 	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"*"}
+
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "other-org/.fullsend",
+		"repository_owner": "other-org",
+		"job_workflow_ref": "other-org/.fullsend/.github/workflows/dispatch.yml@refs/heads/main",
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token",
+		strings.NewReader(`{"role":"coder","repos":["some-repo"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for legacy .fullsend ref in public mode, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_PublicMintRejectsPerRepoSelfWorkflow(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "*")
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{})
+
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
+	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"*"}
+
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "other-org/some-repo",
+		"repository_owner": "other-org",
+		"job_workflow_ref": "other-org/some-repo/.github/workflows/dispatch.yml@refs/heads/main",
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token",
+		strings.NewReader(`{"role":"coder","repos":["some-repo"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for per-repo self-workflow in public mode, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_PerRepoCrossRepoRef(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{})
+
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
+	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"dispatch.yml"}
+	// Both repos are enrolled, but neither is a workflow host repo, so
+	// repo-b may not run a workflow hosted in repo-a.
+	env.handler.perRepoWIFRepos = map[string]bool{"test-org/repo-a": true, "test-org/repo-b": true}
 
 	token := env.signToken(t, map[string]interface{}{
 		"repository":       "test-org/repo-b",
@@ -1715,21 +2768,22 @@ func TestHandler_PerRepoCrossRepoRef(t *testing.T) {
 
 func TestHandler_NonWorkflowPath(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
-	t.Setenv("ALLOWED_ORGS", "test-org")
 
 	env := newTestOIDCEnv(t, &fakePEMAccessor{})
 
-	env.handler.oidcVerifier = NewJWKSVerifier(JWKSVerifierConfig{
-		IssuerURL:            env.issuerURL,
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		AllowedOrgs:          testAllowedOrgs(),
-		AllowedWorkflowFiles: []string{"*"},
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
 	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"*"}
 
+	// Caller is enrolled (default test-org/test-repo) and the host is the
+	// trusted upstream repo, but the path is not under .github/workflows/.
 	token := env.signToken(t, map[string]interface{}{
-		"repository":       "test-org/.fullsend",
-		"repository_owner": "test-org",
-		"job_workflow_ref": "test-org/.fullsend/scripts/run.sh@refs/heads/main",
+		"job_workflow_ref": "fullsend-ai/fullsend/scripts/run.sh@refs/heads/main",
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/token",
@@ -1744,17 +2798,18 @@ func TestHandler_NonWorkflowPath(t *testing.T) {
 
 func TestHandler_PerRepoUnregistered(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
-	t.Setenv("ALLOWED_ORGS", "test-org")
 
 	env := newTestOIDCEnv(t, &fakePEMAccessor{})
 
-	env.handler.oidcVerifier = NewJWKSVerifier(JWKSVerifierConfig{
-		IssuerURL:            env.issuerURL,
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		AllowedOrgs:          testAllowedOrgs(),
-		AllowedWorkflowFiles: []string{"dispatch.yml"},
-		PerRepoWIFRepos:      map[string]bool{"test-org/registered-repo": true},
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
 	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"dispatch.yml"}
+	env.handler.perRepoWIFRepos = map[string]bool{"test-org/registered-repo": true}
 
 	token := env.signToken(t, map[string]interface{}{
 		"repository":       "test-org/unregistered-repo",
@@ -1774,7 +2829,6 @@ func TestHandler_PerRepoUnregistered(t *testing.T) {
 
 func TestHandler_PerRepoMixedCase(t *testing.T) {
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
-	t.Setenv("ALLOWED_ORGS", "test-org")
 
 	pemData, err := generateTestRSAKey()
 	if err != nil {
@@ -1785,17 +2839,20 @@ func TestHandler_PerRepoMixedCase(t *testing.T) {
 		pems: map[string][]byte{"coder": pemData},
 	})
 
-	env.handler.oidcVerifier = NewJWKSVerifier(JWKSVerifierConfig{
-		IssuerURL:            env.issuerURL,
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		AllowedOrgs:          testAllowedOrgs(),
-		AllowedWorkflowFiles: []string{"ci.yml"},
-		PerRepoWIFRepos:      map[string]bool{"test-org/my-repo": true},
+	freshVerifier, fvErr := NewJWKSVerifier(JWKSVerifierConfig{
+		IssuerURL: env.issuerURL,
 	})
+	if fvErr != nil {
+		t.Fatalf("creating JWKS verifier: %v", fvErr)
+	}
+	env.handler.oidcVerifier = freshVerifier
+	env.handler.allowedWorkflowFiles = []string{"ci.yml"}
+	env.handler.perRepoWIFRepos = map[string]bool{"test-org/my-repo": true}
+	env.handler.workflowHostRepos = map[string]bool{"test-org/my-repo": true}
 
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/repos/test-org/test-repo/installation":
+		case r.URL.Path == "/repos/test-org/My-Repo/installation":
 			json.NewEncoder(w).Encode(installationResponse{
 				ID: 55555, Account: struct {
 					Login string `json:"login"`
@@ -1821,7 +2878,7 @@ func TestHandler_PerRepoMixedCase(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/token",
-		strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+		strings.NewReader(`{"role":"coder","repos":["My-Repo"]}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	env.handler.ServeHTTP(rec, req)
 
@@ -1831,9 +2888,7 @@ func TestHandler_PerRepoMixedCase(t *testing.T) {
 }
 
 func TestHandler_STSVerifier_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
-	t.Setenv("ALLOWED_ORGS", "test-org")
 	t.Setenv("ALLOWED_ROLES", "coder")
-	t.Setenv("OIDC_AUDIENCE", "fullsend-mint")
 	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
 
 	pemData, err := generateTestRSAKey()
@@ -1854,20 +2909,22 @@ func TestHandler_STSVerifier_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 	}))
 	defer stsServer.Close()
 
-	verifier := NewSTSVerifier(STSVerifierConfig{
-		HTTPClient:         stsServer.Client(),
+	verifier3, vErr3 := NewSTSVerifier(STSVerifierConfig{
 		STSURL:             stsServer.URL,
 		GCPProjectNum:      "123456",
 		WIFPoolName:        "fullsend-pool",
 		DefaultWIFProvider: "github-oidc",
-		AllowedOrgs:        []string{"test-org"},
-		AllowedWorkflows:   []string{"ci.yml", "dispatch.yml"},
-		OIDCAudience:       "fullsend-mint",
 		PerRepoWIFRepos:    map[string]bool{"test-org/custom-repo": true},
 	})
+	if vErr3 != nil {
+		t.Fatalf("NewSTSVerifier: %v", vErr3)
+	}
 	h := mustNewHandler(t, &fakePEMAccessor{
 		pems: map[string][]byte{"coder": pemData},
-	}, verifier)
+	}, verifier3)
+	h.allowedWorkflowFiles = []string{"ci.yml", "dispatch.yml"}
+	h.perRepoWIFRepos = map[string]bool{"test-org/custom-repo": true}
+	h.workflowHostRepos = map[string]bool{"test-org/custom-repo": true}
 
 	buildToken := func(repo, workflowRef string) string {
 		now := time.Now()
@@ -1889,7 +2946,7 @@ func TestHandler_STSVerifier_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 
 	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/repos/test-org/test-repo/installation":
+		case r.URL.Path == "/repos/test-org/custom-repo/installation":
 			json.NewEncoder(w).Encode(installationResponse{
 				ID: 55555, Account: struct {
 					Login string `json:"login"`
@@ -1911,7 +2968,7 @@ func TestHandler_STSVerifier_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 	// Allowed per-repo workflow via STSVerifier
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/token",
-		strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+		strings.NewReader(`{"role":"coder","repos":["custom-repo"]}`))
 	req.Header.Set("Authorization", "Bearer "+buildToken(
 		"test-org/custom-repo",
 		"test-org/custom-repo/.github/workflows/ci.yml@refs/heads/main"))
@@ -1929,7 +2986,7 @@ func TestHandler_STSVerifier_PerRepoWIF_RestrictedWorkflows(t *testing.T) {
 	// Disallowed per-repo workflow via STSVerifier
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/token",
-		strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+		strings.NewReader(`{"role":"coder","repos":["custom-repo"]}`))
 	req2.Header.Set("Authorization", "Bearer "+buildToken(
 		"test-org/custom-repo",
 		"test-org/custom-repo/.github/workflows/evil.yml@refs/heads/main"))
@@ -2001,4 +3058,1411 @@ func TestHandler_LogsRequestedPermissionNotGranted(t *testing.T) {
 			t.Errorf("expected log to contain %q, got:\n%s", expected, logs)
 		}
 	}
+}
+
+func TestHandler_RequiredPermissionFailureReturns422BeforeTokenPost(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	var tokenCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 99,
+				Permissions: map[string]string{
+					"contents": "write",
+					"metadata": "read",
+				},
+				Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/app/installations/99/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			t.Errorf("token POST should not happen when required permissions are missing")
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if tokenCalls != 0 {
+		t.Fatalf("expected no token POSTs, got %d", tokenCalls)
+	}
+	if !strings.Contains(rec.Body.String(), "issues:write") {
+		t.Fatalf("response should contain missing issues:write: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "installation_id=99") {
+		t.Fatalf("response should contain installation guidance: %s", rec.Body.String())
+	}
+}
+
+func TestHandler_OptionalPermissionDroppedBeforeTokenPost(t *testing.T) {
+	// The installation has every coder permission except the optional
+	// packages:read. The token POST must still happen, with packages omitted
+	// from the requested permissions rather than the request failing.
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	var tokenCalls int
+	var capturedTokenReq map[string]interface{}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 99,
+				Permissions: map[string]string{
+					"contents":      "write",
+					"issues":        "write",
+					"pull_requests": "write",
+					"checks":        "read",
+					"metadata":      "read",
+					// packages:read is pending installation approval.
+				},
+				Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/app/installations/99/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			reqBody, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				t.Errorf("reading token request body: %v", readErr)
+			}
+			if unmarshalErr := json.Unmarshal(reqBody, &capturedTokenReq); unmarshalErr != nil {
+				t.Errorf("decoding token request body: %v", unmarshalErr)
+			}
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_test_token",
+				ExpiresAt: "2026-05-06T12:00:00Z",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(`{"role":"coder","repos":["test-repo"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if tokenCalls != 1 {
+		t.Fatalf("expected exactly 1 token POST, got %d", tokenCalls)
+	}
+
+	perms, ok := capturedTokenReq["permissions"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected permissions in token request: %v", capturedTokenReq)
+	}
+	if _, hasPackages := perms["packages"]; hasPackages {
+		t.Fatalf("packages should have been dropped from the token POST: %v", perms)
+	}
+	if perms["contents"] != "write" {
+		t.Fatalf("expected contents:write in the token POST, got %v", perms["contents"])
+	}
+	if len(perms) != 5 {
+		t.Fatalf("expected exactly 5 permissions after dropping packages, got %d: %v", len(perms), perms)
+	}
+}
+
+func TestHandler_SameOrgExplicitTargetOrg(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"coder": pemData}})
+	token := env.signToken(t, nil)
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 12345, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasPrefix(r.URL.Path, "/app/installations/12345/access_tokens") && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_test_token",
+				ExpiresAt: "2026-05-06T12:00:00Z",
+				Permissions: map[string]string{
+					"contents": "write", "pull_requests": "write", "issues": "write",
+					"checks": "read", "metadata": "read",
+				},
+				Repositories:        []installationTokenRepository{{FullName: "test-org/test-repo"}},
+				RepositorySelection: "selected",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","target_org":"test-org","repos":["test-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_CrossOrgFullFlow(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"e2e": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/e2e.yml@refs/heads/main",
+	})
+
+	var tokenCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/orgs/pool-org/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 999, Account: struct {
+					Login string `json:"login"`
+				}{Login: "pool-org"},
+			})
+		case r.URL.Path == "/app/installations/999/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			w.WriteHeader(http.StatusCreated)
+			if tokenCalls == 1 {
+				json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_policy_token"})
+				return
+			}
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:               "ghs_e2e_token",
+				ExpiresAt:           "2026-05-06T12:00:00Z",
+				Permissions:         map[string]string{"contents": "write", "metadata": "read"},
+				RepositorySelection: "all",
+			})
+		case r.URL.Path == "/orgs/pool-org/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_E2E_REPOS",
+				Value: "fullsend-ai/fullsend",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"e2e","target_org":"pool-org","repos":["*"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp mintResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Token != "ghs_e2e_token" {
+		t.Fatalf("expected e2e token, got %q", resp.Token)
+	}
+}
+
+func TestHandler_CrossOrgNonEmptyReposDenied(t *testing.T) {
+	// Cross-org with specific repos is now allowed by validateReposScope
+	// (repo-level FOREIGN grants), but still denied if neither org-level
+	// nor repo-level FOREIGN variables authorize the caller.
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"e2e": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/e2e.yml@refs/heads/main",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/orgs/pool-org/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 999, Account: struct {
+					Login string `json:"login"`
+				}{Login: "pool-org"},
+			})
+		case r.URL.Path == "/app/installations/999/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_policy_token"})
+		case r.URL.Path == "/orgs/pool-org/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			// Org-level variable does not authorize this caller.
+			w.WriteHeader(http.StatusNotFound)
+		case r.URL.Path == "/repos/pool-org/e2e-lock/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 998, Account: struct {
+					Login string `json:"login"`
+				}{Login: "pool-org"},
+			})
+		case r.URL.Path == "/app/installations/998/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_repo_policy"})
+		case r.URL.Path == "/repos/pool-org/e2e-lock/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			// Repo-level variable not set either.
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"e2e","target_org":"pool-org","repos":["e2e-lock"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_ForeignAllowlistCached(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"e2e": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/e2e.yml@refs/heads/main",
+	})
+
+	var foreignReads int
+	var tokenCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/orgs/pool-org/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 999, Account: struct {
+					Login string `json:"login"`
+				}{Login: "pool-org"},
+			})
+		case r.URL.Path == "/app/installations/999/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			w.WriteHeader(http.StatusCreated)
+			if tokenCalls%2 == 1 {
+				json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_policy_token"})
+				return
+			}
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_e2e_token",
+				ExpiresAt: "2026-05-06T12:00:00Z",
+			})
+		case r.URL.Path == "/orgs/pool-org/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			foreignReads++
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_E2E_REPOS",
+				Value: "fullsend-ai/fullsend",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"e2e","target_org":"pool-org","repos":["*"]}`
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		env.handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d: %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	if foreignReads != 1 {
+		t.Fatalf("expected 1 FOREIGN variable read (cached), got %d", foreignReads)
+	}
+}
+
+func TestHandler_ForeignAllowlistConcurrent(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"e2e": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/e2e.yml@refs/heads/main",
+	})
+
+	var foreignReads int
+	var tokenCalls int
+	var mu sync.Mutex
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/orgs/pool-org/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 999, Account: struct {
+					Login string `json:"login"`
+				}{Login: "pool-org"},
+			})
+		case r.URL.Path == "/app/installations/999/access_tokens" && r.Method == http.MethodPost:
+			mu.Lock()
+			tokenCalls++
+			call := tokenCalls
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			if call%2 == 1 {
+				json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_policy_token"})
+				return
+			}
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_e2e_token",
+				ExpiresAt: "2026-05-06T12:00:00Z",
+			})
+		case r.URL.Path == "/orgs/pool-org/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			mu.Lock()
+			foreignReads++
+			mu.Unlock()
+			time.Sleep(50 * time.Millisecond)
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_E2E_REPOS",
+				Value: "fullsend-ai/fullsend",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"e2e","target_org":"pool-org","repos":["*"]}`
+	const workers = 8
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			env.handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Errorf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+
+	if foreignReads != 1 {
+		t.Fatalf("expected 1 concurrent FOREIGN variable read, got %d", foreignReads)
+	}
+}
+
+func TestHandler_CrossOrgForeignVariableMissing(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"e2e": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/e2e.yml@refs/heads/main",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/orgs/pool-org/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 999, Account: struct {
+					Login string `json:"login"`
+				}{Login: "pool-org"},
+			})
+		case r.URL.Path == "/app/installations/999/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_policy_token"})
+		case r.URL.Path == "/orgs/pool-org/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"e2e","target_org":"pool-org","repos":["*"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_CrossOrgForeignDenied(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "evil-org/evil-repo")
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"e2e": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "evil-org/evil-repo",
+		"repository_owner": "evil-org",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/orgs/pool-org/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{ID: 999, Account: struct {
+				Login string `json:"login"`
+			}{Login: "pool-org"}})
+		case r.URL.Path == "/app/installations/999/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_policy_token"})
+		case r.URL.Path == "/orgs/pool-org/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_E2E_REPOS",
+				Value: "fullsend-ai/fullsend",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"e2e","target_org":"pool-org","repos":["*"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// --- Repo-level foreign allow-list tests (ADR 0083) ---
+
+func TestHandler_RepoLevelForeignGrant_CrossOrg(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"coder":"400"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"coder": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
+	})
+
+	var tokenCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// Repo-level foreign: variable set → authorized.
+		// Org-level endpoints are NOT called for repo-scoped requests.
+		case r.URL.Path == "/repos/target-org/target-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 801, Account: struct {
+					Login string `json:"login"`
+				}{Login: "target-org"},
+			})
+		case r.URL.Path == "/app/installations/801/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			w.WriteHeader(http.StatusCreated)
+			if tokenCalls <= 1 {
+				// Policy token for reading repo variable.
+				json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_repo_policy"})
+			} else {
+				// Mint token for the actual scoped access.
+				json.NewEncoder(w).Encode(installationTokenResponse{
+					Token:               "ghs_coder_token",
+					ExpiresAt:           "2026-08-06T12:00:00Z",
+					Permissions:         map[string]string{"contents": "write"},
+					RepositorySelection: "selected",
+					Repositories: []installationTokenRepository{
+						{FullName: "target-org/target-repo"},
+					},
+				})
+			}
+		case r.URL.Path == "/repos/target-org/target-repo/actions/variables/FULLSEND_FOREIGN_CODER_REPOS" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_CODER_REPOS",
+				Value: "fullsend-ai/fullsend",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","target_org":"target-org","repos":["target-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp mintResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Token != "ghs_coder_token" {
+		t.Fatalf("expected coder token, got %q", resp.Token)
+	}
+}
+
+func TestHandler_RepoLevelForeignGrant_Denied(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "evil-org/evil-repo")
+	t.Setenv("ROLE_APP_IDS", `{"coder":"400"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"coder": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "evil-org/evil-repo",
+		"repository_owner": "evil-org",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// Repo-level foreign: variable authorizes fullsend-ai/fullsend, not evil-org.
+		// Org-level endpoints are NOT called for repo-scoped requests.
+		case r.URL.Path == "/repos/target-org/target-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 801, Account: struct {
+					Login string `json:"login"`
+				}{Login: "target-org"},
+			})
+		case r.URL.Path == "/app/installations/801/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_repo_policy"})
+		case r.URL.Path == "/repos/target-org/target-repo/actions/variables/FULLSEND_FOREIGN_CODER_REPOS" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_CODER_REPOS",
+				Value: "fullsend-ai/fullsend",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","target_org":"target-org","repos":["target-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_RepoLevelForeignGrant_OrgLevelForInstallationWide(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"e2e":"300"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"e2e": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/e2e.yml@refs/heads/main",
+	})
+
+	var tokenCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/orgs/pool-org/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 999, Account: struct {
+					Login string `json:"login"`
+				}{Login: "pool-org"},
+			})
+		case r.URL.Path == "/app/installations/999/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			w.WriteHeader(http.StatusCreated)
+			if tokenCalls == 1 {
+				json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_policy_token"})
+				return
+			}
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:               "ghs_e2e_token",
+				ExpiresAt:           "2026-08-06T12:00:00Z",
+				Permissions:         map[string]string{"contents": "write"},
+				RepositorySelection: "all",
+			})
+		case r.URL.Path == "/orgs/pool-org/actions/variables/FULLSEND_FOREIGN_E2E_REPOS" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_E2E_REPOS",
+				Value: "fullsend-ai/fullsend",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"e2e","target_org":"pool-org","repos":["*"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_IntraOrgRepoForeignGrant(t *testing.T) {
+	// Caller is per-repo enrolled and requests a different same-org repo
+	// that grants it access via a repo-level FOREIGN variable.
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/caller-repo")
+	t.Setenv("ROLE_APP_IDS", `{"coder":"400"}`)
+	t.Setenv("WORKFLOW_HOST_REPOS", "test-org/caller-repo")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"coder": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "test-org/caller-repo",
+		"repository_owner": "test-org",
+		"job_workflow_ref": "test-org/caller-repo/.github/workflows/code.yml@refs/heads/main",
+	})
+
+	var tokenCalls int
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/target-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 900, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/app/installations/900/access_tokens" && r.Method == http.MethodPost:
+			tokenCalls++
+			w.WriteHeader(http.StatusCreated)
+			if tokenCalls == 1 {
+				json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_repo_policy"})
+			} else {
+				json.NewEncoder(w).Encode(installationTokenResponse{
+					Token:               "ghs_coder_token",
+					ExpiresAt:           "2026-08-06T12:00:00Z",
+					Permissions:         map[string]string{"contents": "write"},
+					RepositorySelection: "selected",
+					Repositories: []installationTokenRepository{
+						{FullName: "test-org/target-repo"},
+					},
+				})
+			}
+		case r.URL.Path == "/repos/test-org/target-repo/actions/variables/FULLSEND_FOREIGN_CODER_REPOS" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_CODER_REPOS",
+				Value: "test-org/caller-repo",
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","repos":["target-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp mintResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Token != "ghs_coder_token" {
+		t.Fatalf("expected coder token, got %q", resp.Token)
+	}
+}
+
+func TestHandler_IntraOrgRepoForeignGrant_PartialDenied(t *testing.T) {
+	// Per-repo caller requests two intra-org repos, but only one has a
+	// repo-level FOREIGN grant. All-or-nothing semantics should deny.
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/caller-repo")
+	t.Setenv("ROLE_APP_IDS", `{"coder":"400"}`)
+	t.Setenv("WORKFLOW_HOST_REPOS", "test-org/caller-repo")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"coder": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "test-org/caller-repo",
+		"repository_owner": "test-org",
+		"job_workflow_ref": "test-org/caller-repo/.github/workflows/code.yml@refs/heads/main",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// authorized-repo: has FOREIGN grant for the caller.
+		case r.URL.Path == "/repos/test-org/authorized-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 900, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/app/installations/900/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_auth_policy"})
+		case r.URL.Path == "/repos/test-org/authorized-repo/actions/variables/FULLSEND_FOREIGN_CODER_REPOS" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(variableResponse{
+				Name:  "FULLSEND_FOREIGN_CODER_REPOS",
+				Value: "test-org/caller-repo",
+			})
+		// unauthorized-repo: no FOREIGN grant.
+		case r.URL.Path == "/repos/test-org/unauthorized-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 901, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case r.URL.Path == "/app/installations/901/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_unauth_policy"})
+		case r.URL.Path == "/repos/test-org/unauthorized-repo/actions/variables/FULLSEND_FOREIGN_CODER_REPOS" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","repos":["authorized-repo","unauthorized-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for partial intra-org grant, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_RepoLevelForeignGrant_ScopeRestriction(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"coder":"400"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"coder": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// Org-level endpoints are NOT called for repo-scoped requests.
+		case r.URL.Path == "/repos/target-org/other-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 802, Account: struct {
+					Login string `json:"login"`
+				}{Login: "target-org"},
+			})
+		case r.URL.Path == "/app/installations/802/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_other_policy"})
+		case r.URL.Path == "/repos/target-org/other-repo/actions/variables/FULLSEND_FOREIGN_CODER_REPOS" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","target_org":"target-org","repos":["other-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandler_OrgLevelForeignDoesNotAuthorizeRepoScoped verifies the disjoint
+// authorization boundary from ADR 0083: an org-level FOREIGN grant does NOT
+// authorize cross-org requests with specific repos when no repo-level grant
+// exists on the target repo.
+func TestHandler_OrgLevelForeignDoesNotAuthorizeRepoScoped(t *testing.T) {
+	t.Setenv("PER_REPO_WIF_REPOS", "fullsend-ai/fullsend")
+	t.Setenv("ROLE_APP_IDS", `{"coder":"400"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"coder": pemData}})
+	token := env.signToken(t, map[string]interface{}{
+		"repository":       "fullsend-ai/fullsend",
+		"repository_owner": "fullsend-ai",
+		"job_workflow_ref": "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
+	})
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// Repo-level lookup for target-repo: no FOREIGN variable set.
+		case r.URL.Path == "/repos/target-org/target-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 801, Account: struct {
+					Login string `json:"login"`
+				}{Login: "target-org"},
+			})
+		case r.URL.Path == "/app/installations/801/access_tokens" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{Token: "ghs_repo_policy"})
+		case r.URL.Path == "/repos/target-org/target-repo/actions/variables/FULLSEND_FOREIGN_CODER_REPOS" && r.Method == http.MethodGet:
+			// No repo-level variable — 404.
+			w.WriteHeader(http.StatusNotFound)
+		// Org-level endpoints should NOT be called for repo-scoped requests.
+		case r.URL.Path == "/orgs/target-org/installation":
+			t.Errorf("org-level installation lookup should not be called for repo-scoped request")
+			w.WriteHeader(http.StatusNotFound)
+		case strings.HasPrefix(r.URL.Path, "/orgs/target-org/actions/variables/"):
+			t.Errorf("org-level variable lookup should not be called for repo-scoped request")
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","target_org":"target-org","repos":["target-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (org-level FOREIGN should not authorize repo-scoped request), got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandler_LevelDefault(t *testing.T) {
+	// When level is omitted, the handler defaults to "write" for backward
+	// compatibility — existing HTTP clients that do not send a level field
+	// keep receiving write-level tokens.
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	var capturedPerms map[string]interface{}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body)
+			capturedPerms = body["permissions"].(map[string]interface{})
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_write_default",
+				ExpiresAt: "2026-08-19T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	// No "level" field in the request body.
+	body := `{"role":"coder","repos":["test-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify that write-level permissions were requested (omitted defaults to write).
+	if capturedPerms["contents"] != "write" {
+		t.Fatalf("expected contents=write (write level default), got %v", capturedPerms["contents"])
+	}
+	if capturedPerms["pull_requests"] != "write" {
+		t.Fatalf("expected pull_requests=write (write level default), got %v", capturedPerms["pull_requests"])
+	}
+}
+
+func TestHandler_LevelWrite(t *testing.T) {
+	// Explicit level=write should use the full write-level permissions.
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"coder": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	var capturedPerms map[string]interface{}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body)
+			capturedPerms = body["permissions"].(map[string]interface{})
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_write",
+				ExpiresAt: "2026-08-19T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"coder","level":"write","repos":["test-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify write-level permissions were requested.
+	if capturedPerms["contents"] != "write" {
+		t.Fatalf("expected contents=write (write level), got %v", capturedPerms["contents"])
+	}
+	if capturedPerms["pull_requests"] != "write" {
+		t.Fatalf("expected pull_requests=write (write level), got %v", capturedPerms["pull_requests"])
+	}
+}
+
+func TestHandler_LevelUnknown(t *testing.T) {
+	// Level validation now runs after OIDC auth, so the verifier must
+	// return valid claims for auth to pass before the level check fires.
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{
+		claims: &Claims{
+			RepositoryOwner: "test-org",
+			Repository:      "test-org/test-repo",
+			JobWorkflowRef:  "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
+		},
+	})
+
+	body := `{"role":"coder","level":"admin","repos":["test-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown level, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	json.NewDecoder(rec.Body).Decode(&resp)
+	if !strings.Contains(resp["error"], "has no level") {
+		t.Fatalf("expected 'has no level' error, got: %s", resp["error"])
+	}
+}
+
+func TestHandler_LevelInvalidFormat(t *testing.T) {
+	// Invalid level identifiers (uppercase, too long, starting with digit or
+	// dash) must be rejected with 400 before the role+level lookup runs.
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{
+		claims: &Claims{
+			RepositoryOwner: "test-org",
+			Repository:      "test-org/test-repo",
+			JobWorkflowRef:  "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
+		},
+	})
+
+	cases := []struct {
+		name  string
+		level string
+	}{
+		{"uppercase", "Write"},
+		{"starts-with-digit", "1read"},
+		{"starts-with-dash", "-read"},
+		{"too-long", "abcdefghijklmnopqrstuvwxyz0123456"}, // 33 chars
+		{"contains-space", "re ad"},
+		{"contains-dot", "re.ad"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"role":"coder","level":%q,"repos":["test-repo"]}`, tc.level)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer test-token")
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for level %q, got %d: %s", tc.level, rec.Code, rec.Body.String())
+			}
+			var resp map[string]string
+			json.NewDecoder(rec.Body).Decode(&resp)
+			if !strings.Contains(resp["error"], "invalid level format") {
+				t.Fatalf("expected 'invalid level format' error for level %q, got: %s", tc.level, resp["error"])
+			}
+		})
+	}
+}
+
+func TestHandler_LevelValidCustomName(t *testing.T) {
+	// Extra named levels that match the pattern should pass format
+	// validation and only fail on the role+level lookup (not format check).
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{
+		claims: &Claims{
+			RepositoryOwner: "test-org",
+			Repository:      "test-org/test-repo",
+			JobWorkflowRef:  "fullsend-ai/fullsend/.github/workflows/code.yml@refs/heads/main",
+		},
+	})
+
+	// "deploy-ro" matches the level pattern but coder has no such level.
+	body := `{"role":"coder","level":"deploy-ro","repos":["test-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	json.NewDecoder(rec.Body).Decode(&resp)
+	// Should fail on role+level lookup, not format validation.
+	if !strings.Contains(resp["error"], "has no level") {
+		t.Fatalf("expected 'has no level' error, got: %s", resp["error"])
+	}
+}
+
+func TestHandler_LevelRead_AlreadyReadOnly(t *testing.T) {
+	// For a role like triage (already mostly read), read level should still work.
+	t.Setenv("ROLE_APP_IDS", `{"triage":"100"}`)
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+
+	env := newTestOIDCEnv(t, &fakePEMAccessor{
+		pems: map[string][]byte{"triage": pemData},
+	})
+	token := env.signToken(t, nil)
+
+	var capturedPerms map[string]interface{}
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/test-org/test-repo/installation" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body)
+			capturedPerms = body["permissions"].(map[string]interface{})
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_triage_read",
+				ExpiresAt: "2026-08-19T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	body := `{"role":"triage","level":"read","repos":["test-repo"]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/token", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	env.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Triage read level: issues downgraded from write to read.
+	if capturedPerms["issues"] != "read" {
+		t.Fatalf("expected issues=read (read level), got %v", capturedPerms["issues"])
+	}
+	if capturedPerms["contents"] != "read" {
+		t.Fatalf("expected contents=read, got %v", capturedPerms["contents"])
+	}
+}
+
+func TestNewHandler_CustomRolePermissions_MultiLevel(t *testing.T) {
+	setBindings(t, map[string]string{
+		"ROLE_APP_IDS":            `{"triage":"100","deployer":"400"}`,
+		"CUSTOM_ROLE_PERMISSIONS": `{"deployer":{"levels":{"read":{"contents":"read","metadata":"read"},"write":{"contents":"write","metadata":"read","deployments":"write"}}}}`,
+		"ALLOWED_WORKFLOW_FILES":  "*",
+	})
+	h, err := NewHandler(&fakePEMAccessor{}, &fakeOIDCVerifier{})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	if !h.checkAllowedRole("deployer") {
+		t.Fatal("deployer should be allowed")
+	}
+	if !HasRole("deployer") {
+		t.Fatal("deployer should be registered")
+	}
+
+	readPerms, err := RolePermissionsForLevel("deployer", LevelRead)
+	if err != nil {
+		t.Fatalf("RolePermissionsForLevel read: %v", err)
+	}
+	if readPerms["contents"] != "read" {
+		t.Fatalf("expected read contents=read, got %q", readPerms["contents"])
+	}
+
+	writePerms, err := RolePermissionsForLevel("deployer", LevelWrite)
+	if err != nil {
+		t.Fatalf("RolePermissionsForLevel write: %v", err)
+	}
+	if writePerms["deployments"] != "write" {
+		t.Fatalf("expected write deployments=write, got %q", writePerms["deployments"])
+	}
+
+	t.Cleanup(func() { RegisterCustomRoleLevels(nil) })
+}
+
+// TestHandler_StrictTransportSecurity verifies that every response the
+// handler writes, success or error, carries the documented HSTS value
+// without includeSubDomains or preload.
+func TestHandler_StrictTransportSecurity(t *testing.T) {
+	t.Setenv("ROLE_APP_IDS", `{"coder":"200"}`)
+	t.Setenv("PER_REPO_WIF_REPOS", "test-org/test-repo")
+
+	pemData, err := generateTestRSAKey()
+	if err != nil {
+		t.Fatalf("generating test key: %v", err)
+	}
+	env := newTestOIDCEnv(t, &fakePEMAccessor{pems: map[string][]byte{"coder": pemData}})
+	token := env.signToken(t, nil)
+
+	github := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/installation") && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode(installationResponse{
+				ID: 1, Account: struct {
+					Login string `json:"login"`
+				}{Login: "test-org"},
+			})
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(installationTokenResponse{
+				Token:     "ghs_ok",
+				ExpiresAt: "2026-05-06T12:00:00Z",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer github.Close()
+	env.handler.githubBaseURL = github.URL
+
+	for _, tc := range []struct {
+		name       string
+		method     string
+		path       string
+		auth       string
+		body       string
+		wantStatus int
+	}{
+		{name: "health", method: http.MethodGet, path: "/health", wantStatus: http.StatusOK},
+		{name: "minted token", method: http.MethodPost, path: "/v1/token", auth: "Bearer " + token,
+			body: `{"role":"coder","repos":["test-repo"]}`, wantStatus: http.StatusOK},
+		{name: "wrong method", method: http.MethodGet, path: "/v1/token", wantStatus: http.StatusMethodNotAllowed},
+		{name: "missing authorization", method: http.MethodPost, path: "/v1/token",
+			body: `{"role":"coder","repos":["test-repo"]}`, wantStatus: http.StatusUnauthorized},
+		{name: "invalid token", method: http.MethodPost, path: "/v1/token", auth: "Bearer not-a-jwt",
+			body: `{"role":"coder","repos":["test-repo"]}`, wantStatus: http.StatusUnauthorized},
+		{name: "malformed body", method: http.MethodPost, path: "/v1/token", auth: "Bearer " + token,
+			body: `{`, wantStatus: http.StatusBadRequest},
+		{name: "role not allowed", method: http.MethodPost, path: "/v1/token", auth: "Bearer " + token,
+			body: `{"role":"triage","repos":["test-repo"]}`, wantStatus: http.StatusForbidden},
+		{name: "unknown route", method: http.MethodGet, path: "/nonexistent", wantStatus: http.StatusNotFound},
+		{name: "unauthenticated status", method: http.MethodGet, path: "/v1/status", wantStatus: http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			if tc.auth != "" {
+				req.Header.Set("Authorization", tc.auth)
+			}
+			env.handler.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("%s %s: expected %d, got %d: %s", tc.method, tc.path, tc.wantStatus, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Values("Strict-Transport-Security"); len(got) != 1 || got[0] != "max-age=31536000" {
+				t.Fatalf("%s %s: Strict-Transport-Security = %q, want exactly [max-age=31536000]", tc.method, tc.path, got)
+			}
+		})
+	}
+
+	t.Run("unhealthy health", func(t *testing.T) {
+		t.Setenv("ROLE_APP_IDS", `{"test-org/triage":"100"}`)
+		h := mustNewHandler(t, &fakePEMAccessor{}, &fakeOIDCVerifier{})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503, got %d", rec.Code)
+		}
+		if got := rec.Header().Get("Strict-Transport-Security"); got != "max-age=31536000" {
+			t.Fatalf("Strict-Transport-Security = %q, want max-age=31536000", got)
+		}
+	})
 }

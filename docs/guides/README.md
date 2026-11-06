@@ -4,32 +4,69 @@ Practical how-to documentation for fullsend, organized by audience. For design d
 
 ## Getting started
 
-Guides for onboarding organizations and configuring GitHub — the first thing most users need.
+Guides for onboarding organizations and configuring GitHub or GitLab — the first thing most users need.
 
-- [Getting Inference](getting-started/getting-inference.md)
-- [Configuring GitHub](getting-started/configuring-github.md)
-- [Organization Mode](getting-started/org-mode.md)
+- [Mint enrollment](getting-started/README.md) — Enroll your repo in a token mint before configuring anything else
+- [Getting Inference](getting-started/getting-inference.md) — Provision GCP inference access for your org or repo
+- [Configuring GitHub](getting-started/configuring-github.md) — Install GitHub Apps and run the setup CLI
+- [Configuring GitLab](getting-started/configuring-gitlab.md) — Declare the project in `repos.yaml`, install with `repos install`, runners, polling, and role-credential lifecycle
+- [Repo Management](getting-started/repo-management.md) — Manage many repositories from a declarative `repos.yaml` manifest
+- [Migrating to manifest-driven `repos install`](getting-started/migrating-from-github-setup.md) — Move `github setup` installations and flag-driven `repos install` scripts to `repos.yaml`
+
+## Operations & Advanced Setup
+
+Guides for organization owners and repository administrators who manage fullsend installations.
+
+- [Operations](getting-started/operations.md) — Enrollment, configuration updates, status checks, uninstall, standalone commands, and [private-CA GitLab trust](getting-started/operations.md#private-ca-self-hosted-gitlab)
+- [Advanced setup](infrastructure/advanced-setup.md) — Alternative installation paths, setup flags, custom app sets, and manual WIF configuration
+- [OpenAI Workload Identity](infrastructure/openai-workload-identity.md) — Run GPT models on the pi runtime without a stored OpenAI key: console setup, repository variables, local runs, troubleshooting
 
 ## Infrastructure
 
 Advanced guides for platform operators who deploy and manage the GCP-side infrastructure (token mint, WIF, secrets).
 
-- [Mint service administration](infrastructure/mint-administration.md) — Deploying and managing the token mint Cloud Function
+- [Mint service administration](infrastructure/mint-administration.md) — Deploying and managing the token mint (GCP or Cloudflare)
 - [Standalone mint](infrastructure/standalone-mint.md) — Running the token mint as a standalone HTTP server without GCP
 - [Infrastructure reference](infrastructure/infrastructure-reference.md) — Token mint, WIF, and secrets deployment details
 - [Enabling fullsend on private repositories](infrastructure/private-repositories.md) — Additional guardrails and configuration for private repos
-- [Distributed tracing](infrastructure/distributed-tracing.md) — Configuring OpenTelemetry instrumentation and OTLP backends
+- [Gate binaries](infrastructure/gate-binaries.md) — Building statically linked binaries for custom endpoint access constraints beyond L4/L7 rules
+- [Tracing reference](infrastructure/distributed-tracing.md) — Telemetry levels, environment variables, span hierarchy, and attributes
+- [Eval measurements](infrastructure/eval-measurements.md) — Online trace scoring with `eval-measurements.jsonl` and measurement manifests
+- [Inference gateway operator guide](infrastructure/inference-gateway-operator.md) — Run an agentgateway inference gateway on Cloud Run that trusts GitHub Actions OIDC, for `gateway/` models on pi, codex and Claude Code
 
 ## User guides
 
 Guides for developers working in repositories where fullsend is active.
 
+- [Adopting fullsend incrementally](user/adoption.md) — Crawl, walk, run, fly: incremental adoption path from first agents to auto-merge
+- [How fullsend authenticates](user/how-fullsend-authenticates.md) — Which credential path fullsend uses in each case: the mint, GCP and OpenAI Workload Identity, and the gateway's direct OIDC trust
+- [Using an inference gateway](user/inference-gateway.md) — Reach models through an OpenAI/Anthropic-compatible gateway with direct OIDC trust (no token exchange) or a gateway key
 - [Bugfix workflow](user/bugfix-workflow.md) — End-to-end guide to how fullsend handles a bug report from issue to merge
+- [Issue commands](user/issues-commands.md) — Read, create, and post comments on issues across GitHub, GitLab, and Jira (`fullsend issues get`, `create`, `post-comment`)
+- [OWNERS file authorization](user/owners-file-authorization.md) — Authorize agent dispatch via Prow-style OWNERS files
 - [Running agents locally](user/running-agents-locally.md) — Run fullsend agents on your machine using released binaries (macOS + Linux)
-- [Customizing agents](user/customizing-agents.md) — Harness configurations and layered content resolution for your org and repos
-- [Customizing with AGENTS.md](user/customizing-with-agents-md.md) — Guide agents using your repo's AGENTS.md file
-- [Customizing with skills](user/customizing-with-skills.md) — Extend or replace built-in agent skills with custom skill documents
-- [Building custom agents](user/building-custom-agents.md) — Create a new agent from scratch on a per-repo fullsend installation
+
+### Customizing agents
+
+Start with the [overview](user/customizing-overview.md) to pick the right approach, then follow the relevant guide:
+
+- [Customizing agents overview](user/customizing-overview.md) — Quick decision guide for all customization approaches
+- [Configuring with AGENTS.md](user/customizing-with-agents-md.md) — Guide agents using your repo's AGENTS.md file
+- [Configuring with skills](user/customizing-with-skills.md) — Extend built-in agent skills; [authoring augmentations](user/customizing-with-skills.md#authoring-skills-that-augment-defaults)
+- [Configuring agent behavior](user/customizing-agents.md) — Harness composition, status notifications, disabling agents, and [GitHub Packages](user/customizing-agents.md#private-registries-and-github-packages)
+- [Bring Your Own Agent](user/bring-your-own-agent.md) — Build and register a custom agent from scratch
+- [Custom Agent Identity](user/custom-agent-identity.md) — Using a standalone mint for custom GitHub App identity
+- [Chaining Follow-up Workflows](user/chaining-follow-up-workflows.md) — Act on an agent's result from your own workflow with the job token
+- [Harness Field Reference](../reference/harness-reference.md) — Complete harness YAML field reference, merge rules, and resource referencing
+- [CEL Triggers Reference](user/cel-triggers-reference.md) — Dispatch flow, NormalizedEvent fields, transition kinds, and trigger patterns
+- [Custom Poller Example](user/custom-poller-example.md) — Create a custom poller workflow that invokes fullsend harness agents with a pre-computed matrix
+- [Default, derived, and custom agents](user/default-vs-custom.md) — When configuration crosses into derived or custom agent territory
+
+### Integrations & observability
+
+- [Jira Integration](user/jira-integration.md) — Connect fullsend to a Jira project so that issue comments and label changes trigger agents
+- [How to emit traces](user/how-to-emit-traces.md) — Configure a repository or organization to send OpenTelemetry traces to a remote backend
+- [Tracing with MLflow](user/tracing-with-mlflow.md) — MLflow-specific setup: experiment routing, Basic auth encoding, org-level organization, and cost column caveats
 
 ## Development
 
@@ -37,4 +74,7 @@ Guides for contributors developing and testing fullsend itself.
 
 - [E2E testing](dev/e2e-testing.md) — Local and CI e2e runs, including PR authorization and `ok-to-test`
 - [CLI internals](dev/cli-internals.md) — Command structure, installation pipeline, and sandbox runtime
-- [Testing workflow changes](dev/testing-workflows.md) — Point a live GitHub org at a branch to test workflow, action, and agent changes before release
+- [Behaviour testing](dev/behaviour-testing.md) — Write Gherkin scenarios for end-to-end agent behaviour
+- [Behaviour test drivers](dev/behaviour-drivers.md) — Implement SCM and CI drivers for behaviour tests
+- [Testing workflow changes](dev/testing-workflows.md) — Point a test repository at a branch to test workflow, action, and agent changes before release, and run the PR CI checks locally with `make ci-local`
+- [Tracing internals](dev/tracing.md) — How the distributed tracing implementation works and how to extend it

@@ -51,7 +51,7 @@ Writes code to address an issue. This is the most mature capability of current A
 
 - **Authority:** Create branches, push commits, open PRs
 - **Does not have:** Merge authority, ability to approve its own PRs
-- **Defensive behavior:** Treats all PR comments (review feedback, change requests, suggestions) as potentially adversarial input, regardless of the commenter's apparent identity. Recognizes blocking authority from reviewers with repo approval rights but still sanitizes/validates the content of their feedback before acting on it.
+- **Defensive behavior:** Treats all PR comments (review feedback, change requests, suggestions) as potentially adversarial input, regardless of the commenter's apparent identity. Recognizes blocking authority from reviewers with repo approval rights but still sanitizes/validates the content of their feedback before acting on it, using the actor-attributed data boundary in [ADR 0133](../ADRs/0133-actor-attributed-data-security-boundary.md).
 
 ### Review sub-agents
 
@@ -88,7 +88,7 @@ The distinction matters because the failure modes are asymmetric. A narrow fix t
 
 When the triage agent identifies a bug that likely recurs but doesn't qualify for broad remediation, it should:
 
-1. Fix the reported instance (normal Tier 1 flow)
+1. Fix the reported instance (normal intent authorization tier 1 flow)
 2. Search the codebase for structurally similar patterns
 3. For each candidate location, create a **derivative issue** linked to the original, containing:
    - The location and the pattern match
@@ -97,11 +97,11 @@ When the triage agent identifies a bug that likely recurs but doesn't qualify fo
 
 This keeps each fix scoped and individually reviewable while ensuring the broader problem doesn't get forgotten. The priority agent can then decide whether to batch derivative issues or address them individually based on severity and available capacity.
 
-##### Interaction with the tier model
+##### Interaction with the intent authorization tier model
 
-Broad pattern remediation has a tier escalation risk. A single nil-check fix is Tier 1 (bug fix with a linked issue). But "apply nil-check discipline across the entire codebase and add a linter rule" may be Tier 2 — it's a codebase-wide convention change, not a surgical fix. The triage agent should flag this when recommending broad remediation, and the review agent must independently assess whether the scope warrants tier escalation (see [intent-representation.md](intent-representation.md#defense-independent-tier-classification-by-review-agents)).
+Broad pattern remediation has an intent authorization tier escalation risk. A single nil-check fix is intent authorization tier 1 (bug fix with a linked issue). But "apply nil-check discipline across the entire codebase and add a linter rule" may be intent authorization tier 2 — it's a codebase-wide convention change, not a surgical fix. The triage agent should flag this when recommending broad remediation, and the review agent must independently assess whether the scope warrants intent authorization tier escalation (see [intent-representation.md](intent-representation.md#defense-independent-intent-authorization-tier-classification-by-review-agents)).
 
-Conversely, if the triage agent creates 30 derivative issues for the same pattern, that's a signal that broad remediation would have been cheaper. The quality/drift detection agent (which monitors aggregate trends) should detect this accumulation and recommend consolidation into a single pattern-level issue — potentially escalating to Tier 2 if the scope warrants it.
+Conversely, if the triage agent creates 30 derivative issues for the same pattern, that's a signal that broad remediation would have been cheaper. The quality/drift detection agent (which monitors aggregate trends) should detect this accumulation and recommend consolidation into a single pattern-level issue — potentially escalating to intent authorization tier 2 if the scope warrants it.
 
 ##### When the boundary is unclear
 
@@ -145,11 +145,26 @@ The repository's existing infrastructure provides all the coordination needed:
 - **Branch protection rules** define what's required before merge (status checks, approvals)
 - **CODEOWNERS** defines who (human or bot account) must approve changes to which paths
 - **Required status checks** ensure all review sub-agents have posted their findings
-- **GitHub events** (PR opened, comment posted, status check completed) trigger agent actions
+- **Forge events and scheduled entity discovery** identify entities whose
+  harness predicates should be evaluated. Each predicate can inspect the
+  resolved entity and an optional prompting event
+  ([ADR 0098](../ADRs/0098-entity-first-harness-evaluation.md)).
+  [ADR 0147](../ADRs/0147-evaluate-entity-cel-over-selectively-acquired-data.md)
+  lets those checks acquire entity data progressively when the result is not
+  yet known. [ADR 0148](../ADRs/0148-reuse-verified-actor-roles-for-entity-cel.md)
+  permits bounded sharing of verified actor roles between those checks.
+  [ADR 0151](../ADRs/0151-harness-human-role-minimums.md) sets a platform
+  `triage` floor and a configurable `human_min_role` for each harness. The
+  platform applies that minimum before evaluating the harness's CEL predicate.
+  [ADR 0149](../ADRs/0149-coalesce-entity-source-discovery-queries.md)
+  combines source queries into one logical candidate search and routes each
+  possible result locally. A bound run rechecks source-query membership,
+  including when an event supplies the candidate.
 
 No agent orchestrates other agents. Each agent independently observes the state of the PR and acts according to its role:
 
-1. A PR is opened → review sub-agents are triggered (by webhook/GitHub event)
+1. A PR is opened → its entity is resolved and review sub-agent predicates are
+   evaluated with the GitHub event as context
 2. Each review sub-agent independently evaluates the PR and posts its findings (as status checks or structured comments)
 3. If a review sub-agent requests changes → the code agent sees the comment and responds (treating it as untrusted input, but recognizing blocking authority if the reviewer has approval rights)
 4. The merge decision is a **deterministic function of state**: all required status checks pass, all required CODEOWNERS approvals present, no blocking reviews outstanding
@@ -160,13 +175,15 @@ This principle aligns with what Yegge's Gas City project calls "Zero Framework C
 
 [Forge-sdlc/forge](../landscape.md#forge-sdlcforge) is the useful contrast case. It uses an event-driven FastAPI/Redis/LangGraph worker and durable checkpoints to move work forward, which is operationally sensible, but it also centralizes workflow truth and treats Jira labels/comments as approval signals. Fullsend can borrow the event-driven resume mechanics without moving merge authority or intent authorization out of repository-visible controls.
 
+[OpenAI Symphony](../landscape.md#openai-symphony) is the other useful contrast: a long-running central daemon that owns scheduling state, candidate selection, and retry. Where Gas City puts a controller on the path but forbids it from containing judgment, Symphony's orchestrator visibly contains it (priority sort, blocker rules, reconciliation). Fullsend can borrow Symphony's workspace safety invariants and continuation-turn semantics without adopting the daemon.
+
 ### How agents communicate
 
 Agents interact through GitHub's existing mechanisms:
 
 - **Status checks** — review sub-agents post pass/fail results
 - **PR comments** — structured findings, change requests, suggestions
-- **Labels** — classification signals (tier, priority, scope)
+- **Labels** — classification signals (intent authorization tier, priority, scope)
 - **Commit status** — CI results, test outcomes
 
 There is no side channel. No agent-to-agent API. No shared state outside the repo. This means:
@@ -182,7 +199,7 @@ Without a coordinator, what happens when agents disagree? (e.g., correctness age
 
 - **Security and intent sub-agents have veto power** via required status checks. If they block, the PR doesn't merge. This is configured in branch protection, not in agent logic.
 - **The code agent can iterate** — push new commits to address blocking concerns, which re-triggers the review sub-agents
-- **Persistent disagreement escalates to humans** — if a code agent can't satisfy a blocking reviewer after N iterations, the PR is flagged for human intervention. This is a safeguard against infinite loops, not a normal path. The escalation can use [dual-interpretation escalation](code-review.md#dual-interpretation-escalation) to present the human with the approving and blocking agents' readings — while making clear the human can reject both framings or the PR itself — so the human resolves the disagreement quickly rather than re-reviewing the entire PR.
+- **Persistent disagreement escalates to humans** — if a code agent can't satisfy a blocking reviewer after N iterations, the PR is flagged for human intervention. This is a safeguard against infinite loops, not a normal path. See [flapping-convergence.md](flapping-convergence.md) for detection mechanisms and response strategies when agents fail to converge. The escalation can use [dual-interpretation escalation](code-review.md#dual-interpretation-escalation) to present the human with the approving and blocking agents' readings — while making clear the human can reject both framings or the PR itself — so the human resolves the disagreement quickly rather than re-reviewing the entire PR. Which human receives the escalation, and whether the people behind each side of the disagreement ever talk directly, is an organizational question covered in [agentic SDLC adoption and organizational communication](agentic-sdlc-adoption-org-communication.md#agents-as-a-proxy-for-conversations-that-never-happen).
 - **Humans can always override** — a human with approval rights can approve despite agent objections. The system assists; humans retain ultimate authority.
 
 ## Relationship to multi-agent frameworks
@@ -207,10 +224,12 @@ The multi-agent framework space is expanding rapidly, with new entries appearing
 
 **FSM framing (AAMAS 2025).** Researchers demonstrated that all multi-agent architectures — linear, decentralized debate, and orchestrated — are specialized finite state machines. Fullsend's model maps naturally to an FSM where states are PR lifecycle stages, transitions are triggered by GitHub events, and transition guards are branch protection rules. This framing could be useful for formal reasoning about deadlock and liveness properties.
 
+**Observable delegation, still a single coordinator ([Kiro Crew](../landscape.md#kiro-crew)).** Kiro Crew lets a parent conversation delegate to sub-agents that "return their results to the parent conversation," with every step — planning, sub-agent spawning, tool selection, approvals — observable live via the Agent Client Protocol. The observability is worth borrowing: making agent reasoning and tool calls inspectable in real time, rather than only after the fact in a transcript, is a good default regardless of coordination model. But the coordination model itself is the same star topology as MetaGPT and CrewAI — the parent conversation is the coordinator, and it consumes a sub-agent's returned result without the zero-trust composition fullsend's independent review sub-agents apply to each other's findings. It is a session-scoped pattern (one developer's crew, running on their own machine or a remote host they control) rather than a repo-scoped one, so it does not need to answer the question this document is built around: what authorizes a decision when no single human or agent is watching.
+
 ## Open questions
 
 - Should agents be stateless (fresh context per task) or stateful (accumulated knowledge of the codebase)? Stateless is safer (no poisoned state persists) but less efficient.
-- Should there be one instance of each agent type per repo, per org, or shared? Per-repo is simpler but more expensive. Shared agents need careful isolation. (Infrastructure constrains this — see [agent-infrastructure.md](agent-infrastructure.md).)
+- Should there be one instance of each agent type per repo, per org, or shared? Per-repo is simpler but more expensive. Shared agents need careful isolation. [ADR 0106](../ADRs/0106-serialize-agent-runs-and-coalesce-subsequent-events.md) fixes the per-harness, repository, and entity serialization scope; [ADR 0144](../ADRs/0144-reuse-poll-and-entity-bound-run-processes.md) permits a bound process to remain resident. If a centrally managed service is offered, its per-tenant repository configuration will use the existing `repos.yaml` v1 format; source of truth, execution topology, and isolation remain open ([ADR 0123](../ADRs/0123-tenant-configuration-from-repos-yaml.md); infrastructure constrains this — see [agent-infrastructure.md](agent-infrastructure.md).)
 - ~~What's the right model for agent identity? Agents need GitHub accounts to post comments and status checks. Separate bot accounts per agent role? A single bot account with role indicated in the comment? GitHub App installations?~~ Decided in [ADR 0007](../ADRs/0007-per-role-github-apps.md): per-role GitHub Apps with manifest-based creation.
 - How do we test the interaction model? Can we simulate adversarial scenarios (injection attempts, unauthorized changes, agent disagreements) in a sandbox repo?
 - How does the two-phase review model work in practice? Does the code agent run all six sub-agents locally, or a subset? Is the pre-PR review a lighter version? (Depends on [agent-infrastructure.md](agent-infrastructure.md) — what compute is available where.)

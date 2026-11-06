@@ -1,0 +1,947 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// --- Sub-interfaces for common behaviors ---
+
+// AgentLister provides read access to registered agent entries.
+type AgentLister interface {
+	AgentEntries() []AgentEntry
+}
+
+// KillSwitchReader provides read access to the kill switch state.
+type KillSwitchReader interface {
+	IsKillSwitchActive() bool
+}
+
+// AllowedResourcesReader provides read access to the allowed remote
+// resources list.
+type AllowedResourcesReader interface {
+	AllowedResources() []string
+}
+
+// TrackingReader provides read access to the issue-tracking configuration,
+// including the selected provider's cross-project allowed_targets.
+type TrackingReader interface {
+	IssueTracking() *TrackingConfig
+}
+
+// StatusNotificationsReader provides read access to status notification
+// configuration (comment start & completion).
+type StatusNotificationsReader interface {
+	StatusNotifications() *StatusNotificationConfig
+}
+
+// --- Composite read interface ---
+
+// ConfigReader is the common read interface for the general-purpose
+// configuration fields. Consumer packages should depend on this
+// interface rather than accessing struct fields directly.
+type ConfigReader interface {
+	AgentLister
+	KillSwitchReader
+	AllowedResourcesReader
+	TrackingReader
+	StatusNotificationsReader
+	ConfigVersion() string
+}
+
+// --- Per-repo read interface ---
+
+// PerRepoConfigReader extends ConfigReader with per-repo-specific
+// fields. Methods are prefixed with "Config" to avoid conflicts with
+// the struct field names (Roles and Runtime).
+type PerRepoConfigReader interface {
+	ConfigReader
+	ConfigRoles() []string
+	ConfigRuntime() string
+	ConfigForge() string
+	ConfigTracker() string
+	ConfigMintURL() string
+	// ConfigMintURLFromFile returns the mint URL as set in config.yaml or
+	// config.base.yaml only. Empty means neither file sets mint_url — the
+	// compiled default is not consulted here (contrast with
+	// ConfigMintURL, which falls all the way through to the compiled
+	// default). Callers that need to distinguish "the file is silent" from
+	// "the file resolves to the default" (e.g. fullsend run's
+	// warn-and-skip-minting fallback) use this instead of ConfigMintURL.
+	ConfigMintURLFromFile() string
+	ConfigKeepHistory() bool
+	ConfigInferenceProvider() string
+	ConfigInferenceProject() string
+	ConfigInferenceRegion() string
+	ConfigInferenceWIFProvider() string
+	ConfigInferenceWIFAudience() string
+	ConfigInferenceServiceAccount() string
+	ConfigInferenceOpenAI() OpenAIWIFConfig
+	// ConfigInferenceGateway returns the effective inference.gateway
+	// block, layered field by field (ADR 0137).
+	ConfigInferenceGateway() InferenceGatewayConfig
+	// ConfigModelAliases returns the effective model alias map, merged
+	// per-key through the parent chain. nil (the code default) means no
+	// aliases are configured: every alias resolves through the runtime's
+	// compiled-in table.
+	ConfigModelAliases() map[string]string
+	// IsOwnersFileAuthEnabled reports whether the owners_file
+	// authorization provider is listed.
+	IsOwnersFileAuthEnabled() bool
+	// JiraAuthorization returns the jira authorization provider entry,
+	// or nil when none is listed.
+	JiraAuthorization() *AuthorizationProvider
+}
+
+// --- Write superset interfaces ---
+
+// ConfigWriter extends ConfigReader with mutation methods for the
+// general-purpose configuration fields.
+type ConfigWriter interface {
+	ConfigReader
+	SetKillSwitch(bool)
+	SetAgents([]AgentEntry)
+	SetAllowedRemoteResources([]string)
+	SetStatusNotifications(*StatusNotificationConfig)
+	Marshal() ([]byte, error)
+	Validate() error
+	// ValidateGlobal is Validate without the agents[] entry checks.
+	ValidateGlobal() error
+}
+
+// PerRepoConfigWriter extends PerRepoConfigReader and ConfigWriter with
+// per-repo-specific mutation methods.
+type PerRepoConfigWriter interface {
+	PerRepoConfigReader
+	ConfigWriter
+	SetRoles([]string)
+	SetRuntime(string)
+	SetMintURL(string)
+	SetKeepHistory(bool)
+	SetInferenceProvider(string)
+	SetInferenceProject(string)
+	SetInferenceRegion(string)
+	SetInferenceWIFProvider(string)
+	SetInferenceWIFAudience(string)
+	SetInferenceServiceAccount(string)
+	SetInferenceOpenAI(OpenAIWIFConfig)
+	SetInferenceGateway(InferenceGatewayConfig)
+	// MergeInferenceGateway layers the set fields of g over this layer's
+	// own inference.gateway block, the way the layers merge.
+	MergeInferenceGateway(InferenceGatewayConfig)
+	SetModelAliases(map[string]string)
+	SetOwnersFileAuthEnabled(bool)
+	SetIssueTracking(*TrackingConfig)
+}
+
+// --- Compile-time assertions ---
+
+var (
+	_ ConfigReader        = (*perRepoConfig)(nil)
+	_ PerRepoConfigReader = (*perRepoConfig)(nil)
+	_ ConfigWriter        = (*perRepoConfig)(nil)
+	_ PerRepoConfigWriter = (*perRepoConfig)(nil)
+)
+
+// --- perRepoConfig getter methods ---
+//
+// All getters implement fallback: local value -> parent -> zero value.
+// The parent chain terminates at perRepoDefaults which returns
+// compiled-in code defaults (ADR 0069 Decision 2).
+
+// AgentEntries returns the merged agent set. When the local Agents
+// field is nil (key omitted from YAML), parent agents are returned
+// unchanged. When local Agents is non-nil (including empty), a keyed
+// merge by DerivedName is performed: overlay entries can toggle
+// enable/disable or replace the source of a parent agent without
+// replacing the entire agent list.
+func (c *perRepoConfig) AgentEntries() []AgentEntry {
+	var parentAgents []AgentEntry
+	if c.parent != nil {
+		parentAgents = c.parent.AgentEntries()
+	}
+	if c.Agents == nil {
+		return parentAgents
+	}
+	if len(parentAgents) == 0 {
+		return c.Agents
+	}
+	// Build overlay index by lowercase DerivedName. Multiple entries
+	// with the same name may exist (disable-then-enable pairs).
+	type overlayInfo struct {
+		entry AgentEntry
+		used  bool
+	}
+	overlayByName := make(map[string][]*overlayInfo, len(c.Agents))
+	overlayOrder := make([]*overlayInfo, 0, len(c.Agents))
+	for _, a := range c.Agents {
+		oi := &overlayInfo{entry: a}
+		key := strings.ToLower(a.DerivedName())
+		overlayByName[key] = append(overlayByName[key], oi)
+		overlayOrder = append(overlayOrder, oi)
+	}
+
+	// For each parent agent, apply matching overlay entries.
+	result := make([]AgentEntry, 0, len(parentAgents)+len(c.Agents))
+	for _, pa := range parentAgents {
+		key := strings.ToLower(pa.DerivedName())
+		overlays, hasOverlay := overlayByName[key]
+		if !hasOverlay {
+			result = append(result, pa)
+			continue
+		}
+		// Apply overlays in order (last wins per field).
+		merged := pa
+		for _, oi := range overlays {
+			oi.used = true
+			if oi.entry.Source != "" {
+				merged.Source = oi.entry.Source
+			}
+			if oi.entry.Ref != "" {
+				merged.Ref = oi.entry.Ref
+			}
+			if oi.entry.Enabled != nil {
+				merged.Enabled = oi.entry.Enabled
+			}
+			if oi.entry.Name != "" {
+				merged.Name = oi.entry.Name
+			}
+			// Per-agent settings merge field by field; an empty value
+			// inherits the parent's (there is no way to unset a parent's
+			// value from the overlay short of restating the entry).
+			if oi.entry.Runtime != "" {
+				merged.Runtime = oi.entry.Runtime
+			}
+			if oi.entry.Model != "" {
+				merged.Model = oi.entry.Model
+			}
+			if oi.entry.Effort != "" {
+				merged.Effort = oi.entry.Effort
+			}
+			if strings.TrimSpace(oi.entry.Trigger) != "" {
+				merged.Trigger = oi.entry.Trigger
+			}
+			// Subagents merge per key: overlay entries override or
+			// tombstone parent entries; unstated keys inherit.
+			// `merged := pa` shares the map header, so clone before
+			// writing or the overlay leaks into the parent layer.
+			if oi.entry.Subagents != nil {
+				cloned := make(map[string]*string, len(merged.Subagents)+len(oi.entry.Subagents))
+				for k, v := range merged.Subagents {
+					cloned[k] = v
+				}
+				for k, v := range oi.entry.Subagents {
+					cloned[k] = v
+				}
+				merged.Subagents = cloned
+			}
+		}
+		result = append(result, merged)
+	}
+
+	// Append overlay entries that did not match any parent agent.
+	for _, oi := range overlayOrder {
+		if !oi.used {
+			result = append(result, oi.entry)
+		}
+	}
+
+	return result
+}
+
+// LocalAgentEntries returns only this layer's own agents: entries (what
+// Marshal writes), as opposed to the merged set from AgentEntries.
+func (c *perRepoConfig) LocalAgentEntries() []AgentEntry { return c.Agents }
+
+// IsKillSwitchActive reports whether the kill switch is engaged.
+// KillSwitch is a *bool: nil falls through to parent, non-nil
+// (including explicit false) is the local decision.
+func (c *perRepoConfig) IsKillSwitchActive() bool {
+	if c.KillSwitch != nil {
+		return *c.KillSwitch
+	}
+	if c.parent != nil {
+		return c.parent.IsKillSwitchActive()
+	}
+	return false
+}
+
+// AllowedResources returns the effective allowed remote resource
+// prefixes. nil (key omitted) falls through to parent. An explicit
+// empty slice signals deny-all with no fallthrough. A non-empty
+// slice is unioned with parent resources when a parent is present;
+// without a parent, the local list is returned as-is for backwards
+// compatibility. Code defaults surface only through the terminal
+// perRepoDefaults parent — intermediate parents may omit them.
+func (c *perRepoConfig) AllowedResources() []string {
+	if c.AllowedRemoteResources == nil {
+		if c.parent != nil {
+			return c.parent.AllowedResources()
+		}
+		return nil
+	}
+	if len(c.AllowedRemoteResources) == 0 {
+		return c.AllowedRemoteResources
+	}
+	if c.parent == nil {
+		return c.AllowedRemoteResources
+	}
+	// Non-empty with parent: union overlay + parent.
+	seen := make(map[string]bool, len(c.AllowedRemoteResources))
+	result := make([]string, len(c.AllowedRemoteResources))
+	copy(result, c.AllowedRemoteResources)
+	for _, r := range c.AllowedRemoteResources {
+		seen[r] = true
+	}
+	for _, r := range c.parent.AllowedResources() {
+		if !seen[r] {
+			result = append(result, r)
+			seen[r] = true
+		}
+	}
+	return result
+}
+
+// IssueTracking returns the tracker configuration (the tracker key). nil
+// falls through to parent; a set value replaces the parent's whole
+// mapping, so layers never combine two providers. A layer that still
+// carries the removed create_issues block and sets no tracker of its own
+// denies all extra issue destinations instead of inheriting the parent's
+// grant, so a legacy restrictive overlay is never widened by a permissive
+// base.
+func (c *perRepoConfig) IssueTracking() *TrackingConfig {
+	if c.Tracker != nil {
+		return c.Tracker
+	}
+	if c.legacyCreateIssues {
+		return &TrackingConfig{}
+	}
+	if c.parent != nil {
+		return c.parent.IssueTracking()
+	}
+	return nil
+}
+
+// StatusNotifications returns the status notification configuration.
+// nil falls through to parent.
+func (c *perRepoConfig) StatusNotifications() *StatusNotificationConfig {
+	if c.Notifications != nil {
+		return c.Notifications
+	}
+	if c.parent != nil {
+		return c.parent.StatusNotifications()
+	}
+	return nil
+}
+
+// ConfigVersion returns the config schema version. Empty falls
+// through to parent (code default "1").
+func (c *perRepoConfig) ConfigVersion() string {
+	if c.Version != "" {
+		return c.Version
+	}
+	if c.parent != nil {
+		return c.parent.ConfigVersion()
+	}
+	return ""
+}
+
+// IsOwnersFileAuthEnabled returns whether OWNERS-file authorization is enabled.
+// Intentionally no parent fallback: OWNERS auth is a per-repo opt-in that must
+// not be inheritable from config.base.yaml.
+func (c *perRepoConfig) IsOwnersFileAuthEnabled() bool {
+	for _, p := range c.Authorization {
+		if p.Provider == AuthProviderOwnersFile {
+			return true
+		}
+	}
+	return false
+}
+
+// JiraAuthorization returns a copy of the jira authorization provider
+// entry, or nil when none is listed. Like IsOwnersFileAuthEnabled it has
+// no parent fallback: authorization providers are a per-repo opt-in that
+// is not inherited from config.base.yaml.
+func (c *perRepoConfig) JiraAuthorization() *AuthorizationProvider {
+	for _, p := range c.Authorization {
+		if p.Provider == AuthProviderJira {
+			out := cloneAuthorizationProvider(p)
+			return &out
+		}
+	}
+	return nil
+}
+
+// ConfigRoles returns the configured agent roles. nil (key omitted)
+// falls through to parent. Non-nil (including empty) replaces the
+// parent list entirely.
+func (c *perRepoConfig) ConfigRoles() []string {
+	if c.Roles != nil {
+		return c.Roles
+	}
+	if c.parent != nil {
+		return c.parent.ConfigRoles()
+	}
+	return nil
+}
+
+// ConfigRuntime returns the configured agent runtime. Empty falls
+// through to parent (code default "claude").
+func (c *perRepoConfig) ConfigRuntime() string {
+	if c.Runtime != "" {
+		return c.Runtime
+	}
+	if c.parent != nil {
+		return c.parent.ConfigRuntime()
+	}
+	return ""
+}
+
+// ConfigForge returns the configured forge type (e.g. "github", "gitlab").
+func (c *perRepoConfig) ConfigForge() string {
+	if c.Forge != "" {
+		return c.Forge
+	}
+	if c.parent != nil {
+		return c.parent.ConfigForge()
+	}
+	return ""
+}
+
+// ConfigKeepHistory reports whether sticky comment updates should
+// append previous content as a collapsed "Previous run" block.
+// KeepHistory is a *bool: nil falls through to parent, non-nil
+// (including explicit false) is the local decision. Code default
+// is true (history appended).
+func (c *perRepoConfig) ConfigKeepHistory() bool {
+	if c.KeepHistory != nil {
+		return *c.KeepHistory
+	}
+	if c.parent != nil {
+		return c.parent.ConfigKeepHistory()
+	}
+	return true
+}
+
+// ConfigTracker returns the provider selected by the tracker mapping
+// ("github", "gitlab", "jira"), or "" when none is selected. It is the
+// default for `fullsend issues` commands' --tracker flag when that flag
+// is not set explicitly. Like IssueTracking, a layer that sets tracker
+// replaces the parent's whole mapping, and a layer that still carries the
+// removed create_issues block selects no provider, so the provider always
+// comes from the same layer as the targets (it is derived from
+// IssueTracking). Distinct from ConfigForge: a repo's hosting
+// forge (github/gitlab) does not imply its issue tracker (e.g. a
+// GitHub-hosted repo may track issues in Jira).
+func (c *perRepoConfig) ConfigTracker() string {
+	return c.IssueTracking().Provider()
+}
+
+// ConfigMintURL returns the configured token mint URL.
+func (c *perRepoConfig) ConfigMintURL() string {
+	if c.MintURL != "" {
+		return c.MintURL
+	}
+	if c.parent != nil {
+		return c.parent.ConfigMintURL()
+	}
+	return ""
+}
+
+// ConfigMintURLFromFile returns the mint URL as set in config.yaml or
+// config.base.yaml only; see the PerRepoConfigReader doc comment for why
+// this stops short of the compiled default that ConfigMintURL falls
+// through to.
+func (c *perRepoConfig) ConfigMintURLFromFile() string {
+	if c.MintURL != "" {
+		return c.MintURL
+	}
+	if c.parent != nil {
+		return c.parent.ConfigMintURLFromFile()
+	}
+	return ""
+}
+
+// ConfigInferenceProvider returns the inference provider (e.g. "vertex").
+func (c *perRepoConfig) ConfigInferenceProvider() string {
+	if c.Inference != nil && c.Inference.Provider != "" {
+		return c.Inference.Provider
+	}
+	if c.parent != nil {
+		return c.parent.ConfigInferenceProvider()
+	}
+	return ""
+}
+
+// ConfigInferenceProject returns the GCP project ID for inference.
+func (c *perRepoConfig) ConfigInferenceProject() string {
+	if c.Inference != nil && c.Inference.Project != "" {
+		return c.Inference.Project
+	}
+	if c.parent != nil {
+		return c.parent.ConfigInferenceProject()
+	}
+	return ""
+}
+
+// ConfigInferenceRegion returns the GCP region for inference.
+func (c *perRepoConfig) ConfigInferenceRegion() string {
+	if c.Inference != nil && c.Inference.Region != "" {
+		return c.Inference.Region
+	}
+	if c.parent != nil {
+		return c.parent.ConfigInferenceRegion()
+	}
+	return ""
+}
+
+// ConfigInferenceWIFProvider returns the WIF provider resource name.
+func (c *perRepoConfig) ConfigInferenceWIFProvider() string {
+	if c.Inference != nil && c.Inference.WIFProvider != "" {
+		return c.Inference.WIFProvider
+	}
+	if c.parent != nil {
+		return c.parent.ConfigInferenceWIFProvider()
+	}
+	return ""
+}
+
+// ConfigInferenceWIFAudience returns the GitLab agent job's ID token
+// audience for an existing WIF provider.
+func (c *perRepoConfig) ConfigInferenceWIFAudience() string {
+	if c.Inference != nil && c.Inference.WIFAudience != "" {
+		return c.Inference.WIFAudience
+	}
+	if c.parent != nil {
+		return c.parent.ConfigInferenceWIFAudience()
+	}
+	return ""
+}
+
+// ConfigInferenceServiceAccount returns the service account email the
+// GitLab agent job impersonates for Vertex inference.
+func (c *perRepoConfig) ConfigInferenceServiceAccount() string {
+	if c.Inference != nil && c.Inference.ServiceAccount != "" {
+		return c.Inference.ServiceAccount
+	}
+	if c.parent != nil {
+		return c.parent.ConfigInferenceServiceAccount()
+	}
+	return ""
+}
+
+// ConfigInferenceOpenAI returns the OpenAI WIF identifiers. Each of the
+// three resolves independently through the layers, like the other
+// inference scalars, so an overlay can restate one without the others.
+func (c *perRepoConfig) ConfigInferenceOpenAI() OpenAIWIFConfig {
+	var out OpenAIWIFConfig
+	if c.parent != nil {
+		out = c.parent.ConfigInferenceOpenAI()
+	}
+	if c.Inference != nil && c.Inference.OpenAI != nil {
+		if v := c.Inference.OpenAI.Audience; v != "" {
+			out.Audience = v
+		}
+		if v := c.Inference.OpenAI.IdentityProviderID; v != "" {
+			out.IdentityProviderID = v
+		}
+		if v := c.Inference.OpenAI.ServiceAccountID; v != "" {
+			out.ServiceAccountID = v
+		}
+	}
+	return out
+}
+
+// ConfigInferenceGateway returns the inference.gateway block. url and
+// audience resolve independently through the layers; the model list
+// (models or models_file) is one unit that a layer replaces as a whole.
+func (c *perRepoConfig) ConfigInferenceGateway() InferenceGatewayConfig {
+	var out InferenceGatewayConfig
+	if c.parent != nil {
+		out = c.parent.ConfigInferenceGateway()
+	}
+	if c.Inference != nil {
+		out = mergeGateway(out, c.Inference.Gateway)
+	}
+	return out
+}
+
+// ConfigModelAliases returns the effective model alias map, merged per
+// key through the parent chain. Each key in the local Models.Aliases
+// overrides the same key from the parent; unstated keys inherit the
+// parent's value.
+func (c *perRepoConfig) ConfigModelAliases() map[string]string {
+	var parentAliases map[string]string
+	if c.parent != nil {
+		parentAliases = c.parent.ConfigModelAliases()
+	}
+	if c.Models == nil || len(c.Models.Aliases) == 0 {
+		return parentAliases
+	}
+	if len(parentAliases) == 0 {
+		result := make(map[string]string, len(c.Models.Aliases))
+		for k, v := range c.Models.Aliases {
+			result[k] = v
+		}
+		return result
+	}
+	merged := make(map[string]string, len(parentAliases)+len(c.Models.Aliases))
+	for k, v := range parentAliases {
+		merged[k] = v
+	}
+	for k, v := range c.Models.Aliases {
+		merged[k] = v
+	}
+	return merged
+}
+
+// --- perRepoConfig setter methods ---
+
+// SetKillSwitch sets the kill switch state. Stores a *bool so that
+// an explicit false is distinguishable from unset (nil) across layers.
+func (c *perRepoConfig) SetKillSwitch(v bool) { c.KillSwitch = &v }
+
+// SetOwnersFileAuthEnabled enables or disables OWNERS-file authorization.
+func (c *perRepoConfig) SetOwnersFileAuthEnabled(v bool) {
+	if v {
+		for _, p := range c.Authorization {
+			if p.Provider == "owners_file" {
+				return
+			}
+		}
+		c.Authorization = append(c.Authorization, AuthorizationProvider{Provider: "owners_file"})
+	} else {
+		filtered := make([]AuthorizationProvider, 0, len(c.Authorization))
+		for _, p := range c.Authorization {
+			if p.Provider != "owners_file" {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) == 0 {
+			c.Authorization = nil
+		} else {
+			c.Authorization = filtered
+		}
+	}
+}
+
+// SetAgents replaces the registered agent entries.
+func (c *perRepoConfig) SetAgents(agents []AgentEntry) { c.Agents = agents }
+
+// SetAllowedRemoteResources replaces the allowed remote resource
+// prefixes.
+func (c *perRepoConfig) SetAllowedRemoteResources(resources []string) {
+	c.AllowedRemoteResources = resources
+}
+
+// SetRoles replaces the configured agent roles.
+func (c *perRepoConfig) SetRoles(roles []string) { c.Roles = roles }
+
+// SetRuntime replaces the configured agent runtime.
+func (c *perRepoConfig) SetRuntime(runtime string) { c.Runtime = runtime }
+
+// SetKeepHistory sets whether sticky comment updates append history.
+// Stores a *bool so that an explicit false is distinguishable from
+// unset (nil) across layers.
+func (c *perRepoConfig) SetKeepHistory(v bool) { c.KeepHistory = &v }
+
+// SetMintURL sets the token mint URL.
+func (c *perRepoConfig) SetMintURL(mintURL string) { c.MintURL = mintURL }
+
+// SetInferenceProvider sets the inference provider.
+func (c *perRepoConfig) SetInferenceProvider(provider string) {
+	c.ensureInference().Provider = provider
+}
+
+// SetInferenceProject sets the GCP project ID for inference.
+func (c *perRepoConfig) SetInferenceProject(project string) { c.ensureInference().Project = project }
+
+// SetInferenceRegion sets the GCP region for inference.
+func (c *perRepoConfig) SetInferenceRegion(region string) { c.ensureInference().Region = region }
+
+// SetStatusNotifications sets the status notification configuration.
+func (c *perRepoConfig) SetStatusNotifications(sn *StatusNotificationConfig) {
+	c.Notifications = sn
+}
+
+// SetIssueTracking sets the tracker configuration on this layer.
+func (c *perRepoConfig) SetIssueTracking(t *TrackingConfig) {
+	c.Tracker = t
+}
+
+// SetInferenceWIFProvider sets the WIF provider resource name.
+func (c *perRepoConfig) SetInferenceWIFProvider(wifProvider string) {
+	c.ensureInference().WIFProvider = wifProvider
+}
+
+// SetInferenceWIFAudience sets the GitLab agent job's ID token audience.
+func (c *perRepoConfig) SetInferenceWIFAudience(audience string) {
+	c.ensureInference().WIFAudience = audience
+}
+
+// SetInferenceServiceAccount sets the service account email to impersonate.
+func (c *perRepoConfig) SetInferenceServiceAccount(email string) {
+	c.ensureInference().ServiceAccount = email
+}
+
+// SetModelAliases sets the per-repo model alias overrides; a nil or
+// empty map removes the block.
+func (c *perRepoConfig) SetModelAliases(aliases map[string]string) {
+	if len(aliases) == 0 {
+		c.Models = nil
+		return
+	}
+	if c.Models == nil {
+		c.Models = &ModelsConfig{}
+	}
+	c.Models.Aliases = aliases
+}
+
+// SetInferenceOpenAI sets the OpenAI WIF identifiers; a zero value
+// removes the block.
+func (c *perRepoConfig) SetInferenceOpenAI(ids OpenAIWIFConfig) {
+	inf := c.ensureInference()
+	if ids.IsZero() {
+		inf.OpenAI = nil
+		return
+	}
+	cp := ids
+	inf.OpenAI = &cp
+}
+
+// SetInferenceGateway sets the inference.gateway block; a zero value
+// removes it.
+func (c *perRepoConfig) SetInferenceGateway(g InferenceGatewayConfig) {
+	inf := c.ensureInference()
+	if g.IsZero() {
+		inf.Gateway = nil
+		return
+	}
+	inf.Gateway = cloneGateway(&g)
+}
+
+// MergeInferenceGateway layers the set fields of g over this layer's own
+// inference.gateway block (not the inherited one): url and audience
+// replace individually, and a model list in either form replaces the
+// existing list. Fields g leaves unset keep their current value.
+func (c *perRepoConfig) MergeInferenceGateway(g InferenceGatewayConfig) {
+	inf := c.ensureInference()
+	var cur InferenceGatewayConfig
+	if inf.Gateway != nil {
+		cur = *inf.Gateway
+	}
+	merged := mergeGateway(cur, &g)
+	if merged.IsZero() {
+		inf.Gateway = nil
+		return
+	}
+	inf.Gateway = cloneGateway(&merged)
+}
+
+// ensureInference lazily initializes the Inference struct.
+func (c *perRepoConfig) ensureInference() *PerRepoInferenceConfig {
+	if c.Inference == nil {
+		c.Inference = &PerRepoInferenceConfig{}
+	}
+	return c.Inference
+}
+
+// --- LoadConfig / LoadConfigWriter factories ---
+
+// Layer file names of a per-repo config directory (ADR 0069).
+const (
+	OverlayConfigFile = "config.yaml"
+	BaseConfigFile    = "config.base.yaml"
+)
+
+// LoadOpts controls how LoadConfig handles a missing config.yaml.
+type LoadOpts struct {
+	// MissingOK returns a default config when config.yaml is absent.
+	MissingOK bool
+}
+
+// LoadConfig reads config.yaml (and config.base.yaml if present) from
+// dir, returning a ConfigReader. The parent chain is wired as overlay
+// (config.yaml) → base (config.base.yaml) → code defaults. A config.yaml
+// in the removed per-org format is rejected. This is the preferred
+// entry point for consumer packages that only need read access.
+func LoadConfig(dir string, opts LoadOpts) (ConfigReader, error) {
+	overlayData, haveOverlay, baseData, haveBase, err := readConfigFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Neither file exists.
+	if !haveOverlay && !haveBase {
+		if opts.MissingOK {
+			return NewPerRepoConfig(nil, ""), nil
+		}
+		return nil, fmt.Errorf("reading config: %w",
+			&os.PathError{Op: "open", Path: filepath.Join(dir, "config.yaml"), Err: os.ErrNotExist})
+	}
+
+	if err := checkOverlayYAML(overlayData, haveOverlay); err != nil {
+		return nil, err
+	}
+	if err := checkLegacyCreateIssues(overlayData, haveOverlay, baseData, haveBase); err != nil {
+		return nil, err
+	}
+
+	return loadPerRepoLayers(overlayData, haveOverlay, baseData, haveBase)
+}
+
+// LoadConfigWriter reads config.yaml (and config.base.yaml if present)
+// from dir, returning a ConfigWriter. The parent chain is wired as
+// overlay (config.yaml) → base (config.base.yaml) → code defaults, and
+// a config.yaml in the removed per-org format is rejected. Only the
+// overlay layer is mutable; base and defaults are read-only via the
+// parent pointer. This is the preferred entry
+// point for consumer packages that need read-write access (e.g. CLI
+// commands that modify and write-back config).
+func LoadConfigWriter(dir string, opts LoadOpts) (ConfigWriter, error) {
+	overlayData, haveOverlay, baseData, haveBase, err := readConfigFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Neither file exists.
+	if !haveOverlay && !haveBase {
+		if opts.MissingOK {
+			return NewPerRepoConfig(nil, ""), nil
+		}
+		return nil, fmt.Errorf("reading config: %w",
+			&os.PathError{Op: "open", Path: filepath.Join(dir, "config.yaml"), Err: os.ErrNotExist})
+	}
+
+	if err := checkOverlayYAML(overlayData, haveOverlay); err != nil {
+		return nil, err
+	}
+	if err := checkLegacyCreateIssues(overlayData, haveOverlay, baseData, haveBase); err != nil {
+		return nil, err
+	}
+
+	return loadPerRepoLayers(overlayData, haveOverlay, baseData, haveBase)
+}
+
+// checkLegacyCreateIssues rejects a config.yaml or config.base.yaml that
+// still carries the removed top-level create_issues key. Without this
+// check runtime loading would silently ignore the key, so an unmigrated
+// config would stop granting cross-repo issue creation with no signal.
+// The error names the offending file and the migration path. Malformed
+// YAML is left for loadPerRepoLayers to report.
+func checkLegacyCreateIssues(overlayData []byte, haveOverlay bool, baseData []byte, haveBase bool) error {
+	for _, layer := range []struct {
+		name string
+		data []byte
+		have bool
+	}{
+		{OverlayConfigFile, overlayData, haveOverlay},
+		{BaseConfigFile, baseData, haveBase},
+	} {
+		if !layer.have {
+			continue
+		}
+		if has, err := hasLegacyCreateIssues(layer.data); err == nil && has {
+			return fmt.Errorf("%s: %w", layer.name, errLegacyCreateIssues)
+		}
+	}
+	return nil
+}
+
+// checkOverlayYAML rejects a config.yaml that is malformed YAML or that
+// uses the removed per-org configuration format (ADR 0044). Without the
+// format check, the per-org keys would be silently dropped and the file
+// would load as a mostly empty per-repo config.
+func checkOverlayYAML(overlayData []byte, haveOverlay bool) error {
+	if !haveOverlay {
+		return nil
+	}
+	var probe map[string]interface{}
+	if err := yaml.Unmarshal(overlayData, &probe); err != nil {
+		return fmt.Errorf("parsing config.yaml: %w", err)
+	}
+	if !IsPerRepoYAML(overlayData) {
+		return errPerOrgConfig
+	}
+	return nil
+}
+
+// errPerOrgConfig reports a config.yaml in the removed per-org format.
+var errPerOrgConfig = errors.New("config.yaml uses the removed per-org configuration format (top-level dispatch, repos or defaults keys); per-org installation is no longer supported, use a per-repo .fullsend/config.yaml")
+
+// readConfigFiles reads config.yaml and config.base.yaml from dir.
+// Returns data and existence flags for each file. Genuine I/O errors
+// (not "file not found") are returned immediately.
+func readConfigFiles(dir string) (overlayData []byte, haveOverlay bool, baseData []byte, haveBase bool, err error) {
+	overlayData, overlayErr := os.ReadFile(filepath.Join(dir, OverlayConfigFile))
+	baseData, baseErr := os.ReadFile(filepath.Join(dir, BaseConfigFile))
+
+	if overlayErr != nil && !os.IsNotExist(overlayErr) {
+		return nil, false, nil, false, fmt.Errorf("reading config: %w", overlayErr)
+	}
+	if baseErr != nil && !os.IsNotExist(baseErr) {
+		return nil, false, nil, false, fmt.Errorf("reading base config: %w", baseErr)
+	}
+	return overlayData, overlayErr == nil, baseData, baseErr == nil, nil
+}
+
+// ParsePerRepoConfigWriterLayered parses overlay and optional base YAML
+// bytes into a PerRepoConfigWriter with the parent chain
+// overlay → base → code defaults. When baseData is nil the result is
+// equivalent to ParsePerRepoConfigWriter (parent = code defaults only).
+// This is the preferred entry point when both layers are available as
+// raw bytes (e.g. fetched from a forge API) rather than on the local
+// filesystem (where LoadConfigWriter should be used instead).
+func ParsePerRepoConfigWriterLayered(overlayData []byte, baseData []byte) (PerRepoConfigWriter, error) {
+	return loadPerRepoLayers(overlayData, true, baseData, len(baseData) > 0)
+}
+
+// loadPerRepoLayers parses per-repo config layers and wires the parent
+// chain: overlay → base → code defaults. When haveOverlay is false an
+// empty overlay is created so writes target config.yaml. The returned
+// *perRepoConfig satisfies both ConfigReader and ConfigWriter.
+func loadPerRepoLayers(overlayData []byte, haveOverlay bool, baseData []byte, haveBase bool) (*perRepoConfig, error) {
+	// Parse base layer; parent = code defaults.
+	var baseReader PerRepoConfigReader = &perRepoDefaults{}
+	if haveBase {
+		var base perRepoConfig
+		if err := unmarshalPerRepo(baseData, &base); err != nil {
+			return nil, fmt.Errorf("parsing base config: %w", err)
+		}
+		base.parent = &perRepoDefaults{}
+		baseReader = &base
+	}
+
+	// Parse or create overlay layer; parent = base (or defaults).
+	var overlay perRepoConfig
+	if haveOverlay {
+		if err := unmarshalPerRepo(overlayData, &overlay); err != nil {
+			return nil, fmt.Errorf("parsing per-repo config: %w", err)
+		}
+	}
+	overlay.parent = baseReader
+	return &overlay, nil
+}
+
+// IsPerRepoYAML reports whether raw YAML parses and is free of the
+// top-level keys of the removed per-org configuration format (dispatch,
+// repos, defaults). A per-repo config never has those keys, while a
+// per-org config always did, so their presence identifies a leftover
+// per-org file that must be rejected rather than loaded.
+func IsPerRepoYAML(data []byte) bool {
+	var probe map[string]interface{}
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	for _, key := range []string{"dispatch", "repos", "defaults"} {
+		if _, ok := probe[key]; ok {
+			return false
+		}
+	}
+	return true
+}

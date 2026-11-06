@@ -1,0 +1,191 @@
+package runtime
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/fullsend-ai/fullsend/internal/ui"
+)
+
+// EventRenderer renders normalized AgentEvent values to a Printer.
+// It tracks block state (text/thinking) so transitions between event
+// types produce clean output boundaries.
+type EventRenderer struct {
+	// RedactProgress removes caller-owned credential literals from progress
+	// metadata before and after normalization, before truncation. The callback
+	// must match original and NormalizeProgressText-normalized literals and
+	// use display-safe replacement markers. Pattern and registered
+	// runtime-secret redaction apply even when this callback is nil.
+	RedactProgress func(string) string
+
+	printer    *ui.Printer
+	isCI       bool
+	inText     bool
+	inThinking bool
+	seenInit   bool
+	progress   progressReconciler
+}
+
+// NewEventRenderer creates a renderer that writes to the given printer.
+func NewEventRenderer(printer *ui.Printer) *EventRenderer {
+	return &EventRenderer{
+		printer: printer,
+		isCI:    os.Getenv("GITHUB_ACTIONS") == "true",
+	}
+}
+
+var (
+	thinkingStyle = lipgloss.NewStyle().Italic(true).Foreground(ui.ColorMuted)
+)
+
+// Handle dispatches a single AgentEvent to the appropriate rendering method.
+func (r *EventRenderer) Handle(evt AgentEvent) {
+	switch e := evt.(type) {
+	case StatusProgressEvent:
+		if msg, show := r.progress.status(e, r.RedactProgress); show {
+			r.printProgress(msg)
+		}
+	case TaskProgressEvent:
+		if msg, show := r.progress.task(e, r.RedactProgress); show {
+			r.printProgress(msg)
+		}
+	case InitEvent:
+		if r.seenInit {
+			return
+		}
+		r.seenInit = true
+		r.endBlock()
+		model := sanitizeOutput(e.Model)
+		label := model
+		if e.Version != "" {
+			label = fmt.Sprintf("%s (v%s)", model, sanitizeOutput(e.Version))
+		}
+		r.printer.Header("Agent: " + label)
+	case ThinkingEvent:
+		if !r.inThinking {
+			r.endBlock()
+			r.printer.Raw(thinkingStyle.Render("  \U0001f9e0 "))
+			r.inThinking = true
+		}
+		r.printer.Raw(thinkingStyle.Render(sanitizeStreamText(e.Text)))
+	case TextEvent:
+		if !r.inText {
+			r.endBlock()
+			r.printer.Raw("  \U0001f4ac ")
+			r.inText = true
+		}
+		r.printer.Raw(sanitizeStreamText(e.Text))
+	case ToolUseEvent:
+		r.endBlock()
+		var msg string
+		if e.Summary != "" {
+			msg = fmt.Sprintf("%s: %s", e.Name, e.Summary)
+		} else {
+			msg = e.Name
+		}
+		msg = sanitizeOutput(msg)
+		if r.isCI {
+			fmt.Fprintf(os.Stderr, "::notice::%s\n", msg)
+		}
+		r.printer.ToolProgress(msg)
+	case TokensEvent:
+		r.endBlock()
+		total := e.InputTokens + e.OutputTokens + e.ReasoningTokens + e.CacheRead + e.CacheWrite
+		if e.ReasoningTokens > 0 {
+			r.printer.StepInfo(fmt.Sprintf(
+				"TOKENS in=%d out=%d reasoning=%d cache_r=%d cache_w=%d total=%d",
+				e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.CacheRead, e.CacheWrite, total,
+			))
+		} else {
+			r.printer.StepInfo(fmt.Sprintf(
+				"TOKENS in=%d out=%d cache_r=%d cache_w=%d total=%d",
+				e.InputTokens, e.OutputTokens, e.CacheRead, e.CacheWrite, total,
+			))
+		}
+	case ResultEvent:
+		r.endBlock()
+		subtype := sanitizeOutput(e.Subtype)
+		label := "Result"
+		if subtype != "" {
+			label = fmt.Sprintf("Result: %s", subtype)
+		}
+		if e.IsError {
+			label = "Result: ERROR"
+			if subtype != "" {
+				label = fmt.Sprintf("Result: ERROR (%s)", subtype)
+			}
+		}
+		r.printer.Header(label)
+		r.printer.KeyValue("Turns", fmt.Sprintf("%d", e.NumTurns))
+		r.printer.KeyValue("Cost", fmt.Sprintf("$%.4f", e.TotalCostUSD))
+		if e.ReasoningTokens > 0 {
+			r.printer.KeyValue("Tokens", fmt.Sprintf(
+				"in=%d out=%d reasoning=%d cache_create=%d cache_read=%d",
+				e.InputTokens, e.OutputTokens, e.ReasoningTokens,
+				e.CacheCreationInputTokens, e.CacheReadInputTokens,
+			))
+		} else {
+			r.printer.KeyValue("Tokens", fmt.Sprintf(
+				"in=%d out=%d cache_create=%d cache_read=%d",
+				e.InputTokens, e.OutputTokens,
+				e.CacheCreationInputTokens, e.CacheReadInputTokens,
+			))
+		}
+		if e.IsError && e.ErrorMessage != "" {
+			r.printer.StepFail(sanitizeOutput(e.ErrorMessage))
+		}
+	case ErrorEvent:
+		r.endBlock()
+		r.printer.StepFail(fmt.Sprintf("%s: %s",
+			sanitizeOutput(e.ErrorType), sanitizeOutput(e.Message)))
+	case RetryEvent:
+		r.endBlock()
+		r.printer.StepWarn(fmt.Sprintf("Retry %d/%d: %s (delay %dms)",
+			e.Attempt, e.MaxRetries, sanitizeOutput(e.Error), e.DelayMs))
+	case ModelFallbackEvent:
+		r.endBlock()
+		r.printer.StepWarn(modelFallbackWarning(e.From, e.To, claudeCodeFallbackReason(e.Trigger)))
+	case PluginErrorEvent:
+		r.endBlock()
+		r.printer.StepWarn(pluginErrorMessage(e))
+	}
+}
+
+// pluginErrorMessage formats a plugin load failure as one warning line. The
+// whole line is sanitized once, since plugin names, paths and messages come
+// from the sandbox.
+func pluginErrorMessage(e PluginErrorEvent) string {
+	name := e.Plugin
+	if name == "" {
+		name = "(unnamed)"
+	}
+	msg := "Plugin " + name + " failed to load"
+	if e.Path != "" {
+		msg += " from " + e.Path
+	}
+	if e.Type != "" {
+		msg += " (" + e.Type + ")"
+	}
+	if e.Message != "" {
+		msg += ": " + e.Message
+	}
+	return sanitizeOutput(msg)
+}
+
+// endBlock closes any open text or thinking block.
+func (r *EventRenderer) endBlock() {
+	if r.inText || r.inThinking {
+		r.printer.Raw("\n")
+		r.inText = false
+		r.inThinking = false
+	}
+}
+
+func (r *EventRenderer) printProgress(msg string) {
+	r.endBlock()
+	if r.isCI {
+		fmt.Fprintf(os.Stderr, "::notice::%s\n", msg)
+	}
+	r.printer.ToolProgress(msg)
+}

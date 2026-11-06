@@ -118,7 +118,7 @@ way, without a shared config repo.
 
 [ADR 0038](0038-universal-harness-access.md) complements this by making
 the `.fullsend` config repo unnecessary as a resource distribution point.
-Harness resources (agents, skills, policies) can be referenced by URL
+Harness resources (agents, skills, plugins, policies) can be referenced by URL
 with mandatory SHA256 integrity hashes rather than requiring local copies
 in the `.fullsend` directory structure. A per-repo harness can reference
 `https://raw.githubusercontent.com/fullsend-ai/library/.../agents/code.md#sha256=abc123...`
@@ -333,8 +333,8 @@ ADR 0045 is accepted and its implementation (Phases 1–4) is complete.
   `OrgVariableExists`, `DeleteOrgVariable`, `SetOrgVariableRepos`,
   `GetOrgVariableRepos`, `CreateOrgSecret`, `OrgSecretExists`,
   `DeleteOrgSecret`, `SetOrgSecretRepos`, `GetOrgSecretRepos`,
-  `ListOrgRepos`). Keep `ListOrgInstallations` (per-repo app discovery)
-  and `GetOrgPlan` (plan detection).
+  `ListOrgRepos`). Keep `ListOrgInstallations` (now on `GitHubExtensions`,
+  per-repo app discovery) and `GetOrgPlan` (plan detection).
 - Remove the `FULLSEND_PER_REPO_INSTALL` guard variable and all
   guard-checking logic (no longer needed when per-org enrollment
   does not exist).
@@ -351,10 +351,7 @@ ADR 0045 is accepted and its implementation (Phases 1–4) is complete.
 
 ### 2. Implementation plan
 
-The detailed, per-file implementation plan is maintained in a companion
-document: [`docs/plans/deprecate-per-org-install.md`](../plans/deprecate-per-org-install.md).
-It contains a 15-PR dependency graph, per-function change lists, and a
-release checklist. The summary below captures the high-level ordering.
+The summary below captures the high-level ordering.
 
 **Phase 1** (5 PRs):
 
@@ -374,7 +371,8 @@ release checklist. The summary below captures the high-level ordering.
 - PR 9: Remove per-org scaffold templates; rename per-repo scaffolds.
 - PR 10: Remove org-level forge methods (10 secret/variable methods,
   `ListOrgRepos`); remove `PerRepoGuardVar`; keep
-  `ListOrgInstallations` (per-repo app discovery) and `GetOrgPlan`.
+  `ListOrgInstallations` (now on `GitHubExtensions`, per-repo app
+  discovery) and `GetOrgPlan`.
 - PR 11: Simplify dispatch provisioner; retain `Config.GitHubOrgs`
   (needed by `EnsureOrgInMint`).
 - PR 12: Simplify appsetup; remove per-org branching.
@@ -557,7 +555,7 @@ progress.
   but each new repo requires its own install invocation.
 - **Redundant org-level credentials.** Per-repo install creates
   repo-level copies of shared credentials (`FULLSEND_MINT_URL`,
-  `FULLSEND_GCP_REGION`, etc.) that are identical across repos in
+  `FULLSEND_GCP_REGION` (install-time only), etc.) that are identical across repos in
   an org. GitHub natively supports org-level secret/variable
   inheritance, but the current per-repo install flow does not
   leverage it. A future `fullsend admin setup-org-credentials`
@@ -601,4 +599,3 @@ Ordered by the project's threat priority:
 - [ADR 0035: Layered content resolution](0035-layered-content-resolution.md) — `.fullsend/` directory replaces `.fullsend` repo
 - [ADR 0038: Universal harness access](0038-universal-harness-access.md) — URL-based resource references replace config repo as resource distribution point
 - [ADR 0045: Forge-portable harness schema](0045-forge-portable-harness-schema.md) — agent identity moves to harness files; `base` composition replaces centralized config repo overrides
-- [Implementation plan](../plans/deprecate-per-org-install.md) — PR dependency graph, per-file changes, release checklist

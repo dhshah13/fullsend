@@ -1,10 +1,67 @@
 package security
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 )
+
+// Runtime secrets are exact credential values the runner learned during
+// this process — an access token it exchanged, for example — that no
+// prefix or structural pattern can be trusted to match (the OpenAI WIF
+// token is contractually opaque, #6689). Scan masks them before any
+// pattern runs. Values shorter than minRuntimeSecretLen are ignored so a
+// trivial string can never blank out ordinary output.
+const minRuntimeSecretLen = 8
+
+var (
+	runtimeSecretsMu sync.RWMutex
+	runtimeSecrets   []string
+)
+
+// RegisterRuntimeSecret adds an exact value to the process-wide redaction
+// set and reports whether it is now registered. Registering the same value
+// twice is a no-op; a value below the minimum length is refused (false) so
+// the caller can decide not to use a credential it cannot redact.
+func RegisterRuntimeSecret(value string) bool {
+	if len(value) < minRuntimeSecretLen {
+		return false
+	}
+	runtimeSecretsMu.Lock()
+	defer runtimeSecretsMu.Unlock()
+	for _, v := range runtimeSecrets {
+		if v == value {
+			return true
+		}
+	}
+	runtimeSecrets = append(runtimeSecrets, value)
+	return true
+}
+
+// runtimeSecretSnapshot returns the registered values, longest first, so
+// a value that is a substring of another never breaks the longer match.
+func runtimeSecretSnapshot() []string {
+	runtimeSecretsMu.RLock()
+	snapshot := append([]string(nil), runtimeSecrets...)
+	runtimeSecretsMu.RUnlock()
+	slices.SortStableFunc(snapshot, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
+	return snapshot
+}
+
+// RuntimeSecrets returns the registered runtime secrets, longest first,
+// for callers that combine them with their own literals in one
+// longest-first pass.
+func RuntimeSecrets() []string { return runtimeSecretSnapshot() }
+
+// resetRuntimeSecrets clears the registry; tests only.
+func resetRuntimeSecrets() {
+	runtimeSecretsMu.Lock()
+	defer runtimeSecretsMu.Unlock()
+	runtimeSecrets = nil
+}
 
 // SecretRedactor scans text for API keys, tokens, credentials, and
 // sensitive patterns, replacing them with masked versions. Adapted from
@@ -32,6 +89,24 @@ func (s *SecretRedactor) Name() string { return "secret_redactor" }
 func (s *SecretRedactor) Scan(text string) ScanResult {
 	result := ScanResult{Safe: true, Sanitized: text}
 	current := text
+
+	// Exact runtime values first: they are the highest-confidence match
+	// and must not be partially consumed by a looser pattern.
+	for _, secret := range runtimeSecretSnapshot() {
+		if !strings.Contains(current, secret) {
+			continue
+		}
+		// No prefix is informative for an opaque value, so mask it whole.
+		const masked = "***"
+		result.Findings = append(result.Findings, Finding{
+			Scanner:  "secret_redactor",
+			Name:     "runtime_secret",
+			Severity: "critical",
+			Detail:   "Redacted runtime_secret -> " + masked,
+		})
+		current = strings.ReplaceAll(current, secret, masked)
+		result.Safe = false
+	}
 
 	// Prefix-based patterns (full match is the secret).
 	// Use ReplaceAll to catch duplicate occurrences of the same secret.
@@ -143,6 +218,10 @@ func defaultPrefixPatterns() []secretPattern {
 		{"github_refresh_token", `ghr_[a-zA-Z0-9_]{36,}`},
 		{"slack_token", `xox[baprs]-[a-zA-Z0-9-]{10,}`},
 		{"google_api_key", `AIza[a-zA-Z0-9_-]{35}`},
+		// Google OAuth access tokens: an optional one- or two-letter type
+		// segment (c. service account; dr. for the workforce STS response
+		// Google documents) would otherwise defeat the {20,} quantifier.
+		{"google_oauth_token", `ya29\.(?:[a-z]{1,2}\.)?[a-zA-Z0-9_\-]{20,}`},
 		{"aws_access_key", `AKIA[A-Z0-9]{16}`},
 		{"stripe_live", `sk_live_[a-zA-Z0-9]{24,}`},
 		{"stripe_test", `sk_test_[a-zA-Z0-9]{24,}`},
@@ -153,6 +232,9 @@ func defaultPrefixPatterns() []secretPattern {
 		{"gitlab_pat", `glpat-[a-zA-Z0-9_-]{20,}`},
 		{"vault_token", `hvs\.[a-zA-Z0-9_-]{24,}`},
 		{"age_secret_key", `AGE-SECRET-KEY-[A-Z0-9]{59}`},
+		// Bare three-segment JWTs (and OIDC/WIF STS tokens) carry no
+		// surrounding context for the structural patterns to anchor on.
+		{"jwt", `eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}`},
 	}
 
 	result := make([]secretPattern, len(patterns))
@@ -167,11 +249,11 @@ func defaultStructuralPatterns() []secretPattern {
 		name    string
 		pattern string
 	}{
-		{"env_assignment", `(?i)(?:^|\s)(?:export\s+)?((?:[A-Za-z0-9]+_)*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSWD|AUTH|API_KEY)(?:_[A-Za-z0-9]+)*)\s*=\s*['"]?([^\s'"]{8,})['"]?`},
+		{"env_assignment", `(?i)(?:^|\s)(?:export\s+)?((?:[A-Za-z0-9]+_)*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSWD|AUTH|API_KEY)(?:_[A-Za-z0-9]+)*)\s*=\s*['"]?([^\s"'}\]),;]{8,})['"]?`},
 		{"json_field", `(?:"[^"]*(?i:key|token|secret|password|credential|auth)[^"]*"|'[^']*(?i:key|token|secret|password|credential|auth)[^']*')\s*:\s*(?:"([^"]{8,})"|'([^']{8,})')`},
-		{"auth_header", `(?i)(?:Authorization|X-Api-Key|X-Auth-Token)\s*:\s*(?:Bearer\s+)?(\S{8,})`},
+		{"auth_header", `(?i)(?:Authorization|X-Api-Key|X-Auth-Token)\s*:\s*(?:Bearer\s+)?([^\s"'}\]),;]{12,})`},
 		{"private_key", `-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE KEY-----[\s\S]*?-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE KEY-----`},
-		{"db_connection_password", `(?:postgres(?:ql)?|mysql|mongodb|redis)://[^:]+:(.{4,})@[^@\s/]+`},
+		{"db_connection_password", `(?:postgres(?:ql)?|mysql|mongodb|redis)://[^:]+:([^\s"'}\]),;]{4,})@[^@\s/]+`},
 	}
 
 	result := make([]secretPattern, len(patterns))

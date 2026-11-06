@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # pre-fetch-prior-review-test.sh — Test SHA extraction in pre-fetch-prior-review.sh
 #
-# Verifies that the grep pipeline for extracting Head SHA does not crash
-# under set -euo pipefail when the prior review body lacks a SHA line.
+# Verifies that the sed extraction of the Head SHA does not crash under
+# set -euo pipefail when the prior review body lacks a SHA line, and that it
+# extracts the SHA from the production comment format (#1031).
+#
+# Format coupling: the review agent writes the SHA as the first body line,
+# wrapped in an HTML comment — `<!-- **Head SHA:** <sha> -->` — per
+# fullsend-ai/agents agents/review.md and skills/pr-review/SKILL.md, and
+# internal/sticky/sticky.go prepends `<!-- fullsend:review-agent -->` above
+# it. A drift in either side (format or sed pattern) silently empties
+# prior_sha and degrades every re-review to a full review; cases 12-13 pin it.
 #
 # Run from the repo root:
 #   bash internal/scaffold/fullsend-repo/scripts/pre-fetch-prior-review-test.sh
@@ -51,18 +59,22 @@ MOCKEOF
 }
 
 # make_comment_json builds the JSON that gh api would return after
-# jq filtering. The body field is set to $1.
+# jq filtering. The body field is set to $1. Optional $2 overrides
+# the user login (defaults to the org-specific bot). Optional $3
+# overrides the app client_id (defaults to Iv1.abc123).
 make_comment_json() {
   local body="$1"
+  local login="${2:-test-org-review[bot]}"
+  local client_id="${3:-Iv1.abc123}"
   # Escape the body for JSON embedding.
   local escaped_body
   escaped_body="$(printf '%s' "${body}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
   cat <<ENDJSON
 {
   "id": 12345,
-  "user": {"login": "test-org-review[bot]"},
+  "user": {"login": "${login}"},
   "body": ${escaped_body},
-  "performed_via_github_app": {"client_id": "Iv1.abc123"}
+  "performed_via_github_app": {"client_id": "${client_id}"}
 }
 ENDJSON
 }
@@ -72,6 +84,7 @@ run_test() {
   local comment_json="$2"
   local expected_sha="$3"   # expected value in prior_sha= output line
   local expect_exit="$4"    # 0 = success
+  local app_set="${5:-}"    # optional FULLSEND_APP_SET override
 
   local mock_bin
   mock_bin="$(build_mock "${comment_json}")"
@@ -91,6 +104,7 @@ run_test() {
     SOURCE_REPO="test-org/test-repo" \
     GITHUB_OUTPUT="${github_output}" \
     GITHUB_WORKSPACE="${workspace}" \
+    FULLSEND_APP_SET="${app_set}" \
     bash "${SCRIPT}" > "${TMPDIR}/stdout.log" 2>&1 || exit_code=$?
 
   if [[ ${exit_code} -ne ${expect_exit} ]]; then
@@ -176,6 +190,139 @@ No SHA in this section.
 run_test "sha-only-in-history-section" \
   "$(make_comment_json "${BODY_SHA_IN_HISTORY}")" \
   "" \
+  0
+
+# 6. Shared vendor bot identity (fullsend-ai-review[bot]) is recognized
+#    when ORG_NAME differs. This is the core regression covered by #5550.
+BODY_SHARED_BOT="<!-- fullsend:review-agent -->
+## Review
+
+**Head SHA:** beef123
+
+Review from the shared vendor App."
+
+run_test "shared-vendor-bot-identity" \
+  "$(make_comment_json "${BODY_SHARED_BOT}" "fullsend-ai-review[bot]")" \
+  "beef123" \
+  0
+
+# 7. Unrelated bot login should NOT match — only the org-specific or
+#    shared vendor identity should be recognized.
+BODY_WRONG_BOT="<!-- fullsend:review-agent -->
+## Review
+
+**Head SHA:** bad0bad
+
+This review is from the wrong bot."
+
+run_test "unrelated-bot-no-match" \
+  "$(make_comment_json "${BODY_WRONG_BOT}" "other-org-review[bot]")" \
+  "" \
+  0
+
+# 8. Shared vendor bot with a mismatched client ID should be discarded
+#    by provenance validation (wrong-app path). This verifies that the
+#    dual-identity matching does not bypass the provenance check.
+BODY_MISMATCHED_APP="<!-- fullsend:review-agent -->
+## Review
+
+**Head SHA:** cafe456
+
+Review from a bot with the wrong app client_id."
+
+run_test "shared-vendor-bot-wrong-app" \
+  "$(make_comment_json "${BODY_MISMATCHED_APP}" "fullsend-ai-review[bot]" "Iv1.WRONG")" \
+  "" \
+  0
+
+# 9. Custom app-set identity (FULLSEND_APP_SET configured) is recognized
+#    even though it differs from both ORG_NAME and the shared vendor
+#    identity. This is the core fix for #5480.
+BODY_CUSTOM_APP_SET="<!-- fullsend:review-agent -->
+## Review
+
+**Head SHA:** c0ffee1
+
+Review from the configured custom app-set review bot."
+
+run_test "custom-app-set-bot-identity" \
+  "$(make_comment_json "${BODY_CUSTOM_APP_SET}" "custom-prefix-review[bot]")" \
+  "c0ffee1" \
+  0 \
+  "custom-prefix"
+
+# 10. A bot login that matches none of the org-specific, shared vendor,
+#     or configured custom app-set identities should NOT match — exact
+#     identity matching only, no wildcard bot matching.
+BODY_CUSTOM_MISMATCH="<!-- fullsend:review-agent -->
+## Review
+
+**Head SHA:** bad0999
+
+Review from a bot that doesn't match any configured identity."
+
+run_test "custom-app-set-mismatch-no-match" \
+  "$(make_comment_json "${BODY_CUSTOM_MISMATCH}" "other-prefix-review[bot]")" \
+  "" \
+  0 \
+  "custom-prefix"
+
+# 11. The org-specific identity still matches when FULLSEND_APP_SET is
+#     configured to a different custom value — the custom identity is
+#     additive, not a replacement.
+BODY_ORG_STILL_MATCHES="<!-- fullsend:review-agent -->
+## Review
+
+**Head SHA:** aaaa111
+
+Review from the org-specific bot while a custom app-set is configured."
+
+run_test "org-bot-still-matches-with-custom-app-set" \
+  "$(make_comment_json "${BODY_ORG_STILL_MATCHES}")" \
+  "aaaa111" \
+  0 \
+  "custom-prefix"
+
+# 12. Production format (#1031): sticky marker line, then the Head SHA wrapped
+#     in an HTML comment. Body mirrors e2e/behaviour/results/review/approve.
+BODY_HTML_COMMENT_SHA="<!-- fullsend:review-agent -->
+<!-- **Head SHA:** 5fcdfb95cc5d61819a8e1f5bf60db024cf88b5f0 -->
+
+## Review
+
+No further concerns."
+
+run_test "html-comment-wrapped-sha" \
+  "$(make_comment_json "${BODY_HTML_COMMENT_SHA}")" \
+  "5fcdfb95cc5d61819a8e1f5bf60db024cf88b5f0" \
+  0
+
+# 13. Production re-review shape (generated by sticky.BuildUpdatedBody):
+#     wrapped current SHA plus a collapsed history entry carrying an older
+#     wrapped SHA — the current one wins.
+BODY_HTML_COMMENT_SHA_HISTORY="<!-- fullsend:review-agent -->
+<!-- **Head SHA:** 5429609dce9a122a2721107edb51551c8d73cc6f -->
+
+## Review
+
+Current findings.
+
+<details>
+<summary>Previous run</summary>
+
+<!-- sticky:history-start -->
+<!-- **Head SHA:** 1111111111111111111111111111111111111111 -->
+
+## Review
+
+Older findings.
+<!-- sticky:history-end -->
+
+</details>"
+
+run_test "html-comment-sha-with-history" \
+  "$(make_comment_json "${BODY_HTML_COMMENT_SHA_HISTORY}")" \
+  "5429609dce9a122a2721107edb51551c8d73cc6f" \
   0
 
 # --- Summary ---

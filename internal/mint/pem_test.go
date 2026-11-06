@@ -2,19 +2,14 @@ package function
 
 import (
 	"context"
-	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/mintcore"
 )
 
 func TestGCPSecretPEMAccessor_InputValidation(t *testing.T) {
-	accessor := mintcore.NewGCPSecretPEMAccessor(
-		&http.Client{Timeout: 10 * time.Second},
-		"123456789",
-	)
+	accessor := mintcore.NewGCPSecretPEMAccessor("123456789")
 
 	tests := []struct {
 		name    string

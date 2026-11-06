@@ -1,0 +1,4 @@
+{"type":"step_start","timestamp":1723456780000,"sessionID":"ses_err456","part":{"id":"prt_1","sessionID":"ses_err456","messageID":"msg_1","type":"step-start"}}
+{"type":"tool_use","timestamp":1723456781000,"sessionID":"ses_err456","part":{"id":"prt_2","sessionID":"ses_err456","messageID":"msg_1","type":"tool","callID":"call_1","tool":"edit","state":{"status":"error","input":{"filePath":"/nonexistent"},"error":"file not found","time":{"start":1723456780500,"end":1723456781000}}}}
+{"type":"error","timestamp":1723456782000,"sessionID":"ses_err456","error":{"name":"APIError","data":{"message":"quota exhausted","statusCode":429,"isRetryable":false}}}
+{"type":"step_finish","timestamp":1723456783000,"sessionID":"ses_err456","part":{"id":"prt_3","sessionID":"ses_err456","messageID":"msg_1","type":"step-finish","reason":"error","cost":0.005,"tokens":{"input":50,"output":10,"reasoning":0,"cache":{"read":40,"write":5}}}}

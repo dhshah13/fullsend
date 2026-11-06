@@ -1,0 +1,38 @@
+#!/bin/sh
+# Fake openshell that passes CheckGateway but refuses sandbox creation.
+# Used by the pre-script skip tests to prove that a skip returns *before*
+# sandbox creation: a skipped run sees no error, while a proceeding run
+# fails here.
+#
+# `sandbox get` must fail too — createOnce falls back to it to decide
+# whether a failed create nonetheless left a sandbox behind, and a passing
+# `get` would send it into the ready-poll loop instead of returning.
+
+case "$1" in
+  gateway)
+    case "$2" in
+      list) echo "default-gateway"; exit 0 ;;
+    esac
+    ;;
+  settings)
+    exit 0
+    ;;
+  provider)
+    case "$2" in
+      profile|create|update) exit 0 ;;
+    esac
+    ;;
+  sandbox)
+    case "$2" in
+      create)
+        echo "prescript-stub: sandbox creation refused" >&2
+        exit 1
+        ;;
+      get)
+        exit 1
+        ;;
+      delete|ready|exec) exit 0 ;;
+    esac
+    ;;
+esac
+exit 0

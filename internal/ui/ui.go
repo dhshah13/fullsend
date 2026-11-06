@@ -38,7 +38,7 @@ func (p *Printer) Banner(version string) {
 	brand := lipgloss.NewStyle().Bold(true).Foreground(ColorBrand).Render("fullsend")
 	ver := lipgloss.NewStyle().Foreground(ColorMuted).Render(version)
 	fmt.Fprintf(p.w, "\u26a1 %s %s\n", brand, ver)
-	tagline := lipgloss.NewStyle().Foreground(ColorMuted).Render("Autonomous agentic development for GitHub organizations")
+	tagline := lipgloss.NewStyle().Foreground(ColorMuted).Render("Autonomous agentic development for Git-hosted organizations")
 	fmt.Fprintf(p.w, "  %s\n", tagline)
 }
 
@@ -137,7 +137,15 @@ func (p *Printer) ErrorBox(title, detail string) {
 func (p *Printer) Heartbeat(text string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	styled := lipgloss.NewStyle().Foreground(ColorMuted).Render("⟳ " + text)
+	styled := lipgloss.NewStyle().Foreground(ColorMuted).Render("⏳ " + text)
+	fmt.Fprintf(p.w, "  %s\n", styled)
+}
+
+// ToolProgress prints a tool invocation progress line.
+func (p *Printer) ToolProgress(text string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	styled := lipgloss.NewStyle().Foreground(ColorInfo).Render("⚙ " + text)
 	fmt.Fprintf(p.w, "  %s\n", styled)
 }
 

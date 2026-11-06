@@ -2,9 +2,11 @@ package sticky
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
@@ -17,6 +19,7 @@ import (
 var testCfg = Config{
 	Marker:       "<!-- fullsend:test -->",
 	FooterMarker: "<!-- fullsend:test-footer -->",
+	KeepHistory:  true,
 }
 
 func TestFindMarkedComment(t *testing.T) {
@@ -51,8 +54,7 @@ func TestFindMarkedComment_EmptyBotUser(t *testing.T) {
 	}
 
 	found := FindMarkedComment(comments, "<!-- fullsend:test -->", "")
-	require.NotNil(t, found, "empty botUser should match any author")
-	assert.Equal(t, 1, found.ID)
+	assert.Nil(t, found, "an unresolved (empty) botUser must match nothing, not any author")
 }
 
 func TestFindMarkedComment_Empty(t *testing.T) {
@@ -73,7 +75,7 @@ func TestBuildUpdatedBody_CollapsesOldContent(t *testing.T) {
 }
 
 func TestBuildUpdatedBody_FlatHistory(t *testing.T) {
-	cfg := Config{Marker: "<!-- m -->"}
+	cfg := Config{Marker: "<!-- m -->", KeepHistory: true}
 
 	// Run 1 → Run 2
 	body1 := "<!-- m -->\nRun 1 content."
@@ -113,7 +115,7 @@ func TestBuildUpdatedBody_FlatHistory(t *testing.T) {
 }
 
 func TestBuildUpdatedBody_NestedDetailsInContent(t *testing.T) {
-	cfg := Config{Marker: "<!-- m -->"}
+	cfg := Config{Marker: "<!-- m -->", KeepHistory: true}
 
 	// Run 1 content contains a <details> block (common in GitHub review output).
 	body1 := "<!-- m -->\nReview findings:\n<details>\n<summary>Expanded diff</summary>\nsome diff content\n</details>\nEnd of review."
@@ -151,7 +153,7 @@ func TestBuildUpdatedBody_FooterStripping(t *testing.T) {
 }
 
 func TestBuildUpdatedBody_NoFooterMarker(t *testing.T) {
-	cfg := Config{Marker: "<!-- m -->"}
+	cfg := Config{Marker: "<!-- m -->", KeepHistory: true}
 	oldBody := "<!-- m -->\nOld content."
 	newBody := "<!-- m -->\nNew content."
 
@@ -159,6 +161,66 @@ func TestBuildUpdatedBody_NoFooterMarker(t *testing.T) {
 
 	assert.Contains(t, result, "New content.")
 	assert.Contains(t, result, "Old content.")
+}
+
+func TestBuildUpdatedBody_NoHistory(t *testing.T) {
+	cfg := Config{
+		Marker:      "<!-- test -->",
+		KeepHistory: false,
+	}
+	oldBody := "<!-- test -->\nold content"
+	newBody := "<!-- test -->\nnew content"
+
+	got := BuildUpdatedBody(oldBody, newBody, cfg)
+
+	if strings.Contains(got, "<details>") {
+		t.Error("expected no history block when KeepHistory is false")
+	}
+	if !strings.Contains(got, "new content") {
+		t.Error("expected new content in result")
+	}
+	if strings.Contains(got, "old content") {
+		t.Error("expected old content to be discarded when KeepHistory is false")
+	}
+}
+
+func TestBuildUpdatedBody_NoHistory_PreservesFooter(t *testing.T) {
+	cfg := Config{
+		Marker:       "<!-- fullsend:test -->",
+		FooterMarker: "<!-- fullsend:test-footer -->",
+		KeepHistory:  false,
+	}
+	oldBody := "<!-- fullsend:test -->\nOld review.\n\n<!-- fullsend:test-footer -->\n_some footer info_"
+	newBody := "<!-- fullsend:test -->\nNew review."
+
+	got := BuildUpdatedBody(oldBody, newBody, cfg)
+
+	assert.Contains(t, got, "New review.")
+	assert.NotContains(t, got, "Old review.")
+	assert.NotContains(t, got, "<details>")
+	assert.Contains(t, got, "<!-- fullsend:test-footer -->")
+	assert.Contains(t, got, "_some footer info_")
+}
+
+func TestBuildUpdatedBody_NoHistory_MultipleRuns(t *testing.T) {
+	cfg := Config{Marker: "<!-- m -->", KeepHistory: false}
+
+	body1 := "<!-- m -->\nRun 1 content."
+	body2 := "<!-- m -->\nRun 2 content."
+	result2 := BuildUpdatedBody(body1, body2, cfg)
+
+	// After update, only run 2 should be present.
+	assert.Contains(t, result2, "Run 2 content.")
+	assert.NotContains(t, result2, "Run 1 content.")
+	assert.NotContains(t, result2, "<details>")
+
+	// Run 2 → Run 3
+	body3 := "<!-- m -->\nRun 3 content."
+	result3 := BuildUpdatedBody(result2, body3, cfg)
+
+	assert.Contains(t, result3, "Run 3 content.")
+	assert.NotContains(t, result3, "Run 2 content.")
+	assert.NotContains(t, result3, "<details>")
 }
 
 func TestTruncateBody_UnderLimit(t *testing.T) {
@@ -174,7 +236,7 @@ func TestTruncateBody_OverLimit(t *testing.T) {
 }
 
 func TestBuildUpdatedBody_DropsOldestHistoryOnOverflow(t *testing.T) {
-	cfg := Config{Marker: "<!-- m -->", MaxSize: 500}
+	cfg := Config{Marker: "<!-- m -->", MaxSize: 500, KeepHistory: true}
 
 	body1 := "<!-- m -->\n" + strings.Repeat("A", 100)
 	body2 := "<!-- m -->\n" + strings.Repeat("B", 100)
@@ -229,7 +291,7 @@ func TestPost_UpdateExisting(t *testing.T) {
 	}
 	printer := ui.New(io.Discard)
 
-	cfg := Config{Marker: "<!-- test -->"}
+	cfg := Config{Marker: "<!-- test -->", KeepHistory: true}
 	commentURL, err := Post(context.Background(), client, "o", "r", 1, "New.", cfg, printer)
 	require.NoError(t, err)
 	assert.Equal(t, "https://github.com/o/r/issues/1#issuecomment-100", commentURL)
@@ -243,6 +305,7 @@ func TestPost_UpdateExisting(t *testing.T) {
 
 func TestPost_DryRun(t *testing.T) {
 	client := forge.NewFakeClient()
+	client.AuthenticatedUser = "bot"
 	printer := ui.New(io.Discard)
 
 	cfg := Config{Marker: "<!-- test -->", DryRun: true}
@@ -292,7 +355,7 @@ func TestPost_UpdateExisting_EmptyHTMLURL(t *testing.T) {
 	}
 	printer := ui.New(io.Discard)
 
-	cfg := Config{Marker: "<!-- test -->"}
+	cfg := Config{Marker: "<!-- test -->", KeepHistory: true}
 	commentURL, err := Post(context.Background(), client, "o", "r", 1, "New.", cfg, printer)
 	require.NoError(t, err)
 	assert.Empty(t, commentURL, "should return empty URL when existing comment has no HTMLURL")
@@ -303,6 +366,7 @@ func TestPost_UpdateExisting_EmptyHTMLURL(t *testing.T) {
 
 func TestPost_DryRunExisting(t *testing.T) {
 	client := forge.NewFakeClient()
+	client.AuthenticatedUser = "bot"
 	client.IssueComments = map[string][]forge.IssueComment{
 		"o/r/1": {{ID: 100, Body: "<!-- test -->\nOld.", Author: "bot"}},
 	}
@@ -313,5 +377,128 @@ func TestPost_DryRunExisting(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, commentURL)
 
+	assert.Empty(t, client.UpdatedComments)
+}
+
+// fastBotUserLookup shortens the identity-lookup retry backoff for a test.
+func fastBotUserLookup(t *testing.T) {
+	t.Helper()
+	saved := botUserLookupBackoff
+	botUserLookupBackoff = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { botUserLookupBackoff = saved })
+}
+
+// flakyAuthClient fails GetAuthenticatedUser failures times, then defers to
+// the wrapped forge.Client.
+type flakyAuthClient struct {
+	forge.Client
+	failures int
+	calls    int
+}
+
+func (c *flakyAuthClient) GetAuthenticatedUser(ctx context.Context) (string, error) {
+	c.calls++
+	if c.calls <= c.failures {
+		return "", errors.New("502 Bad Gateway")
+	}
+	return c.Client.GetAuthenticatedUser(ctx)
+}
+
+func TestPost_PersistentIdentityFailure_ErrorsAndPostsNothing(t *testing.T) {
+	fastBotUserLookup(t)
+	fc := forge.NewFakeClient()
+	fc.AuthenticatedUser = "bot"
+	fc.IssueComments = map[string][]forge.IssueComment{
+		"o/r/1": {{ID: 100, Body: "<!-- test -->\nOld.", Author: "bot"}},
+	}
+	client := &flakyAuthClient{Client: fc, failures: 1000}
+	printer := ui.New(io.Discard)
+
+	cfg := Config{Marker: "<!-- test -->", KeepHistory: true}
+	_, err := Post(context.Background(), client, "o", "r", 1, "New.", cfg, printer)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot verify which identity")
+	assert.Contains(t, err.Error(), "502 Bad Gateway", "the error must name the cause")
+	assert.Equal(t, len(botUserLookupBackoff)+1, client.calls)
+
+	assert.Empty(t, fc.UpdatedComments, "no comment may be edited")
+	require.Len(t, fc.IssueComments["o/r/1"], 1, "no comment may be created")
+}
+
+func TestPost_TransientIdentityFailure_RetriesThenEdits(t *testing.T) {
+	fastBotUserLookup(t)
+	fc := forge.NewFakeClient()
+	fc.AuthenticatedUser = "bot"
+	fc.IssueComments = map[string][]forge.IssueComment{
+		"o/r/1": {{ID: 100, Body: "<!-- test -->\nOld.", Author: "bot"}},
+	}
+	client := &flakyAuthClient{Client: fc, failures: len(botUserLookupBackoff)}
+	printer := ui.New(io.Discard)
+
+	cfg := Config{Marker: "<!-- test -->", KeepHistory: true}
+	_, err := Post(context.Background(), client, "o", "r", 1, "New.", cfg, printer)
+	require.NoError(t, err)
+	assert.Equal(t, len(botUserLookupBackoff)+1, client.calls, "every retry is used before success")
+
+	require.Len(t, fc.UpdatedComments, 1)
+	assert.Equal(t, 100, fc.UpdatedComments[0].CommentID)
+	assert.Contains(t, fc.UpdatedComments[0].Body, "New.")
+}
+
+func TestPost_IgnoresPlantedMarker_EditsOnlyOwnComment(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.AuthenticatedUser = "bot"
+	client.IssueComments = map[string][]forge.IssueComment{
+		"o/r/1": {
+			{ID: 100, Body: "<!-- test -->\nplanted by attacker", Author: "attacker"},
+			{ID: 101, Body: "<!-- test -->\nOld.", Author: "bot"},
+		},
+	}
+	printer := ui.New(io.Discard)
+
+	cfg := Config{Marker: "<!-- test -->", KeepHistory: true}
+	_, err := Post(context.Background(), client, "o", "r", 1, "New.", cfg, printer)
+	require.NoError(t, err)
+
+	require.Len(t, client.UpdatedComments, 1)
+	assert.Equal(t, 101, client.UpdatedComments[0].CommentID, "only the bot's own comment may be edited")
+
+	comments := client.IssueComments["o/r/1"]
+	assert.NotContains(t, comments[0].Body, "New.", "the planted comment must be left untouched")
+}
+
+func TestPost_OnlyPlantedMarker_CreatesNewCommentWithoutTouchingPlanted(t *testing.T) {
+	client := forge.NewFakeClient()
+	client.AuthenticatedUser = "bot"
+	client.IssueComments = map[string][]forge.IssueComment{
+		"o/r/1": {{ID: 100, Body: "<!-- test -->\nplanted by attacker", Author: "attacker"}},
+	}
+	printer := ui.New(io.Discard)
+
+	cfg := Config{Marker: "<!-- test -->"}
+	commentURL, err := Post(context.Background(), client, "o", "r", 1, "New.", cfg, printer)
+	require.NoError(t, err)
+	assert.Contains(t, commentURL, "issuecomment-")
+
+	comments := client.IssueComments["o/r/1"]
+	require.Len(t, comments, 2, "a new comment is created; the planted one is left in place")
+	assert.NotContains(t, comments[0].Body, "New.", "the planted comment must be untouched")
+	assert.Contains(t, comments[1].Body, "New.")
+	assert.Empty(t, client.UpdatedComments)
+}
+
+func TestPost_DryRun_UnresolvedIdentity_Errors(t *testing.T) {
+	fastBotUserLookup(t)
+	client := forge.NewFakeClient()
+	client.IssueComments = map[string][]forge.IssueComment{
+		"o/r/1": {{ID: 100, Body: "<!-- test -->\nOld.", Author: "bot"}},
+	}
+	printer := ui.New(io.Discard)
+
+	cfg := Config{Marker: "<!-- test -->", DryRun: true}
+	commentURL, err := Post(context.Background(), client, "o", "r", 1, "New.", cfg, printer)
+	require.Error(t, err, "dry run must not imply an edit would occur when identity is unresolved")
+	assert.Contains(t, err.Error(), "cannot verify which identity")
+	assert.Empty(t, commentURL)
 	assert.Empty(t, client.UpdatedComments)
 }

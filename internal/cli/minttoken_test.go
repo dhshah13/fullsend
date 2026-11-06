@@ -95,6 +95,84 @@ func TestMintTokenCmd_InvalidRole(t *testing.T) {
 	}
 }
 
+func TestMintTokenCmd_LevelDefaultsToWrite(t *testing.T) {
+	oidcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(struct {
+			Value string `json:"value"`
+		}{Value: "oidc-jwt"})
+	}))
+	defer oidcServer.Close()
+
+	var gotLevel string
+	mintServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Level string `json:"level"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		gotLevel = body.Level
+		json.NewEncoder(w).Encode(mintclient.MintResult{
+			Token:     "ghu_test",
+			ExpiresAt: "2026-06-11T23:30:00Z",
+		})
+	}))
+	defer mintServer.Close()
+
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", oidcServer.URL+"?d=1")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "tok")
+
+	var stdout bytes.Buffer
+	cmd := newMintTokenCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--role", "triage", "--repos", "r", "--mint-url", mintServer.URL})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotLevel != "write" {
+		t.Errorf("level sent to mint = %q, want %q (default should be write)", gotLevel, "write")
+	}
+}
+
+func TestMintTokenCmd_LevelPassedThrough(t *testing.T) {
+	oidcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(struct {
+			Value string `json:"value"`
+		}{Value: "oidc-jwt"})
+	}))
+	defer oidcServer.Close()
+
+	var gotLevel string
+	mintServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Level string `json:"level"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		gotLevel = body.Level
+		json.NewEncoder(w).Encode(mintclient.MintResult{
+			Token:     "ghu_test",
+			ExpiresAt: "2026-06-11T23:30:00Z",
+		})
+	}))
+	defer mintServer.Close()
+
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", oidcServer.URL+"?d=1")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "tok")
+
+	var stdout bytes.Buffer
+	cmd := newMintTokenCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--role", "triage", "--repos", "r", "--mint-url", mintServer.URL, "--level", "read"})
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotLevel != "read" {
+		t.Errorf("level sent to mint = %q, want %q", gotLevel, "read")
+	}
+}
+
 func TestMintTokenCmd_RoleAliasResolved(t *testing.T) {
 	oidcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(struct {
@@ -233,6 +311,69 @@ func TestMintTokenCmd_RejectsInvalidTokenChars(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unexpected characters") {
 		t.Errorf("error = %q, want to contain 'unexpected characters'", err.Error())
+	}
+}
+
+func TestMintTokenCmd_AcceptsJWTFormatToken(t *testing.T) {
+	oidcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(struct {
+			Value string `json:"value"`
+		}{Value: "jwt"})
+	}))
+	defer oidcServer.Close()
+
+	// Simulate a JWT-format GitHub App installation token with dots as
+	// segment separators, matching the new ghs_APPID_JWT format.
+	mintServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(mintclient.MintResult{
+			Token:     "ghu_hdr.pay.sig",
+			ExpiresAt: "2026-01-01T00:00:00Z",
+		})
+	}))
+	defer mintServer.Close()
+
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", oidcServer.URL+"?d=1")
+	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "tok")
+
+	var stdout bytes.Buffer
+	cmd := newMintTokenCmd()
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"--role", "triage", "--repos", "r", "--mint-url", mintServer.URL})
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("unexpected error: JWT-format token should be accepted: %v", err)
+	}
+	if got := stdout.String(); got != "ghu_hdr.pay.sig" {
+		t.Errorf("stdout = %q, want %q", got, "ghu_hdr.pay.sig")
+	}
+}
+
+func TestMintTokenCmd_TokenPatternValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		token string
+		valid bool
+	}{
+		{"classic opaque token", "ghs_test_tok", true},
+		{"JWT-format with dots", "ghs_1234_hdr.pay.sig", true},
+		{"hyphens and underscores", "abc-def_ghi", true},
+		{"simple alphanumeric", "abc123", true},
+		{"dots only", "a.b.c", true},
+		{"whitespace", "abc 123", false},
+		{"quotes", `abc"123`, false},
+		{"empty string", "", false},
+		{"newline", "abc\n123", false},
+		{"shell metacharacters", "abc;rm", false},
+		{"colon", "token::set", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mintTokenPattern.MatchString(tt.token)
+			if got != tt.valid {
+				t.Errorf("mintTokenPattern.MatchString(%q) = %v, want %v", tt.token, got, tt.valid)
+			}
+		})
 	}
 }
 

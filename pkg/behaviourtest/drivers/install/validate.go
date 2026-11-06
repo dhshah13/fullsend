@@ -1,0 +1,134 @@
+package install
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"time"
+
+	"github.com/fullsend-ai/fullsend/internal/config"
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/scaffold"
+)
+
+// vendoredBinaryPathPerRepo is the upload path inside a per-repo target.
+// Duplicated from layers.VendoredBinaryPathPerRepo so this package does
+// not import internal/layers (which transitively pulls the nested mintcore
+// module via internal/repos).
+const vendoredBinaryPathPerRepo = ".fullsend/bin/fullsend"
+
+// validateMaxAttempts is the number of GetFileContent attempts before
+// giving up. GitHub's API can return transient 404s immediately after a
+// commit due to read-after-write eventual consistency.
+const validateMaxAttempts = 5
+
+// validateRetryDelay is the delay between retry attempts for
+// GetFileContent calls during post-install validation.
+// Overridden in tests to avoid slow retry loops.
+var validateRetryDelay = 2 * time.Second
+
+// getFileWithRetry wraps GetFileContent with retry logic for transient
+// 404 errors caused by GitHub API read-after-write eventual consistency.
+// Non-404 errors fail immediately without retrying.
+func getFileWithRetry(ctx context.Context, client forge.Client, org, repo, path string) ([]byte, error) {
+	var lastErr error
+	for i := range validateMaxAttempts {
+		data, err := client.GetFileContent(ctx, org, repo, path)
+		if err == nil {
+			return data, nil
+		}
+		if !forge.IsNotFound(err) {
+			return nil, err
+		}
+		lastErr = err
+		if i < validateMaxAttempts-1 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(validateRetryDelay):
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+// validateShimAndConfig checks that a per-repo install left the expected
+// workflow shim and config with the expected runtime. Shared by both
+// vendored and non-vendored validation. When config.base.yaml is present
+// (a --config preset install), runtime is resolved through the overlay
+// → base → defaults chain. An empty expectedRuntime defaults to "dummy".
+func validateShimAndConfig(ctx context.Context, client forge.Client, org, repo, expectedRuntime string) error {
+	if expectedRuntime == "" {
+		expectedRuntime = "dummy"
+	}
+	shimPath := ".github/workflows/fullsend.yaml"
+	if _, err := getFileWithRetry(ctx, client, org, repo, shimPath); err != nil {
+		return fmt.Errorf("post-install: missing %s on %s/%s: %w", shimPath, org, repo, err)
+	}
+
+	cfgPath := filepath.Join(".fullsend", config.OverlayConfigFile)
+	cfgData, err := getFileWithRetry(ctx, client, org, repo, cfgPath)
+	if err != nil {
+		return fmt.Errorf("post-install: reading %s: %w", cfgPath, err)
+	}
+	basePath := filepath.Join(".fullsend", config.BaseConfigFile)
+	baseData, baseErr := client.GetFileContent(ctx, org, repo, basePath)
+	if baseErr != nil {
+		if !forge.IsNotFound(baseErr) {
+			return fmt.Errorf("post-install: reading %s: %w", basePath, baseErr)
+		}
+		baseData = nil
+	}
+	cfgW, err := config.ParsePerRepoConfigWriterLayered(cfgData, baseData)
+	if err != nil {
+		return fmt.Errorf("post-install: parsing %s: %w", cfgPath, err)
+	}
+	if err := cfgW.Validate(); err != nil {
+		return fmt.Errorf("post-install: invalid %s: %w", cfgPath, err)
+	}
+	if cfgW.ConfigRuntime() != expectedRuntime {
+		return fmt.Errorf("post-install: %s runtime is %q, want %s", cfgPath, cfgW.ConfigRuntime(), expectedRuntime)
+	}
+	return nil
+}
+
+// ValidatePerRepoPostInstall checks that a per-repo install left the
+// expected files and configuration in the target repo, with the
+// standard "dummy" runtime.
+func ValidatePerRepoPostInstall(ctx context.Context, client forge.Client, org, repo string) error {
+	return ValidatePerRepoPostInstallWithRuntime(ctx, client, org, repo, "dummy")
+}
+
+// ValidatePerRepoPostInstallWithRuntime is like ValidatePerRepoPostInstall
+// but accepts the expected runtime name, so callers that install with a
+// non-default runtime (e.g. "dummy-playback") can validate against it.
+func ValidatePerRepoPostInstallWithRuntime(ctx context.Context, client forge.Client, org, repo, expectedRuntime string) error {
+	if err := validateShimAndConfig(ctx, client, org, repo, expectedRuntime); err != nil {
+		return err
+	}
+
+	markerPath := scaffold.VendoredMarkerPath()
+	if _, err := getFileWithRetry(ctx, client, org, repo, markerPath); err != nil {
+		return fmt.Errorf("post-install: missing vendored marker %s: %w", markerPath, err)
+	}
+	if _, err := getFileWithRetry(ctx, client, org, repo, vendoredBinaryPathPerRepo); err != nil {
+		return fmt.Errorf("post-install: missing vendored binary at %s: %w", vendoredBinaryPathPerRepo, err)
+	}
+	return nil
+}
+
+// ValidatePerRepoPostInstallNonVendored checks that a non-vendored
+// per-repo install left the expected workflow shim and config, with the
+// standard "dummy" runtime. Unlike ValidatePerRepoPostInstall it does not
+// require vendored assets (marker file and binary) because non-vendored
+// installs reference a remote fullsend-ref instead.
+func ValidatePerRepoPostInstallNonVendored(ctx context.Context, client forge.Client, org, repo string) error {
+	return ValidatePerRepoPostInstallNonVendoredWithRuntime(ctx, client, org, repo, "dummy")
+}
+
+// ValidatePerRepoPostInstallNonVendoredWithRuntime is like
+// ValidatePerRepoPostInstallNonVendored but accepts the expected runtime
+// name.
+func ValidatePerRepoPostInstallNonVendoredWithRuntime(ctx context.Context, client forge.Client, org, repo, expectedRuntime string) error {
+	return validateShimAndConfig(ctx, client, org, repo, expectedRuntime)
+}

@@ -1,0 +1,5 @@
+{invalid json here
+{"type":"text","timestamp":1723456781000,"sessionID":"ses_mal","part":{"id":"prt_1","sessionID":"ses_mal","messageID":"msg_1","type":"text","text":"valid line","time":{"start":1723456780500,"end":1723456781000}}}
+
+{"type":"step_finish","timestamp":1723456783000,"sessionID":"ses_mal","part":{"id":"prt_2","sessionID":"ses_mal","messageID":"msg_1","type":"step-finish","reason":"stop","cost":0.01,"tokens":{"input":50,"output":20,"reasoning":0,"cache":{"read":30,"write":5}}}}
+not json at all

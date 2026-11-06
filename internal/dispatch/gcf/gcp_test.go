@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/fullsend-ai/fullsend/internal/gcp"
 	"github.com/stretchr/testify/assert"
@@ -22,6 +24,14 @@ func newTestClient(srv *httptest.Server) *LiveGCFClient {
 	transport := &rewriteTransport{base: target}
 	httpClient := &http.Client{Transport: transport}
 	return &LiveGCFClient{Client: gcp.NewClientWithHTTP(httpClient), skipUploadURLCheck: true}
+}
+
+// immediateDelay is a pollDelay function that returns immediately,
+// avoiding real sleeps in unit tests.
+func immediateDelay(time.Duration) <-chan time.Time {
+	ch := make(chan time.Time, 1)
+	ch <- time.Time{}
+	return ch
 }
 
 // rewriteTransport rewrites all request URLs to point at a test server,
@@ -196,6 +206,150 @@ func TestLiveGCFClient_CreateWIFProvider(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 4, callCount)
 	})
+
+	t.Run("retries on 429", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		attempts := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			if attempts <= 2 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `{"name":"operations/prov-op","done":true}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).CreateWIFProvider(context.Background(), "123", "pool", "gh-oidc", OIDCProviderConfig{
+			IssuerURI:          "https://token.actions.githubusercontent.com",
+			AttributeCondition: "assertion.repository_owner == 'my-org'",
+			AllowedAudiences:   []string{"fullsend-mint"},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 3, attempts, "should succeed after 2 retries")
+	})
+
+	t.Run("exhausts retries on persistent 429", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		attempts := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts++
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).CreateWIFProvider(context.Background(), "123", "pool", "gh-oidc", OIDCProviderConfig{
+			IssuerURI:          "https://token.actions.githubusercontent.com",
+			AttributeCondition: "assertion.repository_owner == 'my-org'",
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "429")
+		assert.Equal(t, 7, attempts, "should exhaust all 7 retry attempts")
+	})
+}
+
+// --- UpdateWIFProvider ---
+
+func TestLiveGCFClient_UpdateWIFProvider(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodPatch, r.Method)
+			assert.Contains(t, r.URL.RawQuery, "attributeCondition")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `{"name":"operations/update-op","done":true}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).UpdateWIFProvider(context.Background(), "123", "pool", "gh-oidc", OIDCProviderConfig{
+			AttributeCondition: "assertion.repository_owner == 'my-org'",
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("retries on 429", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		attempts := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts++
+			if attempts <= 2 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `{"name":"operations/update-op","done":true}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).UpdateWIFProvider(context.Background(), "123", "pool", "gh-oidc", OIDCProviderConfig{
+			AttributeCondition: "assertion.repository_owner == 'my-org'",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 3, attempts, "should succeed after 2 retries")
+	})
+
+	t.Run("exhausts retries on persistent 429", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		attempts := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts++
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).UpdateWIFProvider(context.Background(), "123", "pool", "gh-oidc", OIDCProviderConfig{
+			AttributeCondition: "assertion.repository_owner == 'my-org'",
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "429")
+		assert.Equal(t, 7, attempts, "should exhaust all 7 retry attempts")
+	})
+
+	t.Run("error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintln(w, `{"error":{"message":"permission denied"}}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).UpdateWIFProvider(context.Background(), "123", "pool", "gh-oidc", OIDCProviderConfig{
+			AttributeCondition: "assertion.repository_owner == 'my-org'",
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unexpected status 403")
+	})
+
+	t.Run("context canceled during 429 backoff", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return 10 * time.Second }
+
+		ctx, cancel := context.WithCancel(context.Background())
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			// Cancel context so the backoff select picks up ctx.Done.
+			cancel()
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).UpdateWIFProvider(ctx, "123", "pool", "gh-oidc", OIDCProviderConfig{
+			AttributeCondition: "assertion.repository_owner == 'my-org'",
+		})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
+	})
 }
 
 // --- GetWIFProvider ---
@@ -225,6 +379,41 @@ func TestLiveGCFClient_GetWIFProvider(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, info)
 	})
+
+	t.Run("decodes state, disabled and issuer", func(t *testing.T) {
+		// Shape of a soft-deleted provider as returned by providers.get:
+		// HTTP 200 with state DELETED and the config still present.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `{"attributeCondition":"assertion.repository == 'acme/widget'","state":"DELETED","disabled":true,"oidc":{"issuerUri":"https://token.actions.githubusercontent.com","allowedAudiences":["fullsend-mint"]}}`)
+		}))
+		defer srv.Close()
+
+		info, err := newTestClient(srv).GetWIFProvider(context.Background(), "123", "pool", "prov")
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.Equal(t, "DELETED", info.State)
+		assert.True(t, info.Disabled)
+		assert.Equal(t, "https://token.actions.githubusercontent.com", info.IssuerURI)
+	})
+}
+
+func TestWIFProviderInfo_Usable(t *testing.T) {
+	tests := []struct {
+		name string
+		info WIFProviderInfo
+		want bool
+	}{
+		{name: "active", info: WIFProviderInfo{State: WIFProviderStateActive}, want: true},
+		{name: "state absent", info: WIFProviderInfo{}, want: true},
+		{name: "soft-deleted", info: WIFProviderInfo{State: "DELETED"}, want: false},
+		{name: "disabled", info: WIFProviderInfo{State: WIFProviderStateActive, Disabled: true}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.info.Usable())
+		})
+	}
 }
 
 // --- GetSecret ---
@@ -382,6 +571,184 @@ func TestLiveGCFClient_SetSecretIAMBinding(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid secret resource path")
 	})
+
+	t.Run("retries on 409 conflict", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callCount++
+			if callCount <= 2 {
+				if callCount%2 == 1 {
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprintln(w, `{"bindings":[],"etag":"v1"}`)
+					return
+				}
+				w.WriteHeader(http.StatusConflict)
+				fmt.Fprintln(w, `{"error":{"message":"conflict"}}`)
+				return
+			}
+			if callCount == 3 {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"bindings":[],"etag":"v2"}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).SetSecretIAMBinding(context.Background(),
+			"projects/proj/secrets/s", "member", "role")
+		require.NoError(t, err)
+		assert.Equal(t, 4, callCount)
+	})
+
+	t.Run("retries past old 3-attempt limit on repeated 409", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		conflictsBeforeSuccess := 4 // more than old maxRetries=3
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callCount++
+			if callCount%2 == 1 {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"bindings":[],"etag":"v1"}`)
+				return
+			}
+			attempt := callCount / 2
+			if attempt <= conflictsBeforeSuccess {
+				w.WriteHeader(http.StatusConflict)
+				fmt.Fprintln(w, `{"error":{"message":"conflict"}}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).SetSecretIAMBinding(context.Background(),
+			"projects/proj/secrets/s", "member", "role")
+		require.NoError(t, err)
+		// 4 conflicts + 1 success = 5 attempts × 2 calls each = 10
+		assert.Equal(t, 10, callCount)
+	})
+
+	t.Run("exhausts all retries on persistent 409", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callCount++
+			if callCount%2 == 1 {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"bindings":[],"etag":"v1"}`)
+				return
+			}
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprintln(w, `{"error":{"message":"conflict"}}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).SetSecretIAMBinding(context.Background(),
+			"projects/proj/secrets/s", "member", "role")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "IAM policy conflict")
+		// 7 attempts × 2 calls each = 14
+		assert.Equal(t, 14, callCount)
+	})
+}
+
+// --- ReplaceSecretIAMBinding ---
+
+func TestLiveGCFClient_ReplaceSecretIAMBinding(t *testing.T) {
+	t.Run("replaces existing members", func(t *testing.T) {
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callCount++
+			if callCount == 1 {
+				assert.Contains(t, r.URL.Path, ":getIamPolicy")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"bindings":[{"role":"roles/secretmanager.secretAccessor","members":["serviceAccount:old@proj.iam.gserviceaccount.com"]}],"etag":"abc"}`)
+				return
+			}
+			assert.Contains(t, r.URL.Path, ":setIamPolicy")
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body)
+			policy := body["policy"].(map[string]interface{})
+			bindings := policy["bindings"].([]interface{})
+			require.Len(t, bindings, 1)
+			binding := bindings[0].(map[string]interface{})
+			members := binding["members"].([]interface{})
+			assert.Equal(t, []interface{}{"serviceAccount:new@proj.iam.gserviceaccount.com"}, members)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).ReplaceSecretIAMBinding(context.Background(),
+			"projects/proj/secrets/s", "serviceAccount:new@proj.iam.gserviceaccount.com", "roles/secretmanager.secretAccessor")
+		require.NoError(t, err)
+		assert.Equal(t, 2, callCount)
+	})
+
+	t.Run("adds binding when role not present", func(t *testing.T) {
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callCount++
+			if callCount == 1 {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"bindings":[],"etag":"abc"}`)
+				return
+			}
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body)
+			policy := body["policy"].(map[string]interface{})
+			bindings := policy["bindings"].([]interface{})
+			require.Len(t, bindings, 1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).ReplaceSecretIAMBinding(context.Background(),
+			"projects/proj/secrets/s", "serviceAccount:sa@proj.iam.gserviceaccount.com", "roles/secretmanager.secretAccessor")
+		require.NoError(t, err)
+	})
+}
+
+// --- iamRetryDelay ---
+
+func TestIAMRetryDelay(t *testing.T) {
+	t.Run("exponential growth capped at 10s", func(t *testing.T) {
+		// Collect many samples at each attempt to verify bounds.
+		for attempt := 0; attempt < 8; attempt++ {
+			for range 20 {
+				d := iamRetryDelay(attempt)
+				// Minimum is 50% of the base (500ms << attempt).
+				base := 500 * time.Millisecond * time.Duration(1<<uint(attempt))
+				if base > 10*time.Second {
+					base = 10 * time.Second
+				}
+				minDelay := base / 2
+				assert.GreaterOrEqual(t, d, minDelay,
+					"attempt %d: delay %v should be >= %v", attempt, d, minDelay)
+				assert.LessOrEqual(t, d, base,
+					"attempt %d: delay %v should be <= %v", attempt, d, base)
+			}
+		}
+	})
+
+	t.Run("has jitter", func(t *testing.T) {
+		seen := make(map[time.Duration]bool)
+		for range 20 {
+			seen[iamRetryDelay(2)] = true
+		}
+		assert.Greater(t, len(seen), 1,
+			"iamRetryDelay should produce varying results due to jitter")
+	})
 }
 
 // --- SetProjectIAMBinding ---
@@ -434,6 +801,10 @@ func TestLiveGCFClient_SetProjectIAMBinding(t *testing.T) {
 	})
 
 	t.Run("retries on 409 conflict", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
 		callCount := 0
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			callCount++
@@ -460,6 +831,67 @@ func TestLiveGCFClient_SetProjectIAMBinding(t *testing.T) {
 			"proj", "member", "role")
 		require.NoError(t, err)
 		assert.Equal(t, 4, callCount)
+	})
+
+	t.Run("retries past old 3-attempt limit on repeated 409", func(t *testing.T) {
+		// Verify that SetProjectIAMBinding can survive more than 3
+		// consecutive 409 conflicts (the old limit). With 12 concurrent
+		// callers this scenario is common.
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		conflictsBeforeSuccess := 4 // more than old maxRetries=3
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callCount++
+			// Odd calls are getIamPolicy, even calls are setIamPolicy.
+			if callCount%2 == 1 {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"bindings":[],"etag":"v1"}`)
+				return
+			}
+			attempt := callCount / 2 // 1-based attempt number
+			if attempt <= conflictsBeforeSuccess {
+				w.WriteHeader(http.StatusConflict)
+				fmt.Fprintln(w, `{"error":{"message":"conflict"}}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).SetProjectIAMBinding(context.Background(),
+			"proj", "member", "role")
+		require.NoError(t, err)
+		// 4 conflicts + 1 success = 5 attempts × 2 calls each = 10
+		assert.Equal(t, 10, callCount)
+	})
+
+	t.Run("exhausts all retries on persistent 409", func(t *testing.T) {
+		origDelay := iamRetryDelay
+		defer func() { iamRetryDelay = origDelay }()
+		iamRetryDelay = func(int) time.Duration { return time.Millisecond }
+
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callCount++
+			if callCount%2 == 1 {
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"bindings":[],"etag":"v1"}`)
+				return
+			}
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprintln(w, `{"error":{"message":"conflict"}}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).SetProjectIAMBinding(context.Background(),
+			"proj", "member", "role")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "IAM policy conflict")
+		// 7 attempts × 2 calls each = 14
+		assert.Equal(t, 14, callCount)
 	})
 
 	t.Run("getIamPolicy error", func(t *testing.T) {
@@ -1067,7 +1499,9 @@ func TestLiveGCFClient_UpdateServiceEnvVars(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		rev, err := newTestClient(srv).UpdateServiceEnvVars(context.Background(), "proj", "us-central1", "my-svc", map[string]string{
+		client := newTestClient(srv)
+		client.pollDelay = immediateDelay
+		rev, err := client.UpdateServiceEnvVars(context.Background(), "proj", "us-central1", "my-svc", map[string]string{
 			"KEY": "val",
 		})
 		require.NoError(t, err)
@@ -1258,7 +1692,9 @@ func TestLiveGCFClient_UpdateServiceEnvVars(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		_, err := newTestClient(srv).UpdateServiceEnvVars(context.Background(), "proj", "us-central1", "my-svc", map[string]string{
+		client := newTestClient(srv)
+		client.pollDelay = immediateDelay
+		_, err := client.UpdateServiceEnvVars(context.Background(), "proj", "us-central1", "my-svc", map[string]string{
 			"KEY": "val",
 		})
 		require.Error(t, err)
@@ -1383,12 +1819,15 @@ func TestLiveGCFClient_UpdateServiceEnvVars(t *testing.T) {
 
 	t.Run("get_after_template_update_failure", func(t *testing.T) {
 		// Template PATCH succeeds but the follow-up GET to discover the
-		// new revision returns an error (e.g., transient 500).
+		// new revision returns an error (e.g., persistent 500).
+		// DoRequest retries 500 responses (up to 3 retries = 4 total
+		// attempts per call), so the server must return 500 on all
+		// retry attempts too.
 		callCount := 0
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			callCount++
-			switch callCount {
-			case 1:
+			switch {
+			case callCount == 1:
 				// GET service
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1398,12 +1837,12 @@ func TestLiveGCFClient_UpdateServiceEnvVars(t *testing.T) {
 						},
 					},
 				})
-			case 2:
+			case callCount == 2:
 				// PATCH template → done
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(map[string]interface{}{"done": true})
-			case 3:
-				// GET to discover revision → 500 Internal Server Error
+			default:
+				// GET to discover revision → persistent 500 (includes DoRequest retries)
 				w.WriteHeader(http.StatusInternalServerError)
 				fmt.Fprintln(w, `{"error":{"message":"internal error"}}`)
 			}
@@ -1416,7 +1855,7 @@ func TestLiveGCFClient_UpdateServiceEnvVars(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unexpected status 500 getting Cloud Run service after update")
 		assert.Equal(t, "", rev, "revision should be empty when discovery GET fails")
-		assert.Equal(t, 3, callCount, "should stop after failed discovery GET")
+		assert.Equal(t, 6, callCount, "should stop after failed discovery GET (includes DoRequest retries)")
 	})
 
 	t.Run("success_with_traffic_polling", func(t *testing.T) {
@@ -1461,7 +1900,9 @@ func TestLiveGCFClient_UpdateServiceEnvVars(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		rev, err := newTestClient(srv).UpdateServiceEnvVars(context.Background(), "proj", "us-central1", "my-svc", map[string]string{
+		client := newTestClient(srv)
+		client.pollDelay = immediateDelay
+		rev, err := client.UpdateServiceEnvVars(context.Background(), "proj", "us-central1", "my-svc", map[string]string{
 			"KEY": "val",
 		})
 		require.NoError(t, err)
@@ -2024,6 +2465,64 @@ func TestLiveGCFClient_GetServiceRevisionInfo_ShortRevisionName(t *testing.T) {
 	})
 }
 
+// --- waitForIAMOperation ---
+
+func TestLiveGCFClient_waitForIAMOperation(t *testing.T) {
+	t.Run("done immediately", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Fatal("should not reach server when operation is already done")
+		}))
+		defer srv.Close()
+
+		body := strings.NewReader(`{"name":"operations/op-1","done":true}`)
+		err := newTestClient(srv).waitForIAMOperation(context.Background(), body)
+		require.NoError(t, err)
+	})
+
+	t.Run("done with error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Fatal("should not reach server when operation is already done")
+		}))
+		defer srv.Close()
+
+		body := strings.NewReader(`{"name":"operations/op-1","done":true,"error":{"message":"quota exceeded"}}`)
+		err := newTestClient(srv).waitForIAMOperation(context.Background(), body)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "quota exceeded")
+	})
+
+	t.Run("not done with empty name returns error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Fatal("should not reach server when operation has no name")
+		}))
+		defer srv.Close()
+
+		body := strings.NewReader(`{"done":false}`)
+		err := newTestClient(srv).waitForIAMOperation(context.Background(), body)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "IAM operation returned no name and is not done")
+	})
+
+	t.Run("not done with name polls until done", func(t *testing.T) {
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			callCount++
+			w.WriteHeader(http.StatusOK)
+			if callCount == 1 {
+				fmt.Fprintln(w, `{"done":false}`)
+			} else {
+				fmt.Fprintln(w, `{"done":true}`)
+			}
+		}))
+		defer srv.Close()
+
+		body := strings.NewReader(`{"name":"operations/iam-poll-op","done":false}`)
+		err := newTestClient(srv).waitForIAMOperation(context.Background(), body)
+		require.NoError(t, err)
+		assert.Equal(t, 2, callCount)
+	})
+}
+
 // --- WaitForOperation ---
 
 func TestLiveGCFClient_WaitForOperation(t *testing.T) {
@@ -2040,7 +2539,9 @@ func TestLiveGCFClient_WaitForOperation(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		err := newTestClient(srv).WaitForOperation(context.Background(), "operations/op-1")
+		client := newTestClient(srv)
+		client.pollDelay = immediateDelay
+		err := client.WaitForOperation(context.Background(), "operations/op-1")
 		require.NoError(t, err)
 		assert.Equal(t, 2, callCount)
 	})
@@ -2361,6 +2862,192 @@ func TestLiveGCFClient_DeleteWIFProvider(t *testing.T) {
 func TestIAMAudience(t *testing.T) {
 	got := iamAudience("123456789", "fullsend-pool", "github-oidc")
 	assert.Equal(t, "https://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/fullsend-pool/providers/github-oidc", got)
+}
+
+// --- DeleteFunction ---
+
+func TestLiveGCFClient_DeleteFunction(t *testing.T) {
+	t.Run("success with operation", func(t *testing.T) {
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			callCount++
+			if callCount == 1 {
+				assert.Equal(t, http.MethodDelete, r.Method)
+				assert.Contains(t, r.URL.Path, "functions/fullsend-mint")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"name":"operations/delete-fn-op","done":true}`)
+			} else {
+				// WaitForOperation poll
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintln(w, `{"name":"operations/delete-fn-op","done":true}`)
+			}
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteFunction(context.Background(), "proj", "us-central1", "fullsend-mint")
+		require.NoError(t, err)
+	})
+
+	t.Run("success without operation name", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodDelete, r.Method)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `{}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteFunction(context.Background(), "proj", "us-central1", "fullsend-mint")
+		require.NoError(t, err)
+	})
+
+	t.Run("not found is idempotent", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteFunction(context.Background(), "proj", "us-central1", "missing")
+		require.NoError(t, err)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintln(w, `{"error":{"message":"permission denied"}}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteFunction(context.Background(), "proj", "us-central1", "fn")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unexpected status 403")
+	})
+}
+
+// --- DeleteServiceAccount ---
+
+func TestLiveGCFClient_DeleteServiceAccount(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodDelete, r.Method)
+			assert.Contains(t, r.URL.Path, "serviceAccounts/")
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteServiceAccount(context.Background(), "proj", "sa@proj.iam.gserviceaccount.com")
+		require.NoError(t, err)
+	})
+
+	t.Run("not found is idempotent", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteServiceAccount(context.Background(), "proj", "missing@proj.iam.gserviceaccount.com")
+		require.NoError(t, err)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintln(w, `{"error":{"message":"permission denied"}}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteServiceAccount(context.Background(), "proj", "sa@proj.iam.gserviceaccount.com")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unexpected status 403")
+	})
+}
+
+// --- DeleteWIFPool ---
+
+func TestLiveGCFClient_DeleteWIFPool(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodDelete, r.Method)
+			assert.Contains(t, r.URL.Path, "workloadIdentityPools/fullsend-pool")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `{"name":"operations/delete-pool-op","done":true}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteWIFPool(context.Background(), "123456789", "fullsend-pool")
+		require.NoError(t, err)
+	})
+
+	t.Run("not found is idempotent", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteWIFPool(context.Background(), "123456789", "missing-pool")
+		require.NoError(t, err)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintln(w, `{"error":{"message":"permission denied"}}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).DeleteWIFPool(context.Background(), "123456789", "pool")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unexpected status 403")
+	})
+}
+
+// --- IAM quota retry (429) for CreateWIFPool and CreateServiceAccount ---
+
+func TestLiveGCFClient_CreateWIFPool_RetriesOn429(t *testing.T) {
+	origDelay := iamRetryDelay
+	iamRetryDelay = func(_ int) time.Duration { return time.Millisecond }
+	t.Cleanup(func() { iamRetryDelay = origDelay })
+
+	t.Run("succeeds after transient 429", func(t *testing.T) {
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			callCount++
+			if callCount == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `{"name":"operations/pool-op","done":true}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).CreateWIFPool(context.Background(), "123", "pool", "Pool")
+		require.NoError(t, err)
+		assert.Equal(t, 2, callCount)
+	})
+}
+
+func TestLiveGCFClient_CreateServiceAccount_RetriesOn429(t *testing.T) {
+	origDelay := iamRetryDelay
+	iamRetryDelay = func(_ int) time.Duration { return time.Millisecond }
+	t.Cleanup(func() { iamRetryDelay = origDelay })
+
+	t.Run("succeeds after transient 429", func(t *testing.T) {
+		callCount := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			callCount++
+			if callCount == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintln(w, `{"email":"sa@proj.iam.gserviceaccount.com"}`)
+		}))
+		defer srv.Close()
+
+		err := newTestClient(srv).CreateServiceAccount(context.Background(), "proj", "sa", "SA")
+		require.NoError(t, err)
+		assert.Equal(t, 2, callCount)
+	})
 }
 
 // --- encodeBase64 ---

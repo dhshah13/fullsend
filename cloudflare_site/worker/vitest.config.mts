@@ -9,15 +9,17 @@ export default defineConfig({
   root: workerRoot,
   plugins: [
     cloudflareTest({
+      // The Worker is a static-asset passthrough: the only binding it needs is
+      // ASSETS, which comes from wrangler.toml. Tests override the assets
+      // directory so unmatched-path routing can see a 404.html (the deploy
+      // public/ tree only has robots.txt / llms.txt at test time).
       wrangler: {
         configPath: path.join(workerRoot, "..", "wrangler.toml"),
       },
       miniflare: {
-        bindings: {
-          GITHUB_APP_CLIENT_ID: "test_github_client_id",
-          GITHUB_APP_CLIENT_SECRET: "test_github_client_secret",
-          TURNSTILE_SITE_KEY: "1x00000000000000000000AA",
-          TURNSTILE_SECRET_KEY: "1x0000000000000000000000000000000AA",
+        assets: {
+          directory: path.join(workerRoot, "test-assets"),
+          binding: "ASSETS",
         },
       },
     }),

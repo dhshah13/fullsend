@@ -101,7 +101,7 @@ a stage name:
 
 - `issue_comment` with `/fs-triage`, `/fs-code`, `/fs-review`, `/fs-fix`, `/fs-retro`, `/fs-prioritize`
   commands → corresponding stage
-- `issue_comment` on `needs-info` issue from non-bot → `triage`
+- ~~`issue_comment` on `needs-info` issue from non-bot → `triage`~~ Removed in [#6740](https://github.com/fullsend-ai/fullsend/issues/6740) — use `/fs-triage` instead
 - `issues` + `labeled` with `ready-to-code` → `code`
 - `pull_request_target` opened/synchronize/ready_for_review → `review`
 - `pull_request_target` closed → `retro`
@@ -145,6 +145,28 @@ The `stage` input to `dispatch.yml` becomes optional. When provided
   independently: a new dispatch now cancels any in-progress run for the
   same issue/PR. In practice, only one agent should run per issue/PR at a
   time, and the latest event takes priority.
+
+> **Update (2026-09):** [ADR 0106](0106-serialize-agent-runs-and-coalesce-subsequent-events.md)
+> replaces automatic cancellation with serialized runs and platform-native
+> pending-run coalescing.
+
+> **Note (2026-07, [#2452](https://github.com/fullsend-ai/fullsend/issues/2452)):** Per-org
+> workflow-call shims now use label-aware concurrency groups with
+> `cancel-in-progress: false` so distinct routing labels get isolated
+> slots. Non-label events (including `unlabeled`) still share a common
+> per-issue/PR group where pending-run replacement applies; isolation is
+> between distinct routing labels only. The shim-level group is kept
+> (rather than relying solely on downstream per-stage groups) to reduce
+> runner spin-ups from label bursts — same-label events share a pending
+> slot instead of each starting a routing job. GitHub's `queue: max`
+> concurrency property would fix pending-run replacement for all buckets
+> at `jobs.<id>.concurrency` without the label-suffix approach, but it is
+> gated behind the `actions-nga` feature flag and its runtime behaviour at
+> job-level concurrency has not been verified; moving to workflow-level
+> `concurrency` (where `queue` is also documented) would gate the
+> `stop-fix` job. See
+> [#2452](https://github.com/fullsend-ai/fullsend/issues/2452) for
+> details. The per-repo shim has no concurrency group (BYOA compat).
 - Events that don't match any stage still trigger a `workflow_call` to
   `dispatch.yml`, which exits early. Cost: one runner spin-up (~20s). The
   `if:` filter on the dispatch job eliminates bot comments, the

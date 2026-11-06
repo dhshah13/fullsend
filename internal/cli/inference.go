@@ -18,17 +18,25 @@ var gcpProjectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
 func newInferenceCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "inference",
-		Short: "Manage inference credentials (requires GCP access)",
-		Long: `Commands for provisioning and inspecting inference WIF infrastructure.
+		Short: "Manage inference credentials (GCP Vertex, OpenAI)",
+		Long: `Commands for provisioning and inspecting inference credentials.
 
-These commands only require GCP project access — no GitHub token or
-mint project is needed. Use them to set up Workload Identity Federation
-for Agent Platform inference, then hand off the WIF provider resource name
-to the GitHub admin who runs 'fullsend github setup'.`,
+'provision', 'deprovision' and 'status' set up Workload Identity
+Federation for Agent Platform (Vertex) inference and only require GCP
+project access — no GitHub token or mint project is needed. Hand the WIF
+provider resource name to the GitHub admin who runs 'fullsend github setup'.
+
+'openai' enrols repositories with OpenAI Workload Identity Federation for
+GPT models on the pi runtime; it needs neither GCP nor an OpenAI key.
+
+'gateway status' checks the self-hosted inference gateway block
+(inference.gateway) and, inside a GitHub Actions job, authenticates to it.`,
 	}
 	cmd.AddCommand(newInferenceProvisionCmd())
 	cmd.AddCommand(newInferenceStatusCmd())
 	cmd.AddCommand(newInferenceDeprovisionCmd())
+	cmd.AddCommand(newInferenceOpenAICmd())
+	cmd.AddCommand(newInferenceGatewayCmd())
 	return cmd
 }
 
@@ -138,13 +146,13 @@ func runInferenceProvisionDryRun(cmd *cobra.Command, printer *ui.Printer, org, r
 		parts := strings.SplitN(repo, "/", 2)
 		providerID := mintcore.BuildRepoProviderID(parts[0], parts[1])
 		printer.StepInfo(fmt.Sprintf("WIF provider: %s (repo-scoped)", providerID))
-		printer.StepInfo(fmt.Sprintf("Condition:    assertion.repository == '%s'", strings.ToLower(repo)))
+		printer.StepInfo(fmt.Sprintf("Condition:    assertion.repository == '%s'", repo))
 	} else {
 		printer.Header("Dry run: provision WIF for org-scoped inference")
 		printer.Blank()
 		printer.StepInfo(fmt.Sprintf("Organization: %s", org))
 		printer.StepInfo(fmt.Sprintf("WIF provider: %s (org-scoped)", provider))
-		printer.StepInfo(fmt.Sprintf("Condition:    assertion.repository_owner == '%s'", strings.ToLower(org)))
+		printer.StepInfo(fmt.Sprintf("Condition:    assertion.repository_owner == '%s'", org))
 	}
 
 	printer.Blank()
@@ -266,7 +274,7 @@ Required IAM roles on the target project:
 				return fmt.Errorf("cannot check status of reserved placeholder org %q", org)
 			}
 
-			return runInferenceStatus(cmd, org, repo, project, pool, provider, format)
+			return runInferenceStatus(cmd, org, repo, project, pool, provider, format, nil)
 		},
 	}
 
@@ -278,9 +286,12 @@ Required IAM roles on the target project:
 	return cmd
 }
 
-func runInferenceStatus(cmd *cobra.Command, org, repo, project, pool, provider, format string) error {
+func runInferenceStatus(cmd *cobra.Command, org, repo, project, pool, provider, format string, client gcf.GCFClient) error {
 	ctx := cmd.Context()
-	gcpClient := gcf.NewLiveGCFClient(project)
+	gcpClient := client
+	if gcpClient == nil {
+		gcpClient = gcf.NewLiveGCFClient(project)
+	}
 
 	poolName := pool
 	providerName := provider
@@ -327,28 +338,43 @@ func runInferenceStatus(cmd *cobra.Command, org, repo, project, pool, provider, 
 	result.Details = append(result.Details, "WIF provider: "+wifProvider)
 	result.Details = append(result.Details, "Attribute condition: "+condition)
 
-	conditionOK := true
+	// A soft-deleted provider is still returned by providers.get (state
+	// DELETED, not 404) with its condition intact, and a disabled one keeps
+	// its config too; neither can exchange tokens.
+	healthy := true
+	if providerInfo.Disabled {
+		result.Details = append(result.Details, "WIF provider is disabled and cannot exchange tokens")
+		healthy = false
+	}
+	if providerInfo.State != "" && providerInfo.State != gcf.WIFProviderStateActive {
+		result.Details = append(result.Details, fmt.Sprintf("WIF provider state is %s and cannot exchange tokens", providerInfo.State))
+		healthy = false
+	}
 	if repo != "" {
-		expected := fmt.Sprintf("assertion.repository == '%s'", strings.ToLower(repo))
-		if condition == expected {
+		if conditionMatchesRepo(condition, repo) {
 			result.Details = append(result.Details, "Condition matches repo: OK")
 		} else {
+			expected := fmt.Sprintf("assertion.repository == '%s'", repo)
 			result.Details = append(result.Details, fmt.Sprintf("Condition mismatch: expected %q", expected))
-			conditionOK = false
+			healthy = false
 		}
 	} else {
-		expected := fmt.Sprintf("assertion.repository_owner == '%s'", strings.ToLower(org))
-		if condition == expected {
-			result.Details = append(result.Details, "Condition matches org: OK")
-		} else if strings.Contains(condition, "repository_owner") && strings.Contains(condition, fmt.Sprintf("'%s'", strings.ToLower(org))) {
-			result.Details = append(result.Details, "Condition includes org (multi-org pool): OK")
+		if conditionMatchesOrg(condition, org) {
+			if strings.EqualFold(
+				condition,
+				fmt.Sprintf("assertion.repository_owner == '%s'", org),
+			) {
+				result.Details = append(result.Details, "Condition matches org: OK")
+			} else {
+				result.Details = append(result.Details, "Condition includes org (multi-org pool): OK")
+			}
 		} else {
 			result.Details = append(result.Details, fmt.Sprintf("Condition does not include org %q", org))
-			conditionOK = false
+			healthy = false
 		}
 	}
 
-	if conditionOK {
+	if healthy {
 		result.Status = "healthy"
 	} else {
 		result.Status = "unhealthy"
@@ -377,7 +403,7 @@ func outputStatus(cmd *cobra.Command, result *inferenceStatusResult, format stri
 		case "healthy":
 			printer.StepDone("Status: healthy")
 		case "unhealthy":
-			printer.StepWarn("Status: unhealthy (condition mismatch)")
+			printer.StepWarn("Status: unhealthy")
 		case "not_provisioned":
 			printer.StepFail("Status: not provisioned")
 		default:
@@ -430,6 +456,30 @@ func formatStatusEnv(result *inferenceStatusResult) string {
 		sb.WriteString(fmt.Sprintf("FULLSEND_GCP_WIF_PROVIDER=%s\n", result.WIFProvider))
 	}
 	return sb.String()
+}
+
+// conditionMatchesRepo reports whether the WIF attribute condition matches a
+// repo-scoped assertion. Comparison is case-insensitive because GitHub OIDC
+// tokens preserve the canonical display case of org/repo names (e.g.
+// "RedHatProductSecurity/osidb-bindings"), so conditions written with any
+// case variant should be accepted.
+func conditionMatchesRepo(condition, repo string) bool {
+	expected := fmt.Sprintf("assertion.repository == '%s'", repo)
+	return strings.EqualFold(condition, expected)
+}
+
+// conditionMatchesOrg reports whether the WIF attribute condition matches an
+// org-scoped assertion, either as a single-org condition or as a member of a
+// multi-org pool. Comparison is case-insensitive for the same reason as
+// conditionMatchesRepo.
+func conditionMatchesOrg(condition, org string) bool {
+	expected := fmt.Sprintf("assertion.repository_owner == '%s'", org)
+	if strings.EqualFold(condition, expected) {
+		return true
+	}
+	// Multi-org pool: condition may contain the org in an "in [...]" list.
+	return strings.Contains(condition, "repository_owner") &&
+		strings.Contains(strings.ToLower(condition), strings.ToLower(fmt.Sprintf("'%s'", org)))
 }
 
 func newInferenceDeprovisionCmd() *cobra.Command {

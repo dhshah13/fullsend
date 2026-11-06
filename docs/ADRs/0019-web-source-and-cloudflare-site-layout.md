@@ -13,9 +13,28 @@ topics:
 
 Date: 2026-04-15
 
+> **Note (2026-08-20):** The admin installation SPA described in points 1 and 3 was
+> removed. `web/` now holds only the static landing page and document graph under
+> `web/public/`; there is no Vite build. Point 1's principle still holds — Node tooling
+> stays at the repository root — but its example scripts are stale: `npm run dev` and
+> `npm run build` no longer exist. The root scripts today are `npm test`,
+> `npm run dev:worker`, and `npm run docs:*`. The site Worker
+> under `cloudflare_site/worker/` is a static-asset passthrough — its OAuth BFF was
+> removed with the SPA. The `web/` vs `cloudflare_site/` split this ADR decided is
+> unchanged, as is the Build Site / Deploy Site artifact contract. The public mint
+> Worker (`internal/dispatch/cf/workersrc/`, `mint.fullsend.sh`) is a separate
+> deployment and was never covered by this ADR.
+
 ## Status
 
 Accepted
+
+> **Note (2026-10-29):** The interactive document graph (`web/public/graph.html`, served at
+> `/graph.html`) was removed from the public site. Its login asked for a GitHub PAT with
+> `repo` scope and stored it in browser `localStorage`, which put a browser credential flow
+> on the public site. `web/` now holds only the landing page and the custom 404 page under
+> `web/public/`. Old `/graph.html` links now get the custom 404 page via
+> `not_found_handling = "404-page"`. See issue #8915.
 
 ## Context
 

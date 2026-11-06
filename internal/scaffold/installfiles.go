@@ -2,6 +2,8 @@ package scaffold
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 )
 
 // InstallFile is a file to commit during install.
@@ -14,52 +16,26 @@ type InstallFile struct {
 // InstallFiles is the slice type returned by install collectors.
 type InstallFiles []InstallFile
 
-// CollectInstallFilesOptions controls which scaffold files are collected.
-type CollectInstallFilesOptions struct {
-	RenderOptions
-	PathPrefix string
+// perRepoThinCallers lists thin stage caller workflows installed directly
+// into per-repo repos (in addition to the per-repo shim). These are
+// workflows that receive workflow_dispatch events from external schedulers
+// rather than being routed through the dispatch shim.
+var perRepoThinCallers = []string{
+	".github/workflows/prioritize.yml",
 }
 
-// CollectInstallFiles gathers scaffold files for org or per-repo installation.
-func CollectInstallFiles(opts CollectInstallFilesOptions) (InstallFiles, error) {
-	var files InstallFiles
-	err := WalkFullsendRepo(func(path string, content []byte) error {
-		rendered, renderErr := RenderTemplate(path, content, opts.RenderOptions)
-		if renderErr != nil {
-			return fmt.Errorf("rendering %s: %w", path, renderErr)
-		}
-		files = append(files, InstallFile{
-			Path:    opts.PathPrefix + path,
-			Content: PrependManagedHeader(path, rendered),
-			Mode:    FileMode(path),
-		})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	for _, dir := range customizedDirsForPrefix(opts.PathPrefix) {
-		files = append(files, InstallFile{
-			Path:    dir + "/.gitkeep",
-			Content: []byte(""),
-			Mode:    "100644",
-		})
-	}
-
-	return files, nil
-}
-
-func customizedDirsForPrefix(prefix string) []string {
-	if prefix == ".fullsend/" {
-		return PerRepoCustomizedDirs()
-	}
-	return CustomizedDirs()
+// PerRepoThinCallerPaths returns the workflow paths installed as thin
+// callers during per-repo installation. Used by uninstall and remote
+// scaffold to keep lifecycle operations in sync with install.
+func PerRepoThinCallerPaths() []string {
+	out := make([]string, len(perRepoThinCallers))
+	copy(out, perRepoThinCallers)
+	return out
 }
 
 // CollectPerRepoInstallFiles gathers files for per-repo installation.
 func CollectPerRepoInstallFiles(vendored bool, upstreamRef, upstreamTag string) (InstallFiles, error) {
-	opts := RenderOptionsForInstall(vendored, true, upstreamRef, upstreamTag)
+	opts := RenderOptionsForInstall(vendored, upstreamRef, upstreamTag)
 
 	shimRaw, err := PerRepoShimTemplate()
 	if err != nil {
@@ -76,10 +52,21 @@ func CollectPerRepoInstallFiles(vendored bool, upstreamRef, upstreamTag string) 
 		Mode:    "100644",
 	}}
 
-	for _, dir := range PerRepoCustomizedDirs() {
+	// Install thin caller workflows that are dispatched externally
+	// (e.g. prioritize.yml receives dispatches from the org-level
+	// scheduler rather than through the dispatch shim).
+	for _, path := range perRepoThinCallers {
+		raw, readErr := FullsendRepoFile(path)
+		if readErr != nil {
+			return nil, fmt.Errorf("loading per-repo thin caller %s: %w", path, readErr)
+		}
+		rendered, renderErr := RenderTemplate(path, raw, opts)
+		if renderErr != nil {
+			return nil, fmt.Errorf("rendering per-repo thin caller %s: %w", path, renderErr)
+		}
 		files = append(files, InstallFile{
-			Path:    dir + "/.gitkeep",
-			Content: []byte(""),
+			Path:    path,
+			Content: PrependManagedHeader(path, rendered),
 			Mode:    "100644",
 		})
 	}
@@ -87,20 +74,194 @@ func CollectPerRepoInstallFiles(vendored bool, upstreamRef, upstreamTag string) 
 	return files, nil
 }
 
-// ManagedPaths returns embed-derived scaffold paths for analyze/sync.
-// Vendored content is reported separately by the vendor layer.
-func ManagedPaths(_ bool, pathPrefix string) ([]string, error) {
-	opts := CollectInstallFilesOptions{
-		RenderOptions: RenderOptionsForInstall(false, pathPrefix != "", "", ""),
-		PathPrefix:    pathPrefix,
-	}
-	files, err := CollectInstallFiles(opts)
+// CollectGitLabPerRepoInstallFiles gathers CI template files for GitLab
+// per-repo installation.
+//
+// The embedded .fullsend/config.yaml is excluded — callers generate a
+// config with roles and forge field instead.
+//
+// The embedded root .gitignore is also excluded: installing it would
+// overwrite a consumer's existing ignore file with a one-line fragment.
+// The embed still ships for docs/tests; adopters (and the guide) add
+// output/ themselves. When --output-dir sits inside --target-repo
+// (GitLab layout), fullsend run omits that top-level directory from the
+// sandbox tarball and .git/info/exclude via outputDirExcludeRel.
+//
+// The root .gitlab-ci.yml is also excluded: the install flow merges
+// fullsend's include directive and workflow rules into the consumer's
+// existing file (or creates a minimal one) instead of overwriting it.
+// See MergeGitLabCI in internal/repos/gitlabci.go.
+//
+// agentRunnerTags and controlRunnerTags specify GitLab runner tags to
+// inject into agent (data-plane) and control-plane CI job definitions.
+// upstreamRef and upstreamTag control the version marker embedded in the
+// pipeline wrapper for upgrade/status drift detection.
+func CollectGitLabPerRepoInstallFiles(agentRunnerTags, controlRunnerTags []string, upstreamRef, upstreamTag string) (InstallFiles, error) {
+	agentTagYAML := FormatRunnerTags(agentRunnerTags)
+	controlTagYAML := FormatRunnerTags(controlRunnerTags)
+	versionMarker := FormatVersionMarker(upstreamRef, upstreamTag)
+	fullsendVersion := ResolveFullsendVersion(upstreamRef, upstreamTag)
+	runnerImageTag := ResolveRunnerImageTag(upstreamRef, upstreamTag)
+	var files InstallFiles
+	err := WalkGitLabPerRepo(func(path string, content []byte) error {
+		if path == ".fullsend/config.yaml" || path == ".gitignore" || path == ".gitlab-ci.yml" {
+			return nil
+		}
+		rendered := strings.ReplaceAll(string(content), "__AGENT_RUNNER_TAGS__", agentTagYAML)
+		rendered = strings.ReplaceAll(rendered, "__CONTROL_RUNNER_TAGS__", controlTagYAML)
+		rendered = strings.ReplaceAll(rendered, "__FULLSEND_VERSION__", fullsendVersion)
+		rendered = RenderRunnerImageTag(rendered, runnerImageTag)
+		// Embed a version marker in the pipeline wrapper so that
+		// extractWorkflowRef (via glWorkflowRefPattern) can detect
+		// the installed version for status and upgrade operations.
+		if path == ".gitlab/ci/fullsend-pipeline.yml" && versionMarker != "" {
+			rendered = InsertAfterDocStart(rendered, versionMarker)
+		}
+		files = append(files, InstallFile{
+			Path:    path,
+			Content: []byte(rendered),
+			Mode:    FileMode(path),
+		})
+		return nil
+	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("walking GitLab per-repo scaffold: %w", err)
 	}
-	paths := make([]string, len(files))
-	for i, f := range files {
-		paths[i] = f.Path
+	return files, nil
+}
+
+// formatVersionMarker returns a YAML comment line containing the version
+// for drift detection. The comment uses "fullsend-ref:" which is matched
+// by glWorkflowRefPattern (\bref:) because the hyphen before "ref"
+// creates a word boundary. Returns "" when no version is available.
+//
+// When both upstreamRef (a commit SHA) and upstreamTag (a human-readable
+// version) are set and differ, the marker includes a parenthesized
+// annotation: "# fullsend-ref: <sha> (<tag>)".
+func FormatVersionMarker(upstreamRef, upstreamTag string) string {
+	if upstreamRef == "" && upstreamTag == "" {
+		return ""
 	}
-	return paths, nil
+	if upstreamRef != "" && upstreamTag != "" && upstreamTag != upstreamRef {
+		return "# fullsend-ref: " + upstreamRef + " (" + upstreamTag + ")"
+	}
+	version := upstreamTag
+	if version == "" {
+		version = upstreamRef
+	}
+	return "# fullsend-ref: " + version
+}
+
+// insertAfterDocStart inserts a line after the YAML document start
+// marker (---\n). If no document start marker is present, the line
+// is prepended.
+func InsertAfterDocStart(content, line string) string {
+	const docStart = "---\n"
+	if strings.HasPrefix(content, docStart) {
+		return docStart + line + "\n" + content[len(docStart):]
+	}
+	return line + "\n" + content
+}
+
+// formatRunnerTags formats runner tags as a YAML inline list.
+func FormatRunnerTags(tags []string) string {
+	if len(tags) == 0 {
+		return "[]"
+	}
+	quoted := make([]string, len(tags))
+	for i, t := range tags {
+		quoted[i] = fmt.Sprintf("%q", t)
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+// ResolveFullsendVersion returns the version string for the
+// __FULLSEND_VERSION__ placeholder in GitLab CI templates. The shared
+// install-fullsend-cli.sh script uses this to install the CLI at runtime: version
+// tags (v0.42.0) trigger a pre-built binary download from GitHub Releases;
+// commit SHAs trigger a clone-and-build from source. Dev builds (both
+// inputs empty) return "latest" so the before_script resolves the newest
+// release — the before_script always installs the pinned version,
+// overwriting any default binary in the runner image.
+func ResolveFullsendVersion(upstreamRef, upstreamTag string) string {
+	if upstreamTag != "" {
+		return upstreamTag
+	}
+	if upstreamRef != "" {
+		return upstreamRef
+	}
+	return "latest"
+}
+
+// RunnerImageRepository is the image the GitLab CI templates run their
+// poll, dispatcher, and agent jobs in. Only Fullsend's runner-image
+// workflow publishes to it.
+const RunnerImageRepository = "ghcr.io/fullsend-ai/fullsend-runner"
+
+// Runner image tags that are not release versions. RunnerImageLatestTag
+// is published only for non-prerelease release tags, so it tracks
+// releases. RunnerImageDevTag moves on every main push that changes the
+// runner image and is not supported for production.
+const (
+	RunnerImageLatestTag = "latest"
+	RunnerImageDevTag    = "dev"
+)
+
+// runnerImageTagPlaceholder is replaced with the resolved runner image
+// tag in the GitLab CI templates (see RenderRunnerImageTag).
+const runnerImageTagPlaceholder = "__FULLSEND_RUNNER_IMAGE_TAG__"
+
+// legacyRunnerImageRef is the image reference GitLab templates hardcoded
+// before the tag was rendered from fullsend_ref (#8865). Templates fetched
+// from a ref that predates the placeholder still carry it.
+const legacyRunnerImageRef = RunnerImageRepository + ":" + RunnerImageDevTag
+
+// runnerReleaseRefPattern matches a Fullsend release ref (vX.Y.Z with an
+// optional prerelease suffix) and captures the runner image tag, which is
+// the version without the leading v. It mirrors job_image_release_version
+// in hack/gitlab-runner-vm/executor/gateway.sh.
+var runnerReleaseRefPattern = regexp.MustCompile(`^v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$`)
+
+// ResolveRunnerImageTag returns the fullsend-runner image tag the GitLab CI
+// templates run, derived from the same inputs as ResolveFullsendVersion so
+// the image follows the pinned CLI:
+//
+//   - a release ref or tag (vX.Y.Z) selects the release image X.Y.Z;
+//   - no ref at all (a dev build with no fullsend_ref, which installs the
+//     latest release CLI) selects "latest", which tracks releases;
+//   - any other ref (a branch such as main, or an untagged commit SHA)
+//     selects "dev". The runner image is built only for main commits that
+//     touch its inputs, so such a ref cannot map to an image of its own;
+//     pinning one is the explicit opt-in to main's image.
+func ResolveRunnerImageTag(upstreamRef, upstreamTag string) string {
+	for _, ref := range []string{upstreamTag, upstreamRef} {
+		if m := runnerReleaseRefPattern.FindStringSubmatch(ref); m != nil {
+			return m[1]
+		}
+	}
+	if upstreamRef == "" && upstreamTag == "" {
+		return RunnerImageLatestTag
+	}
+	return RunnerImageDevTag
+}
+
+// IsRunnerImageTag reports whether tag is one ResolveRunnerImageTag can
+// return: a release version (X.Y.Z, optionally a prerelease), "latest",
+// or "dev".
+func IsRunnerImageTag(tag string) bool {
+	if tag == RunnerImageLatestTag || tag == RunnerImageDevTag {
+		return true
+	}
+	return runnerReleaseRefPattern.MatchString("v" + tag)
+}
+
+// RenderRunnerImageTag renders tag into the runner image references of a
+// GitLab CI template. Besides the placeholder, it rewrites the legacy
+// hardcoded ":dev" reference so templates fetched from an older pinned
+// ref also run the image matching that ref instead of tracking main.
+func RenderRunnerImageTag(content, tag string) string {
+	return strings.NewReplacer(
+		RunnerImageRepository+":"+runnerImageTagPlaceholder, RunnerImageRepository+":"+tag,
+		legacyRunnerImageRef, RunnerImageRepository+":"+tag,
+	).Replace(content)
 }

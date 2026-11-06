@@ -1,0 +1,188 @@
+---
+sidebar_label: fullsend inference
+---
+
+# fullsend inference
+
+Manage the inference credentials agent runs use. `provision`, `deprovision` and `status` create, inspect, and remove the GCP Workload Identity Federation (WIF) pool, OIDC provider, and IAM bindings that let GitHub Actions workflows authenticate with GCP for Agent Platform (Vertex) access. [`openai`](#inference-openai) enrols repositories with OpenAI WIF for GPT models on the pi runtime. [`gateway status`](#inference-gateway-status) is not part of WIF: it checks a repository's `inference.gateway` block and whether the gateway accepts the job's OIDC assertion through direct OIDC trust (no token exchange).
+
+## Commands
+
+| Command | Description | Who runs it / permission |
+|---------|-------------|--------------------------|
+| `fullsend inference provision <org\|owner/repo>` | Create WIF pool/provider and grant Agent Platform access | GCP project admin, with `roles/iam.workloadIdentityPoolAdmin` and `roles/resourcemanager.projectIamAdmin` |
+| `fullsend inference deprovision <org\|owner/repo>` | Remove org or repo from WIF | GCP project admin, with `roles/iam.workloadIdentityPoolAdmin` |
+| `fullsend inference status <org\|owner/repo>` | Check WIF health and print config values | Read access on the GCP project: `roles/iam.workloadIdentityPoolViewer` and `roles/browser` |
+| `fullsend inference openai request <owner/repo>[,…]` | Generate WIF provider/mapping request for OpenAI admin | Anyone; needs no credentials |
+| `fullsend inference openai import [reply.json]` | Import OpenAI WIF identifiers into config | Repo admin. Writes `.fullsend/config.yaml` locally, to commit afterwards; `--variables` needs a GitHub token that can set repository variables |
+| `fullsend inference openai status <owner/repo>` | Check OpenAI WIF configuration and exchange status | Config checks: anyone, from a checkout of the repository. Live exchange: only inside a GitHub Actions job in `<owner/repo>` with `id-token: write`, so a repo writer adds the workflow |
+| `fullsend inference gateway status <owner/repo>` | Check inference gateway configuration and authentication | Config checks: anyone, from a checkout of the repository. Live check, `oidc` mode only: inside a GitHub Actions job in `<owner/repo>` with `id-token: write`, so a repo writer adds the workflow |
+
+## `inference provision`
+
+Creates a WIF pool (`fullsend-inference`), an OIDC provider (`github-oidc`), and grants `roles/aiplatform.user` to the WIF principal. Idempotent and safe to re-run.
+
+```bash
+fullsend inference provision <org> \
+  --project "<GCP_PROJECT>"
+```
+
+Per-repo mode scopes the WIF provider to a single repository:
+
+```bash
+fullsend inference provision <owner/repo> \
+  --project "<GCP_PROJECT>"
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--project` | | GCP project ID |
+| `--region` | `global` | GCP region |
+
+### Required IAM roles
+
+| Role | Description |
+|------|-------------|
+| `roles/iam.workloadIdentityPoolAdmin` | Create WIF pool and provider |
+| `roles/resourcemanager.projectIamAdmin` | Grant `roles/aiplatform.user` to WIF principals |
+
+### Required GCP APIs
+
+```bash
+gcloud services enable \
+  iam.googleapis.com \
+  cloudresourcemanager.googleapis.com \
+  aiplatform.googleapis.com \
+  --project="$GCP_PROJECT"
+```
+
+## `inference deprovision`
+
+Removes an org or repo from WIF by deleting the IAM binding and (optionally) the WIF provider.
+
+```bash
+fullsend inference deprovision <org|owner/repo> \
+  --project "<GCP_PROJECT>"
+```
+
+### Required IAM roles
+
+| Role | Description |
+|------|-------------|
+| `roles/iam.workloadIdentityPoolAdmin` | Modify WIF pool and provider |
+
+## `inference status`
+
+Checks WIF health and prints the configuration values needed for `github setup`.
+
+```bash
+fullsend inference status <org|owner/repo> \
+  --project "<GCP_PROJECT>"
+```
+
+Read-only — makes no changes.
+
+## `inference openai`
+
+Commands for enrolling repositories with OpenAI Workload Identity Federation (see the [operator guide](../guides/infrastructure/openai-workload-identity.md)). They need neither GCP access nor an OpenAI key.
+
+What reaches the network, and what does not:
+
+| Command | Network |
+|---|---|
+| `request` | None. The document is computed from the repository names. |
+| `import` | None, unless `--variables` is passed: that calls the GitHub API through the forge client to set the three repository variables. |
+| `status` | Reads configuration only, except inside a GitHub Actions job with `id-token: write`, where it performs one token exchange with OpenAI to prove the mapping accepts *that* job's repository — reporting the granted scope and expiry, never the token. |
+
+No OpenAI API key is used or created by any of them.
+
+### `inference openai request`
+
+Generates the request document an administrator needs to enable OpenAI WIF for one or more repositories. Every value is computed from the repository names. Nothing is sent anywhere; the command needs no credentials.
+
+```bash
+fullsend inference openai request <owner/repo>[,<owner/repo>…] \
+  [--audience "<audience>"] \
+  [--project "<openai-project>"] \
+  [--service-account "<existing-sa-id>"] \
+  [--ref "refs/heads/<branch>"] \
+  [--format json|md] \
+  [--out <file>]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--audience` | `fullsend://<owner>` | OpenAI Workload Identity audience |
+| `--project` | *(empty)* | OpenAI project name or ID for the service accounts |
+| `--service-account` | *(none)* | Map this existing service account instead of asking for `fullsend-<repo>-ci` to be created in the mapping |
+| `--ref` | *(none)* | Optional tightening. Must be a full ref (`refs/…`). When set, emits **two mappings** per repository — one asserting the given ref (e.g. `refs/heads/main`) and one asserting `refs/pull/*` — so both branch and PR-review-triggered runs work. Without `--ref`, mappings assert `iss`, `aud`, and `repository` only (no ref), matching the Vertex path's repository-scoped trust. The two-mapping cost halves the 50-mapping-per-provider budget to 25 repositories |
+| `--format` | `json` | Output format: `json` (versioned schema) or `md` (copy-paste ticket) |
+| `--out` | *(stdout)* | Write output to a file |
+
+### `inference openai import`
+
+Takes the administrator's reply and writes `inference.openai` into `.fullsend/config.yaml` through the same setters as `fullsend github setup --openai-*`. All three identifiers must be present — a partial trio is refused, and the config is validated before it is written. The write is local: commit `.fullsend/config.yaml` afterwards, since fullsend reads the base branch for pull-request events.
+
+The reply file may be either the bare reply object or the whole document `request --format json` produced with its `reply` section filled in — an administrator can edit and return the same file. When it names service accounts for several repositories, pass `--repo <owner/repo>` to choose one, or `--service-account-id` to give the value outright.
+
+```bash
+# From a reply JSON file:
+fullsend inference openai import reply.json
+
+# From flags:
+fullsend inference openai import \
+  --audience "fullsend://<owner>" \
+  --identity-provider-id "<idp-id>" \
+  --service-account-id "<sa-id>"
+
+# Set repository variables instead of config.yaml:
+fullsend inference openai import \
+  --variables --repo <owner/repo> \
+  --audience "fullsend://<owner>" \
+  --identity-provider-id "<idp-id>" \
+  --service-account-id "<sa-id>"
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--audience` | | OpenAI Workload Identity audience |
+| `--identity-provider-id` | | OpenAI identity provider ID |
+| `--service-account-id` | | OpenAI service account ID |
+| `--fullsend-dir` | `.fullsend` | Path to the .fullsend configuration directory |
+| `--variables` | `false` | Set `FULLSEND_OPENAI_*` repository variables instead of config.yaml |
+| `--repo` | | Two roles: the target repository for `--variables`, and the repository to select from a reply that names several (`service_account_ids`). Matched case-insensitively |
+
+### `inference openai status`
+
+Prints the resolved OpenAI WIF identifiers and their source (config layer or environment variables), and flags a partial trio. When nothing is configured, reports that a run will refuse the openai provider and names both remedies: the WIF trio, or the `FULLSEND_OPENAI_API_KEY` repository secret (exported as `OPENAI_API_KEY`). A static `OPENAI_API_KEY` already in the environment is reported as the source; in CI the runner warns and WIF remains preferred. When run inside a GitHub Actions job with `id-token: write`, performs one exchange and reports the returned scope and expiry without ever printing the token.
+
+```bash
+fullsend inference openai status <owner/repo> \
+  [--fullsend-dir ".fullsend"]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fullsend-dir` | `.fullsend` | Path to the .fullsend configuration directory |
+
+## `inference gateway status`
+
+Prints the resolved `inference.gateway` block ([ADR 0137](../ADRs/0137-inference-gateway-credential-route.md)) — `url`, `audience`, the `auth` mode, `messages_auth_header` (`authorization (default)` when unset; [ADR 0142](../ADRs/0142-inference-gateway-x-api-key-header-for-messages-models.md)) and the model list (`models` or `models_file`) — with the config layer each comes from (`config.yaml` or `config.base.yaml`), and flags a partial block (url missing, or audience missing in the `oidc` mode). The block has no environment-variable override. For a complete block it also reports the Claude Code route: the `ANTHROPIC_BASE_URL` a claude runtime `gateway/<model>` run gets, and how the credential reaches it (an `apiKeyHelper` in the `oidc` mode, an `ANTHROPIC_AUTH_TOKEN` placeholder in the `api-key` mode, sent as `Authorization: Bearer` in both, and in the `oidc` mode Claude Code also copies the helper value into `x-api-key`; an `ANTHROPIC_API_KEY` placeholder sent as `x-api-key` only when an `api-key` block sets `messages_auth_header: x-api-key`; see [Claude Code § Inference gateway route](../runtimes/claude.md#inference-gateway-route)). In the `api-key` mode ([ADR 0138](../ADRs/0138-inference-gateway-api-key-credential-mode.md)) it warns that the mode relies on a long-lived secret and recommends `oidc` when the gateway supports it, reports whether `FULLSEND_INFERENCE_GATEWAY_API_KEY` is set (never its value), and stops at the config checks. In the `oidc` mode, when run inside a GitHub Actions job in `<owner/repo>` with `id-token: write`, fetches one GitHub OIDC assertion for the configured audience, reports its expiry (`exp`, lifetime, time left), and sends one authenticated request, `GET <url>/v1/models` with the assertion as a bearer token (under the url's path prefix when it has one, for example `GET https://gateway.example.com/team-a/v1/models`). It reports the HTTP status and reads the reply as an OpenAI-style model list (`{"data":[{"id":...}]}`, at most 1 MiB): a 2xx list with entries means the gateway accepted the assertion, and the command prints how many models the gateway authorises for `<owner/repo>` and their ids (the first 20, with JWT-shaped values redacted, control characters replaced by `?` and every `::` printed as `: :` so an id cannot form a workflow command); an empty list means the assertion was authenticated but no models are authorised for the repository, which is an error; 401 or 403 means the gateway refused the assertion; 3xx is an error (redirects are not followed); any other status (for example 404, 405, 429 or 5xx), or a 2xx reply that is not a model list, means authentication could not be confirmed, which is also an error. The request goes out over `https` only, ignores proxy settings, and refuses to connect to loopback, private or other internal addresses. The assertion is never printed. Outside Actions, it says so and stops at the config checks.
+
+```bash
+fullsend inference gateway status <owner/repo> \
+  [--fullsend-dir ".fullsend"]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fullsend-dir` | `.fullsend` | Path to the .fullsend configuration directory |
+
+## See also
+
+- [Getting inference for fullsend](../guides/getting-started/getting-inference.md) — getting started guide
+- [OpenAI Workload Identity](../guides/infrastructure/openai-workload-identity.md) — end-to-end OpenAI WIF setup guide
+- [Advanced setup](../guides/infrastructure/advanced-setup.md) — non-standard installation paths and WIF configuration
+- [CLI internals](../guides/dev/cli-internals.md) — command tree and implementation details

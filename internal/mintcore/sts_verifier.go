@@ -1,3 +1,5 @@
+//go:build !js
+
 package mintcore
 
 import (
@@ -10,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/fullsend-ai/fullsend/internal/mintcore/mintconsts"
 )
 
 const defaultGitHubOIDCIssuer = "https://token.actions.githubusercontent.com"
@@ -22,38 +26,31 @@ type stsResponse struct {
 
 // STSVerifierConfig configures a new STSVerifier.
 type STSVerifierConfig struct {
-	HTTPClient         HTTPDoer
 	STSURL             string
 	GCPProjectNum      string
 	WIFPoolName        string
 	DefaultWIFProvider string
-	AllowedOrgs        []string
-	AllowedWorkflows   []string
 	PerRepoWIFRepos    map[string]bool
-	OIDCAudience       string
 }
 
 // STSVerifier validates OIDC tokens by exchanging them with GCP STS
 // (Workload Identity Federation). It performs lightweight JWT pre-validation
-// before the STS exchange.
+// before the STS exchange. Authorization (per-repo enrollment, workflow-ref) is
+// performed by the Handler after authentication succeeds.
 type STSVerifier struct {
-	httpClient         HTTPDoer
 	stsBaseURL         string
 	gcpProjectNum      string
 	wifPoolName        string
 	defaultWIFProvider string
-	allowedOrgs        []string
-	allowedWorkflows   []string
 	perRepoWIFRepos    map[string]bool
 	oidcAudience       string
 }
 
-// NewSTSVerifier creates a verifier that validates tokens via GCP STS exchange.
-func NewSTSVerifier(opts STSVerifierConfig) *STSVerifier {
-	httpClient := opts.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
-	}
+// NewSTSVerifier creates a verifier that validates tokens via GCP STS
+// exchange. The OIDC audience is the compile-time constant
+// mintconsts.OIDCAudience. HTTP requests are made via the
+// package-internal mintHTTP function.
+func NewSTSVerifier(opts STSVerifierConfig) (*STSVerifier, error) {
 	stsURL := opts.STSURL
 	if stsURL == "" {
 		stsURL = "https://sts.googleapis.com"
@@ -63,16 +60,13 @@ func NewSTSVerifier(opts STSVerifierConfig) *STSVerifier {
 		perRepo = make(map[string]bool)
 	}
 	return &STSVerifier{
-		httpClient:         httpClient,
 		stsBaseURL:         stsURL,
 		gcpProjectNum:      opts.GCPProjectNum,
 		wifPoolName:        opts.WIFPoolName,
 		defaultWIFProvider: opts.DefaultWIFProvider,
-		allowedOrgs:        opts.AllowedOrgs,
-		allowedWorkflows:   opts.AllowedWorkflows,
 		perRepoWIFRepos:    perRepo,
-		oidcAudience:       opts.OIDCAudience,
-	}
+		oidcAudience:       mintconsts.OIDCAudience,
+	}, nil
 }
 
 // Verify pre-validates the JWT claims, then exchanges the token with GCP STS.
@@ -136,26 +130,16 @@ func (v *STSVerifier) prevalidate(token string) (*Claims, error) {
 		return nil, fmt.Errorf("missing repository claim")
 	}
 
-	if err := ValidateOrgAllowed(claims.RepositoryOwner, v.allowedOrgs); err != nil {
-		return nil, err
-	}
-
-	if err := ValidateWorkflowRef(claims.JobWorkflowRef, claims.Repository, v.perRepoWIFRepos, v.allowedWorkflows); err != nil {
-		return nil, err
-	}
-
 	return &claims, nil
 }
 
 // resolveWIFProvider returns the WIF provider name to use for STS validation.
-// Repos in the perRepoWIFRepos registry use a dedicated per-repo provider;
-// all others (including .fullsend) use the default.
+// Repos explicitly listed in the perRepoWIFRepos registry use their
+// dedicated per-repo provider; all others (e.g. callers admitted by the
+// public-mode "*" entry) use the default.
 func (v *STSVerifier) resolveWIFProvider(repository string) string {
 	parts := strings.SplitN(repository, "/", 2)
 	if len(parts) != 2 {
-		return v.defaultWIFProvider
-	}
-	if parts[1] == ".fullsend" {
 		return v.defaultWIFProvider
 	}
 	if v.perRepoWIFRepos[strings.ToLower(repository)] {
@@ -185,7 +169,7 @@ func (v *STSVerifier) exchangeSTS(ctx context.Context, oidcToken, providerName s
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := v.httpClient.Do(req)
+	resp, err := mintHTTP(req)
 	if err != nil {
 		return fmt.Errorf("STS request failed: %w", err)
 	}

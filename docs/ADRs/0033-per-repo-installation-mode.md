@@ -38,7 +38,7 @@ Three ADRs and the implementation in PR 792 create the building blocks that make
 - ADR 0029 replaces PEM secrets and dispatch PATs with OIDC-based credential issuance via a central token mint. The `mint-token` composite action takes a role name (triage, coder, review, fix) and returns a scoped GitHub App installation token — no PEMs or client IDs in the calling repo.
 - [ADR 0031](0031-reusable-workflows-for-action-installed-distribution.md) publishes five reusable workflows (`reusable-triage.yml`, `reusable-code.yml`, `reusable-review.yml`, `reusable-fix.yml`, `reusable-retro.yml`) and four composite actions (`fullsend`, `mint-token`, `validate-enrollment`, `setup-gcp`) from `fullsend-ai/fullsend`, enabling any repo to call fullsend infrastructure via `workflow_call` without copying workflow files. Scaffold stage workflows in `.fullsend` are now thin callers (41–66 lines) that delegate to these reusable workflows.
 - [ADR 0034](0034-centralized-shim-routing-via-dispatch.md) centralizes event-to-stage routing in `dispatch.yml` within the `.fullsend` config repo. The enrolled-repo shim (~70 lines) forwards raw event context to `dispatch.yml` via `workflow_call`; `dispatch.yml` (~370 lines) determines the stage, mints an OIDC dispatch token, validates the stage, checks the kill switch, and dispatches to the matching thin caller via `workflow_call`. Adding a new stage requires only a case branch in `dispatch.yml` — zero changes to enrolled repos.
-- ADR 0035 introduces layered content resolution: upstream defaults (agents, skills, schemas, harness, policies, scripts) are sparse-checked from `fullsend-ai/fullsend` at runtime, then org overrides from `customized/` are copied on top. The scaffold installs only org-specific files (~23 files instead of ~68).
+- ADR 0035 introduces layered content resolution: upstream defaults (agents, skills, plugins, schemas, harness, policies, scripts) are sparse-checked from `fullsend-ai/fullsend` at runtime, then org overrides from `customized/` are copied on top. The scaffold installs only org-specific files (~23 files instead of ~68).
 
 The per-org flow after PR 792:
 
@@ -65,6 +65,8 @@ Run `fullsend admin install` targeting a single repo instead of an org. Copy all
 Use one GitHub App for triage, code, review, and fix roles to simplify per-repo setup.
 
 **Rejected**: GitHub suppresses events triggered by pushes made with any `GITHUB_TOKEN` or GitHub App installation token, to prevent infinite loops. Two separate Apps work because a push made with App-A's token _does_ generate events that trigger workflows authenticated as App-B. The fix→review loop requires the coder/fix agent to push commits that trigger review — if both roles share one App, the push token matches the workflow's App and the event is silently suppressed, breaking the feedback cycle. At minimum, coder and review must be separate Apps.
+
+> **Note (2026-09):** The first sentence overstates the suppression scope. GitHub's event suppression applies only to `GITHUB_TOKEN` pushes; GitHub App installation token pushes _do_ trigger new workflow runs regardless of App identity — the observed [scaffold-sync dispatch recursion](../contributing/bot-identities.md#app-token-push-recursion) confirms this. The separate-Apps conclusion still holds for permission isolation ([ADR 0007](0007-per-role-github-apps.md)), but the suppression-based rationale above was incorrect. See also [`platform-nativeness.md`](../problems/platform-nativeness.md), which notes this overstatement.
 
 ### Alternative 3: Per-repo as a separate codebase
 
@@ -137,7 +139,7 @@ Per-repo requirements: repo admin + org admin to install GitHub Apps on the repo
 target-repo/
 ├── .github/workflows/fullsend.yml    ← single workflow file (~70 lines, shim)
 ├── .fullsend/                        ← in-repo config workspace (optional)
-│   ├── customized/                  ← user overrides (same convention as per-org)
+│   ├── customized/                  ← user overrides (deprecated by ADR-0064)
 │   │   ├── agents/                 ← agent prompt overrides
 │   │   ├── harness/                ← harness config overrides
 │   │   ├── policies/               ← sandbox policies
@@ -161,7 +163,7 @@ fullsend-ai/fullsend defaults  <  .fullsend/customized/  <  AGENTS.md
 (base, sparse-checked)           (overrides)               (instructions)
 ```
 
-The org-level `.fullsend` config repo tier is skipped — the in-repo `.fullsend/` directory serves as the config workspace. The reusable workflows' "Prepare workspace" step is parameterized by root directory: `.` for per-org (the `.fullsend` repo checkout), `.fullsend/` for per-repo. In both modes, it sparse-checkouts upstream defaults into `{root}/agents/`, `{root}/skills/`, etc., then copies `{root}/customized/*` on top — identical code path, different root.
+The org-level `.fullsend` config repo configuration tier is skipped — the in-repo `.fullsend/` directory serves as the config workspace. The reusable workflows' "Prepare workspace" step is parameterized by root directory: `.` for per-org (the `.fullsend` repo checkout), `.fullsend/` for per-repo. In both modes, it sparse-checkouts upstream defaults into `{root}/agents/`, `{root}/skills/`, etc., then copies `{root}/customized/*` on top — identical code path, different root.
 
 **Git ref for config reads**: In per-repo mode, `.fullsend/`, `AGENTS.md`, and `.github/workflows/fullsend.yml` are always read from the **base branch** (the default branch of the repository), not the PR head branch. This is enforced by `pull_request_target`, which checks out the base branch by default. The reusable workflows do not check out the PR head ref for config or agent instructions — only the target repo's source code is checked out from the PR head for the agent to operate on. This prevents PR authors from injecting modified agent instructions, policies, or workflow files via their PR — the project's #1 threat category (external prompt injection).
 
@@ -172,7 +174,7 @@ This is the key new artifact, published in `fullsend-ai/fullsend/.github/workflo
 The routing logic (identical to per-org `dispatch.yml`) maps:
 - `issues` + `labeled` → `ready-to-code` → code
 - `issue_comment` + slash commands → `/fs-triage`, `/fs-code`, `/fs-review`, `/fs-fix`, `/fs-retro`, `/fs-prioritize`
-- `issue_comment` + `needs-info` label (non-command) → auto-triage
+- ~~`issue_comment` + `needs-info` label (non-command) → auto-triage~~ Removed in [#6740](https://github.com/fullsend-ai/fullsend/issues/6740) — use `/fs-triage` instead
 - `pull_request_target` + `opened`/`synchronize`/`ready_for_review` → review
 - `pull_request_target` + `closed` → retro
 - `pull_request_review` + `changes_requested` from review bot → fix (same-repo PRs only)
@@ -253,7 +255,7 @@ fullsend admin install <owner/repo>     # per-repo installation
 
 Per-repo flags:
 - `--inference-project` — GCP project for Vertex AI inference (required)
-- `--inference-region` — GCP region for Vertex AI inference (default: `global`)
+- `--inference-region` — GCP region for Vertex AI inference (install-time only, not stored in manifest)
 - `--inference-wif-provider` — full WIF provider resource name (`projects/{number}/locations/global/.../providers/{id}`); auto-provisioned if omitted
 
 Shared flags (valid for both per-org and per-repo):
@@ -283,9 +285,9 @@ All other flags are shared between per-org and per-repo modes — per-repo can c
 4. If a mint already exists: validates PEMs, registers the org, and sets up per-repo WIF.
 5. Auto-provisions inference WIF pool/provider if `--inference-wif-provider` is omitted.
 6. Generates scaffold files (`.github/workflows/fullsend.yaml`, `.fullsend/config.yaml`, `.fullsend/customized/` directories).
-7. Commits all scaffold files to the target repo via the GitHub API.
-8. Sets repository variables (`FULLSEND_MINT_URL`, `FULLSEND_GCP_REGION`, `FULLSEND_PER_REPO_INSTALL`).
-9. Sets repository secrets (`FULLSEND_GCP_PROJECT_ID`, WIF credentials).
+7. Sets repository variables (`FULLSEND_MINT_URL`, `FULLSEND_GCP_REGION`, `FULLSEND_PER_REPO_INSTALL`).
+8. Sets repository secrets (`FULLSEND_GCP_PROJECT_ID`, WIF credentials).
+9. Commits all scaffold files to the target repo via the GitHub API. Variables and secrets are written before the commit so the workflow's required credentials exist by the time an event triggers a run (#6122).
 
 Per-repo install requires only `repo` and `workflow` OAuth scopes when reusing existing infrastructure. When creating apps, scope escalation to `admin:org` is required (same as per-org).
 
@@ -334,6 +336,8 @@ Ordered by the project's threat priority (external injection > insider > drift >
 - **Insider — workflow and config modification**: In per-repo mode, `.github/workflows/fullsend.yml` and `.fullsend/` live alongside code. A contributor with write access could modify agent behavior, sandbox policies, or the workflow trigger in a PR. Without CODEOWNERS protection, these changes could be merged by any approver.
 - **`event_payload` size**: Per-org's `dispatch.yml` builds a minimal payload from `$GITHUB_EVENT_PATH` (extracting only `issue`, `pull_request`, and `comment` fields), avoiding the 65KB `workflow_call` input limit. Per-repo's shim forwards `event_action` via `workflow_call` and `reusable-dispatch.yml` reads remaining context from `github.event.*` expressions, following the same pattern. Large PR event payloads are unlikely to be an issue since the shim does not pass the full payload as an input.
 - **App identity confusion**: Users unfamiliar with the fix→review loop requirement may attempt a single-App setup and get silent failures (no review triggered after fix pushes).
+
+> **Note (2026-09):** The "silent failures" failure mode described above is incorrect. GitHub's event suppression applies only to `GITHUB_TOKEN` pushes; App installation token pushes _do_ trigger new workflow runs regardless of App identity (see [correction note in Alternative 2](#alternative-2-single-github-app-for-all-roles)). A single-App fix push would therefore trigger the review workflow. The actual risk of a single-App setup is that it grants every role the union of all permissions — violating least-privilege ([ADR 0007](0007-per-role-github-apps.md)) — and that GitHub's `422 Can not approve your own pull request` error blocks one identity from both authoring and approving a PR.
 
 ### Mitigations
 

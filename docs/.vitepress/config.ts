@@ -1,0 +1,632 @@
+import { defineConfig } from "@lando/vitepress-theme-default-plus/config";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { getLatestPatchMatching } from "./mvb-satisfies";
+import { copyMarkdownSources } from "./markdown-sources";
+import {
+  DOCS_URL_BASE,
+  globalSeoHead,
+  isIndexablePage,
+  isSitemapUrl,
+  pageRobotsHead,
+  pageSeoHead,
+} from "./seo";
+import { getMarkdownFiles } from "./sidebar";
+import { githubSlugify } from "./slugify";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const docsDir = path.resolve(__dirname, "..");
+const repoRoot = path.resolve(__dirname, "..", "..");
+
+/** Git glob passed to `git tag --list` and to mvb `multiVersionBuild.match`. */
+const MVB_TAG_MATCH = "v[0-9].*";
+
+/**
+ * Number of newest minors that get a versioned docs copy under /docs/v/.
+ *
+ * Cloudflare Workers Free rejects a deploy with more than 20,000 static asset
+ * files per Worker version. Each versioned copy adds about 1,650 files, and
+ * stable/edge/dev plus the rest of the site add about 6,500 more, so 6 minors
+ * keeps the site near 16,500 files. Lower this if the per-version cost grows.
+ */
+const MVB_MAX_MINORS = 6;
+
+/** Git tags mvb will later re-test with `semver.satisfies` (one version at a time). */
+function gitVersionTags(match: string): string[] {
+  return execFileSync("git", ["tag", "--list", match], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  })
+    .split("\n")
+    .filter(Boolean);
+}
+
+const version =
+  JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "..", "package.json"), "utf-8"))
+    .version ?? "dev";
+
+// Escape Vue-incompatible syntax ({ }, {{ }}, <non-HTML-tags>) in markdown
+// before markdown-it processes it. Code fence tracking uses backtick-count
+// matching per CommonMark spec to correctly handle nested fences.
+function escapeVueSyntax(src: string): string {
+  const lines = src.split("\n");
+  let fenceLen = 0;
+  let fenceChar = "";
+  return lines
+    .map((line) => {
+      const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+      if (fenceMatch) {
+        const ch = fenceMatch[1][0];
+        const len = fenceMatch[1].length;
+        if (fenceLen === 0) {
+          fenceLen = len;
+          fenceChar = ch;
+          return line;
+        }
+        if (ch === fenceChar && len >= fenceLen && line.trim() === ch.repeat(len)) {
+          fenceLen = 0;
+          fenceChar = "";
+          return line;
+        }
+        return line;
+      }
+      if (fenceLen > 0) return line;
+      return escapeLine(line);
+    })
+    .join("\n");
+}
+
+const KNOWN_TAGS =
+  /^<\/?(?:a|abbr|address|area|article|aside|audio|b|base|bdi|bdo|blockquote|body|br|button|canvas|caption|cite|code|col|colgroup|data|datalist|dd|del|details|dfn|dialog|div|dl|dt|em|embed|fieldset|figcaption|figure|footer|form|h[1-6]|head|header|hgroup|hr|html|i|iframe|img|input|ins|kbd|label|legend|li|link|main|map|mark|menu|meta|meter|nav|noscript|object|ol|optgroup|option|output|p|param|picture|pre|progress|q|rp|rt|ruby|s|samp|script|search|section|select|slot|small|source|span|strong|style|sub|summary|sup|table|tbody|td|template|textarea|tfoot|th|thead|time|title|tr|track|u|ul|var|video|wbr|svg|path|g|circle|rect|line|polyline|polygon|text|defs|use|symbol)[\s>/!]/i;
+
+function escapeLine(line: string): string {
+  let result = "";
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] === "`") {
+      let runLen = 0;
+      while (i + runLen < line.length && line[i + runLen] === "`") runLen++;
+      let found = -1;
+      let j = i + runLen;
+      while (j < line.length) {
+        if (line[j] === "`") {
+          let closeLen = 0;
+          while (j + closeLen < line.length && line[j + closeLen] === "`") closeLen++;
+          if (closeLen === runLen) {
+            found = j;
+            break;
+          }
+          j += closeLen;
+        } else {
+          j++;
+        }
+      }
+      if (found !== -1) {
+        result += line.slice(i, found + runLen);
+        i = found + runLen;
+      } else {
+        result += "`".repeat(runLen);
+        i += runLen;
+      }
+    } else if (line[i] === "{") {
+      result += "&#123;";
+      i++;
+    } else if (line[i] === "}") {
+      result += "&#125;";
+      i++;
+    } else if (line[i] === "<") {
+      const rest = line.slice(i);
+      if (KNOWN_TAGS.test(rest) || /^<!--/.test(rest)) {
+        result += "<";
+      } else {
+        result += "&lt;";
+      }
+      i++;
+    } else {
+      result += line[i];
+      i++;
+    }
+  }
+  return result;
+}
+
+export default defineConfig({
+  title: "Fullsend",
+  description: "Autonomous SDLC agents for your codebase",
+
+  base: "/docs/",
+  // Required for SEO correctness, not cosmetic: Cloudflare Workers serves the
+  // extensionless URL with a 200 and 307-redirects the `.html` form. With
+  // cleanUrls the canonical/og:url/sitemap URLs match the 200-serving shape
+  // instead of pointing at redirecting `.html` URLs (search engines discard
+  // canonicals that redirect).
+  cleanUrls: true,
+
+  rewrites: {
+    "README.md": "index.md",
+    ":path(.*)/README.md": ":path/index.md",
+  },
+
+  head: [
+    // Redirect legacy Svelte SPA hash routes (#/path) to VitePress paths (/docs/path)
+    [
+      "script",
+      {},
+      `(function(){var h=location.hash;if(h&&h.startsWith('#/')){var r=h.slice(2),s=r.indexOf('::'),p,a;if(s!==-1){p=r.slice(0,s);a=r.slice(s+2)}else{p=r;a=''}p=p.replace(/\\.{2,}/g,'').replace(/^\\/+/,'');if(!p)return;var u=new URL('/docs/'+p+(a?'#'+a:''),location.origin);if(u.origin===location.origin)location.replace(u.href)}})();`,
+    ],
+    ["link", { rel: "icon", href: "/docs/img/favicon.png" }],
+    ["link", { rel: "preconnect", href: "https://fonts.googleapis.com" }],
+    ["link", { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "" }],
+    [
+      "link",
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap",
+      },
+    ],
+    // Site-wide SEO metadata (Open Graph type/site name/image + Twitter card).
+    ...globalSeoHead,
+  ],
+
+  // Emit sitemap.xml for the docs. The hostname carries the /docs/ base (and a
+  // trailing slash) because VitePress resolves base-less page paths against it.
+  sitemap: {
+    hostname: DOCS_URL_BASE,
+    transformItems: (items) => items.filter((item) => isSitemapUrl(item.url)),
+  },
+
+  // Per-page canonical + Open Graph tags derived from the resolved page data.
+  transformHead({ page, title, description, siteConfig }) {
+    const robotsHead = pageRobotsHead(page);
+    if (!isIndexablePage(page)) return robotsHead;
+    return [
+      ...robotsHead,
+      ...pageSeoHead({
+        page,
+        title,
+        description,
+        base: siteConfig.site.base,
+        cleanUrls: siteConfig.cleanUrls,
+      }),
+    ];
+  },
+
+  // Emit the markdown source next to each HTML page so /docs/foo.md is a
+  // static file alongside /docs/foo.html (and /docs/foo with cleanUrls).
+  buildEnd(siteConfig) {
+    copyMarkdownSources({
+      pages: siteConfig.pages,
+      srcDir: siteConfig.srcDir,
+      outDir: siteConfig.outDir,
+      rewrites: siteConfig.rewrites.map,
+    });
+  },
+
+  srcExclude: ["**/agents/icons/**", "**/testing/**"],
+  ignoreDeadLinks: true,
+
+  themeConfig: {
+    logo: "/img/logo.png",
+    logoLink: { link: "https://fullsend.sh", target: "_self" },
+    siteTitle: "Fullsend",
+
+    multiVersionBuild: {
+      match: MVB_TAG_MATCH,
+      satisfies: getLatestPatchMatching(gitVersionTags(MVB_TAG_MATCH), ">=0.37.0", MVB_MAX_MINORS),
+      build: "stable",
+    },
+
+    nav: [
+      { text: "Docs", link: "/guides/getting-started/", activeMatch: "^/(?!cli/)" },
+      { text: "CLI Reference", link: "/cli/", activeMatch: "/cli/" },
+    ],
+
+    sidebar: {
+      "/cli/": [
+        {
+          text: "CLI Reference",
+          items: [
+            { text: "Overview", link: "/cli/" },
+            { text: "fullsend agent", link: "/cli/agent" },
+            { text: "fullsend github", link: "/cli/github" },
+            { text: "fullsend inference", link: "/cli/inference" },
+            { text: "fullsend lint", link: "/cli/lint" },
+            { text: "fullsend mint", link: "/cli/mint" },
+            { text: "fullsend repos", link: "/cli/repos" },
+            { text: "fullsend run", link: "/cli/run" },
+          ],
+        },
+      ],
+      "/": [
+        {
+          text: "Getting Started",
+          collapsed: true,
+          link: "/guides/getting-started/",
+          items: [
+            { text: "Getting Inference", link: "/guides/getting-started/getting-inference" },
+            { text: "Choose a Runtime", link: "/guides/getting-started/choosing-a-runtime" },
+            { text: "Configuring GitHub", link: "/guides/getting-started/configuring-github" },
+            { text: "Configuring GitLab", link: "/guides/getting-started/configuring-gitlab" },
+            { text: "Repo Management", link: "/guides/getting-started/repo-management" },
+            {
+              text: "Migrating to Manifest-Driven Install",
+              link: "/guides/getting-started/migrating-from-github-setup",
+            },
+            { text: "Operations", link: "/guides/getting-started/operations" },
+          ],
+        },
+        {
+          text: "Runtimes",
+          collapsed: true,
+          link: "/runtimes",
+          items: [
+            { text: "Claude Code", link: "/runtimes/claude" },
+            { text: "Pi", link: "/runtimes/pi" },
+            { text: "Codex", link: "/runtimes/codex" },
+            { text: "OpenCode", link: "/runtimes/opencode" },
+          ],
+        },
+        {
+          text: "Agents",
+          collapsed: true,
+          link: "/agents/",
+          items: [
+            { text: "Triage", link: "/agents/triage" },
+            { text: "Code", link: "/agents/code" },
+            { text: "Review", link: "/agents/review" },
+            { text: "Fix", link: "/agents/fix" },
+            { text: "Retro", link: "/agents/retro" },
+            { text: "Prioritize", link: "/agents/prioritize" },
+          ],
+        },
+        {
+          text: "User Guides",
+          collapsed: true,
+          link: "/guides/",
+          items: [
+            { text: "Adopting Fullsend Incrementally", link: "/guides/user/adoption" },
+            {
+              text: "How fullsend authenticates",
+              link: "/guides/user/how-fullsend-authenticates",
+            },
+            { text: "Using an inference gateway", link: "/guides/user/inference-gateway" },
+            { text: "Bugfix Workflow", link: "/guides/user/bugfix-workflow" },
+            { text: "Issue Commands", link: "/guides/user/issues-commands" },
+            {
+              text: "Customizing Agents",
+              collapsed: true,
+              items: [
+                { text: "Overview", link: "/guides/user/customizing-overview" },
+                {
+                  text: "Configuring with AGENTS.md",
+                  link: "/guides/user/customizing-with-agents-md",
+                },
+                { text: "Configuring with Skills", link: "/guides/user/customizing-with-skills" },
+                {
+                  text: "Configuring Agent Behavior",
+                  link: "/guides/user/customizing-agents",
+                },
+                { text: "Default vs. Custom", link: "/guides/user/default-vs-custom" },
+                { text: "Escalation Ladder", link: "/guides/user/escalation-ladder" },
+                { text: "Bring Your Own Agent", link: "/guides/user/bring-your-own-agent" },
+                {
+                  text: "Custom Agent Identity",
+                  link: "/guides/user/custom-agent-identity",
+                },
+                {
+                  text: "Chaining Follow-up Workflows",
+                  link: "/guides/user/chaining-follow-up-workflows",
+                },
+                { text: "Config Reference", link: "/reference/config-reference" },
+                { text: "Harness Field Reference", link: "/reference/harness-reference" },
+                { text: "CEL Triggers Reference", link: "/guides/user/cel-triggers-reference" },
+              ],
+            },
+            {
+              text: "OWNERS File Authorization",
+              link: "/guides/user/owners-file-authorization",
+            },
+            { text: "Running Agents Locally", link: "/guides/user/running-agents-locally" },
+            { text: "Jira Integration", link: "/guides/user/jira-integration" },
+            { text: "How To Emit Traces", link: "/guides/user/how-to-emit-traces" },
+            { text: "Tracing with MLflow", link: "/guides/user/tracing-with-mlflow" },
+          ],
+        },
+        {
+          text: "Concepts",
+          collapsed: true,
+          items: [
+            { text: "Vision", link: "/vision" },
+            { text: "Architecture", link: "/architecture" },
+            { text: "Glossary", link: "/glossary" },
+          ],
+        },
+        {
+          text: "Reference",
+          collapsed: true,
+          items: [
+            { text: "Config Reference", link: "/reference/config-reference" },
+            { text: "Harness Field Reference", link: "/reference/harness-reference" },
+            { text: "Trace Context Reference", link: "/reference/trace-context" },
+          ],
+        },
+        {
+          text: "Infrastructure",
+          collapsed: true,
+          items: [
+            {
+              text: "Infrastructure Reference",
+              link: "/guides/infrastructure/infrastructure-reference",
+            },
+            { text: "Mint Administration", link: "/guides/infrastructure/mint-administration" },
+            { text: "Standalone Mint", link: "/guides/infrastructure/standalone-mint" },
+            { text: "Private Repositories", link: "/guides/infrastructure/private-repositories" },
+            { text: "Tracing Reference", link: "/guides/infrastructure/distributed-tracing" },
+            { text: "Eval Measurements", link: "/guides/infrastructure/eval-measurements" },
+            { text: "Gate Binaries", link: "/guides/infrastructure/gate-binaries" },
+            { text: "Advanced Setup", link: "/guides/infrastructure/advanced-setup" },
+            {
+              text: "OpenAI Workload Identity",
+              link: "/guides/infrastructure/openai-workload-identity",
+            },
+            {
+              text: "Inference Gateway Operator",
+              link: "/guides/infrastructure/inference-gateway-operator",
+            },
+            {
+              text: "Layered Config Reference",
+              link: "/guides/infrastructure/layered-config-reference",
+            },
+          ],
+        },
+        {
+          text: "Contributing",
+          collapsed: true,
+          items: [
+            {
+              text: "Development",
+              collapsed: true,
+              items: [
+                { text: "Behaviour Drivers", link: "/guides/dev/behaviour-drivers" },
+                { text: "Behaviour Testing", link: "/guides/dev/behaviour-testing" },
+                { text: "CLI Internals", link: "/guides/dev/cli-internals" },
+                { text: "E2E Testing", link: "/guides/dev/e2e-testing" },
+                { text: "Testing Workflows", link: "/guides/dev/testing-workflows" },
+                { text: "Tracing Internals", link: "/guides/dev/tracing" },
+              ],
+            },
+            {
+              text: "Contributor Guidelines",
+              collapsed: true,
+              items: getMarkdownFiles("contributing", "contributing"),
+            },
+            { text: "Roadmap", link: "/roadmap" },
+            {
+              text: "Archived roadmaps",
+              collapsed: true,
+              items: [
+                { text: "Index", link: "/archived-roadmaps/" },
+                ...getMarkdownFiles("archived-roadmaps", "archived-roadmaps").reverse(),
+              ],
+            },
+            { text: "Landscape", link: "/landscape" },
+            {
+              text: "Architecture Decisions",
+              collapsed: true,
+              items: getMarkdownFiles("ADRs", "ADRs"),
+            },
+            {
+              text: "Normative Specifications",
+              collapsed: true,
+              items: getMarkdownFiles("normative", "normative"),
+            },
+            {
+              text: "Design Documents",
+              collapsed: true,
+              items: getMarkdownFiles("problems", "problems"),
+            },
+            {
+              text: "Spikes",
+              collapsed: true,
+              items: getMarkdownFiles("spikes", "spikes"),
+            },
+            {
+              text: "Experiments (Exploratory)",
+              collapsed: true,
+              items: getMarkdownFiles("experiments", "experiments"),
+            },
+            { text: "Doc Site", link: "/doc-site" },
+            { text: "Site Deployment", link: "/site-deployment" },
+          ],
+        },
+      ],
+    },
+
+    sidebarEnder: {
+      text: version,
+      collapsed: true,
+      items: [
+        {
+          text: "Other Doc Versions",
+          items: [
+            { rel: "mvb", text: "stable", target: "_blank", link: "/stable/" },
+            { rel: "mvb", text: "edge", target: "_blank", link: "/edge/" },
+            { rel: "mvb", text: "dev", target: "_blank", link: "/dev/" },
+            { text: "<strong>see all versions</strong>", link: "/v/" },
+          ],
+        },
+        {
+          text: "Other Releases",
+          link: "https://github.com/fullsend-ai/fullsend/releases",
+        },
+      ],
+    },
+
+    socialLinks: [{ icon: "github", link: "https://github.com/fullsend-ai/fullsend" }],
+
+    editLink: {
+      pattern: "https://github.com/fullsend-ai/fullsend/edit/main/docs/:path",
+      text: "Edit this page on GitHub",
+    },
+
+    search: {
+      provider: "local",
+      options: {
+        scopes: [
+          {
+            label: "Guides",
+            prefixes: [
+              "/docs/guides/",
+              "/docs/agents/",
+              "/docs/cli/",
+              "/docs/runtimes",
+              "/docs/reference/",
+            ],
+          },
+          {
+            label: "Design Docs",
+            prefixes: ["/docs/problems/", "/docs/ADRs/", "/docs/normative/", "/docs/spikes/"],
+          },
+          { label: "Experiments", prefixes: ["/docs/experiments/"] },
+          { label: "Contributing", prefixes: ["/docs/contributing/"] },
+          { label: "Others", prefixes: [], others: true },
+        ],
+      },
+    },
+  },
+
+  vite: {
+    resolve: {
+      alias: [
+        {
+          find: /^.*\/VPLocalSearchBox\.vue$/,
+          replacement: fileURLToPath(
+            new URL("./theme/components/VPLocalSearchBox.vue", import.meta.url),
+          ),
+        },
+        {
+          find: "vue/server-renderer",
+          replacement: path.resolve(
+            __dirname,
+            "..",
+            "..",
+            "node_modules",
+            "vue",
+            "server-renderer",
+            "index.mjs",
+          ),
+        },
+        {
+          find: "vue",
+          replacement: path.resolve(__dirname, "..", "..", "node_modules", "vue"),
+        },
+        {
+          find: "mermaid",
+          replacement: path.resolve(
+            __dirname,
+            "..",
+            "..",
+            "node_modules",
+            "mermaid",
+            "dist",
+            "mermaid.esm.mjs",
+          ),
+        },
+      ],
+      // Prevent VitePress SSR from resolving CJS packages in the
+      // repo-root node_modules (which causes ESM default-import
+      // failures on Node 22 for packages like entities, estree-walker).
+      preserveSymlinks: true,
+    },
+    ssr: {
+      noExternal: [/./],
+    },
+  },
+
+  markdown: {
+    // GitHub-compatible heading ids, so links lychee accepts also work here.
+    anchor: { slugify: githubSlugify },
+
+    shikiSetup: async (shiki) => {
+      await shiki.loadLanguage("toml");
+    },
+
+    preConfig: (md) => {
+      const defaultParse = md.parse.bind(md);
+      md.parse = (src: string, env: Record<string, unknown>) => {
+        const rel = (env?.relativePath as string) ?? "";
+        if (rel === "v/index.md") return defaultParse(src, env);
+        return defaultParse(escapeVueSyntax(src), env);
+      };
+    },
+    config: (md) => {
+      const defaultCodeInline = md.renderer.rules.code_inline!;
+      md.renderer.rules.code_inline = (tokens, idx, options, env, self) => {
+        tokens[idx].attrSet("v-pre", "");
+        return defaultCodeInline(tokens, idx, options, env, self);
+      };
+
+      // Rewrite relative links that escape the docs/ directory to GitHub
+      // source URLs, and rewrite README.md links to directory index paths
+      // (only for links that stay within docs/).
+      md.core.ruler.push("rewrite-links", (state) => {
+        for (const token of state.tokens) {
+          if (!token.children) continue;
+          for (const child of token.children) {
+            if (child.type !== "link_open") continue;
+            const href = child.attrGet("href");
+            if (
+              !href ||
+              href.startsWith("http") ||
+              href.startsWith("#") ||
+              href.startsWith("mailto:")
+            )
+              continue;
+
+            // Check if the link escapes docs/ (more ../  than directory depth)
+            const docPath = state.env?.relativePath || "";
+            const docDir = docPath.split("/").slice(0, -1);
+            const parts = href.split("#");
+            const linkPath = parts[0];
+            const anchor = parts[1] ? "#" + parts[1] : "";
+            const segments = linkPath.split("/");
+            let depth = 0;
+            for (const s of segments) {
+              if (s === "..") depth++;
+              else break;
+            }
+            if (depth > docDir.length) {
+              const remainder = segments.slice(depth).join("/");
+              const prefix =
+                /\.[a-zA-Z0-9]+$/.test(remainder) && !remainder.endsWith("/") ? "blob" : "tree";
+              child.attrSet(
+                "href",
+                `https://github.com/fullsend-ai/fullsend/${prefix}/main/${remainder}${anchor}`,
+              );
+              continue;
+            }
+
+            // For links staying within docs/, rewrite README.md to directory index
+            if (/README\.md(#.*)?$/.test(href)) {
+              child.attrSet(
+                "href",
+                href.replace(/README\.md(#.*)?$/, (_: string, a: string) => a || "./"),
+              );
+            }
+          }
+        }
+      });
+
+      const defaultFence = md.renderer.rules.fence!.bind(md.renderer.rules);
+      md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+        if (tokens[idx].info.trim() === "mermaid") {
+          const encoded = encodeURIComponent(tokens[idx].content);
+          return `<Mermaid id="mermaid-${idx}" graph="${encoded}" />`;
+        }
+        return defaultFence(tokens, idx, options, env, self);
+      };
+    },
+  },
+});

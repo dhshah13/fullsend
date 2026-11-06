@@ -51,7 +51,7 @@ Possible criteria (all TBD — this needs experimentation):
 - History of successful agent-reviewed PRs (agents review but don't merge, humans validate the agent's judgment)
 - No recent security incidents attributable to missed review
 
-These criteria are all properties of the repo and the agents. But graduation also changes the role of the humans responsible for guarded paths — from active participants to approvers of agent output. Whether those humans can remain effective in that reduced role is an open question explored in [human-factors.md](human-factors.md).
+These criteria are all properties of the repo and the agents. [Trustworthiness evidence](trustworthiness-evidence.md) explores a structured portfolio model for composing these signals into trust decisions. [Review autonomy evidence](review-autonomy-evidence.md) tracks empirical observations from real PRs where agent and human review can be compared — the data that informs whether graduation criteria are met for specific change types. But graduation also changes the role of the humans responsible for guarded paths — from active participants to approvers of agent output. Whether those humans can remain effective in that reduced role is an open question explored in [human-factors.md](human-factors.md).
 
 ## The probationary period
 
@@ -63,6 +63,27 @@ Before flipping a repo to full autonomy, run agents in "shadow mode":
 4. When confidence in alignment is high, graduate to autonomous mode
 
 This builds trust incrementally and provides data on agent reliability.
+
+**Eligibility is not authority.** A bounded
+[lab trial](../spikes/2026-10-24-gemara-auto-merge.md) showed that a PR's
+candidate checks can pass while a separate quality condition still holds it.
+A later, explicitly authorized trial passed the selected conditions and merged
+through GitHub's protected merge queue. The broader production-readiness
+assessment still held, and the lab then returned to shadow mode. The trial is
+evidence about enforcement behavior, not evidence that an agent or repository
+has graduated to general autonomy. It suggests keeping several states
+distinct:
+
+- **Shadow:** agents evaluate and recommend; nothing is enforced.
+- **Experimental enforcement:** a time-boxed, revocable trial of a gate.
+- **Eligibility:** a specific change satisfies the configured conditions.
+- **Scoped owner authority:** a repository owner delegates merge authority for
+  a bounded scope and period.
+- **Production qualification:** the graduation decision described above.
+
+None of these replaces CODEOWNERS or the human-owned path questions in this
+document. A policy evaluation that returns "pass" does not grant authority by
+itself.
 
 ## Alternative: per-decision escalation dimensions
 
@@ -92,6 +113,7 @@ This addresses the gap where the binary model can miss risky changes that don't 
 - Requires agents to accurately self-assess dimensions in real time — a judgment call the binary model avoids entirely.
 - The dimensions listed above are examples, not necessarily exhaustive. Different organizations might weight or define them differently.
 - Could produce false escalations (agent is uncertain, so it escalates conservatively) or false confidence (agent misjudges blast radius). Shadow mode data would help calibrate.
+- Deciding *to* escalate is only half of the handoff. Who receives the escalation, and whether they have the context and authority to act, is covered in [escalation without context](agentic-sdlc-adoption-org-communication.md#escalation-without-context).
 
 ## Open questions
 
@@ -103,4 +125,4 @@ This addresses the gap where the binary model can miss risky changes that don't 
 - How do we handle the CODEOWNERS bootstrap — who decides the initial set of guarded paths?
 - Should graduation criteria include human factors — not just "can agents be trusted here?" but "can the humans responsible for guarded paths remain effective once they stop implementing?" (See [human-factors.md](human-factors.md))
 - Automation research suggests that [intermediate levels of automation preserve better human oversight than full automation](human-factors.md#the-out-of-the-loop-performance-problem). Does this argue for a third autonomy level between "human-approved" and "fully autonomous" — one where agents do most of the work but humans retain some implementation role?
-- If autonomy can be revoked, should human engagement metrics (approval times, review depth, domain expert confidence) be among the triggers, alongside code quality metrics?
+- If autonomy can be revoked, should human engagement metrics (approval times, review depth, domain expert confidence) be among the triggers, alongside code quality metrics? Agent flapping rate is another candidate signal — see [flapping-convergence.md](flapping-convergence.md).

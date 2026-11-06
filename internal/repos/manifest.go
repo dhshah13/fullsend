@@ -1,0 +1,2023 @@
+// Package repos implements parsing, validation, and resolution of the
+// repos.yaml declarative manifest that drives multi-repo management
+// (ADR 0057).
+package repos
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/fullsend-ai/fullsend/internal/appsetup"
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/netutil"
+	"gopkg.in/yaml.v3"
+
+	"github.com/fullsend-ai/fullsend/internal/config"
+)
+
+const maxManifestBytes = 1 << 20 // 1 MB
+
+// Forge type constants used in the manifest's platform sections.
+const (
+	ForgeGitHub = "github"
+	ForgeGitLab = "gitlab"
+)
+
+// Mint mode constants control the default mint URL for GitHub repos.
+const (
+	MintModePublic  = "public"
+	MintModePrivate = "private"
+
+	DefaultPublicMintURL = "https://mint.fullsend.sh"
+)
+
+// NoneSentinel is the YAML value that explicitly clears an inherited
+// field in the override cascade. Use "fullsend_ref: none" in YAML to
+// stop the per-repo → platform-default → built-in-default chain.
+const NoneSentinel = "none"
+
+// Inference authentication methods accepted by inference.auth in
+// repos.yaml. There is no built-in
+// default: every repository must resolve an explicit selection from its
+// entry, its forge section, or defaults.
+const (
+	InferenceAuthVertexWIF    = "vertex-wif"
+	InferenceAuthOpenAIAPIKey = "openai-api-key"
+	// InferenceAuthOpenAIWIF selects OpenAI Workload Identity Federation
+	// (ADR 0092). It needs no Fullsend-managed secret: the runtime
+	// exchanges the GitHub Actions OIDC token using three non-secret
+	// identifiers delivered as repository variables or through
+	// .fullsend/config.yaml. GitHub only.
+	InferenceAuthOpenAIWIF = "openai-wif"
+)
+
+// ValidInferenceAuths returns the accepted inference.auth values in
+// documentation order.
+func ValidInferenceAuths() []string {
+	return []string{InferenceAuthVertexWIF, InferenceAuthOpenAIAPIKey, InferenceAuthOpenAIWIF}
+}
+
+// ValidateInferenceAuth accepts an empty value (inherit) or one of
+// ValidInferenceAuths. The key names the offending field or flag in the
+// error message.
+func ValidateInferenceAuth(key, value string) error {
+	if value == "" || slices.Contains(ValidInferenceAuths(), value) {
+		return nil
+	}
+	return fmt.Errorf("%s %q is not a valid inference authentication method; valid values: %s",
+		key, value, strings.Join(ValidInferenceAuths(), ", "))
+}
+
+// InferenceSettings is the nested inference block in repos.yaml. It may
+// appear under defaults, a forge section, or a repository entry. It holds
+// only the non-secret authentication selection; credential and connection
+// values are supplied on the command line and never stored here.
+type InferenceSettings struct {
+	// Auth selects which managed inference credentials the repository
+	// needs: "vertex-wif", "openai-api-key" or "openai-wif". Empty
+	// inherits from the next level (entry → forge section → defaults).
+	Auth string `yaml:"auth,omitempty"`
+}
+
+// validForges is the set of accepted forge values.
+var validForges = map[string]bool{
+	ForgeGitHub: true,
+	ForgeGitLab: true,
+}
+
+// IsValidForge reports whether the given forge name is supported.
+func IsValidForge(name string) bool {
+	return validForges[name]
+}
+
+// Manifest is the top-level structure of a repos.yaml file.
+// Platform sections (github, gitlab) replace the former nested forge
+// section. Each platform section contains infrastructure config AND
+// its repos list.
+type Manifest struct {
+	Version  int             `yaml:"version"`
+	Defaults DefaultsConfig  `yaml:"defaults,omitempty"`
+	GitHub   *PlatformConfig `yaml:"github,omitempty"`
+	GitLab   *PlatformConfig `yaml:"gitlab,omitempty"`
+
+	// sourceRemote and sourceDir are set only when the manifest is loaded
+	// through LoadManifest. They keep config preset paths tied to the
+	// manifest's trust boundary without affecting manifests built in memory.
+	sourceRemote bool
+	sourceDir    string
+	// sourceURL is the sanitized HTTPS location the manifest was loaded
+	// from (see sanitizeManifestSource), recorded in every managed
+	// .fullsend/config.yaml so readers can trace its content back to the
+	// manifest. Empty for a local-path manifest or one built in memory.
+	sourceURL string
+	// legacyTrackingMigrations lists the config layers whose legacy
+	// tracker/create_issues keys were converted on parse (#9075).
+	legacyTrackingMigrations []LegacyTrackingMigration
+}
+
+// PlatformConfig holds per-platform infrastructure settings and the
+// list of repos managed under that platform. A single struct serves
+// both GitHub and GitLab; validation rejects platform-specific fields
+// on the wrong platform (e.g. mint_url under gitlab).
+type PlatformConfig struct {
+	URL         string `yaml:"url,omitempty"`
+	MintURL     string `yaml:"mint_url,omitempty"`
+	MintMode    string `yaml:"mint_mode,omitempty"`
+	FullsendRef string `yaml:"fullsend_ref,omitempty"`
+	// AppSet is the GitHub App set prefix (apps named "{app_set}-{role}")
+	// persisted as the FULLSEND_APP_SET repo variable. GitHub-only; the
+	// sentinel "none" resets a per-repo override back to the built-in
+	// default. Rejected under the gitlab platform.
+	AppSet string `yaml:"app_set,omitempty"`
+	// AgentRunnerTags routes GitLab agent (data-plane) jobs. GitLab-only.
+	AgentRunnerTags []string `yaml:"agent_runner_tags,omitempty"`
+	// ControlRunnerTags routes GitLab control-plane jobs (poll today;
+	// webhook dispatcher next). GitLab-only. Fully independent of
+	// AgentRunnerTags: there is no cross-fallback. Unset renders an
+	// empty tag list (untagged), not the agent tags.
+	ControlRunnerTags []string `yaml:"control_runner_tags,omitempty"`
+	// DeprecatedRunnerTags is the deprecated gitlab.runner_tags alias.
+	// Parse populates AgentRunnerTags from it when agent_runner_tags is
+	// unset; MarshalWithHeader / Manifest.Marshal drop it so rewrites
+	// emit agent_runner_tags.
+	DeprecatedRunnerTags []string `yaml:"runner_tags,omitempty"`
+	// Inference holds the forge-wide inference authentication selection,
+	// overriding defaults.inference and overridden by repository entries.
+	Inference InferenceSettings `yaml:"inference,omitempty"`
+	// Signoff, when non-nil, enables or disables a Signed-off-by trailer
+	// on scaffold commits for every repository in this forge section,
+	// overriding defaults.signoff and overridden by repository entries.
+	Signoff *bool `yaml:"signoff,omitempty"`
+	// Config is a sparse managed .fullsend/config.yaml layer for every
+	// repository in this forge section (ADR 0122). It overrides
+	// defaults.config and is overridden by each repository entry's config,
+	// using the per-field merge rules of per-repo config. It never affects
+	// repositories of the other forge.
+	Config config.ManagedConfig `yaml:"config,omitempty"`
+	Repos  []RepoEntry          `yaml:"repos"`
+}
+
+// ConfigBase is the nested config_base object in repos.yaml. Source is
+// a local path or HTTPS URL written as .fullsend/config.base.yaml;
+// SHA256 is an optional digest matching github setup --config-hash.
+// Empty Source inherits the parent value; "none" disables inheritance.
+// Empty SHA256 inherits the parent digest; "none" skips validation.
+type ConfigBase struct {
+	Source string `yaml:"source,omitempty"`
+	SHA256 string `yaml:"sha256,omitempty"`
+
+	// resolvedSource caches the manifest-directory-relative absolute
+	// path Validate computed for a local Source. It is unexported and
+	// tagged yaml:"-" so a subsequent marshal (RemoveFromManifest /
+	// WriteManifest) always writes the original relative path or
+	// HTTPS URL the operator wrote.
+	resolvedSource string `yaml:"-"`
+}
+
+// configSource returns the path to fetch: the Validate-resolved absolute
+// path for a local Source, or the raw Source value (empty, "none",
+// or an HTTPS URL) when no local-path resolution applies.
+func (c ConfigBase) configSource() string {
+	if c.resolvedSource != "" {
+		return c.resolvedSource
+	}
+	return c.Source
+}
+
+// RepoEntry represents a single repo or glob pattern in a platform's
+// repos list. Always uses object form with name as the required field.
+// Override fields use plain strings (config_base is a nested object);
+// the sentinel value "none" stops the inheritance chain.
+type RepoEntry struct {
+	Name        string `yaml:"name"`
+	FullsendRef string `yaml:"fullsend_ref,omitempty"`
+	MintURL     string `yaml:"mint_url,omitempty"`
+	MintMode    string `yaml:"mint_mode,omitempty"`
+	// AppSet overrides the GitHub App set prefix for this repository,
+	// persisted as the FULLSEND_APP_SET repo variable. GitHub-only; the
+	// sentinel "none" resets back to the built-in default.
+	AppSet string `yaml:"app_set,omitempty"`
+	// Inference overrides the inference authentication selection for this
+	// repository (or every repository matched by this glob entry).
+	Inference InferenceSettings `yaml:"inference,omitempty"`
+	// Vendor overrides the default vendor setting for this repo.
+	// nil inherits defaults.vendor; non-nil overrides it.
+	Vendor *bool `yaml:"vendor,omitempty"`
+	// Signoff overrides the forge-section and defaults signoff setting
+	// for this repository. nil inherits; an explicit false disables an
+	// inherited true.
+	Signoff *bool `yaml:"signoff,omitempty"`
+	// ConfigBase configures the configuration preset written as
+	// .fullsend/config.base.yaml. Empty Source inherits
+	// defaults.config_base; source "none" disables inheritance. SHA256
+	// is an optional digest verified against the fetched preset.
+	ConfigBase ConfigBase `yaml:"config_base,omitempty"`
+	// Config is a sparse managed .fullsend/config.yaml for this
+	// repository (ADR 0122). It accepts every per-repo config field,
+	// including runtime and allowed_remote_resources, and overrides the
+	// forge section's config and defaults.config.
+	Config config.ManagedConfig `yaml:"config,omitempty"`
+}
+
+// DefaultsConfig holds default field values applied to every repo
+// across all platforms.
+type DefaultsConfig struct {
+	// Inference is the operator-provided default inference authentication
+	// selection for every repository. It is not a built-in fallback: when
+	// no level sets inference.auth, install/convergence/status report a
+	// configuration error for the repository.
+	Inference InferenceSettings `yaml:"inference,omitempty"`
+	// Vendor, when true, vendors the fullsend binary and content into
+	// each repo so CI does not need network access to fetch them.
+	Vendor *bool `yaml:"vendor,omitempty"`
+	// Signoff, when true, adds a Signed-off-by trailer for the
+	// authenticated installing user to every scaffold commit created by
+	// repos install. Forge sections and repository entries override it.
+	Signoff *bool `yaml:"signoff,omitempty"`
+	// ConfigBase is the default configuration preset, written as
+	// .fullsend/config.base.yaml. Empty Source disables the default;
+	// source "none" disables inheritance for entries that reference it.
+	// SHA256 is an optional digest verified against the fetched preset.
+	ConfigBase ConfigBase `yaml:"config_base,omitempty"`
+	// Config is a fleet-wide sparse managed .fullsend/config.yaml layer
+	// (ADR 0122). It accepts every per-repo config field, including
+	// runtime and allowed_remote_resources, and is overridden by the forge
+	// section's config and each repository entry's config.
+	Config config.ManagedConfig `yaml:"config,omitempty"`
+}
+
+// IsZero reports whether no default is declared. A declared config
+// mapping (even an empty one, or one holding only
+// `allowed_remote_resources: []`) counts as declared, so omitempty on the
+// parent keeps it.
+func (d DefaultsConfig) IsZero() bool {
+	return reflect.DeepEqual(d, DefaultsConfig{})
+}
+
+// DefaultGitHubURL is the default forge URL for GitHub.com.
+const DefaultGitHubURL = "https://github.com"
+
+// ResolvedRepo pairs an owner/repo with the manifest entry that
+// matched it (either an explicit entry or a glob-generated one).
+type ResolvedRepo struct {
+	Owner string
+	Repo  string
+	Forge string
+	Entry RepoEntry
+}
+
+// ResolvedConfig is the fully resolved configuration for a single
+// repository after merging manifest defaults and platform-level settings.
+// The ForgeConfig field carries per-forge patterns and (when populated
+// by ForgeClientFactory.ConfigFor) a live API client.
+type ResolvedConfig struct {
+	Owner       string
+	Repo        string
+	Forge       string
+	ForgeConfig ForgeConfig
+	// MintURL is the FULLSEND_MINT_URL value for a GitHub repository. Manifest
+	// resolution sets it from mint_url/mint_mode; applyEffectiveInfrastructure
+	// then replaces it with the mint_url the effective configuration declares
+	// (#8220).
+	MintURL string
+	// MintURLExplicit reports whether a non-empty mint_url was declared on
+	// the repository entry or the forge section, as opposed to the mint_mode
+	// default. A declared configuration mint_url may not contradict it.
+	MintURLExplicit bool
+	MintMode        string
+	FullsendRef     string
+	// AppSet is the resolved GitHub App set prefix persisted as the
+	// FULLSEND_APP_SET repo variable. GitHub-only; empty for GitLab.
+	AppSet string
+	// AppSetExplicit reports whether app_set was explicitly configured
+	// (per-repo override or manifest default, including the "none"
+	// sentinel). When false, convergence preserves any existing
+	// FULLSEND_APP_SET value on the repo rather than forcing the default.
+	AppSetExplicit bool
+	// Runtime is the runtime explicitly declared by the managed
+	// configuration layers (repository config, then forge section config,
+	// then defaults.config); empty means the preset or code default.
+	Runtime string
+	// InferenceAuth is the resolved inference authentication method
+	// (entry, then forge section, then defaults). Empty means no level
+	// declared one; RequireInferenceAuth turns that into an actionable
+	// error for install, convergence, and status.
+	InferenceAuth string
+	// Vendor is true when the fullsend binary and content should be
+	// vendored into the repo for offline CI.
+	Vendor bool
+	// Signoff is true when scaffold commits for this repository carry a
+	// Signed-off-by trailer for the authenticated installing user
+	// (entry, then forge section, then defaults; default false).
+	Signoff bool
+	// Config is the resolved preset source; empty means no preset is
+	// declared, so the desired state is no base file and an existing one
+	// is drift (#8218).
+	Config string
+	// ProposedBase holds the validated bytes of the declared preset once a
+	// caller has loaded it (the convergence pre-write stage and status).
+	// The ADR 0122 safety gate layers the proposed overlay on these bytes,
+	// not on the installed base, so replacing a base cannot bypass
+	// restrictions. Nil when no preset is declared or not yet loaded.
+	ProposedBase []byte
+	// FreshInstall is set by convergence and status when the repository has
+	// no Fullsend installation yet. Together with the absence of both
+	// configuration files it marks a pristine first install: there is no
+	// existing effective configuration to relax, so the ADR 0122 safety
+	// gate has nothing to compare against and must not reject values the
+	// declared preset supplies (#8218).
+	FreshInstall bool
+	// ConfigHash is the resolved SHA-256 hex digest; empty skips
+	// digest validation.
+	ConfigHash string
+	// InferenceRegion is the effective FULLSEND_GCP_REGION for a repository
+	// whose inference.auth uses Vertex (vertex-wif or openai-wif): the
+	// inference.region the effective configuration declares, else the code
+	// default. Empty for openai-api-key and until
+	// applyEffectiveInfrastructure runs.
+	InferenceRegion string
+	// InferenceRegionDeclared reports whether the effective configuration
+	// declares inference.region (rather than InferenceRegion falling back to
+	// the code default).
+	InferenceRegionDeclared bool
+	// DeclaredInferenceProject and DeclaredWIFProvider are the GCP inference
+	// project and WIF provider the effective configuration declares (managed
+	// configuration over the preset); empty when not declared. They supply
+	// the Vertex credential secrets when no command-line input does.
+	DeclaredInferenceProject string
+	DeclaredWIFProvider      string
+	// DeclaredWIFAudience and DeclaredServiceAccount are the GitLab
+	// vertex-wif options for an existing WIF provider the installer does
+	// not own (inference.wif_audience, inference.service_account): the
+	// agent job's ID token audience and the service account it
+	// impersonates. Empty when not declared, which keeps aud "fullsend"
+	// and direct federation.
+	DeclaredWIFAudience    string
+	DeclaredServiceAccount string
+	// ConfigManaged reports whether this repository's
+	// .fullsend/config.yaml is managed (ADR 0122). It is true for every
+	// repository; no config key is required to opt in (#8218).
+	ConfigManaged bool
+	// Managed is the sparse managed configuration: defaults.config, the
+	// forge section's config, and the repository config merged in that
+	// order. Nil when ConfigManaged is false. It does not bake in code
+	// defaults or config.base.yaml.
+	Managed config.PerRepoConfigWriter
+	// ManifestSource is the sanitized HTTPS URL of the repos.yaml manifest
+	// this configuration was resolved from, written after the ownership
+	// marker in the managed .fullsend/config.yaml. Empty when the manifest
+	// was loaded from a local path (whose machine-specific location is not
+	// meaningful to readers of the target repository) or built in memory.
+	ManifestSource string
+}
+
+func parseManifestBytes(data []byte, m *Manifest) error {
+	if err := rejectRemovedConfigSiblings(data); err != nil {
+		return err
+	}
+	// The legacy tracker/create_issues shape is converted before strict
+	// decoding, which rejects it (#9075).
+	migrated, trackingMigrations, err := migrateLegacyManifestTracking(data)
+	if err != nil {
+		return fmt.Errorf("migrating legacy tracker configuration: %w", err)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(migrated))
+	dec.KnownFields(true)
+	if err := dec.Decode(m); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	m.legacyTrackingMigrations = trackingMigrations
+	migrateDeprecatedRunnerTags(m)
+	return nil
+}
+
+// removedConfigSiblingKeys are per-repo config fields that older manifests
+// declared as sibling keys under defaults and repository entries. They now
+// live only inside the matching config block (#8330).
+var removedConfigSiblingKeys = []string{"runtime", "allowed_remote_resources"}
+
+// rejectRemovedConfigSiblings fails when a manifest still declares runtime
+// or allowed_remote_resources as a sibling key under defaults or a
+// repository entry, naming the config path that replaces each one. The old
+// spellings are neither migrated nor accepted as aliases. Malformed YAML is
+// left to the strict decoder, which reports it with full context.
+func rejectRemovedConfigSiblings(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	var errs []error
+	check := func(n *yaml.Node, path string) {
+		if n == nil || n.Kind != yaml.MappingNode {
+			return
+		}
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			key := n.Content[i]
+			if !slices.Contains(removedConfigSiblingKeys, key.Value) {
+				continue
+			}
+			errs = append(errs, fmt.Errorf("line %d: %s.%s is no longer supported; move it to %s.config.%s",
+				key.Line, path, key.Value, path, key.Value))
+		}
+	}
+	root := doc.Content[0]
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key, val := root.Content[i].Value, root.Content[i+1]
+		switch key {
+		case "defaults":
+			check(val, "defaults")
+		case ForgeGitHub, ForgeGitLab:
+			if val.Kind != yaml.MappingNode {
+				continue
+			}
+			for j := 0; j+1 < len(val.Content); j += 2 {
+				if val.Content[j].Value != "repos" || val.Content[j+1].Kind != yaml.SequenceNode {
+					continue
+				}
+				for idx, entry := range val.Content[j+1].Content {
+					check(entry, fmt.Sprintf("%s.repos[%s]", key, repoEntryLabel(entry, idx)))
+				}
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// repoEntryLabel returns the name of a repository entry node for error
+// paths, or its index when the entry has no scalar name.
+func repoEntryLabel(entry *yaml.Node, idx int) string {
+	if entry.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(entry.Content); i += 2 {
+			if entry.Content[i].Value == "name" && entry.Content[i+1].Kind == yaml.ScalarNode && entry.Content[i+1].Value != "" {
+				return entry.Content[i+1].Value
+			}
+		}
+	}
+	return fmt.Sprint(idx)
+}
+
+// migrateDeprecatedRunnerTags copies gitlab.runner_tags onto
+// agent_runner_tags when the new key is unset, then drops the old key
+// so a subsequent marshal writes agent_runner_tags. When both keys are
+// set, agent_runner_tags wins and runner_tags is still dropped.
+//
+// This only migrates the GitLab platform section: runner_tags (like
+// agent_runner_tags/control_runner_tags) is a GitLab-only key. Leaving
+// a GitHub section's deprecated key untouched keeps it reachable by
+// rejectGitHubRunnerTags, so a manifest that mistakenly sets
+// github.runner_tags is rejected by the key the operator actually
+// wrote, not by the migrated agent_runner_tags name.
+func migrateDeprecatedRunnerTags(m *Manifest) {
+	if m == nil || m.GitLab == nil {
+		return
+	}
+	p := m.GitLab
+	if len(p.AgentRunnerTags) == 0 && len(p.DeprecatedRunnerTags) > 0 {
+		p.AgentRunnerTags = p.DeprecatedRunnerTags
+	}
+	p.DeprecatedRunnerTags = nil
+}
+
+// manifestFetcher retrieves a remote manifest for LoadManifest. It is a
+// variable only so tests can exercise LoadManifest's HTTPS branch without
+// a TLS server; production always uses fetchManifestURL with its timeout,
+// size limit and SSRF protections.
+var manifestFetcher = fetchManifestURL
+
+// LoadManifest reads and parses a repos.yaml manifest from a local
+// file path or an HTTPS URL. Remote fetches enforce a 30-second
+// timeout and a 1 MB response size limit.
+func LoadManifest(ctx context.Context, pathOrURL string) (*Manifest, error) {
+	var data []byte
+	var err error
+	var sourceDir string
+	var sourceRemote bool
+
+	if strings.HasPrefix(pathOrURL, "https://") {
+		sourceRemote = true
+		data, err = manifestFetcher(ctx, pathOrURL, false)
+		if err != nil {
+			return nil, err
+		}
+	} else if strings.HasPrefix(pathOrURL, "http://") {
+		return nil, fmt.Errorf("insecure http:// not supported; use https://")
+	} else {
+		f, err := os.Open(pathOrURL)
+		if err != nil {
+			return nil, fmt.Errorf("reading manifest file %s: %w", pathOrURL, err)
+		}
+		defer f.Close()
+		limited := io.LimitReader(f, maxManifestBytes+1)
+		data, err = io.ReadAll(limited)
+		if err != nil {
+			return nil, fmt.Errorf("reading manifest file %s: %w", pathOrURL, err)
+		}
+		if int64(len(data)) > maxManifestBytes {
+			return nil, fmt.Errorf("manifest file %s exceeds maximum size of %d bytes", pathOrURL, maxManifestBytes)
+		}
+		absolutePath, absErr := filepath.Abs(pathOrURL)
+		if absErr != nil {
+			return nil, fmt.Errorf("resolving manifest file %s: %w", pathOrURL, absErr)
+		}
+		sourceDir = filepath.Dir(absolutePath)
+	}
+
+	var m Manifest
+	if err := parseManifestBytes(data, &m); err != nil {
+		return nil, fmt.Errorf("parsing manifest YAML: %w", err)
+	}
+	m.sourceRemote = sourceRemote
+	m.sourceDir = sourceDir
+	if sourceRemote {
+		m.sourceURL = sanitizeManifestSource(pathOrURL)
+	}
+
+	return &m, nil
+}
+
+// SafeDialContext wraps a net.Dialer to reject connections to
+// internal/reserved IP addresses (loopback, link-local, private, etc.).
+func SafeDialContext(d *net.Dialer, skipIPCheck bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+		}
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("no addresses found for %q", host)
+		}
+		var safeIPs []net.IPAddr
+		for _, ip := range ips {
+			if skipIPCheck {
+				safeIPs = append(safeIPs, ip)
+			} else if reason := netutil.CheckIP(ip.IP); reason != "" {
+				continue
+			} else {
+				safeIPs = append(safeIPs, ip)
+			}
+		}
+		if len(safeIPs) == 0 {
+			return nil, fmt.Errorf("all resolved addresses for %q are blocked", host)
+		}
+		var lastErr error
+		for _, ip := range safeIPs {
+			conn, dialErr := d.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+			if dialErr == nil {
+				return conn, nil
+			}
+			lastErr = dialErr
+		}
+		return nil, lastErr
+	}
+}
+
+// fetchManifestURL retrieves manifest YAML from an HTTPS URL with
+// timeout, size limit, SSRF protections, and redirect restrictions.
+// skipIPCheck bypasses internal-IP validation for tests using httptest
+// servers on localhost; production callers must pass false.
+func fetchManifestURL(ctx context.Context, rawURL string, skipIPCheck bool) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: nil, // ignore environment proxy settings
+			DialContext: SafeDialContext(&net.Dialer{
+				Timeout: 10 * time.Second,
+			}, skipIPCheck),
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("exceeded redirect limit (3)")
+			}
+			if req.URL.Scheme != "https" {
+				return fmt.Errorf("redirect to non-HTTPS URL %s", req.URL)
+			}
+			return nil
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetching manifest from %s: %w", rawURL, err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching manifest from %s: %w", rawURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetching manifest from %s: HTTP %d", rawURL, resp.StatusCode)
+	}
+
+	limited := io.LimitReader(resp.Body, maxManifestBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("reading manifest body from %s: %w", rawURL, err)
+	}
+	if int64(len(data)) > maxManifestBytes {
+		return nil, fmt.Errorf("manifest from %s exceeds maximum size of %d bytes", rawURL, maxManifestBytes)
+	}
+
+	return data, nil
+}
+
+// PlatformFor returns the PlatformConfig for the given forge name, or
+// nil if that platform section is not present in the manifest.
+func (m *Manifest) PlatformFor(forgeName string) *PlatformConfig {
+	switch forgeName {
+	case ForgeGitHub:
+		return m.GitHub
+	case ForgeGitLab:
+		return m.GitLab
+	default:
+		return nil
+	}
+}
+
+// EnsurePlatform returns the PlatformConfig for the given forge name,
+// creating it if it does not exist.
+func (m *Manifest) EnsurePlatform(forgeName string) *PlatformConfig {
+	switch forgeName {
+	case ForgeGitHub:
+		if m.GitHub == nil {
+			m.GitHub = &PlatformConfig{}
+		}
+		return m.GitHub
+	case ForgeGitLab:
+		if m.GitLab == nil {
+			m.GitLab = &PlatformConfig{}
+		}
+		return m.GitLab
+	default:
+		return nil
+	}
+}
+
+// AllRepos returns a flat list of all repo entries across all platform
+// sections. The order is GitHub repos first, then GitLab repos,
+// preserving the order within each section.
+func (m *Manifest) AllRepos() []RepoEntry {
+	var result []RepoEntry
+	if m.GitHub != nil {
+		result = append(result, m.GitHub.Repos...)
+	}
+	if m.GitLab != nil {
+		result = append(result, m.GitLab.Repos...)
+	}
+	return result
+}
+
+// Validate checks the manifest for structural correctness:
+//   - version must be 1
+//   - github.url defaults to https://github.com when unset;
+//     mint_url defaults to DefaultPublicMintURL in public mode,
+//     and is required in private mode
+//   - gitlab.url is required when a gitlab section is present with repos
+//   - platform-specific fields are rejected on the wrong platform
+//   - each repo entry must have a valid owner/repo or owner/glob format
+//   - glob characters are only allowed in the repo name, not the owner
+//   - no duplicate repo entries (before glob expansion)
+//   - glob patterns must be valid filepath.Match patterns
+//   - forge URLs must be valid HTTPS URLs with no path component
+//   - inference.auth values must be one of ValidInferenceAuths
+func (m *Manifest) Validate() error {
+	return m.validate(validateManifestInferenceAuth)
+}
+
+// validateManifestInferenceAuth is ValidateInferenceAuth for a manifest
+// key, additionally rejecting values the key's forge cannot satisfy
+// (openai-wif under the gitlab section or on a GitLab entry). Defaults
+// apply to both forges, so they are checked per repository instead
+// (ResolvedConfig.RequireInferenceAuth).
+func validateManifestInferenceAuth(key, value string) error {
+	if err := ValidateInferenceAuth(key, value); err != nil {
+		return err
+	}
+	if strings.HasPrefix(key, ForgeGitLab+".") {
+		if err := ValidateInferenceAuthForForge(ForgeGitLab, value); err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+// ValidateStructure is Validate without the inference.auth value checks.
+// Callers that evaluate repositories independently (status, uninstall)
+// use it so one invalid inference.auth does not abort the whole command;
+// the effective selection is checked per repository via
+// ResolvedConfig.RequireInferenceAuth where it matters.
+func (m *Manifest) ValidateStructure() error {
+	return m.validate(func(_, _ string) error { return nil })
+}
+
+// ValidateForUninstall is Validate without the inference.auth value
+// checks. Uninstall removes every Fullsend-managed inference credential
+// regardless of the selected method, so a missing or invalid
+// inference.auth must not block cleanup of an installation.
+func (m *Manifest) ValidateForUninstall() error {
+	return m.ValidateStructure()
+}
+
+func (m *Manifest) validate(checkInferenceAuth func(key, value string) error) error {
+	if m.Version != 1 {
+		return fmt.Errorf("unsupported manifest version %d (expected 1)", m.Version)
+	}
+
+	if err := checkInferenceAuth("defaults.inference.auth", m.Defaults.Inference.Auth); err != nil {
+		return err
+	}
+	var err error
+	// validateConfigSource resolves a local config_base.source path to a
+	// manifest-directory-relative absolute path for containment checking;
+	// that resolved value is cached on resolvedSource for later fetches
+	// and must not overwrite the user-facing Source field, which is what
+	// RemoveFromManifest/WriteManifest marshal back to repos.yaml.
+	if m.Defaults.ConfigBase.resolvedSource, err = m.validateConfigSource("defaults.config_base.source", m.Defaults.ConfigBase.Source); err != nil {
+		return err
+	}
+	if err := validateConfigHash("defaults.config_base.sha256", m.Defaults.ConfigBase.SHA256); err != nil {
+		return err
+	}
+	if configHashSet(m.Defaults.ConfigBase.SHA256) && !configSourceSet(m.Defaults.ConfigBase.Source) {
+		return fmt.Errorf("defaults.config_base.sha256 is set without defaults.config_base.source")
+	}
+	for _, p := range []struct {
+		name string
+		cfg  *PlatformConfig
+	}{{"github", m.GitHub}, {"gitlab", m.GitLab}} {
+		if p.cfg == nil {
+			continue
+		}
+		if err := checkInferenceAuth(p.name+".inference.auth", p.cfg.Inference.Auth); err != nil {
+			return err
+		}
+		for i := range p.cfg.Repos {
+			e := &p.cfg.Repos[i]
+			if err := checkInferenceAuth(fmt.Sprintf("%s.repos[%s].inference.auth", p.name, e.Name), e.Inference.Auth); err != nil {
+				return err
+			}
+			if e.ConfigBase.resolvedSource, err = m.validateConfigSource(fmt.Sprintf("%s.repos[%d].config_base.source", p.name, i), e.ConfigBase.Source); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Track all repo names across platforms for cross-platform duplicate detection.
+	allSeen := make(map[string]bool)
+
+	// Validate GitHub platform section.
+	if m.GitHub != nil {
+		// Reject GitLab-only fields on GitHub.
+		if err := rejectGitHubRunnerTags(m.GitHub); err != nil {
+			return err
+		}
+
+		githubURL := m.GitHub.URL
+		if githubURL == "" {
+			githubURL = DefaultGitHubURL
+		}
+		u, err := url.Parse(githubURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("github.url must be a valid HTTPS URL, got %q", githubURL)
+		}
+		if err := RejectExtraneousURLParts(u, "github.url"); err != nil {
+			return err
+		}
+
+		mintMode := m.GitHub.MintMode
+		if mintMode == "" {
+			mintMode = MintModePublic
+		}
+		if mintMode != MintModePublic && mintMode != MintModePrivate {
+			return fmt.Errorf("github.mint_mode must be %q or %q, got %q", MintModePublic, MintModePrivate, mintMode)
+		}
+		// In private mode the URL may come from github.mint_url, a per-repo
+		// mint_url, config.mint_url or a config_base preset, so the
+		// requirement that one of them resolves is enforced per entry
+		// (validatePlatformRepos) and, for a preset-supplied value, by
+		// effective-infrastructure resolution.
+		mintURL := m.GitHub.MintURL
+		if mintURL == "" && mintMode == MintModePublic {
+			mintURL = DefaultPublicMintURL
+		}
+		if mintURL != "" {
+			mu, err := url.Parse(mintURL)
+			if err != nil || mu.Scheme != "https" || mu.Host == "" {
+				return fmt.Errorf("github.mint_url must be a valid HTTPS URL, got %q", mintURL)
+			}
+		}
+		if m.GitHub.FullsendRef != "" && !IsValidRef(m.GitHub.FullsendRef) {
+			return fmt.Errorf("github.fullsend_ref %q contains invalid characters; only alphanumeric, dot, underscore, and hyphen are allowed", m.GitHub.FullsendRef)
+		}
+		// app_set is well-formed except for the "none" sentinel, which
+		// resets a per-repo override back to the built-in default.
+		if m.GitHub.AppSet != "" && m.GitHub.AppSet != NoneSentinel {
+			if err := appsetup.ValidateAppSet(m.GitHub.AppSet); err != nil {
+				return fmt.Errorf("github.app_set: %w", err)
+			}
+		}
+
+		if err := m.validatePlatformRepos(ForgeGitHub, m.GitHub, allSeen); err != nil {
+			return err
+		}
+	}
+
+	// Validate GitLab platform section.
+	if m.GitLab != nil {
+		// Reject GitHub-only fields on GitLab.
+		if m.GitLab.MintURL != "" {
+			return fmt.Errorf("gitlab.mint_url is not supported; mint_url is a GitHub-only field")
+		}
+		if m.GitLab.MintMode != "" {
+			return fmt.Errorf("gitlab.mint_mode is not supported; mint_mode is a GitHub-only field")
+		}
+		if m.GitLab.AppSet != "" {
+			return fmt.Errorf("gitlab.app_set is not supported; app_set is a GitHub-only field")
+		}
+
+		if len(m.GitLab.Repos) > 0 && m.GitLab.URL == "" {
+			return fmt.Errorf("gitlab.url is required when GitLab repos are present")
+		}
+		if m.GitLab.URL != "" {
+			u, err := url.Parse(m.GitLab.URL)
+			if err != nil || u.Scheme != "https" || u.Host == "" {
+				return fmt.Errorf("gitlab.url must be a valid HTTPS URL, got %q", m.GitLab.URL)
+			}
+			if err := RejectExtraneousURLParts(u, "gitlab.url"); err != nil {
+				return err
+			}
+		}
+		if m.GitLab.FullsendRef != "" && !IsValidRef(m.GitLab.FullsendRef) {
+			return fmt.Errorf("gitlab.fullsend_ref %q contains invalid characters; only alphanumeric, dot, underscore, and hyphen are allowed", m.GitLab.FullsendRef)
+		}
+
+		if err := validateRunnerTagElements("gitlab.agent_runner_tags", m.GitLab.AgentRunnerTags); err != nil {
+			return err
+		}
+		if err := validateRunnerTagElements("gitlab.control_runner_tags", m.GitLab.ControlRunnerTags); err != nil {
+			return err
+		}
+
+		if err := m.validatePlatformRepos(ForgeGitLab, m.GitLab, allSeen); err != nil {
+			return err
+		}
+	}
+
+	if err := validateManifestManaged(m); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateRunnerTagElements rejects empty or whitespace-only runner tags,
+// which would render as an empty CI tag instead of an untagged job. An empty
+// list is valid.
+func validateRunnerTagElements(key string, tags []string) error {
+	for i, tag := range tags {
+		if strings.TrimSpace(tag) == "" {
+			return fmt.Errorf("%s[%d]: tags must not be empty", key, i)
+		}
+	}
+	return nil
+}
+
+// validatePlatformRepos validates repo entries within a platform section.
+func (m *Manifest) validatePlatformRepos(forgeName string, platform *PlatformConfig, allSeen map[string]bool) error {
+	seen := make(map[string]bool, len(platform.Repos))
+
+	for i, entry := range platform.Repos {
+		if entry.Name == "" {
+			return fmt.Errorf("%s.repos[%d]: name field is required", forgeName, i)
+		}
+
+		parts := strings.SplitN(entry.Name, "/", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return fmt.Errorf("%s.repos[%d]: %q must be in owner/repo format", forgeName, i, entry.Name)
+		}
+
+		// Glob characters are only allowed in the repo segment, not the owner.
+		if strings.ContainsAny(parts[0], "*?[") {
+			return fmt.Errorf("%s.repos[%d]: glob characters are not allowed in owner segment %q", forgeName, i, parts[0])
+		}
+
+		// Validate glob patterns in the repo segment.
+		if strings.ContainsAny(parts[1], "*?[") {
+			if _, err := filepath.Match(parts[1], "test"); err != nil {
+				return fmt.Errorf("%s.repos[%d]: invalid glob pattern %q: %w", forgeName, i, entry.Name, err)
+			}
+		}
+
+		// Reject GitHub-only per-repo fields on GitLab repos before
+		// format validation so users see the platform error first.
+		if forgeName == ForgeGitLab {
+			if entry.MintMode != "" {
+				return fmt.Errorf("%s.repos[%d]: mint_mode is only supported for GitHub repos", forgeName, i)
+			}
+			if entry.MintURL != "" {
+				return fmt.Errorf("%s.repos[%d]: mint_url is only supported for GitHub repos", forgeName, i)
+			}
+			if entry.AppSet != "" {
+				return fmt.Errorf("%s.repos[%d]: app_set is only supported for GitHub repos", forgeName, i)
+			}
+		}
+
+		// Validate per-repo app_set override (GitHub). The "none" sentinel
+		// resets to the built-in default and skips format validation.
+		if forgeName == ForgeGitHub && entry.AppSet != "" && entry.AppSet != NoneSentinel {
+			if err := appsetup.ValidateAppSet(entry.AppSet); err != nil {
+				return fmt.Errorf("%s.repos[%d]: per-repo app_set: %w", forgeName, i, err)
+			}
+		}
+
+		// Validate per-repo mint_url override.
+		if entry.MintURL != "" && entry.MintURL != NoneSentinel {
+			mu, muErr := url.Parse(entry.MintURL)
+			if muErr != nil || mu.Scheme != "https" || mu.Host == "" {
+				return fmt.Errorf("%s.repos[%d]: per-repo mint_url must be a valid HTTPS URL, got %q", forgeName, i, entry.MintURL)
+			}
+		}
+
+		// Validate per-repo mint_mode override.
+		if entry.MintMode != "" && entry.MintMode != NoneSentinel {
+			if entry.MintMode != MintModePublic && entry.MintMode != MintModePrivate {
+				return fmt.Errorf("%s.repos[%d]: per-repo mint_mode must be %q or %q, got %q", forgeName, i, MintModePublic, MintModePrivate, entry.MintMode)
+			}
+		}
+
+		// Cross-field: mint_url must resolve to a non-empty value for
+		// GitHub repos. In private mode there is no builtin default; in
+		// public mode the default is applied only when the field is
+		// omitted — the "none" sentinel clears it.
+		if forgeName == ForgeGitHub {
+			resolvedMode := resolveField(entry.MintMode, platform.MintMode, MintModePublic)
+			if resolvedMode == MintModePrivate {
+				resolvedURL := resolveField(entry.MintURL, platform.MintURL, "")
+				if resolvedURL == "" && !m.mintURLFromConfigOrPreset(platform, entry) {
+					return fmt.Errorf("%s.repos[%d]: mint_url is required when mint_mode is %q (declare mint_url, config.mint_url or a config_base preset that sets mint_url)", forgeName, i, MintModePrivate)
+				}
+			} else {
+				resolvedURL := resolveField(entry.MintURL, platform.MintURL, DefaultPublicMintURL)
+				if resolvedURL == "" {
+					return fmt.Errorf("%s.repos[%d]: mint_url must not be cleared in public mode (omit to use the default %s)", forgeName, i, DefaultPublicMintURL)
+				}
+			}
+		}
+
+		// Validate per-repo fullsend_ref override.
+		if entry.FullsendRef != "" && entry.FullsendRef != NoneSentinel && !IsValidRef(entry.FullsendRef) {
+			return fmt.Errorf("%s.repos[%d]: per-repo fullsend_ref %q contains invalid characters; only alphanumeric, dot, underscore, and hyphen are allowed", forgeName, i, entry.FullsendRef)
+		}
+
+		if _, err := m.validateConfigSource(fmt.Sprintf("%s.repos[%d].config_base.source", forgeName, i), entry.ConfigBase.Source); err != nil {
+			return err
+		}
+		if err := validateConfigHash(fmt.Sprintf("%s.repos[%d].config_base.sha256", forgeName, i), entry.ConfigBase.SHA256); err != nil {
+			return err
+		}
+		if configHashSet(entry.ConfigBase.SHA256) && entry.ConfigBase.Source == NoneSentinel {
+			return fmt.Errorf("%s.repos[%d]: config_base.sha256 is set but config_base.source is %q", forgeName, i, NoneSentinel)
+		}
+		resolvedConfig := resolveField(entry.ConfigBase.Source, m.Defaults.ConfigBase.Source, "")
+		resolvedHash := resolveField(entry.ConfigBase.SHA256, m.Defaults.ConfigBase.SHA256, "")
+		if resolvedConfig == "" && configHashSet(resolvedHash) && entry.ConfigBase.Source != NoneSentinel {
+			return fmt.Errorf("%s.repos[%d]: config_base.sha256 is set but no config_base.source is declared", forgeName, i)
+		}
+
+		// Check for duplicates within this platform (case-insensitive).
+		lowerName := strings.ToLower(entry.Name)
+		if seen[lowerName] {
+			return fmt.Errorf("%s.repos[%d]: duplicate repo %q", forgeName, i, entry.Name)
+		}
+		seen[lowerName] = true
+
+		// Check for duplicates across platforms (case-insensitive).
+		if allSeen[lowerName] {
+			return fmt.Errorf("%s.repos[%d]: duplicate repo %q (also present in another platform section)", forgeName, i, entry.Name)
+		}
+		allSeen[lowerName] = true
+	}
+
+	return nil
+}
+
+// mintURLFromConfigOrPreset reports whether a private-mode repository's mint
+// URL can be supplied by its managed configuration (config.mint_url at any
+// layer) or by a declared config_base preset. A preset is not loaded during
+// manifest validation, so a declared preset defers the check to
+// applyEffectiveInfrastructure, which rejects a private repository whose
+// effective configuration still has no mint URL.
+func (m *Manifest) mintURLFromConfigOrPreset(platform *PlatformConfig, entry RepoEntry) bool {
+	if declared, err := config.DeclaredInfrastructureValues(m.mergeManagedConfig(platform, entry), nil); err == nil && declared.MintURL != "" {
+		return true
+	}
+	source := resolveField(entry.ConfigBase.Source, m.Defaults.ConfigBase.Source, "")
+	return source != ""
+}
+
+// RejectExtraneousURLParts validates that a parsed URL contains only
+// scheme and host — no path, userinfo, query, or fragment. The field
+// parameter is used in error messages to identify the source.
+func RejectExtraneousURLParts(u *url.URL, field string) error {
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("%s must not contain a path component, got %q", field, u.String())
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not contain userinfo, got %q", field, u.String())
+	}
+	if u.RawQuery != "" {
+		return fmt.Errorf("%s must not contain query parameters, got %q", field, u.String())
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("%s must not contain a fragment, got %q", field, u.String())
+	}
+	return nil
+}
+
+// ExpandGlobs resolves wildcard repo entries by listing org repos
+// via the forge API (requires network access). Explicit entries always
+// win over glob-matched entries. The returned list is deduplicated and
+// sorted.
+//
+// ListOrgRepos is called with includePrivate=true because repos.yaml
+// manifests are used in per-repo mode, where agents run on the target
+// repo itself. Archived and forked repos remain excluded.
+//
+// The clients factory provides per-forge API clients so glob entries
+// targeting different forges resolve against the correct API.
+func (m *Manifest) ExpandGlobs(ctx context.Context, clients ForgeClientFactory) ([]ResolvedRepo, error) {
+	return m.ExpandGlobsFor(ctx, clients, nil)
+}
+
+// ExpandGlobsFor is like ExpandGlobs, but skips expanding a platform's
+// glob entries when filter is non-empty and does not select any repo on
+// that platform. This keeps a filtered operation (e.g. "repos install
+// gitlab-group/project") from requiring credentials for a forge that
+// only appears via an unrelated glob entry (e.g. a GitHub "acme/*"
+// entry) elsewhere in the manifest.
+func (m *Manifest) ExpandGlobsFor(ctx context.Context, clients ForgeClientFactory, filter []string) ([]ResolvedRepo, error) {
+	resolved := make(map[string]ResolvedRepo)
+
+	platforms := []struct {
+		name string
+		cfg  *PlatformConfig
+	}{
+		{ForgeGitHub, m.GitHub},
+		{ForgeGitLab, m.GitLab},
+	}
+
+	for _, p := range platforms {
+		if p.cfg == nil {
+			continue
+		}
+
+		if len(filter) > 0 {
+			matched, err := platformEntriesMatchFilter(p.cfg, filter)
+			if err != nil {
+				return nil, fmt.Errorf("matching repo filter against forge %q: %w", p.name, err)
+			}
+			if !matched {
+				continue
+			}
+		}
+
+		// First pass: separate explicit entries from glob patterns.
+		explicit := make(map[string]RepoEntry)
+		type globEntry struct {
+			org     string
+			pattern string
+			entry   RepoEntry
+		}
+		var globs []globEntry
+
+		for _, entry := range p.cfg.Repos {
+			parts := strings.SplitN(entry.Name, "/", 2)
+			org := parts[0]
+			name := parts[1]
+
+			if strings.ContainsAny(name, "*?[") {
+				globs = append(globs, globEntry{org: org, pattern: name, entry: entry})
+			} else {
+				// Keys are lowercased: forges treat repository paths
+				// case-insensitively, and manifest validation and filter
+				// matching already do.
+				explicit[strings.ToLower(entry.Name)] = entry
+			}
+		}
+
+		// Add explicit entries first (they take priority).
+		for key, entry := range explicit {
+			parts := strings.SplitN(entry.Name, "/", 2)
+			resolved[key] = ResolvedRepo{
+				Owner: parts[0],
+				Repo:  parts[1],
+				Forge: p.name,
+				Entry: entry,
+			}
+		}
+
+		// Expand each glob pattern.
+		orgRepoCache := make(map[string][]forge.Repository)
+		for _, g := range globs {
+			repos, ok := orgRepoCache[g.org]
+			if !ok {
+				fc, err := clients.ConfigFor(p.name)
+				if err != nil {
+					return nil, fmt.Errorf("expanding glob %q: creating client for forge %q: %w", g.org+"/"+g.pattern, p.name, err)
+				}
+				repos, err = fc.Client.ListOrgRepos(ctx, g.org, true)
+				if err != nil {
+					return nil, fmt.Errorf("expanding glob %q: listing repos for org %q: %w", g.org+"/"+g.pattern, g.org, err)
+				}
+				orgRepoCache[g.org] = repos
+			}
+
+			for _, repo := range repos {
+				matched, err := filepath.Match(g.pattern, repo.Name)
+				if err != nil {
+					return nil, fmt.Errorf("matching glob %q against %q: %w", g.pattern, repo.Name, err)
+				}
+				if !matched {
+					continue
+				}
+
+				fullName := g.org + "/" + repo.Name
+				key := strings.ToLower(fullName)
+				// Explicit entries win over glob matches.
+				if _, exists := explicit[key]; exists {
+					continue
+				}
+				// First glob match wins (if multiple globs match the same repo).
+				if _, exists := resolved[key]; exists {
+					continue
+				}
+
+				// Create an entry for the glob-matched repo, inheriting the
+				// glob entry's overrides but replacing the name field with the
+				// actual repo name.
+				entry := g.entry
+				entry.Name = fullName
+				resolved[key] = ResolvedRepo{
+					Owner: g.org,
+					Repo:  repo.Name,
+					Forge: p.name,
+					Entry: entry,
+				}
+			}
+		}
+	}
+
+	// Collect and sort results.
+	result := make([]ResolvedRepo, 0, len(resolved))
+	for _, rr := range resolved {
+		result = append(result, rr)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Owner+"/"+result[i].Repo < result[j].Owner+"/"+result[j].Repo
+	})
+
+	return result, nil
+}
+
+// ResolveConfig computes the fully merged configuration for the given
+// owner/repo by looking up the entry in the manifest's platform sections.
+// The resolution order is:
+//
+//  1. Per-repo override (from RepoEntry)
+//  2. Platform-level default (from PlatformConfig)
+//  3. Built-in defaults (empty strings)
+//
+// The sentinel value "none" at any level stops the fallback chain, returning "".
+// The second return value indicates whether the repo was found in the
+// manifest's repo list. When false, the returned config is empty.
+//
+// For repos matched via glob expansion, use ResolveConfigForEntry
+// instead — this method only finds exact matches in the manifest's
+// repo list and will not match glob patterns.
+func (m *Manifest) ResolveConfig(owner, repo string) (ResolvedConfig, bool) {
+	fullName := owner + "/" + repo
+
+	if m.GitHub != nil {
+		for _, e := range m.GitHub.Repos {
+			if strings.EqualFold(e.Name, fullName) {
+				return m.resolveWithEntry(owner, repo, ForgeGitHub, m.GitHub, e), true
+			}
+		}
+	}
+	if m.GitLab != nil {
+		for _, e := range m.GitLab.Repos {
+			if strings.EqualFold(e.Name, fullName) {
+				return m.resolveWithEntry(owner, repo, ForgeGitLab, m.GitLab, e), true
+			}
+		}
+	}
+
+	return ResolvedConfig{}, false
+}
+
+// ResolveConfigWithGlobs resolves config for a repo, falling back to
+// glob-pattern matching when the exact entry lookup fails.
+func (m *Manifest) ResolveConfigWithGlobs(owner, repo string) (ResolvedConfig, bool) {
+	if resolved, ok := m.ResolveConfig(owner, repo); ok {
+		return resolved, true
+	}
+	fullName := owner + "/" + repo
+
+	if m.GitHub != nil {
+		for _, e := range m.GitHub.Repos {
+			if ok, _ := matchesPattern(e.Name, fullName); ok {
+				return m.ResolveConfigForEntry(owner, repo, ForgeGitHub, e), true
+			}
+		}
+	}
+	if m.GitLab != nil {
+		for _, e := range m.GitLab.Repos {
+			if ok, _ := matchesPattern(e.Name, fullName); ok {
+				return m.ResolveConfigForEntry(owner, repo, ForgeGitLab, e), true
+			}
+		}
+	}
+
+	return ResolvedConfig{}, false
+}
+
+// ResolveConfigForEntry computes the fully merged configuration for
+// the given owner/repo using the provided RepoEntry and forge name.
+// Use this with entries returned by ExpandGlobs, which carry per-glob
+// overrides that ResolveConfig cannot find by exact match.
+func (m *Manifest) ResolveConfigForEntry(owner, repo, forgeName string, entry RepoEntry) ResolvedConfig {
+	platform := m.PlatformFor(forgeName)
+	if platform == nil {
+		platform = &PlatformConfig{}
+	}
+	return m.resolveWithEntry(owner, repo, forgeName, platform, entry)
+}
+
+func (m *Manifest) resolveWithEntry(owner, repo, forgeName string, platform *PlatformConfig, entry RepoEntry) ResolvedConfig {
+	cfg := ResolvedConfig{
+		Owner: owner,
+		Repo:  repo,
+		Forge: forgeName,
+	}
+
+	// Runtime: the most specific managed configuration layer that declares
+	// one (repository, then forge section, then defaults).
+	cfg.Runtime = firstNonEmpty(entry.Config.ExplicitRuntime(), platform.Config.ExplicitRuntime(), m.Defaults.Config.ExplicitRuntime())
+	// InferenceAuth: entry, then forge section, then defaults. There is
+	// deliberately no built-in fallback (see RequireInferenceAuth).
+	cfg.InferenceAuth = firstNonEmpty(entry.Inference.Auth, platform.Inference.Auth, m.Defaults.Inference.Auth)
+	// Vendor: per-repo *bool overrides defaults *bool; default is false.
+	cfg.Vendor = resolveBoolField(entry.Vendor, m.Defaults.Vendor, false)
+	// Signoff: entry, then forge section, then defaults; default false.
+	// An explicit false at a narrower level overrides an inherited true.
+	inheritedSignoff := platform.Signoff
+	if inheritedSignoff == nil {
+		inheritedSignoff = m.Defaults.Signoff
+	}
+	cfg.Signoff = resolveBoolField(entry.Signoff, inheritedSignoff, false)
+	// ConfigBase: per-repo overrides defaults; source "none" disables
+	// the preset. A resolved empty source drops the hash so callers do
+	// not validate a digest against an unspecified document. configSource()
+	// returns the Validate-resolved absolute path for a local preset
+	// (falling back to the raw value for "", "none", and HTTPS sources)
+	// so a preset declared as a manifest-relative path fetches correctly
+	// without mutating the user-facing Source field.
+	cfg.Config = resolveField(entry.ConfigBase.configSource(), m.Defaults.ConfigBase.configSource(), "")
+	if cfg.Config == "" {
+		cfg.ConfigHash = ""
+	} else {
+		cfg.ConfigHash = resolveField(entry.ConfigBase.SHA256, m.Defaults.ConfigBase.SHA256, "")
+	}
+	// Every manifest repository's .fullsend/config.yaml is managed; no
+	// config key is required to opt in (#8218).
+	cfg.ConfigManaged = true
+	cfg.Managed = m.mergeManagedConfig(platform, entry)
+	cfg.ManifestSource = m.sourceURL
+
+	// Source infrastructure config from the platform-level section,
+	// with per-repo overrides via the string fallback chain.
+	// GitLab repos do not use mint or inference fields.
+	switch forgeName {
+	case ForgeGitHub:
+		cfg.MintMode = resolveField(entry.MintMode, platform.MintMode, MintModePublic)
+		if cfg.MintMode != MintModePrivate {
+			cfg.MintMode = MintModePublic
+		}
+		mintURLDefault := ""
+		if cfg.MintMode == MintModePublic {
+			mintURLDefault = DefaultPublicMintURL
+		}
+		cfg.MintURL = resolveField(entry.MintURL, platform.MintURL, mintURLDefault)
+		cfg.MintURLExplicit = cfg.MintURL != "" && (entry.MintURL != "" || platform.MintURL != "")
+		cfg.FullsendRef = resolveField(entry.FullsendRef, platform.FullsendRef, "")
+		// AppSet: per-repo override, then manifest default, then the
+		// built-in default. The "none" sentinel resolves to empty, which
+		// we then map back to the built-in default (a reset, not a disable).
+		// AppSetExplicit records whether app_set was configured at all so
+		// convergence can preserve an existing custom value when it is not.
+		cfg.AppSet = resolveField(entry.AppSet, platform.AppSet, appsetup.DefaultAppSet)
+		if cfg.AppSet == "" {
+			cfg.AppSet = appsetup.DefaultAppSet
+		}
+		cfg.AppSetExplicit = entry.AppSet != "" || platform.AppSet != ""
+	case ForgeGitLab:
+		cfg.FullsendRef = resolveField(entry.FullsendRef, platform.FullsendRef, "")
+	}
+	return cfg
+}
+
+// RequireInferenceAuth returns an actionable configuration error when no
+// manifest level (entry, forge section, defaults) selects an inference
+// authentication method for this repository, or when the effective
+// selection is not a valid method. Install, convergence, and status call
+// it before any dependent forge reads or writes; uninstall deliberately
+// does not, so incomplete or older installations can still be cleaned up.
+func (c ResolvedConfig) RequireInferenceAuth() error {
+	if c.InferenceAuth != "" {
+		if err := ValidateInferenceAuth("inference.auth", c.InferenceAuth); err != nil {
+			return fmt.Errorf("invalid inference authentication for %s/%s: %w", c.Owner, c.Repo, err)
+		}
+		if err := ValidateInferenceAuthForForge(c.Forge, c.InferenceAuth); err != nil {
+			return fmt.Errorf("unsupported inference authentication for %s/%s: %w", c.Owner, c.Repo, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("no inference authentication selected for %s/%s: set inference.auth (%s) on the repository entry, in the %s section, or under defaults in repos.yaml (for example: fullsend repos set defaults.inference.auth %s)",
+		c.Owner, c.Repo, strings.Join(ValidInferenceAuths(), " or "), c.Forge, InferenceAuthVertexWIF)
+}
+
+// ValidateInferenceAuthForForge rejects an inference.auth selection the
+// forge cannot satisfy. OpenAI Workload Identity Federation exchanges a
+// GitHub Actions OIDC token, so it is GitHub only; a GitLab repository
+// must use openai-api-key (or vertex-wif) instead.
+func ValidateInferenceAuthForForge(forgeName, auth string) error {
+	if auth == InferenceAuthOpenAIWIF && forgeName == ForgeGitLab {
+		return fmt.Errorf("inference.auth %s is supported on GitHub only (the exchange needs a GitHub Actions OIDC token); use %s or %s for GitLab repositories",
+			InferenceAuthOpenAIWIF, InferenceAuthOpenAIAPIKey, InferenceAuthVertexWIF)
+	}
+	return nil
+}
+
+// firstNonEmpty returns the first non-empty value, or "" when all are empty.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// resolveBoolField implements the three-level fallback chain for a
+// boolean override field. A nil pointer falls through to the next level.
+func resolveBoolField(perRepo, defaultVal *bool, builtinDefault bool) bool {
+	if perRepo != nil {
+		return *perRepo
+	}
+	if defaultVal != nil {
+		return *defaultVal
+	}
+	return builtinDefault
+}
+
+// resolveField implements the three-level fallback chain for an
+// override field. The sentinel value "none" stops the chain, returning "".
+// An empty string falls through to the next level.
+func resolveField(perRepo, platformDefault, builtinDefault string) string {
+	if perRepo == NoneSentinel {
+		return "" // sentinel stops fallback chain
+	}
+	if perRepo != "" {
+		return perRepo
+	}
+	if platformDefault == NoneSentinel {
+		return "" // sentinel stops fallback chain
+	}
+	if platformDefault != "" {
+		return platformDefault
+	}
+	return builtinDefault
+}
+
+// DistinctForges returns the deduplicated set of forge names actually
+// used by entries in the manifest. Only forges with a non-nil platform
+// section containing repos are included. The order is deterministic
+// (github before gitlab).
+func (m *Manifest) DistinctForges() []string {
+	// A nil filter short-circuits platformEntriesMatchFilter before any
+	// pattern matching happens, so this can never return an error.
+	forges, _ := m.DistinctForgesFor(nil)
+	return forges
+}
+
+// DistinctForgesFor returns the deduplicated set of forge names used by
+// repos matching filter. An empty filter returns DistinctForges(). The
+// order is deterministic (github before gitlab). A glob manifest entry
+// counts as selected when a concrete filter would be produced by
+// expanding it (for example entry "acme/*" and filter "acme/api"). An
+// error is returned if a filter or manifest entry is an invalid glob
+// pattern.
+func (m *Manifest) DistinctForgesFor(filter []string) ([]string, error) {
+	var forges []string
+	ghMatch, err := platformEntriesMatchFilter(m.GitHub, filter)
+	if err != nil {
+		return nil, err
+	}
+	if ghMatch {
+		forges = append(forges, ForgeGitHub)
+	}
+	glMatch, err := platformEntriesMatchFilter(m.GitLab, filter)
+	if err != nil {
+		return nil, err
+	}
+	if glMatch {
+		forges = append(forges, ForgeGitLab)
+	}
+	return forges, nil
+}
+
+// platformEntriesMatchFilter reports whether cfg has at least one repo
+// entry selected by filter. Matching errors (an invalid glob pattern) are
+// surfaced to the caller rather than swallowed, since silently treating
+// an invalid pattern as "no match" could wrongly skip a targeted forge's
+// credential check or glob expansion.
+//
+// Two glob patterns (a glob manifest entry compared against a glob filter
+// pattern) are treated as always matching. Determining whether two globs
+// can ever overlap requires expanding both against the real repo list;
+// comparing the literal pattern strings against each other proves
+// nothing (e.g. entry "acme/*" and filter "*/api" don't match as literal
+// strings in either direction, but both can resolve to "acme/api"). Since
+// wrongly excluding a targeted forge is worse than wrongly including an
+// unselected one, this case is conservative and matches.
+func platformEntriesMatchFilter(cfg *PlatformConfig, filter []string) (bool, error) {
+	if cfg == nil || len(cfg.Repos) == 0 {
+		return false, nil
+	}
+	for _, e := range cfg.Repos {
+		ok, err := entryMatchesFilter(e, filter)
+		if err != nil || ok {
+			return ok, err
+		}
+	}
+	return false, nil
+}
+
+// entryMatchesFilter reports whether a single manifest entry is selected
+// by filter, using the conservative glob semantics described on
+// platformEntriesMatchFilter. An empty filter selects every entry.
+func entryMatchesFilter(e RepoEntry, filter []string) (bool, error) {
+	if len(filter) == 0 {
+		return true, nil
+	}
+	for _, pattern := range filter {
+		ok, err := patternSelectsEntry(e, pattern)
+		if err != nil || ok {
+			return ok, err
+		}
+	}
+	return false, nil
+}
+
+// patternSelectsEntry reports whether a single filter pattern selects the
+// manifest entry e, using the conservative glob semantics described on
+// platformEntriesMatchFilter.
+func patternSelectsEntry(e RepoEntry, pattern string) (bool, error) {
+	ok, err := matchesPattern(pattern, e.Name)
+	if err != nil {
+		return false, fmt.Errorf("matching filter %q against manifest entry %q: %w", pattern, e.Name, err)
+	}
+	if ok {
+		return true, nil
+	}
+	if !isGlob(e.Name) {
+		return false, nil
+	}
+	if isGlob(pattern) {
+		// Both sides are globs: conservative match (see doc comment).
+		return true, nil
+	}
+	// A glob manifest entry ("acme/*") counts as selected when the
+	// filter names a concrete repo that would expand from it.
+	ok, err = matchesPattern(e.Name, pattern)
+	if err != nil {
+		return false, fmt.Errorf("matching manifest entry %q against filter %q: %w", e.Name, pattern, err)
+	}
+	return ok, nil
+}
+
+// withGlobCoveredSelections returns repos plus, for every concrete name in
+// filter that repos does not contain, the repository resolved through its
+// manifest entry: an explicit entry, else the covering glob entry. Glob
+// expansion lists only an organization's non-fork, non-archived
+// repositories, so a concrete selection covered by a glob (a fork, an
+// archived repository) is otherwise silently missing. Install, dry run and
+// status all select through this, so an explicit selection is converged
+// with its glob entry's settings without adding an explicit manifest entry.
+// A name no manifest entry covers is left out (callers report it).
+func withGlobCoveredSelections(m *Manifest, repos []ResolvedRepo, filter []string) []ResolvedRepo {
+	seen := make(map[string]bool, len(repos))
+	for _, rr := range repos {
+		seen[strings.ToLower(rr.Owner+"/"+rr.Repo)] = true
+	}
+	for _, name := range filter {
+		if isGlob(name) || seen[strings.ToLower(name)] {
+			continue
+		}
+		owner, repo, ok := strings.Cut(name, "/")
+		if !ok {
+			continue
+		}
+		if rr, found := lookupManifestEntry(m, owner, repo); found {
+			repos = append(repos, rr)
+			seen[strings.ToLower(name)] = true
+		}
+	}
+	return repos
+}
+
+// lookupManifestEntry finds the entry that resolves owner/repo: an
+// explicit entry, else the first covering glob entry (GitHub before
+// GitLab, matching ResolveConfigWithGlobs).
+func lookupManifestEntry(m *Manifest, owner, repo string) (ResolvedRepo, bool) {
+	fullName := owner + "/" + repo
+	for _, p := range []struct {
+		name string
+		cfg  *PlatformConfig
+	}{{ForgeGitHub, m.GitHub}, {ForgeGitLab, m.GitLab}} {
+		if p.cfg == nil {
+			continue
+		}
+		for _, e := range p.cfg.Repos {
+			if strings.EqualFold(e.Name, fullName) {
+				return ResolvedRepo{Owner: owner, Repo: repo, Forge: p.name, Entry: e}, true
+			}
+		}
+	}
+	for _, p := range []struct {
+		name string
+		cfg  *PlatformConfig
+	}{{ForgeGitHub, m.GitHub}, {ForgeGitLab, m.GitLab}} {
+		if p.cfg == nil {
+			continue
+		}
+		for _, e := range p.cfg.Repos {
+			if ok, _ := matchesPattern(e.Name, fullName); ok {
+				entry := e
+				entry.Name = fullName
+				return ResolvedRepo{Owner: owner, Repo: repo, Forge: p.name, Entry: entry}, true
+			}
+		}
+	}
+	return ResolvedRepo{}, false
+}
+
+// UndeclaredSelectors returns the concrete (non-glob) selectors in filter
+// that select no manifest entry: a name with neither an explicit entry nor
+// a covering glob entry. It needs no forge access, so repos install runs it
+// first for the precise declare-it-first message. Glob selectors cannot be
+// judged from the manifest alone (a declared glob may or may not list a
+// repository a selector glob matches), so they are validated for syntax
+// only here and checked against the resolved repositories by
+// RequireDeclaredSelections; an unrelated glob is never declared merely
+// because the manifest contains another glob.
+func (m *Manifest) UndeclaredSelectors(filter []string) ([]string, error) {
+	var undeclared []string
+	for _, selector := range filter {
+		if isGlob(selector) {
+			if _, err := matchesPattern(selector, "owner/repo"); err != nil {
+				return nil, fmt.Errorf("invalid glob pattern %q: %w", selector, err)
+			}
+			continue
+		}
+		declared := false
+		for _, platform := range []*PlatformConfig{m.GitHub, m.GitLab} {
+			if platform == nil {
+				continue
+			}
+			for _, e := range platform.Repos {
+				ok, err := patternSelectsEntry(e, selector)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
+					declared = true
+					break
+				}
+			}
+			if declared {
+				break
+			}
+		}
+		if !declared {
+			undeclared = append(undeclared, selector)
+		}
+	}
+	return undeclared, nil
+}
+
+// VendorSelected reports whether any repository selected by filter (an
+// empty filter selects every entry) resolves vendor: true. A concrete
+// filter name is resolved exactly as per-repo resolution does (an explicit
+// entry first, then the first matching glob), and a glob entry that an
+// earlier glob fully covers is ignored (see globShadowedByEarlier). Glob
+// filters and unfiltered runs stay conservative, like SignoffForgesFor.
+func (m *Manifest) VendorSelected(filter []string) (bool, error) {
+	for _, forgeName := range []string{ForgeGitHub, ForgeGitLab} {
+		platform := m.PlatformFor(forgeName)
+		if platform == nil {
+			continue
+		}
+		for i, e := range platform.Repos {
+			if globShadowedByEarlier(platform.Repos[:i], e) {
+				continue
+			}
+			vendored, err := m.entryResolves(forgeName, e, filter, func(c ResolvedConfig) bool { return c.Vendor })
+			if err != nil {
+				return false, err
+			}
+			if vendored {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// SignoffForgesFor returns the forges (in DistinctForgesFor order) that
+// have at least one manifest entry selected by filter whose resolved
+// signoff setting is true. Callers use it to resolve the installing
+// user's identity once per forge before any scaffold commit is made.
+//
+// A concrete (non-glob) filter pattern is resolved exactly as the real
+// per-repo resolution does (ResolveConfigWithGlobs: an explicit entry
+// first, then the first matching glob), so an explicit unsigned entry or
+// an earlier unsigned glob is not overridden by a signed glob that also
+// matches. Glob filter patterns and unfiltered runs stay conservative, so
+// a forge may be reported when no concrete repository it expands to ends
+// up needing a trailer. Even so, a glob entry that an earlier glob entry
+// fully covers can never win resolution, so it is ignored (see
+// globShadowedByEarlier).
+func (m *Manifest) SignoffForgesFor(filter []string) ([]string, error) {
+	var forges []string
+	for _, forgeName := range []string{ForgeGitHub, ForgeGitLab} {
+		platform := m.PlatformFor(forgeName)
+		if platform == nil {
+			continue
+		}
+		for i, e := range platform.Repos {
+			if globShadowedByEarlier(platform.Repos[:i], e) {
+				continue
+			}
+			needed, err := m.entryNeedsSignoff(forgeName, e, filter)
+			if err != nil {
+				return nil, err
+			}
+			if needed {
+				forges = append(forges, forgeName)
+				break
+			}
+		}
+	}
+	return forges, nil
+}
+
+// globShadowedByEarlier reports whether e is a glob entry that an earlier
+// glob entry in the same platform section is guaranteed to cover, so
+// ResolveConfigWithGlobs (first matching glob wins) never selects e. The
+// check is sound but not complete: it only considers earlier globs whose
+// sole wildcard is "*", and matches them against e's pattern text with
+// e's own wildcards treated as literal characters. Each such wildcard
+// must then be consumed by a "*" in the earlier pattern, which would
+// equally consume anything the wildcard expands to. That holds for "*"
+// and "?" but not for character classes or escapes: the characters inside
+// a class like "[ab]" can be matched literally by the earlier pattern even
+// though the class expands to other characters, so entries containing "["
+// or "\" are never treated as shadowed.
+func globShadowedByEarlier(earlier []RepoEntry, e RepoEntry) bool {
+	if !isGlob(e.Name) || strings.ContainsAny(e.Name, "[\\") {
+		return false
+	}
+	for _, prev := range earlier {
+		if !isGlob(prev.Name) || strings.ContainsAny(prev.Name, "?[\\") {
+			continue
+		}
+		if ok, err := matchesPattern(prev.Name, e.Name); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+// entryNeedsSignoff reports whether manifest entry e on forgeName is
+// selected by filter and resolves to signoff=true for at least one
+// repository the filter selects.
+func (m *Manifest) entryNeedsSignoff(forgeName string, e RepoEntry, filter []string) (bool, error) {
+	return m.entryResolves(forgeName, e, filter, func(c ResolvedConfig) bool { return c.Signoff })
+}
+
+// entryResolves reports whether manifest entry e on forgeName is selected
+// by filter and pick is true for the resolved config of at least one
+// repository the filter selects. Concrete filter names resolve with
+// explicit-entry and first-glob precedence; glob filters and an empty
+// filter stay conservative.
+func (m *Manifest) entryResolves(forgeName string, e RepoEntry, filter []string, pick func(ResolvedConfig) bool) (bool, error) {
+	owner, repo, _ := strings.Cut(e.Name, "/")
+	picked := func() bool {
+		return pick(m.ResolveConfigForEntry(owner, repo, forgeName, e))
+	}
+	if len(filter) == 0 {
+		return picked(), nil
+	}
+	for _, pattern := range filter {
+		ok, err := patternSelectsEntry(e, pattern)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			continue
+		}
+		if isGlob(pattern) {
+			// Conservative: the pattern may select repos this entry governs.
+			if picked() {
+				return true, nil
+			}
+			continue
+		}
+		// Concrete repo: honor explicit-entry and first-glob precedence.
+		pOwner, pRepo, _ := strings.Cut(pattern, "/")
+		resolved, found := m.ResolveConfigWithGlobs(pOwner, pRepo)
+		if found && resolved.Forge == forgeName && pick(resolved) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// HasForge reports whether any repo in the manifest resolves to the
+// given forge name.
+func (m *Manifest) HasForge(name string) bool {
+	switch name {
+	case ForgeGitHub:
+		return m.GitHub != nil && len(m.GitHub.Repos) > 0
+	case ForgeGitLab:
+		return m.GitLab != nil && len(m.GitLab.Repos) > 0
+	default:
+		return false
+	}
+}
+
+// TotalRepoCount returns the total number of repo entries across all
+// platform sections.
+func (m *Manifest) TotalRepoCount() int {
+	n := 0
+	if m.GitHub != nil {
+		n += len(m.GitHub.Repos)
+	}
+	if m.GitLab != nil {
+		n += len(m.GitLab.Repos)
+	}
+	return n
+}
+
+// gitlabAgentRunnerTags returns the GitLab agent-job runner tags from
+// the manifest, or nil if no GitLab platform section exists.
+func gitlabAgentRunnerTags(m *Manifest) []string {
+	if m != nil && m.GitLab != nil {
+		return m.GitLab.AgentRunnerTags
+	}
+	return nil
+}
+
+// gitlabControlRunnerTags returns the GitLab control-plane runner tags.
+// control_runner_tags is fully independent of agent_runner_tags: there
+// is no cross-fallback. An unset control_runner_tags renders as an
+// empty tag list (untagged), not the agent tags.
+func gitlabControlRunnerTags(m *Manifest) []string {
+	if m == nil || m.GitLab == nil {
+		return nil
+	}
+	return m.GitLab.ControlRunnerTags
+}
+
+func rejectGitHubRunnerTags(p *PlatformConfig) error {
+	switch {
+	case len(p.AgentRunnerTags) > 0:
+		return fmt.Errorf("github.agent_runner_tags is not supported; agent_runner_tags is a GitLab-only field")
+	case len(p.ControlRunnerTags) > 0:
+		return fmt.Errorf("github.control_runner_tags is not supported; control_runner_tags is a GitLab-only field")
+	case len(p.DeprecatedRunnerTags) > 0:
+		return fmt.Errorf("github.runner_tags is not supported; runner_tags is a GitLab-only field")
+	}
+	return nil
+}
+
+// IsValidGCPProjectID checks that s matches the GCP project ID format:
+// 6-30 characters, lowercase letters, digits, and hyphens, starting with a letter.
+func IsValidGCPProjectID(s string) bool {
+	if len(s) < 6 || len(s) > 30 {
+		return false
+	}
+	if s[0] < 'a' || s[0] > 'z' {
+		return false
+	}
+	if s[len(s)-1] == '-' {
+		return false
+	}
+	for _, c := range s[1:] {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// IsValidGCPRegion checks that s looks like a GCP region: lowercase
+// letters, digits, and hyphens (e.g. "us-central1", "europe-west4").
+func IsValidGCPRegion(s string) bool {
+	if len(s) < 3 || len(s) > 40 {
+		return false
+	}
+	if s[0] < 'a' || s[0] > 'z' {
+		return false
+	}
+	for _, c := range s[1:] {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return s[len(s)-1] != '-'
+}
+
+// IsNumeric reports whether s contains only ASCII digits.
+func IsNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// Marshal serializes the manifest back to YAML. Deprecated runner_tags
+// is dropped so rewrites emit agent_runner_tags. Marshal does not
+// mutate the receiver: the deprecated-key migration runs against a
+// shallow copy, so the caller's Manifest (and its platform configs)
+// are unchanged after a call to Marshal.
+func (m *Manifest) Marshal() ([]byte, error) {
+	return yaml.Marshal(migratedManifestForMarshal(m))
+}
+
+// MarshalWithHeader serializes the manifest with a descriptive header
+// comment. Like Manifest.Marshal, it does not mutate the receiver — the
+// deprecated runner_tags migration runs against a shallow copy.
+func MarshalWithHeader(m *Manifest) ([]byte, error) {
+	data, err := yaml.Marshal(migratedManifestForMarshal(m))
+	if err != nil {
+		return nil, fmt.Errorf("marshalling manifest: %w", err)
+	}
+
+	header := fmt.Sprintf("# Generated by fullsend on %s.\n# Review and adjust before running fullsend repos install.\n",
+		time.Now().UTC().Format("2006-01-02"))
+
+	return append([]byte(header), data...), nil
+}
+
+// migratedManifestForMarshal returns a shallow copy of m with the
+// deprecated gitlab.runner_tags key migrated onto agent_runner_tags,
+// without mutating m or its platform configs. Marshal and
+// MarshalWithHeader both serialize through this helper so that
+// serializing a manifest has no observable side effect on the value
+// being serialized. Copying the GitHub/GitLab PlatformConfig structs
+// (not just the Manifest) is required because migrateDeprecatedRunnerTags
+// writes fields on the PlatformConfig, not the Manifest itself; a
+// shallow copy is sufficient since migration only reassigns the
+// AgentRunnerTags/DeprecatedRunnerTags fields, never mutating the
+// slices' backing arrays or the shared Repos slice.
+func migratedManifestForMarshal(m *Manifest) *Manifest {
+	if m == nil {
+		return nil
+	}
+	copied := *m
+	if m.GitHub != nil {
+		ghCopy := *m.GitHub
+		copied.GitHub = &ghCopy
+	}
+	if m.GitLab != nil {
+		glCopy := *m.GitLab
+		copied.GitLab = &glCopy
+	}
+	migrateDeprecatedRunnerTags(&copied)
+	return &copied
+}
+
+func configSourceSet(s string) bool {
+	return s != "" && s != NoneSentinel
+}
+
+func configHashSet(s string) bool {
+	return s != "" && s != NoneSentinel
+}
+
+func validateConfigSource(field, source string) error {
+	if source == "" || source == NoneSentinel {
+		return nil
+	}
+	if strings.HasPrefix(strings.ToLower(source), "https://") {
+		u, err := url.Parse(source)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("%s must be a valid HTTPS URL or local file path, got %q", field, source)
+		}
+		return nil
+	}
+	if strings.Contains(source, "://") {
+		return fmt.Errorf("%s: unsupported URL scheme: only local paths and https:// URLs are supported", field)
+	}
+	return nil
+}
+
+func (m *Manifest) validateConfigSource(field, source string) (string, error) {
+	if err := validateConfigSource(field, source); err != nil {
+		return "", err
+	}
+	if source == "" || source == NoneSentinel || strings.HasPrefix(strings.ToLower(source), "https://") {
+		if m.sourceRemote && source != "" && source != NoneSentinel && !strings.HasPrefix(strings.ToLower(source), "https://") {
+			return "", fmt.Errorf("%s: remote manifests must use HTTPS config_base sources, got local path %q", field, source)
+		}
+		return source, nil
+	}
+	if m.sourceRemote {
+		return "", fmt.Errorf("%s: remote manifests must use HTTPS config_base sources, got local path %q", field, source)
+	}
+	if m.sourceDir == "" {
+		return source, nil
+	}
+
+	base, err := filepath.Abs(m.sourceDir)
+	if err != nil {
+		return "", fmt.Errorf("%s: resolving manifest directory: %w", field, err)
+	}
+	if canonicalBase, evalErr := filepath.EvalSymlinks(base); evalErr == nil {
+		base = canonicalBase
+	}
+	resolved := source
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(base, resolved)
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", fmt.Errorf("%s: resolving local config_base path %q: %w", field, source, err)
+	}
+	checked := resolved
+	if canonicalPath, evalErr := filepath.EvalSymlinks(resolved); evalErr == nil {
+		checked = canonicalPath
+	} else if canonicalParent, parentErr := filepath.EvalSymlinks(filepath.Dir(resolved)); parentErr == nil {
+		checked = filepath.Join(canonicalParent, filepath.Base(resolved))
+	}
+	rel, err := filepath.Rel(base, checked)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s: local config_base path %q escapes manifest directory %q", field, source, base)
+	}
+	return resolved, nil
+}
+
+func validateConfigHash(field, hash string) error {
+	if hash == "" || hash == NoneSentinel {
+		return nil
+	}
+	hash = strings.ToLower(strings.TrimSpace(hash))
+	if len(hash) != 64 {
+		return fmt.Errorf("%s must be a 64-character hex-encoded SHA-256 hash, got %d characters", field, len(hash))
+	}
+	if _, err := hex.DecodeString(hash); err != nil {
+		return fmt.Errorf("%s is not valid hex: %w", field, err)
+	}
+	return nil
+}

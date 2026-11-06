@@ -1,0 +1,113 @@
+---
+# VirtualMachine template for a GitLab Runner on OpenShift Virtualization.
+#
+# Creates a Fedora VM with podman, curl, git, and python3 pre-installed
+# via cloud-init. After the VM boots, run setup.sh to register and configure
+# the runner.
+#
+# Usage: ./create-openshift-vm.sh (auto-numbers and applies this template)
+#
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: __VM_NAME__
+  labels:
+    app: fullsend-gitlab-runner
+    kubevirt.io/dynamic-credentials-support: "true"
+    vm.kubevirt.io/template: fedora-server-medium
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+    - apiVersion: cdi.kubevirt.io/v1beta1
+      kind: DataVolume
+      metadata:
+        name: __VM_NAME__
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: fedora
+          namespace: openshift-virtualization-os-images
+        storage:
+          resources:
+            requests:
+              storage: 20Gi
+  template:
+    metadata:
+      annotations:
+        vm.kubevirt.io/flavor: medium
+        vm.kubevirt.io/os: fedora
+        vm.kubevirt.io/workload: server
+      labels:
+        kubevirt.io/domain: __VM_NAME__
+        kubevirt.io/size: medium
+    spec:
+      architecture: amd64
+      domain:
+        cpu:
+          cores: 4
+          sockets: 1
+          threads: 1
+        memory:
+          guest: 14Gi
+        resources:
+          requests:
+            memory: 14848Mi
+          limits:
+            memory: 15Gi
+        devices:
+          disks:
+            - disk:
+                bus: virtio
+              name: rootdisk
+            - disk:
+                bus: virtio
+              name: cloudinitdisk
+          interfaces:
+            - masquerade:
+                ports:
+                  - port: 22
+              model: virtio
+              name: default
+          rng: {}
+        features:
+          smm:
+            enabled: true
+        firmware:
+          bootloader:
+            efi: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - dataVolume:
+            name: __VM_NAME__
+          name: rootdisk
+        - cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              user: __VM_USER__
+              ssh_authorized_keys:
+                - __SSH_PUBLIC_KEY__
+              # bootcmd runs before the packages module, so the repo config
+              # must be usable here (setup.sh's fix_fedora_repos runs too
+              # late). Switch metalink= to baseurl= (egress allowlist),
+              # replace the download.example placeholder that Fedora 43/44
+              # cloud images ship in their commented-out baseurl= lines, and
+              # use HTTPS: the stock baseurl= lines are plain HTTP, which
+              # egress-restricted clusters may block (port 80) while HTTPS
+              # to dl.fedoraproject.org works. The HTTPS rewrite also mends
+              # an already-enabled HTTP baseurl= with no metalink= left.
+              # The optional OpenH264 repo has no baseurl= at all, so once
+              # its metalink= is commented out dnf cannot load it: disable
+              # it. Keep in step with vm_test.sh and setup.sh's
+              # fix_fedora_repos.
+              bootcmd:
+                - "sed -i -e 's/^metalink=/#metalink=/' -e 's/^#baseurl=/baseurl=/' -e 's|download[.]example|dl.fedoraproject.org|g' -e 's|^baseurl=http://dl[.]fedoraproject[.]org/|baseurl=https://dl.fedoraproject.org/|' /etc/yum.repos.d/fedora*.repo"
+                - "[ ! -f /etc/yum.repos.d/fedora-cisco-openh264.repo ] || sed -i 's/^enabled=1/enabled=0/' /etc/yum.repos.d/fedora-cisco-openh264.repo"
+              packages:
+                - podman
+                - curl
+                - git
+                - python3
+                - openssl
+          name: cloudinitdisk

@@ -19,9 +19,22 @@ Date: 2026-04-29
 
 Deprecated — the harness-level forge-specific vs. forge-neutral split
 is now addressed by [ADR 0045](0045-forge-portable-harness-schema.md)
-(forge-portable harness schema). The broader GitLab support architecture
-(CI/CD pipeline mapping, PAT-based auth, webhook bridging) documented
-here remains reference material.
+(forge-portable harness schema). The external webhook-bridge approach
+described here is superseded by [ADR 0067](0067-gitlab-cron-polling-event-dispatch.md)
+(cron-polling, which removed the bridge) and then by
+[ADR 0125](0125-gitlab-hybrid-webhook-poller-dispatch.md) (GitLab-native
+webhook fast-path + poller backstop). The broader GitLab support
+architecture (CI/CD pipeline mapping, PAT-based auth) documented here
+remains reference material.
+
+> **Update (2026-09, #7758):** The claim in "Event Handling and Webhook
+> Architecture" that webhook JSON and the pipeline trigger API are not
+> wire-compatible — so a translation bridge is required — is refuted.
+> GitLab's native "use a webhook" trigger
+> (`POST /api/v4/projects/:id/ref/:ref/trigger/pipeline`) pins `:ref` in
+> the URL, which overrides the payload ref. No intermediary and no
+> inbound endpoint we operate. See
+> [ADR 0125](0125-gitlab-hybrid-webhook-poller-dispatch.md).
 
 ## Context
 
@@ -130,6 +143,24 @@ GitLab doesn't have an exact GitHub Apps equivalent, but Project Access Tokens (
 | review  | Developer | Read repos, create MR reviews/comments |
 | fix     | Developer | Read/write target repos, push to MR branches |
 
+> **Update (2026-09, #7343):** This table is the original per-role PAT
+> sketch from the webhook-bridge design (now superseded by
+> [ADR 0067](0067-gitlab-cron-polling-event-dispatch.md)). It is a
+> different credential from the poller's bot PAT (`FULLSEND_FORGE_TOKEN`).
+> The poller uses a **single** project access token at Developer (30),
+> not the Maintainer-level orchestrator row above: poller *state* lives
+> on dedicated unprotected branches (`fullsend-poll-state-slash` /
+> `fullsend-poll-state-events`) rather than Maintainer-only CI/CD
+> variables. Creating pipelines on a protected default branch still
+> needs merge or push access (GitLab's default "Protected" preset
+> grants that to Developers; a stricter Maintainer-only preset does
+> not). The orchestrator row remains historical for the abandoned
+> `.fullsend` config-repo / per-role PAT model and is not the poller's
+> runtime identity. The current registered-role contract (built-in
+> Poller/Analyst/Coder plus administrator custom roles, provisioned
+> additively by `repos install`) is in
+> [gitlab-role-credentials.md](../contributing/gitlab-role-credentials.md).
+
 **Storage**: Project Access Token values stored as CI/CD variables:
 - Project-level **masked and protected** variable in `.fullsend`: `FULLSEND_DISPATCH_TOKEN` (used to trigger child pipelines; never exposed to enrolled repos)
 - Project-level **masked and protected** variables in `.fullsend`:
@@ -225,6 +256,25 @@ The implementation document is structured for iterative evolution as GitLab supp
 
 ## Consequences
 
+> **Update (#8083):** GitLab role provisioning on project service accounts,
+> with project access tokens as the capability fallback, is being delivered
+> incrementally under #7772 and is not active until its CLI activation
+> change merges. The Poller remains Developer at runtime. Native trigger
+> creation and rotation as the Poller remain deferred until an adapter can
+> establish server-side request draining before temporary elevation;
+> revocation and empty inventories are insufficient. Existing compliant
+> triggers can be reused, and polling remains available when enabled. See
+> the [lifecycle reference](../cli/repos.md#gitlab-project-service-account-lifecycle).
+>
+> **Update (#8242):** the CLI activation change has merged, so install,
+> rotation, status and uninstall now use the service-account lifecycle
+> described above. Native trigger creation and rotation as the Poller remain
+> deferred.
+>
+> **Update (#8243):** native trigger creation and rotation are now enabled for
+> eligible projects. A fresh Poller service-account generation mints the
+> trigger and is cut over to; the current Poller is never re-elevated.
+
 ### Positive
 
 - **Multi-forge support**: Organizations on GitLab can adopt fullsend
@@ -260,14 +310,14 @@ The implementation document is structured for iterative evolution as GitLab supp
 
 ### Webhook-to-Trigger Translation Architecture
 
-**Problem**: GitLab webhooks (JSON payloads) and the pipeline trigger API (form-encoded parameters) are not wire-compatible. An intermediary is required to translate webhook events to trigger API calls.
+~~**Problem**: GitLab webhooks (JSON payloads) and the pipeline trigger API (form-encoded parameters) are not wire-compatible. An intermediary is required to translate webhook events to trigger API calls.~~ Decided in [ADR 0125](0125-gitlab-hybrid-webhook-poller-dispatch.md): GitLab's native "use a webhook" trigger pins `:ref` in the URL, so no translation bridge is required. [ADR 0067](0067-gitlab-cron-polling-event-dispatch.md) had previously eliminated the bridge by going poll-only.
 
 **Trade-offs**:
 - **Option 1 (CI/CD webhook integration)**: Runs in enrolled repo, but cannot enforce protected-branch-only execution without blocking MR reactions entirely. Reintroduces security concern.
 - **Option 2 (GitLab serverless functions)**: Keeps compute within GitLab infrastructure, but requires GitLab Premium/Ultimate tier.
 - **Option 3 (Minimal bridge service)**: Works on GitLab Free tier, but reintroduces hosted webhook receiver concern from ADR-0009.
 
-**Decision needed**: Choose between infrastructure cost (options 2/3) and security model compromise (option 1). For GitLab Free tier, option 3 appears to be the only viable path. This question should be resolved before production deployment.
+**Decision needed**: ~~Choose between infrastructure cost (options 2/3) and security model compromise (option 1). For GitLab Free tier, option 3 appears to be the only viable path. This question should be resolved before production deployment.~~ Resolved by [ADR 0125](0125-gitlab-hybrid-webhook-poller-dispatch.md) (no translation bridge).
 
 ### ADR Scope and Structure
 

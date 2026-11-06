@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fullsend-ai/fullsend/internal/mintcore/mintconsts"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -28,13 +29,11 @@ const (
 
 // JWKSVerifier validates GitHub Actions OIDC JWTs by fetching JWKS from
 // the issuer's discovery endpoint and verifying RS256 signatures directly.
+// It handles authentication only (token parsing, signature verification);
+// authorization (per-repo enrollment, workflow-ref) is performed by the Handler.
 type JWKSVerifier struct {
-	issuerURL            string
-	audience             string
-	httpClient           HTTPDoer
-	allowedOrgs          []string
-	allowedWorkflowFiles []string
-	perRepoWIFRepos      map[string]bool
+	issuerURL string
+	audience  string
 
 	mu            sync.RWMutex
 	keys          map[string]*rsa.PublicKey
@@ -46,33 +45,17 @@ type JWKSVerifier struct {
 
 // JWKSVerifierConfig configures a new JWKSVerifier.
 type JWKSVerifierConfig struct {
-	IssuerURL            string
-	Audience             string
-	HTTPClient           HTTPDoer
-	AllowedOrgs          []string
-	AllowedWorkflowFiles []string
-	PerRepoWIFRepos      map[string]bool
+	IssuerURL string
 }
 
 // NewJWKSVerifier creates a verifier that validates tokens from issuerURL
-// against the given audience. If httpClient is nil, http.DefaultClient is used.
-func NewJWKSVerifier(opts JWKSVerifierConfig) *JWKSVerifier {
-	httpClient := opts.HTTPClient
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	perRepo := opts.PerRepoWIFRepos
-	if perRepo == nil {
-		perRepo = make(map[string]bool)
-	}
+// against the compile-time OIDC audience (mintconsts.OIDCAudience).
+// HTTP requests are made via the package-internal mintHTTP function.
+func NewJWKSVerifier(opts JWKSVerifierConfig) (*JWKSVerifier, error) {
 	return &JWKSVerifier{
-		issuerURL:            opts.IssuerURL,
-		audience:             opts.Audience,
-		httpClient:           httpClient,
-		allowedOrgs:          opts.AllowedOrgs,
-		allowedWorkflowFiles: opts.AllowedWorkflowFiles,
-		perRepoWIFRepos:      perRepo,
-	}
+		issuerURL: opts.IssuerURL,
+		audience:  mintconsts.OIDCAudience,
+	}, nil
 }
 
 // jwtHeader represents the JOSE header of a JWT.
@@ -174,13 +157,6 @@ func (v *JWKSVerifier) Verify(ctx context.Context, rawToken string) (*Claims, er
 		return nil, fmt.Errorf("invalid JWT signature")
 	}
 
-	if err := ValidateOrgAllowed(claims.RepositoryOwner, v.allowedOrgs); err != nil {
-		return nil, err
-	}
-	if err := ValidateWorkflowRef(claims.JobWorkflowRef, claims.Repository, v.perRepoWIFRepos, v.allowedWorkflowFiles); err != nil {
-		return nil, err
-	}
-
 	return &claims, nil
 }
 
@@ -248,7 +224,7 @@ func (v *JWKSVerifier) refreshKeys(ctx context.Context) error {
 		return fmt.Errorf("creating JWKS request: %w", err)
 	}
 
-	resp, err := v.httpClient.Do(req)
+	resp, err := mintHTTP(req)
 	if err != nil {
 		return fmt.Errorf("fetching JWKS: %w", err)
 	}
@@ -297,7 +273,7 @@ func (v *JWKSVerifier) discoverJWKSURI(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("creating discovery request: %w", err)
 	}
 
-	resp, err := v.httpClient.Do(req)
+	resp, err := mintHTTP(req)
 	if err != nil {
 		return "", fmt.Errorf("fetching discovery document: %w", err)
 	}

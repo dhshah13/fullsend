@@ -22,6 +22,12 @@ var RepoNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.][a-zA-Z0-9._-]{0,99}$`)
 // RolePattern restricts role to safe lowercase identifiers.
 var RolePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 
+// LevelPattern restricts privilege level names to safe lowercase identifiers:
+// starts with a letter, followed by up to 31 lowercase letters, digits,
+// underscores, or hyphens (max 32 chars total). Empty is treated as
+// "omitted" by callers and is not validated here.
+var LevelPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+
 // ValidateOrgName checks that an org name matches GitHubOrgPattern and
 // does not contain double-hyphens (which would be ambiguous in secret names).
 func ValidateOrgName(org string) error {
@@ -38,4 +44,36 @@ func ValidateRoleName(role string) error {
 		return fmt.Errorf("invalid role name %q", role)
 	}
 	return nil
+}
+
+// RoleIdentifier maps a role name onto the identifier used in environment
+// variables, GitHub Actions secrets/variables, and similar. Hyphens become
+// underscores and the result is uppercased so the identifier is a valid
+// bash/Actions name. For example, "ci-check" becomes "CI_CHECK".
+//
+// Roles that differ only by hyphen vs underscore (ci-check vs ci_check)
+// share an identifier.
+func RoleIdentifier(role string) string {
+	return strings.ToUpper(strings.ReplaceAll(role, "-", "_"))
+}
+
+// ValidateLevelName checks that a privilege level name matches LevelPattern.
+// Empty names are allowed (callers treat them as "omitted").
+func ValidateLevelName(level string) error {
+	if level == "" {
+		return nil
+	}
+	if !LevelPattern.MatchString(level) {
+		return fmt.Errorf("invalid level name %q", level)
+	}
+	return nil
+}
+
+// PemSecretRole returns the PEM secret role key for a mint request role.
+// The fix stage uses the coder PEM.
+func PemSecretRole(role string) string {
+	if role == "fix" {
+		return "coder"
+	}
+	return role
 }

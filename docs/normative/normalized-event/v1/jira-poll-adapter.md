@@ -1,0 +1,180 @@
+# Jira poll adapter (NormalizedEvent extension)
+
+Poll input driver mapping for Jira work items, defined in
+[ADR 0063](../../../ADRs/0063-polling-based-work-discovery.md). This document
+extends [NormalizedEvent v1](README.md) for `jira-poll` input drivers until the
+changes are merged into `normalized-event.schema.json`.
+
+## Scope
+
+- **In scope:** Jira **issues** polled by `fullsend poll --input-driver jira-poll`.
+  Events use `entity.kind: work_item` only.
+- **Out of scope:** Jira webhooks, Service Desk, sprint/board events, and forge
+  change-proposal routing (e.g. `/fs-fix`) — those stages require a
+  `change_proposal` entity and are triggered from forge webhooks or poll drivers
+  on the code repo, not from Jira issue comments alone.
+
+## Schema extensions
+
+The following fields are defined in
+[`normalized-event.schema.json`](normalized-event.schema.json):
+
+| Field | Definition |
+|-------|------------|
+| `source.system` | Enum includes `jira` |
+| `entity.key` | Optional for GitHub; **required** when `source.system` is `jira` |
+
+When `source.system` is `jira`, `entity.key` MUST be present (e.g. `PROJ-123`).
+
+## Top-level fields
+
+| Field | Jira poll value |
+|-------|-----------------|
+| `repo` | Target repo slug from poll context (`GITHUB_REPOSITORY` or config). |
+| `source.system` | `jira` |
+| `source.raw_type` | Native Jira object: `issue`, `comment`, `changelog` |
+| `source.raw_action` | Native action when applicable: `created`, `updated`, `deleted` |
+| `entity.kind` | `work_item` |
+| `entity.id` | Jira numeric issue id (`fields` or search result `id`) |
+| `entity.key` | Issue key (`PROJ-123`) |
+| `entity.url` | Browse URL (`{base}/browse/{key}`) |
+| `entity.linked_change_proposal` | Omitted — Jira poll emits work-item events only |
+| `actor` | Comment/changelog author (see below) |
+| `transition` | Mapped semantic transition (see below) |
+| `state.labels` | Current Jira label names at event time |
+
+## Transition mapping
+
+| Jira signal | `transition.kind` | Sub-fields |
+|-------------|---------------------|------------|
+| Issue created | `opened` | — |
+| Issue reopened | `reopened` | — |
+| Summary/description/fields updated | `edited` | — |
+| Label added | `label_changed` | `label.name`, `label.action: added` |
+| Label removed | `label_changed` | `label.name`, `label.action: removed` |
+| Comment added | `comment_added` | `comment.body`, optional `command` / `instruction` |
+| Issue closed | `closed` | — |
+
+Comment parsing matches the `gha-event` adapter: `command` is the first
+whitespace-delimited token of the first line; `instruction` is the remainder of
+the first line after the command (same rules as
+[README — execution ref projection](README.md)).
+
+## Actor mapping
+
+> **ADR 0107 target contract — not yet implemented:** The bot-role and
+> `role_verified` rows describe the post-migration adapter output. Current Jira
+> polling remains on its existing compatibility path until the resolver is
+> integrated.
+
+| Field | Source |
+|-------|--------|
+| `actor.id` | Jira `accountId` (preferred) or `name` when accountId unavailable |
+| `actor.kind` | For the target adapter contract, `bot` only when Jira's authoritative account metadata identifies an app or the adapter configuration identifies the authenticated poller as a verified service identity; otherwise `human`. A display-name automation pattern alone is insufficient. The current compatibility poller may retain its legacy heuristics until it adopts the ADR 0107 target implementation. |
+| `actor.role` | `none` for target bots; for humans, from the source the `jira` authorization provider selects ([Authorization v1](../../authorization/v1/README.md#forge-native-permission-mapping), [ADR 0153](../../../ADRs/0153-authorize-jira-poll-actors-without-project-administration.md)): from its lists, `write` or `triage` for listed actors and `none` otherwise; from the Jira project role, `admin` for Administrators, `write` for Developers, `read` for other named project roles, `external` when the actor does not hold any project role; `none` when the role is not resolved (label additions under a `jira` entry's `labels: jira_editors`, and non-command events when a `jira` entry sets no lists and not `labels: project_roles`). With no `jira` entry, every event takes its role from the Jira project role. Cross-system identity resolution (Jira user → GitHub user → repo permission) is not performed; the Jira project is the authorization boundary for Jira-sourced events. |
+| `actor.bot_role` | Provider lookup of the verified bot identity; the canonical fullsend role when recognized, otherwise `null` |
+| `actor.role_verified` | `true` when bot-role or Jira project-role lookup completed, including a no-match result; `false` when resolution failed |
+| `actor.is_entity_author` | `true` when actor is the issue reporter |
+
+Authorization is enforced by `fullsend dispatch` per
+[ADR 0054](../../../ADRs/0054-require-authorization-on-all-agent-dispatch-paths.md)
+**after** normalization. The poll loop does not bypass the gate.
+
+## State
+
+- `state.labels` — label names from `fields.labels` at event time.
+- `state.change_proposal` — omitted. Change-proposal stages (`fix`, PR-linked
+  `review`, merge `retro`) are forge-scoped; harness CEL triggers for those
+  stages MUST require `entity.kind == 'change_proposal'` or equivalent guards.
+
+## Execution ref projection
+
+When `source.system` is `jira`, projection supplements the GitHub-shaped
+`event_payload` fields:
+
+| Execution ref / env | Source |
+|---------------------|--------|
+| `FULLSEND_WORK_ITEM_URL` | `entity.url` |
+| `FULLSEND_WORK_ITEM_SOURCE` | `jira` |
+| `FULLSEND_WORK_ITEM_KEY` | `entity.key` |
+| `ISSUE_NUMBER` | Omit or empty — a Jira key is not a GitHub issue number |
+| `event_payload.comment` | `transition.comment` when present |
+| `GITHUB_ISSUE_URL` | Omit or empty — not a GitHub issue |
+| `status-number` | `entity.id` (numeric Jira id) |
+
+Harnesses and pre-scripts that require forge-agnostic work item URLs SHOULD use
+`FULLSEND_WORK_ITEM_*` rather than forge-specific variables like
+`GITHUB_ISSUE_URL`. The dispatch workflow sets `FULLSEND_WORK_ITEM_URL` and
+`FULLSEND_WORK_ITEM_KEY` from the normalized entity for Jira events. For
+forge-native events, the generic key and `ISSUE_NUMBER` carry the same value.
+
+`fullsend run` reads the normalized event embedded in the dispatch payload.
+On GitLab, the agent job extracts it from the signed `jira_*` dispatch payload
+and passes it with `--event-file`.
+For a Jira event it sets `FULLSEND_WORK_ITEM_SOURCE`, `FULLSEND_WORK_ITEM_KEY`,
+and `FULLSEND_WORK_ITEM_URL` from that event, replacing any inherited values.
+It also clears `ISSUE_NUMBER` before pre-scripts, post-scripts, and harness
+env expansion run. Neither the numeric Jira entity ID nor the numeric suffix
+of the key reaches scripts as a forge issue number. The run fails before any
+script runs in three cases:
+
+- `entity.key` is missing or is not a Jira key such as `PROJ-123`. The key
+  must match `^[A-Z][A-Z0-9_]+-[1-9][0-9]*$`, so single-character project keys
+  such as `P-1` are rejected.
+- `entity.url` is missing or is not an `https` URL.
+- The payload declares `source.system: jira`, but its normalized event fails
+  validation.
+
+For forge-native events, `fullsend run` only fills in
+`FULLSEND_WORK_ITEM_SOURCE` when the caller left it unset. It uses
+`source.system`, or the detected forge when no normalized event is present.
+
+## Example
+
+Issue comment with slash command:
+
+```json
+{
+  "repo": "acme/platform",
+  "source": {
+    "system": "jira",
+    "raw_type": "comment",
+    "raw_action": "created"
+  },
+  "entity": {
+    "kind": "work_item",
+    "id": 10042,
+    "key": "PROJ-123",
+    "url": "https://acme.atlassian.net/browse/PROJ-123"
+  },
+  "actor": {
+    "id": "557058:abc123def456",
+    "kind": "human",
+    "role": "write",
+    "is_entity_author": false
+  },
+  "transition": {
+    "kind": "comment_added",
+    "comment": {
+      "command": "/fs-triage",
+      "body": "/fs-triage check acceptance criteria",
+      "instruction": "check acceptance criteria"
+    }
+  },
+  "state": {
+    "labels": ["needs-info", "bug"]
+  }
+}
+```
+
+## CEL triggers
+
+Harness `trigger` expressions use the same `event` root variable as GitHub
+events. Example:
+
+```yaml
+trigger: event.source.system == 'jira' && event.transition.kind == 'comment_added' && event.transition.comment.command == '/fs-triage'
+```
+
+Routing logic lives on harness files per
+[ADR 0061](../../../ADRs/0061-harness-cel-dispatch.md), not in poll config.

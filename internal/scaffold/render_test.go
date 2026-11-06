@@ -1,6 +1,8 @@
 package scaffold
 
 import (
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -8,33 +10,18 @@ import (
 )
 
 func TestRenderThinCallerNotVendored(t *testing.T) {
-	raw, err := FullsendRepoFile(".github/workflows/triage.yml")
+	raw, err := FullsendRepoFile(".github/workflows/prioritize.yml")
 	require.NoError(t, err)
 
-	rendered, err := RenderTemplate(".github/workflows/triage.yml", raw, RenderOptions{
+	rendered, err := RenderTemplate(".github/workflows/prioritize.yml", raw, RenderOptions{
 		Vendored: false,
 	})
 	require.NoError(t, err)
 	out := string(rendered)
-	assert.Contains(t, out, "uses: fullsend-ai/fullsend/.github/workflows/reusable-triage.yml@v0")
+	assert.Contains(t, out, "uses: fullsend-ai/fullsend/.github/workflows/reusable-prioritize.yml@main")
 	assertFreeOfRenderPlaceholders(t, out)
 	assert.NotContains(t, out, "distribution_mode")
 	assert.NotContains(t, out, "fullsend_ai_repo:")
-}
-
-func TestRenderThinCallerVendoredPerOrg(t *testing.T) {
-	raw, err := FullsendRepoFile(".github/workflows/triage.yml")
-	require.NoError(t, err)
-
-	rendered, err := RenderTemplate(".github/workflows/triage.yml", raw, RenderOptions{
-		Vendored: true,
-	})
-	require.NoError(t, err)
-	out := string(rendered)
-	assert.Contains(t, out, "uses: ./.github/workflows/reusable-triage.yml")
-	assertFreeOfRenderPlaceholders(t, out)
-	assert.NotContains(t, out, "distribution_mode")
-	assert.Contains(t, out, "install_mode: per-org")
 }
 
 func TestRenderPerRepoShimVendored(t *testing.T) {
@@ -43,31 +30,16 @@ func TestRenderPerRepoShimVendored(t *testing.T) {
 
 	rendered, err := RenderTemplate("templates/shim-per-repo.yaml", raw, RenderOptions{
 		Vendored: true,
-		PerRepo:  true,
 	})
 	require.NoError(t, err)
 	out := string(rendered)
 	assert.Contains(t, out, "uses: ./.github/workflows/reusable-dispatch.yml")
 	assert.NotContains(t, out, "distribution_mode")
+	assert.NotContains(t, out, "install_mode",
+		"per-repo shim must rely on the reusable-dispatch.yml install_mode default")
 }
 
-func TestRenderThinCallerVendoredPerRepo(t *testing.T) {
-	raw, err := FullsendRepoFile(".github/workflows/triage.yml")
-	require.NoError(t, err)
-
-	rendered, err := RenderTemplate(".github/workflows/triage.yml", raw, RenderOptions{
-		Vendored: true,
-		PerRepo:  true,
-	})
-	require.NoError(t, err)
-	out := string(rendered)
-	// GitHub Actions requires local reusable workflow references to be under .github/workflows/.
-	assert.Contains(t, out, "uses: ./.github/workflows/reusable-triage.yml")
-	assert.NotContains(t, out, ".fullsend/")
-	assertFreeOfRenderPlaceholders(t, out)
-}
-
-func TestRenderPrioritizeThinCallerVendored(t *testing.T) {
+func TestRenderPrioritizeThinCaller(t *testing.T) {
 	raw, err := FullsendRepoFile(".github/workflows/prioritize.yml")
 	require.NoError(t, err)
 
@@ -77,8 +49,22 @@ func TestRenderPrioritizeThinCallerVendored(t *testing.T) {
 	require.NoError(t, err)
 	out := string(rendered)
 	assert.Contains(t, out, "uses: ./.github/workflows/reusable-prioritize.yml")
+	assert.NotContains(t, out, "install_mode")
 	assert.NotContains(t, out, "distribution_mode")
-	assert.Contains(t, out, "project_number: ${{ vars.FULLSEND_PROJECT_NUMBER }}")
+	assert.Contains(t, out, "project_number: ${{ inputs.project_number || vars.FULLSEND_PROJECT_NUMBER }}")
+	assertFreeOfRenderPlaceholders(t, out)
+}
+
+func TestRenderThinCallerNormalizesLegacyInstallMode(t *testing.T) {
+	legacy := []byte("# fullsend-stage: prioritize\n" +
+		"uses: __REUSABLE_WORKFLOW__\n" +
+		"install_mode: per-org\n")
+
+	rendered, err := RenderTemplate(".github/workflows/prioritize.yml", legacy, RenderOptions{})
+	require.NoError(t, err)
+	out := string(rendered)
+	assert.Contains(t, out, "install_mode: per-repo")
+	assert.NotContains(t, out, "install_mode: per-org")
 }
 
 func TestWalkUpstreamIncludesReusableWorkflows(t *testing.T) {
@@ -90,7 +76,6 @@ func TestWalkUpstreamIncludesReusableWorkflows(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, want := range []string{
-		".github/workflows/reusable-triage.yml",
 		".github/workflows/reusable-prioritize.yml",
 		".github/workflows/reusable-dispatch.yml",
 		".github/actions/mint-token/action.yml",
@@ -98,23 +83,6 @@ func TestWalkUpstreamIncludesReusableWorkflows(t *testing.T) {
 	} {
 		assert.Contains(t, paths, want)
 	}
-}
-
-func TestRenderDispatchPerRepoStagePaths(t *testing.T) {
-	var raw []byte
-	err := WalkUpstream(func(path string, content []byte) error {
-		if path == ".github/workflows/reusable-dispatch.yml" {
-			raw = content
-		}
-		return nil
-	})
-	require.NoError(t, err)
-	require.NotEmpty(t, raw)
-
-	rendered := RenderDispatchPerRepoStagePaths(raw)
-	assert.Contains(t, string(rendered), "uses: ./.github/workflows/reusable-triage.yml")
-	assert.Contains(t, string(rendered), "uses: ./.github/workflows/reusable-prioritize.yml")
-	assert.NotContains(t, string(rendered), "uses: fullsend-ai/fullsend/.github/workflows/reusable-triage.yml@v0")
 }
 
 func assertFreeOfRenderPlaceholders(t *testing.T, out string) {
@@ -129,12 +97,6 @@ func assertFreeOfRenderPlaceholders(t *testing.T, out string) {
 	} {
 		assert.NotContains(t, out, placeholder)
 	}
-}
-
-func TestRenderDispatchPerRepoStagePathsIgnoresOtherRepos(t *testing.T) {
-	input := []byte("uses: evil-org/evil-repo/.github/workflows/reusable-triage.yml@v0\n")
-	rendered := RenderDispatchPerRepoStagePaths(input)
-	assert.Equal(t, string(input), string(rendered))
 }
 
 func TestThinStageWorkflowRegistryMatchesTemplates(t *testing.T) {
@@ -162,16 +124,16 @@ func TestRenderAllThinCallersFreeOfPlaceholders(t *testing.T) {
 }
 
 func TestRenderThinCallerPinnedSHA(t *testing.T) {
-	raw, err := FullsendRepoFile(".github/workflows/triage.yml")
+	raw, err := FullsendRepoFile(".github/workflows/prioritize.yml")
 	require.NoError(t, err)
 
-	rendered, err := RenderTemplate(".github/workflows/triage.yml", raw, RenderOptions{
+	rendered, err := RenderTemplate(".github/workflows/prioritize.yml", raw, RenderOptions{
 		UpstreamRef: "abc123def456",
 		UpstreamTag: "v0.19.0",
 	})
 	require.NoError(t, err)
 	out := string(rendered)
-	assert.Contains(t, out, "uses: fullsend-ai/fullsend/.github/workflows/reusable-triage.yml@abc123def456")
+	assert.Contains(t, out, "uses: fullsend-ai/fullsend/.github/workflows/reusable-prioritize.yml@abc123def456")
 	assert.Contains(t, out, "# v0.19.0")
 	assert.NotContains(t, out, "fullsend_ai_ref:")
 	assertFreeOfRenderPlaceholders(t, out)
@@ -182,7 +144,6 @@ func TestRenderPerRepoShimPinnedSHA(t *testing.T) {
 	require.NoError(t, err)
 
 	rendered, err := RenderTemplate("templates/shim-per-repo.yaml", raw, RenderOptions{
-		PerRepo:     true,
 		UpstreamRef: "abc123def456",
 		UpstreamTag: "v0.19.0",
 	})
@@ -195,10 +156,10 @@ func TestRenderPerRepoShimPinnedSHA(t *testing.T) {
 }
 
 func TestRenderDefaultRunner(t *testing.T) {
-	raw, err := FullsendRepoFile(".github/workflows/triage.yml")
+	raw, err := FullsendRepoFile(".github/workflows/prioritize.yml")
 	require.NoError(t, err)
 
-	rendered, err := RenderTemplate(".github/workflows/triage.yml", raw, RenderOptions{})
+	rendered, err := RenderTemplate(".github/workflows/prioritize.yml", raw, RenderOptions{})
 	require.NoError(t, err)
 	out := string(rendered)
 	assert.Contains(t, out, "runner_image: ubuntu-24.04")
@@ -206,10 +167,10 @@ func TestRenderDefaultRunner(t *testing.T) {
 }
 
 func TestRenderCustomRunner(t *testing.T) {
-	raw, err := FullsendRepoFile(".github/workflows/triage.yml")
+	raw, err := FullsendRepoFile(".github/workflows/prioritize.yml")
 	require.NoError(t, err)
 
-	rendered, err := RenderTemplate(".github/workflows/triage.yml", raw, RenderOptions{
+	rendered, err := RenderTemplate(".github/workflows/prioritize.yml", raw, RenderOptions{
 		RunnerImage: "ubuntu-22.04",
 	})
 	require.NoError(t, err)
@@ -223,9 +184,7 @@ func TestRenderPerRepoShimRunner(t *testing.T) {
 	raw, err := PerRepoShimTemplate()
 	require.NoError(t, err)
 
-	rendered, err := RenderTemplate("templates/shim-per-repo.yaml", raw, RenderOptions{
-		PerRepo: true,
-	})
+	rendered, err := RenderTemplate("templates/shim-per-repo.yaml", raw, RenderOptions{})
 	require.NoError(t, err)
 	out := string(rendered)
 	assert.Contains(t, out, "runner_image: ubuntu-24.04")
@@ -234,12 +193,87 @@ func TestRenderPerRepoShimRunner(t *testing.T) {
 }
 
 func TestRenderFallbackToDefaultRef(t *testing.T) {
-	raw, err := FullsendRepoFile(".github/workflows/triage.yml")
+	raw, err := FullsendRepoFile(".github/workflows/prioritize.yml")
 	require.NoError(t, err)
 
-	rendered, err := RenderTemplate(".github/workflows/triage.yml", raw, RenderOptions{})
+	rendered, err := RenderTemplate(".github/workflows/prioritize.yml", raw, RenderOptions{})
 	require.NoError(t, err)
 	out := string(rendered)
-	assert.Contains(t, out, "@v0")
+	assert.Contains(t, out, "@main")
 	assert.NotContains(t, out, "fullsend_ai_ref:")
+}
+
+// Inline version comments need two spaces before '#' to satisfy yamllint's
+// default comments rule (#7902).
+func TestRenderRefCommentSpacing(t *testing.T) {
+	const sha = "abc123def456"
+	base := "fullsend-ai/fullsend/.github/workflows/"
+	tests := []struct {
+		name string
+		opts RenderOptions
+		ref  string
+		wf   string
+		disp string
+	}{
+		{
+			name: "sha with tag",
+			opts: RenderOptions{UpstreamRef: sha, UpstreamTag: "v0.19.0"},
+			ref:  sha + "  # v0.19.0",
+			wf:   base + "reusable-prioritize.yml@" + sha + "  # v0.19.0",
+			disp: base + "reusable-dispatch.yml@" + sha + "  # v0.19.0",
+		},
+		{
+			name: "tag equals ref",
+			opts: RenderOptions{UpstreamRef: "v0.19.0", UpstreamTag: "v0.19.0"},
+			ref:  "v0.19.0",
+			wf:   base + "reusable-prioritize.yml@v0.19.0",
+			disp: base + "reusable-dispatch.yml@v0.19.0",
+		},
+		{
+			name: "no tag",
+			opts: RenderOptions{UpstreamRef: sha},
+			ref:  sha,
+			wf:   base + "reusable-prioritize.yml@" + sha,
+			disp: base + "reusable-dispatch.yml@" + sha,
+		},
+		{
+			name: "vendored ignores tag",
+			opts: RenderOptions{Vendored: true, UpstreamRef: sha, UpstreamTag: "v0.19.0"},
+			ref:  sha + "  # v0.19.0",
+			wf:   "./.github/workflows/reusable-prioritize.yml",
+			disp: "./.github/workflows/reusable-dispatch.yml",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.ref, resolvedRefWithComment(tt.opts))
+			assert.Equal(t, tt.wf, reusableWorkflowUses("prioritize", tt.opts))
+			assert.Equal(t, tt.disp, reusableDispatchUses(tt.opts))
+		})
+	}
+}
+
+func TestRenderedTemplatesHaveNoSingleSpaceInlineComments(t *testing.T) {
+	singleSpace := regexp.MustCompile(`\S #`)
+	opts := RenderOptions{UpstreamRef: "abc123def456", UpstreamTag: "v0.19.0"}
+
+	shim, err := PerRepoShimTemplate()
+	require.NoError(t, err)
+	files := map[string][]byte{"templates/shim-per-repo.yaml": shim}
+	for _, w := range thinStageWorkflows {
+		raw, err := FullsendRepoFile(w.path)
+		require.NoError(t, err, w.path)
+		files[w.path] = raw
+	}
+
+	for path, raw := range files {
+		rendered, err := RenderTemplate(path, raw, opts)
+		require.NoError(t, err, path)
+		for i, line := range strings.Split(string(rendered), "\n") {
+			if strings.Contains(line, "uses:") {
+				assert.NotRegexp(t, singleSpace, line, "%s:%d", path, i+1)
+			}
+		}
+		assert.Contains(t, string(rendered), "@abc123def456  # v0.19.0", path)
+	}
 }

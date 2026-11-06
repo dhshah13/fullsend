@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -43,6 +44,24 @@ type OIDCProviderConfig struct {
 type WIFProviderInfo struct {
 	AttributeCondition string
 	AllowedAudiences   []string
+	IssuerURI          string
+	// State is the provider's lifecycle state ("ACTIVE" or "DELETED").
+	// providers.get returns soft-deleted providers with HTTP 200 and
+	// State "DELETED" rather than 404, so a non-nil WIFProviderInfo does
+	// not by itself mean the provider can exchange tokens.
+	State string
+	// Disabled reports whether the provider has been disabled. A disabled
+	// provider cannot exchange tokens.
+	Disabled bool
+}
+
+// WIFProviderStateActive is the State of a provider that is not soft-deleted.
+const WIFProviderStateActive = "ACTIVE"
+
+// Usable reports whether the provider can exchange tokens: not disabled and
+// not soft-deleted. An absent State is treated as active.
+func (i *WIFProviderInfo) Usable() bool {
+	return !i.Disabled && (i.State == "" || i.State == WIFProviderStateActive)
 }
 
 // FunctionInfo holds metadata about a deployed Cloud Function.
@@ -75,6 +94,10 @@ type ServiceRevisionInfo struct {
 	RecentRevisions []RevisionSummary
 	// TrafficEnvVars holds the env vars from the traffic-serving revision.
 	TrafficEnvVars map[string]string
+	// TrafficEnvVarsFromTemplate is true when TrafficEnvVars were taken from
+	// the service template because the traffic-serving revision could not be
+	// read. Such values may not reflect what the mint is actually serving.
+	TrafficEnvVarsFromTemplate bool
 }
 
 // RevisionSummary is a brief snapshot of a Cloud Run revision.
@@ -97,9 +120,11 @@ type FunctionConfig struct {
 type GCFClient interface {
 	// Service account operations
 	CreateServiceAccount(ctx context.Context, projectID, saName, displayName string) error
+	DeleteServiceAccount(ctx context.Context, projectID, saEmail string) error
 
 	// WIF operations
 	CreateWIFPool(ctx context.Context, projectNumber, poolID, displayName string) error
+	DeleteWIFPool(ctx context.Context, projectNumber, poolID string) error
 	CreateWIFProvider(ctx context.Context, projectNumber, poolID, providerID string, cfg OIDCProviderConfig) error
 	GetWIFProvider(ctx context.Context, projectNumber, poolID, providerID string) (*WIFProviderInfo, error)
 	UpdateWIFProvider(ctx context.Context, projectNumber, poolID, providerID string, cfg OIDCProviderConfig) error
@@ -117,13 +142,27 @@ type GCFClient interface {
 
 	// IAM bindings
 	SetSecretIAMBinding(ctx context.Context, resource, member, role string) error
+	// ReplaceSecretIAMBinding sets the IAM binding for a role on a Secret
+	// Manager resource, replacing all existing members for that role with
+	// the specified member. This is destructive: any other members bound
+	// to the same role on the resource are removed. Use this instead of
+	// SetSecretIAMBinding when re-install with a different service account
+	// should revoke the old account's access.
+	ReplaceSecretIAMBinding(ctx context.Context, resource, member, role string) error
+	// SetProjectIAMBinding adds an IAM binding on a Cloud Resource Manager
+	// project. This is intentionally additive (unlike ReplaceSecretIAMBinding)
+	// because project-level roles may have multiple legitimate members.
 	SetProjectIAMBinding(ctx context.Context, projectID, member, role string) error
 
 	// Cloud Run IAM (for function invoker policy)
 	SetCloudRunInvoker(ctx context.Context, projectID, region, serviceName string) error
 
 	// Cloud Functions v2
+	DeleteFunction(ctx context.Context, projectID, region, functionName string) error
 	GetFunction(ctx context.Context, projectID, region, functionName string) (*FunctionInfo, error)
+	// GetCloudRunServiceURI returns the public URI of the Cloud Run service
+	// backing a Gen2 Cloud Function (same name as the function).
+	GetCloudRunServiceURI(ctx context.Context, projectID, region, serviceName string) (string, error)
 	UploadFunctionSource(ctx context.Context, projectID, region string, sourceZip []byte) (storageSource json.RawMessage, err error)
 	CreateFunction(ctx context.Context, projectID, region, functionName string, cfg FunctionConfig) (string, error)
 	UpdateFunction(ctx context.Context, projectID, region, functionName string, cfg FunctionConfig) (string, error)
@@ -161,6 +200,12 @@ type GCFClient interface {
 type LiveGCFClient struct {
 	*gcp.Client
 	skipUploadURLCheck bool // testing only: skip googleapis.com domain validation
+
+	// pollDelay returns a channel that fires after the given duration,
+	// used by WaitForOperation, waitForIAMOperation, and
+	// waitForCloudRunOperation for inter-poll delays. nil → time.After.
+	// Tests inject a zero-delay function to avoid real sleeps.
+	pollDelay func(time.Duration) <-chan time.Time
 }
 
 // NewLiveGCFClient creates a new LiveGCFClient. The quotaProject is
@@ -172,7 +217,17 @@ func NewLiveGCFClient(quotaProject string) *LiveGCFClient {
 	return &LiveGCFClient{Client: c}
 }
 
-// CreateServiceAccount creates a new service account.
+// getPollDelay returns the configured poll delay function, defaulting
+// to time.After when none is set.
+func (c *LiveGCFClient) getPollDelay() func(time.Duration) <-chan time.Time {
+	if c.pollDelay != nil {
+		return c.pollDelay
+	}
+	return time.After
+}
+
+// CreateServiceAccount creates a new service account. Retries on HTTP 429
+// (quota exhaustion) with exponential backoff via doWIFRequestWithRetry.
 func (c *LiveGCFClient) CreateServiceAccount(ctx context.Context, projectID, saName, displayName string) error {
 	reqURL := fmt.Sprintf("https://iam.googleapis.com/v1/projects/%s/serviceAccounts",
 		url.PathEscape(projectID))
@@ -190,7 +245,7 @@ func (c *LiveGCFClient) CreateServiceAccount(ctx context.Context, projectID, saN
 	}
 	payload := string(payloadBytes)
 
-	resp, err := c.Client.DoRequest(ctx, http.MethodPost, reqURL, payload)
+	resp, err := c.doWIFRequestWithRetry(ctx, http.MethodPost, reqURL, payload)
 	if err != nil {
 		return fmt.Errorf("creating service account: %w", err)
 	}
@@ -206,7 +261,29 @@ func (c *LiveGCFClient) CreateServiceAccount(ctx context.Context, projectID, saN
 	return nil
 }
 
-// CreateWIFPool creates a new WIF pool.
+// DeleteServiceAccount permanently deletes a service account.
+func (c *LiveGCFClient) DeleteServiceAccount(ctx context.Context, projectID, saEmail string) error {
+	reqURL := fmt.Sprintf("https://iam.googleapis.com/v1/projects/%s/serviceAccounts/%s",
+		url.PathEscape(projectID), url.PathEscape(saEmail))
+
+	resp, err := c.Client.DoRequest(ctx, http.MethodDelete, reqURL, "")
+	if err != nil {
+		return fmt.Errorf("deleting service account: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // already deleted
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return fmt.Errorf("unexpected status %d deleting service account: %s", resp.StatusCode, gcp.ExtractErrorMessage(body))
+	}
+	return nil
+}
+
+// CreateWIFPool creates a new WIF pool. Retries on HTTP 429 (quota
+// exhaustion) with exponential backoff via doWIFRequestWithRetry.
 func (c *LiveGCFClient) CreateWIFPool(ctx context.Context, projectNumber, poolID, displayName string) error {
 	reqURL := fmt.Sprintf("https://iam.googleapis.com/v1/projects/%s/locations/global/workloadIdentityPools?workloadIdentityPoolId=%s",
 		url.PathEscape(projectNumber), url.QueryEscape(poolID))
@@ -216,7 +293,7 @@ func (c *LiveGCFClient) CreateWIFPool(ctx context.Context, projectNumber, poolID
 	}
 	payload := string(payloadBytes)
 
-	resp, err := c.Client.DoRequest(ctx, http.MethodPost, reqURL, payload)
+	resp, err := c.doWIFRequestWithRetry(ctx, http.MethodPost, reqURL, payload)
 	if err != nil {
 		return fmt.Errorf("creating WIF pool: %w", err)
 	}
@@ -232,6 +309,31 @@ func (c *LiveGCFClient) CreateWIFPool(ctx context.Context, projectNumber, poolID
 
 	if err := c.waitForIAMOperation(ctx, resp.Body); err != nil {
 		return fmt.Errorf("waiting for WIF pool creation: %w", err)
+	}
+	return nil
+}
+
+// DeleteWIFPool permanently deletes a WIF pool and all its providers.
+func (c *LiveGCFClient) DeleteWIFPool(ctx context.Context, projectNumber, poolID string) error {
+	reqURL := fmt.Sprintf("https://iam.googleapis.com/v1/projects/%s/locations/global/workloadIdentityPools/%s",
+		url.PathEscape(projectNumber), url.PathEscape(poolID))
+
+	resp, err := c.Client.DoRequest(ctx, http.MethodDelete, reqURL, "")
+	if err != nil {
+		return fmt.Errorf("deleting WIF pool: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // already deleted
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return fmt.Errorf("unexpected status %d deleting WIF pool: %s", resp.StatusCode, gcp.ExtractErrorMessage(body))
+	}
+
+	if err := c.waitForIAMOperation(ctx, resp.Body); err != nil {
+		return fmt.Errorf("waiting for WIF pool deletion: %w", err)
 	}
 	return nil
 }
@@ -264,7 +366,7 @@ func (c *LiveGCFClient) CreateWIFProvider(ctx context.Context, projectNumber, po
 		return fmt.Errorf("marshaling WIF provider payload: %w", err)
 	}
 
-	resp, err := c.Client.DoRequest(ctx, http.MethodPost, reqURL, string(payloadBytes))
+	resp, err := c.doWIFRequestWithRetry(ctx, http.MethodPost, reqURL, string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("creating WIF provider: %w", err)
 	}
@@ -312,7 +414,10 @@ func (c *LiveGCFClient) GetWIFProvider(ctx context.Context, projectNumber, poolI
 
 	var provider struct {
 		AttributeCondition string `json:"attributeCondition"`
+		State              string `json:"state"`
+		Disabled           bool   `json:"disabled"`
 		OIDC               struct {
+			IssuerURI        string   `json:"issuerUri"`
 			AllowedAudiences []string `json:"allowedAudiences"`
 		} `json:"oidc"`
 	}
@@ -323,6 +428,9 @@ func (c *LiveGCFClient) GetWIFProvider(ctx context.Context, projectNumber, poolI
 	return &WIFProviderInfo{
 		AttributeCondition: provider.AttributeCondition,
 		AllowedAudiences:   provider.OIDC.AllowedAudiences,
+		IssuerURI:          provider.OIDC.IssuerURI,
+		State:              provider.State,
+		Disabled:           provider.Disabled,
 	}, nil
 }
 
@@ -345,7 +453,7 @@ func (c *LiveGCFClient) UpdateWIFProvider(ctx context.Context, projectNumber, po
 		return fmt.Errorf("marshaling WIF provider update: %w", err)
 	}
 
-	resp, err := c.Client.DoRequest(ctx, http.MethodPatch, patchURL, string(payloadBytes))
+	resp, err := c.doWIFRequestWithRetry(ctx, http.MethodPatch, patchURL, string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("updating WIF provider: %w", err)
 	}
@@ -370,7 +478,7 @@ func (c *LiveGCFClient) undeleteWIFProvider(ctx context.Context, projectNumber, 
 	reqURL := fmt.Sprintf("https://iam.googleapis.com/v1/projects/%s/locations/global/workloadIdentityPools/%s/providers/%s:undelete",
 		url.PathEscape(projectNumber), url.PathEscape(poolID), url.PathEscape(providerID))
 
-	resp, err := c.Client.DoRequest(ctx, http.MethodPost, reqURL, "{}")
+	resp, err := c.doWIFRequestWithRetry(ctx, http.MethodPost, reqURL, "{}")
 	if err != nil {
 		return err
 	}
@@ -667,7 +775,7 @@ func (c *LiveGCFClient) enableWIFProvider(ctx context.Context, projectNumber, po
 		return fmt.Errorf("marshaling enable payload: %w", err)
 	}
 
-	resp, err := c.Client.DoRequest(ctx, http.MethodPatch, patchURL, string(payloadBytes))
+	resp, err := c.doWIFRequestWithRetry(ctx, http.MethodPatch, patchURL, string(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("enabling WIF provider: %w", err)
 	}
@@ -705,16 +813,32 @@ func (c *LiveGCFClient) DeleteWIFProvider(ctx context.Context, projectNumber, po
 
 // SetSecretIAMBinding sets an IAM binding on a Secret Manager resource.
 // Uses read-modify-write with retry on 409 Conflict (etag mismatch).
+// The member is added to the existing binding for the role (additive).
 func (c *LiveGCFClient) SetSecretIAMBinding(ctx context.Context, resource, member, role string) error {
+	return c.setSecretIAMBindingWithMode(ctx, resource, member, role, false)
+}
+
+// ReplaceSecretIAMBinding sets the IAM binding for a role on a Secret
+// Manager resource, replacing all existing members for that role with
+// the specified member. This is destructive: any other members bound
+// to the same role are silently removed. Safe for fullsend-managed bot
+// token secrets which have a single expected accessor.
+func (c *LiveGCFClient) ReplaceSecretIAMBinding(ctx context.Context, resource, member, role string) error {
+	return c.setSecretIAMBindingWithMode(ctx, resource, member, role, true)
+}
+
+// setSecretIAMBindingWithMode is the shared implementation for both additive
+// (replace=false) and replace (replace=true) Secret Manager IAM operations.
+func (c *LiveGCFClient) setSecretIAMBindingWithMode(ctx context.Context, resource, member, role string, replace bool) error {
 	if !secretResourcePattern.MatchString(resource) {
 		return fmt.Errorf("invalid secret resource path %q", resource)
 	}
-	const maxRetries = 3
+	const maxRetries = 7
 	getURL := fmt.Sprintf("https://secretmanager.googleapis.com/v1/%s:getIamPolicy", resource)
 	setURL := fmt.Sprintf("https://secretmanager.googleapis.com/v1/%s:setIamPolicy", resource)
 
 	for attempt := range maxRetries {
-		err := c.trySetIAMBinding(ctx, http.MethodGet, "", getURL, setURL, member, role)
+		err := c.trySetIAMBinding(ctx, http.MethodGet, "", getURL, setURL, member, role, replace)
 		if err == nil {
 			return nil
 		}
@@ -724,7 +848,7 @@ func (c *LiveGCFClient) SetSecretIAMBinding(ctx context.Context, resource, membe
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Duration(200*(attempt+1)) * time.Millisecond):
+		case <-time.After(iamRetryDelay(attempt)):
 		}
 	}
 	return fmt.Errorf("IAM policy update failed after %d retries", maxRetries)
@@ -741,17 +865,69 @@ func isConflict(err error) bool {
 	return errors.As(err, &ce)
 }
 
+// doWIFRequestWithRetry executes an HTTP request and retries on 429
+// (Too Many Requests) responses from the GCP IAM API. Uses iamRetryDelay
+// for exponential backoff with jitter, consistent with the retry strategy
+// used for IAM read-modify-write 409 conflicts. On success (or any
+// non-429 status), returns the response for the caller to handle.
+func (c *LiveGCFClient) doWIFRequestWithRetry(ctx context.Context, method, url, payload string) (*http.Response, error) {
+	const maxRetries = 7
+	for attempt := range maxRetries {
+		resp, err := c.Client.DoRequest(ctx, method, url, payload)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			return resp, nil
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if attempt == maxRetries-1 {
+			return nil, fmt.Errorf("rate limited (HTTP 429) after %d attempts", maxRetries)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(iamRetryDelay(attempt)):
+		}
+	}
+	return nil, fmt.Errorf("rate limited (HTTP 429) after %d attempts", maxRetries)
+}
+
+// iamRetryDelay returns the backoff duration for an IAM read-modify-write
+// retry. Uses exponential backoff with jitter: 500ms base, doubling each
+// attempt, capped at 10s. Jitter randomises 50-100% of the computed delay
+// to desynchronise concurrent callers (e.g. parallel behaviour test pool
+// repos all updating the same project IAM policy).
+//
+// Package-level var so tests can override (see secondaryRateLimitBackoff
+// in internal/forge/github for the same pattern).
+var iamRetryDelay = func(attempt int) time.Duration {
+	const (
+		baseDelay = 500 * time.Millisecond
+		maxDelay  = 10 * time.Second
+	)
+	delay := min(baseDelay<<uint(attempt), maxDelay) // 500ms, 1s, 2s, 4s, 8s, 10s, …
+	// Jitter: randomise between 50-100% of the delay.
+	half := delay / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
 // SetProjectIAMBinding sets an IAM binding on a GCP project.
 // Uses read-modify-write with retry on 409 Conflict (etag mismatch).
+// Retries up to 7 times with exponential backoff and jitter (500ms base,
+// capped at 10s) to handle concurrent read-modify-write contention when
+// multiple callers (e.g. parallel behaviour test pool repos) update the
+// same project-level IAM policy simultaneously.
 func (c *LiveGCFClient) SetProjectIAMBinding(ctx context.Context, projectID, member, role string) error {
-	const maxRetries = 3
+	const maxRetries = 7
 	getURL := fmt.Sprintf("https://cloudresourcemanager.googleapis.com/v1/projects/%s:getIamPolicy",
 		url.PathEscape(projectID))
 	setURL := fmt.Sprintf("https://cloudresourcemanager.googleapis.com/v1/projects/%s:setIamPolicy",
 		url.PathEscape(projectID))
 
 	for attempt := range maxRetries {
-		err := c.trySetIAMBinding(ctx, http.MethodPost, "{}", getURL, setURL, member, role)
+		err := c.trySetIAMBinding(ctx, http.MethodPost, "{}", getURL, setURL, member, role, false)
 		if err == nil {
 			return nil
 		}
@@ -761,7 +937,7 @@ func (c *LiveGCFClient) SetProjectIAMBinding(ctx context.Context, projectID, mem
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Duration(200*(attempt+1)) * time.Millisecond):
+		case <-time.After(iamRetryDelay(attempt)):
 		}
 	}
 	return fmt.Errorf("project IAM policy update failed after %d retries", maxRetries)
@@ -770,7 +946,9 @@ func (c *LiveGCFClient) SetProjectIAMBinding(ctx context.Context, projectID, mem
 // trySetIAMBinding performs a single read-modify-write IAM policy update.
 // getMethod/getBody control the getIamPolicy request (GET+"" for Secret Manager,
 // POST+"{}" for Cloud Resource Manager). setIamPolicy always uses POST.
-func (c *LiveGCFClient) trySetIAMBinding(ctx context.Context, getMethod, getBody, getURL, setURL, member, role string) error {
+// When replace is true, all existing members for the role are replaced with
+// the specified member instead of appending.
+func (c *LiveGCFClient) trySetIAMBinding(ctx context.Context, getMethod, getBody, getURL, setURL, member, role string, replace bool) error {
 	resp, err := c.Client.DoRequest(ctx, getMethod, getURL, getBody)
 	if err != nil {
 		return fmt.Errorf("getting IAM policy: %w", err)
@@ -798,13 +976,19 @@ func (c *LiveGCFClient) trySetIAMBinding(ctx context.Context, getMethod, getBody
 		if binding["role"] != role {
 			continue
 		}
-		members, _ := binding["members"].([]interface{})
-		for _, m := range members {
-			if m == member {
-				return nil
+		if replace {
+			// Replace mode: set members to only the specified member.
+			binding["members"] = []string{member}
+		} else {
+			// Additive mode: append the member if not already present.
+			members, _ := binding["members"].([]interface{})
+			for _, m := range members {
+				if m == member {
+					return nil
+				}
 			}
+			binding["members"] = append(members, member)
 		}
-		binding["members"] = append(members, member)
 		found = true
 		break
 	}
@@ -936,6 +1120,40 @@ func (c *LiveGCFClient) trySetCloudRunInvoker(ctx context.Context, baseURL strin
 	return true, nil
 }
 
+// DeleteFunction permanently deletes a Cloud Function v2.
+func (c *LiveGCFClient) DeleteFunction(ctx context.Context, projectID, region, functionName string) error {
+	reqURL := fmt.Sprintf("https://cloudfunctions.googleapis.com/v2/projects/%s/locations/%s/functions/%s",
+		url.PathEscape(projectID), url.PathEscape(region), url.PathEscape(functionName))
+
+	resp, err := c.Client.DoRequest(ctx, http.MethodDelete, reqURL, "")
+	if err != nil {
+		return fmt.Errorf("deleting function: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // already deleted
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return fmt.Errorf("unexpected status %d deleting function: %s", resp.StatusCode, gcp.ExtractErrorMessage(body))
+	}
+
+	// The response is a long-running operation.
+	var result struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decoding delete function response: %w", err)
+	}
+	if result.Name != "" {
+		if err := c.WaitForOperation(ctx, result.Name); err != nil {
+			return fmt.Errorf("waiting for function deletion: %w", err)
+		}
+	}
+	return nil
+}
+
 // GetFunction checks if a Cloud Function exists and returns its info.
 func (c *LiveGCFClient) GetFunction(ctx context.Context, projectID, region, functionName string) (*FunctionInfo, error) {
 	reqURL := fmt.Sprintf("https://cloudfunctions.googleapis.com/v2/projects/%s/locations/%s/functions/%s",
@@ -974,6 +1192,34 @@ func (c *LiveGCFClient) GetFunction(ctx context.Context, projectID, region, func
 		Region:  region,
 		EnvVars: result.ServiceConfig.EnvironmentVariables,
 	}, nil
+}
+
+// GetCloudRunServiceURI returns the public URI of a Cloud Run service.
+func (c *LiveGCFClient) GetCloudRunServiceURI(ctx context.Context, projectID, region, serviceName string) (string, error) {
+	serviceURL := fmt.Sprintf("https://run.googleapis.com/v2/projects/%s/locations/%s/services/%s",
+		url.PathEscape(projectID), url.PathEscape(region), url.PathEscape(serviceName))
+
+	resp, err := c.Client.DoRequest(ctx, http.MethodGet, serviceURL, "")
+	if err != nil {
+		return "", fmt.Errorf("getting Cloud Run service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return "", fmt.Errorf("unexpected status %d getting Cloud Run service: %s", resp.StatusCode, gcp.ExtractErrorMessage(body))
+	}
+
+	var service struct {
+		URI string `json:"uri"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&service); err != nil {
+		return "", fmt.Errorf("decoding Cloud Run service: %w", err)
+	}
+	return service.URI, nil
 }
 
 // UploadFunctionSource generates a signed upload URL and uploads the source zip.
@@ -1526,6 +1772,7 @@ func (c *LiveGCFClient) waitForCloudRunOperation(ctx context.Context, operationN
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
+	delay := c.getPollDelay()
 	for {
 		resp, err := c.Client.DoRequest(ctx, http.MethodGet, reqURL, "")
 		if err != nil {
@@ -1554,7 +1801,7 @@ func (c *LiveGCFClient) waitForCloudRunOperation(ctx context.Context, operationN
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(3 * time.Second):
+		case <-delay(3 * time.Second):
 		}
 	}
 }
@@ -1743,6 +1990,7 @@ func (c *LiveGCFClient) GetServiceRevisionInfo(ctx context.Context, projectID, r
 			envVars[e.Name] = e.Value
 		}
 		info.TrafficEnvVars = envVars
+		info.TrafficEnvVarsFromTemplate = true
 	}
 
 	return info, nil
@@ -1759,6 +2007,7 @@ func (c *LiveGCFClient) WaitForOperation(ctx context.Context, operationName stri
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
+	delay := c.getPollDelay()
 	for {
 		resp, err := c.Client.DoRequest(ctx, http.MethodGet, reqURL, "")
 		if err != nil {
@@ -1787,7 +2036,7 @@ func (c *LiveGCFClient) WaitForOperation(ctx context.Context, operationName stri
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-delay(5 * time.Second):
 		}
 	}
 }
@@ -1813,7 +2062,7 @@ func (c *LiveGCFClient) waitForIAMOperation(ctx context.Context, body io.Reader)
 		return nil
 	}
 	if op.Name == "" {
-		return nil
+		return fmt.Errorf("IAM operation returned no name and is not done")
 	}
 	if !operationNamePattern.MatchString(op.Name) {
 		return fmt.Errorf("invalid IAM operation name format: %q", op.Name)
@@ -1822,12 +2071,13 @@ func (c *LiveGCFClient) waitForIAMOperation(ctx context.Context, body io.Reader)
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
+	delay := c.getPollDelay()
 	reqURL := fmt.Sprintf("https://iam.googleapis.com/v1/%s", op.Name)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-delay(2 * time.Second):
 		}
 
 		resp, err := c.Client.DoRequest(ctx, http.MethodGet, reqURL, "")

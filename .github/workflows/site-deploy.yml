@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   deploy:
+    timeout-minutes: 15
     runs-on: ubuntu-24.04
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
@@ -28,9 +29,9 @@ jobs:
     steps:
       # Trusted tree only: wrangler.toml must not come from PR checkout (no PR-controlled [build] on the deploy runner).
       # PR/fork Worker + static files ship in the Build Site artifact under _bundle/; we copy only public/ and worker/ (never extract TOML from the zip into cloudflare_site/).
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "22"
           cache: npm
@@ -40,7 +41,7 @@ jobs:
         run: npm ci
 
       - name: Download build artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: site
           path: _bundle
@@ -72,11 +73,6 @@ jobs:
           mkdir -p cloudflare_site/public cloudflare_site/worker
           cp -a _bundle/public/. cloudflare_site/public/
           cp -a _bundle/worker/. cloudflare_site/worker/
-
-      - name: Patch wrangler.toml for CI (worker name + rate limit namespaces)
-        env:
-          CLOUDFLARE_PROJECT_NAME: ${{ vars.CLOUDFLARE_PROJECT_NAME }}
-        run: node cloudflare_site/scripts/patch-wrangler-rate-limit-namespace-ids.mjs
 
       - name: Resolve preview context (PR number + preview alias)
         id: preview-context
@@ -122,57 +118,33 @@ jobs:
             core.setOutput('preview_alias', previewAlias);
             core.setOutput('pr_number', prNumber != null ? String(prNumber) : '');
 
-      # Same 10214 issue as previews: wrangler-action runs script-level `wrangler secret bulk`
-      # before `deploy` when `secrets:` is set. Use `wrangler versions secret bulk` in preCommands
-      # instead (cloudflare/wrangler-action#374).
-      # preCommands run under `/bin/sh` (dash on Ubuntu): no `pipefail` (bash-only).
-      # Each newline in preCommands is a separate shell invocation — no line continuations or
-      # multi-line printf; keep the secret bulk prep on one line so mktemp and the file path match.
+      # The site Worker is a static-asset passthrough: no vars or secrets are required.
       - name: Deploy to production (Workers + static assets)
         id: cf-prod
         if: github.event.workflow_run.event == 'push'
-        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65 # v3.14.1
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
         with:
-          wranglerVersion: "4.36.0"
+          wranglerVersion: "4.157.0"
           workingDirectory: cloudflare_site
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          preCommands: set -eu; secrets_file="$(mktemp)"; printf '%s\n' "GITHUB_APP_CLIENT_SECRET=${GITHUB_APP_CLIENT_SECRET}" "TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY}" >"$secrets_file"; npx wrangler@4.36.0 versions secret bulk "$secrets_file" --message "Production secrets (workflow-run ${{ github.event.workflow_run.id }})"; rm -f "$secrets_file"
+          packageManager: npm
           command: deploy --name="${{ vars.CLOUDFLARE_PROJECT_NAME }}"
-          vars: |
-            GITHUB_APP_CLIENT_ID
-            TURNSTILE_SITE_KEY
-        env:
-          GITHUB_APP_CLIENT_ID: ${{ vars.FULLSEND_GITHUB_APP_CLIENT_ID }}
-          GITHUB_APP_CLIENT_SECRET: ${{ secrets.FULLSEND_GITHUB_APP_CLIENT_SECRET }}
-          TURNSTILE_SITE_KEY: ${{ vars.FULLSEND_TURNSTILE_SITE_KEY }}
-          TURNSTILE_SECRET_KEY: ${{ secrets.FULLSEND_TURNSTILE_SECRET_KEY }}
 
-      # PR previews: wrangler-action runs script-level `wrangler secret bulk` *before* the main command.
-      # That conflicts with `versions upload` (API 10214: latest version isn't deployed). Apply secrets
-      # with `wrangler versions secret bulk` in preCommands instead (cloudflare/wrangler-action#374).
-      # Plain `vars` are only auto-injected for deploy/publish, so pass `--var` on `versions upload`.
-      # preCommands run under `/bin/sh` (dash on Ubuntu): no `pipefail` (bash-only).
-      # Each newline in preCommands is a separate shell invocation — keep secret bulk prep on one line.
       - name: Upload preview version (Workers + static assets)
         id: cf-preview
         if: github.event.workflow_run.event == 'pull_request'
-        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65 # v3.14.1
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
         with:
-          wranglerVersion: "4.36.0"
+          wranglerVersion: "4.157.0"
           workingDirectory: cloudflare_site
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          preCommands: set -eu; secrets_file="$(mktemp)"; printf '%s\n' "GITHUB_APP_CLIENT_SECRET=${GITHUB_APP_CLIENT_SECRET}" "TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY}" >"$secrets_file"; npx wrangler@4.36.0 versions secret bulk "$secrets_file" --message "PR preview secrets (workflow-run ${{ github.event.workflow_run.id }})"; rm -f "$secrets_file"
+          packageManager: npm
           command: >-
             versions upload
             --name="${{ vars.CLOUDFLARE_PROJECT_NAME }}"
             --preview-alias ${{ steps.preview-context.outputs.preview_alias }}
-            --var GITHUB_APP_CLIENT_ID:${{ vars.FULLSEND_GITHUB_APP_CLIENT_ID }}
-            --var TURNSTILE_SITE_KEY:${{ vars.FULLSEND_TURNSTILE_SITE_KEY }}
-        env:
-          GITHUB_APP_CLIENT_SECRET: ${{ secrets.FULLSEND_GITHUB_APP_CLIENT_SECRET }}
-          TURNSTILE_SECRET_KEY: ${{ secrets.FULLSEND_TURNSTILE_SECRET_KEY }}
 
       - name: Resolve deployment URL
         id: meta

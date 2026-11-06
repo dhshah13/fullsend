@@ -1,0 +1,80 @@
+{
+  "__typename": "Issue",
+  "number": 42,
+  "title": "Example issue",
+  "url": "https://github.com/acme/widget/issues/42",
+  "state": "OPEN",
+  "author": {
+    "login": "alice"
+  },
+  "assignees": {
+    "nodes": [
+      {
+        "login": "alice"
+      }
+    ]
+  },
+  "labels": {
+    "nodes": [
+      {
+        "name": "ready-to-code"
+      }
+    ]
+  },
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-02T00:00:00Z",
+  "body": "Some issue body text.",
+  "comments": {
+    "nodes": [
+      {
+        "author": {
+          "login": "bob"
+        },
+        "body": "A comment",
+        "createdAt": "2024-01-02T00:00:00Z"
+      }
+    ]
+  },
+  "blockedBy": {
+    "nodes": [
+      {
+        "number": 7,
+        "state": "OPEN",
+        "repository": {
+          "nameWithOwner": "acme/widget"
+        }
+      },
+      {
+        "number": 8,
+        "state": "CLOSED",
+        "repository": {
+          "nameWithOwner": "acme/widget"
+        }
+      }
+    ]
+  },
+  "subIssuesSummary": {
+    "total": 2,
+    "completed": 1
+  },
+  "subIssues": {
+    "nodes": [
+      {
+        "number": 50,
+        "state": "OPEN",
+        "title": "Child open",
+        "repository": {
+          "nameWithOwner": "acme/widget"
+        }
+      },
+      {
+        "number": 51,
+        "state": "CLOSED",
+        "title": "Child closed",
+        "repository": {
+          "nameWithOwner": "acme/widget"
+        }
+      }
+    ]
+  }
+}

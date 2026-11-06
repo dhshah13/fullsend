@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/fullsend-ai/fullsend/internal/fetch"
-	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/gitfetch"
 	"github.com/fullsend-ai/fullsend/internal/harness"
 )
 
@@ -41,35 +42,30 @@ func forgeSkillCleanURL(path string) string {
 		testForgeOwner, testForgeRepo, testForgeRef, path)
 }
 
-// registerSkillDir sets up a skill directory in the FakeClient and returns the tree hash.
-func registerSkillDir(fc *forge.FakeClient, path string, files map[string][]byte) string {
-	treeHash := fetch.ComputeTreeHash(files)
+// skillRegistry accumulates skill directories and produces a TreeFetchFunc
+// that routes requests by path.
+type skillRegistry struct {
+	dirs map[string]map[string][]byte // path → files
+}
 
-	dirKey := fmt.Sprintf("%s/%s/%s@%s", testForgeOwner, testForgeRepo, path, testForgeRef)
+func newSkillRegistry() *skillRegistry {
+	return &skillRegistry{dirs: make(map[string]map[string][]byte)}
+}
 
-	entries := make([]forge.DirectoryEntry, 0, len(files))
-	for relPath, content := range files {
-		entries = append(entries, forge.DirectoryEntry{
-			Path: relPath,
-			Type: "file",
-			Size: len(content),
-		})
+// register adds a skill directory and returns the tree hash.
+func (r *skillRegistry) register(path string, files map[string][]byte) string {
+	r.dirs[path] = files
+	return fetch.ComputeTreeHash(files)
+}
+
+// fetcher returns a TreeFetchFunc that serves registered directories.
+func (r *skillRegistry) fetcher() gitfetch.TreeFetchFunc {
+	return func(_ context.Context, _, path, _, _ string) (map[string][]byte, error) {
+		if files, ok := r.dirs[path]; ok {
+			return files, nil
+		}
+		return nil, fmt.Errorf("path %q not found in skill registry", path)
 	}
-
-	if fc.DirContents == nil {
-		fc.DirContents = make(map[string][]forge.DirectoryEntry)
-	}
-	if fc.FileContentsRef == nil {
-		fc.FileContentsRef = make(map[string][]byte)
-	}
-
-	fc.DirContents[dirKey] = entries
-	for relPath, content := range files {
-		fileKey := fmt.Sprintf("%s/%s/%s/%s@%s", testForgeOwner, testForgeRepo, path, relPath, testForgeRef)
-		fc.FileContentsRef[fileKey] = content
-	}
-
-	return treeHash
 }
 
 // skillFrontmatter returns SKILL.md content with the given YAML frontmatter fields
@@ -100,17 +96,17 @@ func TestResolveHarness_LocalPassThrough(t *testing.T) {
 	h := &harness.Harness{
 		Agent:  "/abs/path/agents/test.md",
 		Policy: "/abs/path/policies/readonly.yaml",
-		Skills: []string{"/abs/path/skills/local-skill"},
+		Skills: []harness.SkillEntry{{Source: "/abs/path/skills/local-skill"}},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
 	})
 	require.NoError(t, err)
-	assert.Empty(t, deps)
+	assert.Empty(t, result.Deps)
 	assert.Equal(t, "/abs/path/agents/test.md", h.Agent)
 	assert.Equal(t, "/abs/path/policies/readonly.yaml", h.Policy)
-	assert.Equal(t, "/abs/path/skills/local-skill", h.Skills[0])
+	assert.Equal(t, "/abs/path/skills/local-skill", h.Skills[0].Source)
 }
 
 func TestResolveHarness_URLFetchAndCache(t *testing.T) {
@@ -128,17 +124,17 @@ func TestResolveHarness_URLFetchAndCache(t *testing.T) {
 		AllowedRemoteResources: []string{srv.URL + "/"},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
 		FetchPolicy:   policy,
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 1)
+	require.Len(t, result.Deps, 1)
 
-	assert.Equal(t, fmt.Sprintf("%s/agents/code.md", srv.URL), deps[0].URL)
-	assert.Equal(t, agentHash, deps[0].SHA256)
-	assert.False(t, deps[0].CacheHit)
-	assert.Equal(t, "file", deps[0].Type)
+	assert.Equal(t, fmt.Sprintf("%s/agents/code.md", srv.URL), result.Deps[0].URL)
+	assert.Equal(t, agentHash, result.Deps[0].SHA256)
+	assert.False(t, result.Deps[0].CacheHit)
+	assert.Equal(t, "file", result.Deps[0].Type)
 
 	assert.True(t, strings.HasSuffix(h.Agent, "/content"))
 	assert.False(t, harness.IsURL(h.Agent))
@@ -166,71 +162,74 @@ func TestResolveHarness_DependencyField(t *testing.T) {
 		}
 	}))
 
-	fc := &forge.FakeClient{}
-	skillHash := registerSkillDir(fc, "skills/rust", map[string][]byte{"SKILL.md": skillMD})
+	reg := newSkillRegistry()
+	skillHash := reg.register("skills/rust", map[string][]byte{"SKILL.md": skillMD})
 
 	root := t.TempDir()
 	h := &harness.Harness{
 		Agent:                  fmt.Sprintf("%s/agents/code.md#sha256=%s", srv.URL, agentHash),
 		Policy:                 fmt.Sprintf("%s/policies/ro.yaml#sha256=%s", srv.URL, policyHash),
-		Skills:                 []string{forgeSkillURL("skills/rust", skillHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/rust", skillHash)}},
 		AllowedRemoteResources: []string{srv.URL + "/", testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
 		FetchPolicy:   fetchPolicy,
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 3)
+	require.Len(t, result.Deps, 3)
 
-	assert.Equal(t, "agent", deps[0].Field)
-	assert.Equal(t, "file", deps[0].Type)
-	assert.Equal(t, "policy", deps[1].Field)
-	assert.Equal(t, "file", deps[1].Type)
-	assert.Equal(t, "skills[0]", deps[2].Field)
-	assert.Equal(t, "directory", deps[2].Type)
+	assert.Equal(t, "agent", result.Deps[0].Field)
+	assert.Equal(t, "file", result.Deps[0].Type)
+	assert.Equal(t, "policy", result.Deps[1].Field)
+	assert.Equal(t, "file", result.Deps[1].Type)
+	assert.Equal(t, "skills[0]", result.Deps[2].Field)
+	assert.Equal(t, "directory", result.Deps[2].Type)
 }
 
 func TestResolveHarness_SkillDirFetchAndCache(t *testing.T) {
 	skillMD := []byte("---\nname: review\n---\n# Code Review skill")
 	helperSh := []byte("#!/bin/bash\necho hello")
 
-	fc := &forge.FakeClient{}
-	treeHash := registerSkillDir(fc, "skills/review", map[string][]byte{
+	reg := newSkillRegistry()
+	treeHash := reg.register("skills/review", map[string][]byte{
 		"SKILL.md":          skillMD,
 		"scripts/helper.sh": helperSh,
 	})
 
 	root := t.TempDir()
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/review", treeHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/review", treeHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 1)
-	assert.Equal(t, "directory", deps[0].Type)
-	assert.Equal(t, treeHash, deps[0].SHA256)
-	assert.False(t, deps[0].CacheHit)
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, "directory", result.Deps[0].Type)
+	assert.Equal(t, treeHash, result.Deps[0].SHA256)
+	assert.False(t, result.Deps[0].CacheHit)
 
-	// Verify h.Skills[0] is a directory path (the tree/ subdirectory).
-	info, err := os.Stat(h.Skills[0])
+	// Verify h.Skills[0] is a directory path whose basename is the skill
+	// directory name from the URL ("review"), not the cache-internal "tree".
+	info, err := os.Stat(h.Skills[0].Source)
 	require.NoError(t, err)
 	assert.True(t, info.IsDir())
+	assert.Equal(t, "review", filepath.Base(h.Skills[0].Source),
+		"skill path basename should be the skill directory name from the URL, not 'tree'")
 
 	// Verify SKILL.md is inside the cached directory.
-	got, err := os.ReadFile(filepath.Join(h.Skills[0], "SKILL.md"))
+	got, err := os.ReadFile(filepath.Join(h.Skills[0].Source, "SKILL.md"))
 	require.NoError(t, err)
 	assert.Equal(t, skillMD, got)
 
 	// Verify companion file is inside the cached directory.
-	got, err = os.ReadFile(filepath.Join(h.Skills[0], "scripts", "helper.sh"))
+	got, err = os.ReadFile(filepath.Join(h.Skills[0].Source, "scripts", "helper.sh"))
 	require.NoError(t, err)
 	assert.Equal(t, helperSh, got)
 }
@@ -238,9 +237,9 @@ func TestResolveHarness_SkillDirFetchAndCache(t *testing.T) {
 func TestResolveHarness_SkillDirCacheHit(t *testing.T) {
 	skillMD := []byte("# Cached skill")
 
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 	files := map[string][]byte{"SKILL.md": skillMD}
-	treeHash := registerSkillDir(fc, "skills/cached", files)
+	treeHash := reg.register("skills/cached", files)
 
 	root := t.TempDir()
 	// Pre-populate the directory cache.
@@ -248,33 +247,81 @@ func TestResolveHarness_SkillDirCacheHit(t *testing.T) {
 	require.NoError(t, err)
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/cached", treeHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/cached", treeHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 1)
-	assert.True(t, deps[0].CacheHit)
+	require.Len(t, result.Deps, 1)
+	assert.True(t, result.Deps[0].CacheHit)
+	assert.Equal(t, "cached", filepath.Base(h.Skills[0].Source),
+		"cache-hit skill path basename should be the skill directory name from the URL")
+}
+
+func TestResolveHarness_SkillDirDotDotFallsBackToTree(t *testing.T) {
+	skillMD := []byte("# DotDot skill")
+
+	reg := newSkillRegistry()
+	files := map[string][]byte{"SKILL.md": skillMD}
+	treeHash := reg.register("skills/..", files)
+
+	root := t.TempDir()
+	h := &harness.Harness{
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/..", treeHash)}},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		TreeFetcher:   reg.fetcher(),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, "tree", filepath.Base(h.Skills[0].Source),
+		"skill path with '..' basename should fall back to 'tree' to prevent traversal")
+}
+
+func TestResolveHarness_SkillDirMetadataJsonFallsBackToTree(t *testing.T) {
+	skillMD := []byte("# MetadataJson skill")
+
+	reg := newSkillRegistry()
+	files := map[string][]byte{"SKILL.md": skillMD}
+	treeHash := reg.register("skills/metadata.json", files)
+
+	root := t.TempDir()
+	h := &harness.Harness{
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/metadata.json", treeHash)}},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		TreeFetcher:   reg.fetcher(),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, "tree", filepath.Base(h.Skills[0].Source),
+		"skill path with 'metadata.json' basename should fall back to 'tree' to avoid cache file collision")
 }
 
 func TestResolveHarness_SkillDirHashMismatch(t *testing.T) {
-	fc := &forge.FakeClient{}
-	registerSkillDir(fc, "skills/tampered", map[string][]byte{"SKILL.md": []byte("wrong content")})
+	reg := newSkillRegistry()
+	reg.register("skills/tampered", map[string][]byte{"SKILL.md": []byte("wrong content")})
 
 	wrongHash := fetch.ComputeTreeHash(map[string][]byte{"SKILL.md": []byte("expected content")})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/tampered", wrongHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/tampered", wrongHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "integrity check failed")
@@ -287,7 +334,7 @@ func TestResolveHarness_SkillNonForgeURLRejected(t *testing.T) {
 
 	fakeHash := strings.Repeat("a", 64)
 	h := &harness.Harness{
-		Skills:                 []string{fmt.Sprintf("%s/skills/review#sha256=%s", srv.URL, fakeHash)},
+		Skills:                 []harness.SkillEntry{{Source: fmt.Sprintf("%s/skills/review#sha256=%s", srv.URL, fakeHash)}},
 		AllowedRemoteResources: []string{srv.URL + "/"},
 	}
 
@@ -299,37 +346,52 @@ func TestResolveHarness_SkillNonForgeURLRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "supported forge")
 }
 
+func TestResolveHarness_GitLabURLRejected(t *testing.T) {
+	fakeHash := strings.Repeat("a", 64)
+	h := &harness.Harness{
+		Skills:                 []harness.SkillEntry{{Source: fmt.Sprintf("https://gitlab.com/org/repo/-/tree/main/skills/review#sha256=%s", fakeHash)}},
+		AllowedRemoteResources: []string{"https://gitlab.com/org/repo/"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: t.TempDir(),
+		FetchPolicy:   fetch.FetchPolicy{},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fetch support has not landed yet")
+}
+
 func TestResolveHarness_DiamondDependency(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	sharedMD := []byte("---\ndependencies: []\n---\n# Shared skill")
-	sharedHash := registerSkillDir(fc, "skills/shared", map[string][]byte{"SKILL.md": sharedMD})
+	sharedHash := reg.register("skills/shared", map[string][]byte{"SKILL.md": sharedMD})
 
 	parentMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - shared#sha256=%s\n", sharedHash),
 		"# Parent skill",
 	)
-	parentHash := registerSkillDir(fc, "skills/parent", map[string][]byte{"SKILL.md": parentMD})
+	parentHash := reg.register("skills/parent", map[string][]byte{"SKILL.md": parentMD})
 
 	root := t.TempDir()
 	h := &harness.Harness{
-		Skills: []string{
-			forgeSkillURL("skills/parent", parentHash),
-			forgeSkillURL("skills/shared", sharedHash),
+		Skills: []harness.SkillEntry{
+			{Source: forgeSkillURL("skills/parent", parentHash)},
+			{Source: forgeSkillURL("skills/shared", sharedHash)},
 		},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      5,
 	})
 	require.NoError(t, err)
 
 	sharedCleanURL := forgeSkillCleanURL("skills/shared")
 	var sharedFields []string
-	for _, d := range deps {
+	for _, d := range result.Deps {
 		if d.URL == sharedCleanURL {
 			sharedFields = append(sharedFields, d.Field)
 		}
@@ -359,13 +421,13 @@ func TestResolveHarness_CacheHit(t *testing.T) {
 		AllowedRemoteResources: []string{srv.URL + "/"},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
 		FetchPolicy:   policy,
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 1)
-	assert.True(t, deps[0].CacheHit)
+	require.Len(t, result.Deps, 1)
+	assert.True(t, result.Deps[0].CacheHit)
 	assert.Equal(t, int32(0), fetchCount.Load())
 }
 
@@ -457,13 +519,13 @@ func TestResolveHarness_OfflineHit(t *testing.T) {
 		AllowedRemoteResources: []string{"https://example.com/"},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
 		FetchPolicy:   fetch.FetchPolicy{Offline: true},
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 1)
-	assert.True(t, deps[0].CacheHit)
+	require.Len(t, result.Deps, 1)
+	assert.True(t, result.Deps[0].CacheHit)
 
 	got, err := os.ReadFile(h.Agent)
 	require.NoError(t, err)
@@ -471,17 +533,17 @@ func TestResolveHarness_OfflineHit(t *testing.T) {
 }
 
 func TestResolveHarness_SkillDirOfflineMiss(t *testing.T) {
-	fc := &forge.FakeClient{}
-	skillHash := registerSkillDir(fc, "skills/offline", map[string][]byte{"SKILL.md": []byte("# Skill")})
+	reg := newSkillRegistry()
+	skillHash := reg.register("skills/offline", map[string][]byte{"SKILL.md": []byte("# Skill")})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/offline", skillHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/offline", skillHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		FetchPolicy:   fetch.FetchPolicy{Offline: true},
 	})
 	require.Error(t, err)
@@ -489,27 +551,27 @@ func TestResolveHarness_SkillDirOfflineMiss(t *testing.T) {
 }
 
 func TestResolveHarness_SkillDirOfflineHit(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 	files := map[string][]byte{"SKILL.md": []byte("# Cached skill for offline")}
-	skillHash := registerSkillDir(fc, "skills/offline", files)
+	skillHash := reg.register("skills/offline", files)
 
 	root := t.TempDir()
 	_, err := fetch.CachePutDir(root, forgeSkillCleanURL("skills/offline"), files)
 	require.NoError(t, err)
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/offline", skillHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/offline", skillHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		FetchPolicy:   fetch.FetchPolicy{Offline: true},
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 1)
-	assert.True(t, deps[0].CacheHit)
+	require.Len(t, result.Deps, 1)
+	assert.True(t, result.Deps[0].CacheHit)
 }
 
 func TestResolveHarness_MixedHarness(t *testing.T) {
@@ -525,20 +587,20 @@ func TestResolveHarness_MixedHarness(t *testing.T) {
 	h := &harness.Harness{
 		Agent:                  agentURL,
 		Policy:                 "/local/policies/readonly.yaml",
-		Skills:                 []string{"/local/skills/debug"},
+		Skills:                 []harness.SkillEntry{{Source: "/local/skills/debug"}},
 		AllowedRemoteResources: []string{srv.URL + "/"},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
 		FetchPolicy:   policy,
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 1)
+	require.Len(t, result.Deps, 1)
 
 	assert.False(t, harness.IsURL(h.Agent))
 	assert.Equal(t, "/local/policies/readonly.yaml", h.Policy)
-	assert.Equal(t, "/local/skills/debug", h.Skills[0])
+	assert.Equal(t, "/local/skills/debug", h.Skills[0].Source)
 }
 
 func TestResolveHarness_AuditEntries(t *testing.T) {
@@ -583,41 +645,45 @@ func TestResolveHarness_AuditEntries(t *testing.T) {
 }
 
 func TestResolveHarness_MultipleSkills(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 	skill1MD := []byte("# Skill one")
 	skill2MD := []byte("# Skill two")
 
-	skill1Hash := registerSkillDir(fc, "skills/one", map[string][]byte{"SKILL.md": skill1MD})
-	skill2Hash := registerSkillDir(fc, "skills/two", map[string][]byte{"SKILL.md": skill2MD})
+	skill1Hash := reg.register("skills/one", map[string][]byte{"SKILL.md": skill1MD})
+	skill2Hash := reg.register("skills/two", map[string][]byte{"SKILL.md": skill2MD})
 
 	root := t.TempDir()
 	h := &harness.Harness{
 		Agent: "/local/agents/test.md",
-		Skills: []string{
-			"/local/skills/debug",
-			forgeSkillURL("skills/one", skill1Hash),
-			forgeSkillURL("skills/two", skill2Hash),
+		Skills: []harness.SkillEntry{
+			{Source: "/local/skills/debug"},
+			{Source: forgeSkillURL("skills/one", skill1Hash)},
+			{Source: forgeSkillURL("skills/two", skill2Hash)},
 		},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 2)
+	require.Len(t, result.Deps, 2)
 
-	assert.Equal(t, "/local/skills/debug", h.Skills[0])
-	assert.False(t, harness.IsURL(h.Skills[1]))
-	assert.False(t, harness.IsURL(h.Skills[2]))
+	assert.Equal(t, "/local/skills/debug", h.Skills[0].Source)
+	assert.False(t, harness.IsURL(h.Skills[1].Source))
+	assert.False(t, harness.IsURL(h.Skills[2].Source))
+
+	// Verify skills resolve to directories named after the URL path, not "tree".
+	assert.Equal(t, "one", filepath.Base(h.Skills[1].Source))
+	assert.Equal(t, "two", filepath.Base(h.Skills[2].Source))
 
 	// Verify skills resolve to directories with SKILL.md inside.
-	got1, err := os.ReadFile(filepath.Join(h.Skills[1], "SKILL.md"))
+	got1, err := os.ReadFile(filepath.Join(h.Skills[1].Source, "SKILL.md"))
 	require.NoError(t, err)
 	assert.Equal(t, skill1MD, got1)
 
-	got2, err := os.ReadFile(filepath.Join(h.Skills[2], "SKILL.md"))
+	got2, err := os.ReadFile(filepath.Join(h.Skills[2].Source, "SKILL.md"))
 	require.NoError(t, err)
 	assert.Equal(t, skill2MD, got2)
 }
@@ -638,13 +704,13 @@ func TestResolveHarness_PolicyURL(t *testing.T) {
 		AllowedRemoteResources: []string{srv.URL + "/"},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: root,
 		FetchPolicy:   policy,
 	})
 	require.NoError(t, err)
-	require.Len(t, deps, 1)
-	assert.Equal(t, policyHash, deps[0].SHA256)
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, policyHash, result.Deps[0].SHA256)
 
 	got, err := os.ReadFile(h.Policy)
 	require.NoError(t, err)
@@ -674,49 +740,49 @@ func TestResolveHarness_EmptyFields(t *testing.T) {
 		Agent: "/local/agents/test.md",
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
 	})
 	require.NoError(t, err)
-	assert.Empty(t, deps)
+	assert.Empty(t, result.Deps)
 }
 
 // TestResolveHarness_TransitiveChain verifies A→B→C transitive resolution:
 // all three skill directories are fetched and added to h.Skills.
 func TestResolveHarness_TransitiveChain(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	cMD := []byte("# Skill C — leaf node")
-	cHash := registerSkillDir(fc, "skills/c", map[string][]byte{"SKILL.md": cMD})
+	cHash := reg.register("skills/c", map[string][]byte{"SKILL.md": cMD})
 
 	bMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - c#sha256=%s\n", cHash),
 		"# Skill B",
 	)
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.NoError(t, err)
-	assert.Len(t, deps, 3)
+	assert.Len(t, result.Deps, 3)
 	assert.Len(t, h.Skills, 3)
 
 	urls := make(map[string]bool)
-	for _, d := range deps {
+	for _, d := range result.Deps {
 		urls[d.URL] = true
 	}
 	assert.True(t, urls[forgeSkillCleanURL("skills/a")])
@@ -727,42 +793,42 @@ func TestResolveHarness_TransitiveChain(t *testing.T) {
 // TestResolveHarness_DiamondDedup verifies that a diamond graph (A→C, B→C) resolves C
 // exactly once and produces no duplicate entries in deps or h.Skills.
 func TestResolveHarness_DiamondDedup(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	cMD := []byte("# Skill C — shared dep")
-	cHash := registerSkillDir(fc, "skills/c", map[string][]byte{"SKILL.md": cMD})
+	cHash := reg.register("skills/c", map[string][]byte{"SKILL.md": cMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - c#sha256=%s\n", cHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	bMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - c#sha256=%s\n", cHash),
 		"# Skill B",
 	)
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	h := &harness.Harness{
-		Skills: []string{
-			forgeSkillURL("skills/a", aHash),
-			forgeSkillURL("skills/b", bHash),
+		Skills: []harness.SkillEntry{
+			{Source: forgeSkillURL("skills/a", aHash)},
+			{Source: forgeSkillURL("skills/b", bHash)},
 		},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.NoError(t, err)
-	assert.Len(t, deps, 3)
+	assert.Len(t, result.Deps, 3)
 	assert.Len(t, h.Skills, 3)
 
 	urls := make(map[string]bool)
-	for _, d := range deps {
+	for _, d := range result.Deps {
 		assert.False(t, urls[d.URL], "duplicate dep URL %s", d.URL)
 		urls[d.URL] = true
 	}
@@ -770,7 +836,7 @@ func TestResolveHarness_DiamondDedup(t *testing.T) {
 
 // TestResolveHarness_CycleDetection verifies that A→B→A is rejected with a cycle error.
 func TestResolveHarness_CycleDetection(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	placeholderHash := strings.Repeat("a", 64)
 
@@ -779,22 +845,22 @@ func TestResolveHarness_CycleDetection(t *testing.T) {
 		fmt.Sprintf("dependencies:\n  - a#sha256=%s\n", placeholderHash),
 		"# Skill B",
 	)
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.Error(t, err)
@@ -803,31 +869,31 @@ func TestResolveHarness_CycleDetection(t *testing.T) {
 
 // TestResolveHarness_MaxDepthExceeded verifies that a chain A→B→C fails when MaxDepth=1.
 func TestResolveHarness_MaxDepthExceeded(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	cMD := []byte("# Skill C — should not be reached")
-	cHash := registerSkillDir(fc, "skills/c", map[string][]byte{"SKILL.md": cMD})
+	cHash := reg.register("skills/c", map[string][]byte{"SKILL.md": cMD})
 
 	bMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - c#sha256=%s\n", cHash),
 		"# Skill B",
 	)
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      1,
 	})
 	require.Error(t, err)
@@ -837,26 +903,26 @@ func TestResolveHarness_MaxDepthExceeded(t *testing.T) {
 // TestResolveHarness_MaxResourcesExceeded verifies that resolution stops when the
 // resource count reaches MaxResources.
 func TestResolveHarness_MaxResourcesExceeded(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	bMD := []byte("# Skill B")
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
 	// MaxResources=1: A consumes the single slot; B is rejected.
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 		MaxResources:  1,
 	})
@@ -867,26 +933,26 @@ func TestResolveHarness_MaxResourcesExceeded(t *testing.T) {
 // TestResolveHarness_TransitiveNotInAllowlist verifies that a transitive dep whose
 // URL does not match allowed_remote_resources is rejected.
 func TestResolveHarness_TransitiveNotInAllowlist(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	bMD := []byte("# Skill B")
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills: []string{forgeSkillURL("skills/a", aHash)},
+		Skills: []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		// Only skill A's exact path is allowed; skill B (the transitive dep) is not.
 		AllowedRemoteResources: []string{forgeSkillCleanURL("skills/a")},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.Error(t, err)
@@ -896,10 +962,10 @@ func TestResolveHarness_TransitiveNotInAllowlist(t *testing.T) {
 // TestResolveHarness_TransitiveHashMismatch verifies that a transitive dep whose
 // fetched content does not match the declared tree hash is rejected.
 func TestResolveHarness_TransitiveHashMismatch(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	// Register B with content that doesn't match the hash A declares.
-	registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": []byte("tampered B content")})
+	reg.register("skills/b", map[string][]byte{"SKILL.md": []byte("tampered B content")})
 
 	// A declares B with the hash of "expected B content".
 	expectedBHash := fetch.ComputeTreeHash(map[string][]byte{"SKILL.md": []byte("expected B content")})
@@ -907,16 +973,16 @@ func TestResolveHarness_TransitiveHashMismatch(t *testing.T) {
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", expectedBHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.Error(t, err)
@@ -926,33 +992,33 @@ func TestResolveHarness_TransitiveHashMismatch(t *testing.T) {
 // TestResolveHarness_TransitiveRelativeURL verifies that a relative dependency reference
 // in skill frontmatter is resolved against the parent skill's URL.
 func TestResolveHarness_TransitiveRelativeURL(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	bMD := []byte("# Skill B — resolved via relative URL")
-	bHash := registerSkillDir(fc, "common/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("common/b", map[string][]byte{"SKILL.md": bMD})
 
 	// A is at skills/a; the relative dep "../common/b" resolves to common/b.
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - ../common/b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.NoError(t, err)
-	assert.Len(t, deps, 2)
+	assert.Len(t, result.Deps, 2)
 
 	urls := make(map[string]bool)
-	for _, d := range deps {
+	for _, d := range result.Deps {
 		urls[d.URL] = true
 	}
 	assert.True(t, urls[forgeSkillCleanURL("common/b")], "relative URL should resolve to common/b")
@@ -961,10 +1027,10 @@ func TestResolveHarness_TransitiveRelativeURL(t *testing.T) {
 // TestResolveHarness_ConflictingHashesForSameURL verifies that two skills declaring the
 // same transitive dep URL with different tree hashes is rejected.
 func TestResolveHarness_ConflictingHashesForSameURL(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	dMD := []byte("# Skill D")
-	dHash := registerSkillDir(fc, "skills/d", map[string][]byte{"SKILL.md": dMD})
+	dHash := reg.register("skills/d", map[string][]byte{"SKILL.md": dMD})
 	fakeHash := strings.Repeat("b", 64)
 
 	dURL := forgeSkillCleanURL("skills/d")
@@ -973,27 +1039,27 @@ func TestResolveHarness_ConflictingHashesForSameURL(t *testing.T) {
 		fmt.Sprintf("dependencies:\n  - d#sha256=%s\n", dHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	bMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - d#sha256=%s\n", fakeHash),
 		"# Skill B",
 	)
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	_ = dURL // referenced only to clarify the test setup
 
 	h := &harness.Harness{
-		Skills: []string{
-			forgeSkillURL("skills/a", aHash),
-			forgeSkillURL("skills/b", bHash),
+		Skills: []harness.SkillEntry{
+			{Source: forgeSkillURL("skills/a", aHash)},
+			{Source: forgeSkillURL("skills/b", bHash)},
 		},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.Error(t, err)
@@ -1013,102 +1079,102 @@ func TestResolveHarness_SkillPolicyLeafNode(t *testing.T) {
 		}
 	}))
 
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	policyURL := fmt.Sprintf("%s/policies/sandbox.yaml#sha256=%s", srv.URL, policyHash)
 	aMD := skillFrontmatter(
 		fmt.Sprintf("policy: %s\n", policyURL),
 		"# Skill A content",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase, srv.URL + "/"},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
 		FetchPolicy:   fetchPolicy,
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.NoError(t, err)
-	assert.Len(t, deps, 2) // skill A + its policy
+	assert.Len(t, result.Deps, 2) // skill A + its policy
 	assert.Len(t, h.Skills, 1)
 
 	depURLs := make(map[string]bool)
-	for _, d := range deps {
+	for _, d := range result.Deps {
 		depURLs[d.URL] = true
 	}
 	assert.True(t, depURLs[srv.URL+"/policies/sandbox.yaml"], "policy should be in deps")
 
 	for _, s := range h.Skills {
-		assert.NotContains(t, s, "sandbox.yaml", "policy path must not appear in h.Skills")
+		assert.NotContains(t, s.Source, "sandbox.yaml", "policy path must not appear in h.Skills")
 	}
 }
 
 // TestResolveHarness_ZeroMaxDepthDisablesTransitive verifies that MaxDepth=0 prevents
 // any transitive dependency resolution even when skills declare dependencies.
 func TestResolveHarness_ZeroMaxDepthDisablesTransitive(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	bMD := []byte("# Skill B — must not be fetched")
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      0, // disabled
 	})
 	require.NoError(t, err)
-	assert.Len(t, deps, 1)     // only A
-	assert.Len(t, h.Skills, 1) // only A
+	assert.Len(t, result.Deps, 1) // only A
+	assert.Len(t, h.Skills, 1)    // only A
 }
 
 // TestResolveHarness_MaxDepthDefaultApplied verifies that MaxDepth<0 uses DefaultMaxDepth
 // and enables transitive resolution.
 func TestResolveHarness_MaxDepthDefaultApplied(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	bMD := []byte("# Skill B")
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1, // uses DefaultMaxDepth
 	})
 	require.NoError(t, err)
-	assert.Len(t, deps, 2) // A and B both resolved
+	assert.Len(t, result.Deps, 2) // A and B both resolved
 }
 
 // TestResolveHarness_NonHTTPSSchemeRejected verifies that resolveSkillDirURL rejects URLs
 // whose scheme is not https.
 func TestResolveHarness_NonHTTPSSchemeRejected(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	bHash := fetch.ComputeTreeHash(map[string][]byte{"SKILL.md": []byte("# B")})
 
@@ -1119,16 +1185,16 @@ func TestResolveHarness_NonHTTPSSchemeRejected(t *testing.T) {
 		fmt.Sprintf("dependencies:\n  - %s\n", httpDepURL),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/a", aHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/a", aHash)}},
 		AllowedRemoteResources: []string{testForgeBase, "http://github.com/"},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.Error(t, err)
@@ -1138,57 +1204,1488 @@ func TestResolveHarness_NonHTTPSSchemeRejected(t *testing.T) {
 // TestResolveHarness_DirectAndTransitiveOverlap verifies that a skill appearing both as a
 // direct harness skill and as a transitive dep of another skill is deduplicated.
 func TestResolveHarness_DirectAndTransitiveOverlap(t *testing.T) {
-	fc := &forge.FakeClient{}
+	reg := newSkillRegistry()
 
 	bMD := []byte("# Skill B — shared skill")
-	bHash := registerSkillDir(fc, "skills/b", map[string][]byte{"SKILL.md": bMD})
+	bHash := reg.register("skills/b", map[string][]byte{"SKILL.md": bMD})
 
 	aMD := skillFrontmatter(
 		fmt.Sprintf("dependencies:\n  - b#sha256=%s\n", bHash),
 		"# Skill A",
 	)
-	aHash := registerSkillDir(fc, "skills/a", map[string][]byte{"SKILL.md": aMD})
+	aHash := reg.register("skills/a", map[string][]byte{"SKILL.md": aMD})
 
 	bURL := forgeSkillURL("skills/b", bHash)
 
 	// Both A and B are direct harness skills; A also depends on B transitively.
 	h := &harness.Harness{
-		Skills: []string{
-			forgeSkillURL("skills/a", aHash),
-			bURL,
+		Skills: []harness.SkillEntry{
+			{Source: forgeSkillURL("skills/a", aHash)},
+			{Source: bURL},
 		},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
-	deps, err := ResolveHarness(context.Background(), h, ResolveOpts{
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
-		ForgeClient:   fc,
+		TreeFetcher:   reg.fetcher(),
 		MaxDepth:      -1,
 	})
 	require.NoError(t, err)
-	assert.Len(t, deps, 2)     // A and B, each exactly once
-	assert.Len(t, h.Skills, 2) // A's path and B's path, B deduped
+	assert.Len(t, result.Deps, 2) // A and B, each exactly once
+	assert.Len(t, h.Skills, 2)    // A's path and B's path, B deduped
 
 	// B must not appear twice in h.Skills.
 	seen := make(map[string]bool)
 	for _, s := range h.Skills {
-		assert.False(t, seen[s], "h.Skills contains duplicate entry %s", s)
-		seen[s] = true
+		assert.False(t, seen[s.Source], "h.Skills contains duplicate entry %s", s.Source)
+		seen[s.Source] = true
 	}
 }
 
-// TestResolveHarness_NilForgeClientWithSkillURL verifies that a skill URL without
-// a ForgeClient produces a clear error.
-func TestResolveHarness_NilForgeClientWithSkillURL(t *testing.T) {
+// TestResolveHarness_TreeFetcherError verifies that a TreeFetcher error is
+// propagated with a clear message.
+func TestResolveHarness_TreeFetcherError(t *testing.T) {
 	fakeHash := strings.Repeat("a", 64)
 	h := &harness.Harness{
-		Skills:                 []string{forgeSkillURL("skills/test", fakeHash)},
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/test", fakeHash)}},
 		AllowedRemoteResources: []string{testForgeBase},
 	}
 
 	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
 		WorkspaceRoot: t.TempDir(),
+		TreeFetcher: func(_ context.Context, _, _, _, _ string) (map[string][]byte, error) {
+			return nil, fmt.Errorf("git fetch failed")
+		},
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ForgeClient is required")
+	assert.Contains(t, err.Error(), "fetching directory")
+	assert.Contains(t, err.Error(), "hint:")
+}
+
+func TestResolveHarness_TreeFetcherErrorWithToken(t *testing.T) {
+	fakeHash := strings.Repeat("a", 64)
+	h := &harness.Harness{
+		Skills:                 []harness.SkillEntry{{Source: forgeSkillURL("skills/test", fakeHash)}},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: t.TempDir(),
+		GitToken:      "ghp_test123",
+		TreeFetcher: func(_ context.Context, _, _, _, _ string) (map[string][]byte, error) {
+			return nil, fmt.Errorf("git fetch failed")
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fetching directory")
+	assert.NotContains(t, err.Error(), "hint:")
+}
+
+func TestResolveHarness_ProfileURL(t *testing.T) {
+	profileContent := []byte(`id: claude-code
+display_name: Claude Code
+category: llm
+credentials:
+  - name: ANTHROPIC_API_KEY
+`)
+	profileHash := fetch.ComputeSHA256(profileContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(profileContent)
+	}))
+
+	root := t.TempDir()
+	profileURL := fmt.Sprintf("%s/profiles/claude-code.yaml#sha256=%s", srv.URL, profileHash)
+	h := &harness.Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{profileURL},
+		},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Profiles, 1)
+	assert.Equal(t, "claude-code", result.Profiles[0].ID)
+	assert.FileExists(t, result.Profiles[0].LocalPath)
+	assert.True(t, strings.HasSuffix(result.Profiles[0].LocalPath, ".yaml"),
+		"profile LocalPath should end with .yaml for openshell compatibility, got %s",
+		result.Profiles[0].LocalPath)
+	assert.Equal(t, "claude-code.yaml", filepath.Base(result.Profiles[0].LocalPath),
+		"profile LocalPath basename should be <id>.yaml")
+
+	// The named path must be a symlink (not a copy) so its relative "content"
+	// target keeps resolving after the cache dir is bind-mounted into the sandbox.
+	info, err := os.Lstat(result.Profiles[0].LocalPath)
+	require.NoError(t, err)
+	assert.True(t, info.Mode()&os.ModeSymlink != 0,
+		"profile LocalPath should be a symlink, got mode %s", info.Mode())
+
+	// Verify the symlink target is readable and contains the profile content.
+	got, err := os.ReadFile(result.Profiles[0].LocalPath)
+	require.NoError(t, err)
+	assert.Equal(t, profileContent, got)
+
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, "file", result.Deps[0].Type)
+	assert.Equal(t, result.Profiles[0].LocalPath, result.Deps[0].LocalPath,
+		"Dependency.LocalPath should match the renamed profile path, not the pre-rename cache path")
+}
+
+// TestResolveHarness_ProfileURL_DuplicateReference pins the state.resolved sync
+// (resolve.go): when the same profile URL is referenced twice in one harness,
+// the fetch-dedup fast path must return the renamed .yaml path both times, not
+// the pre-rename extensionless "content" path.
+func TestResolveHarness_ProfileURL_DuplicateReference(t *testing.T) {
+	profileContent := []byte("id: claude-code\ncategory: llm\n")
+	profileHash := fetch.ComputeSHA256(profileContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(profileContent)
+	}))
+
+	root := t.TempDir()
+	profileURL := fmt.Sprintf("%s/profiles/claude-code.yaml#sha256=%s", srv.URL, profileHash)
+	h := &harness.Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{profileURL, profileURL}, // referenced twice
+		},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Profiles, 2)
+	for i, p := range result.Profiles {
+		assert.True(t, strings.HasSuffix(p.LocalPath, ".yaml"),
+			"profile[%d] LocalPath should end with .yaml, got %s", i, p.LocalPath)
+	}
+	assert.Equal(t, result.Profiles[0].LocalPath, result.Profiles[1].LocalPath,
+		"both references to the same profile URL should resolve to the same .yaml path")
+}
+
+// TestResolveHarness_ProfileURL_SymlinkError exercises the error path when
+// CacheNamedSymlink fails (resolve.go): the cache is populated, its directory
+// is made read-only, and a re-resolve must surface the wrapped naming error.
+func TestResolveHarness_ProfileURL_SymlinkError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory permission checks")
+	}
+	profileContent := []byte("id: claude-code\ncategory: llm\n")
+	profileHash := fetch.ComputeSHA256(profileContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(profileContent)
+	}))
+
+	root := t.TempDir()
+	profileURL := fmt.Sprintf("%s/profiles/claude-code.yaml#sha256=%s", srv.URL, profileHash)
+	// ResolveHarness mutates its harness in place, so use a fresh harness for
+	// each resolve. Both share the same workspace root, so the second resolve
+	// is a cache hit off disk.
+	newHarness := func() *harness.Harness {
+		return &harness.Harness{
+			Agent: "agents/test.md",
+			Role:  "test",
+			OpenShell: &harness.OpenShellConfig{
+				Profiles: []string{profileURL},
+			},
+			AllowedRemoteResources: []string{srv.URL + "/"},
+		}
+	}
+	opts := ResolveOpts{WorkspaceRoot: root, FetchPolicy: policy}
+
+	// First resolve populates the cache and creates the .yaml symlink.
+	result, err := ResolveHarness(context.Background(), newHarness(), opts)
+	require.NoError(t, err)
+	require.Len(t, result.Profiles, 1)
+
+	// Drop the symlink and make its cache directory unwritable so the second
+	// resolve (a cache hit) fails inside CacheNamedSymlink.
+	cacheDir := filepath.Dir(result.Profiles[0].LocalPath)
+	require.NoError(t, os.Remove(result.Profiles[0].LocalPath))
+	require.NoError(t, os.Chmod(cacheDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(cacheDir, 0o700) })
+
+	_, err = ResolveHarness(context.Background(), newHarness(), opts)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "naming cached profile")
+}
+
+func TestResolveHarness_ProfileMissingID(t *testing.T) {
+	profileContent := []byte(`display_name: Bad Profile
+category: llm
+`)
+	profileHash := fetch.ComputeSHA256(profileContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(profileContent)
+	}))
+
+	root := t.TempDir()
+	profileURL := fmt.Sprintf("%s/profiles/bad.yaml#sha256=%s", srv.URL, profileHash)
+	h := &harness.Harness{
+		Agent: "agents/test.md",
+		Role:  "test",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{profileURL},
+		},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "profile has no id field")
+}
+
+func TestResolveHarness_ProviderURL(t *testing.T) {
+	providerContent := []byte(`name: my-claude
+type: claude-code
+credentials:
+  ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+`)
+	providerHash := fetch.ComputeSHA256(providerContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(providerContent)
+	}))
+
+	root := t.TempDir()
+	providerURL := fmt.Sprintf("%s/providers/my-claude.yaml#sha256=%s", srv.URL, providerHash)
+	h := &harness.Harness{
+		Agent:                  "agents/test.md",
+		Role:                   "test",
+		Providers:              []string{providerURL, "local-provider"},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Providers, 1)
+	assert.Equal(t, "my-claude", result.Providers[0].Def.Name)
+	assert.Equal(t, "claude-code", result.Providers[0].Def.Type)
+
+	// Local provider name left in h.Providers
+	require.Len(t, h.Providers, 1)
+	assert.Equal(t, "local-provider", h.Providers[0])
+}
+
+func TestResolveHarness_ProviderURLMissingName(t *testing.T) {
+	providerContent := []byte(`type: claude-code
+credentials:
+  ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+`)
+	providerHash := fetch.ComputeSHA256(providerContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(providerContent)
+	}))
+
+	root := t.TempDir()
+	providerURL := fmt.Sprintf("%s/providers/bad.yaml#sha256=%s", srv.URL, providerHash)
+	h := &harness.Harness{
+		Agent:                  "agents/test.md",
+		Role:                   "test",
+		Providers:              []string{providerURL},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "provider name is required")
+}
+
+func TestResolveHarness_ProviderURLMissingType(t *testing.T) {
+	providerContent := []byte(`name: my-claude
+credentials:
+  ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+`)
+	providerHash := fetch.ComputeSHA256(providerContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(providerContent)
+	}))
+
+	root := t.TempDir()
+	providerURL := fmt.Sprintf("%s/providers/bad.yaml#sha256=%s", srv.URL, providerHash)
+	h := &harness.Harness{
+		Agent:                  "agents/test.md",
+		Role:                   "test",
+		Providers:              []string{providerURL},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "provider type is required")
+}
+
+func TestResolveHarness_ProviderCredentialWarning(t *testing.T) {
+	providerContent := []byte(`name: my-claude
+type: claude-code
+credentials:
+  ANTHROPIC_API_KEY: "sk-ant-actual-secret-value"
+`)
+	providerHash := fetch.ComputeSHA256(providerContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(providerContent)
+	}))
+
+	root := t.TempDir()
+	providerURL := fmt.Sprintf("%s/providers/my-claude.yaml#sha256=%s", srv.URL, providerHash)
+	h := &harness.Harness{
+		Agent:                  "agents/test.md",
+		Role:                   "test",
+		Providers:              []string{providerURL},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Providers, 1)
+	require.Len(t, result.Deps, 1)
+	assert.Contains(t, result.Deps[0].Warning, "do not look like ${VAR} references")
+}
+
+func TestResolveHarness_ProviderURLInvalidName(t *testing.T) {
+	providerContent := []byte(`name: "-flag-injection"
+type: claude-code
+credentials:
+  ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+`)
+	providerHash := fetch.ComputeSHA256(providerContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(providerContent)
+	}))
+
+	root := t.TempDir()
+	providerURL := fmt.Sprintf("%s/providers/bad.yaml#sha256=%s", srv.URL, providerHash)
+	h := &harness.Harness{
+		Agent:                  "agents/test.md",
+		Role:                   "test",
+		Providers:              []string{providerURL},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "provider name")
+	assert.Contains(t, err.Error(), "invalid characters")
+}
+
+func TestResolveHarness_ProviderURLInvalidType(t *testing.T) {
+	providerContent := []byte(`name: my-claude
+type: "../traversal"
+credentials:
+  ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+`)
+	providerHash := fetch.ComputeSHA256(providerContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(providerContent)
+	}))
+
+	root := t.TempDir()
+	providerURL := fmt.Sprintf("%s/providers/bad.yaml#sha256=%s", srv.URL, providerHash)
+	h := &harness.Harness{
+		Agent:                  "agents/test.md",
+		Role:                   "test",
+		Providers:              []string{providerURL},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "provider type")
+	assert.Contains(t, err.Error(), "invalid characters")
+}
+
+func TestResolveHarness_PluginDirFetchAndCache(t *testing.T) {
+	manifestJSON := []byte(`{"name": "gopls-lsp", "version": "1.0.0"}`)
+	initSh := []byte("#!/bin/bash\necho init")
+
+	reg := newSkillRegistry()
+	treeHash := reg.register("plugins/gopls-lsp", map[string][]byte{
+		"plugin.json":     manifestJSON,
+		"scripts/init.sh": initSh,
+	})
+
+	root := t.TempDir()
+	h := &harness.Harness{
+		Agent:                  "/local/agents/test.md",
+		Plugins:                []harness.PluginSpec{{Path: forgeSkillURL("plugins/gopls-lsp", treeHash)}},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		TreeFetcher:   reg.fetcher(),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, "directory", result.Deps[0].Type)
+	assert.Equal(t, "plugins[0]", result.Deps[0].Field)
+	assert.Equal(t, treeHash, result.Deps[0].SHA256)
+	assert.False(t, result.Deps[0].CacheHit)
+
+	// Verify h.Plugins[0].Path is a local directory path (not a URL) whose
+	// basename is the plugin directory name from the URL.
+	assert.False(t, harness.IsURL(h.Plugins[0].Path))
+	info, err := os.Stat(h.Plugins[0].Path)
+	require.NoError(t, err)
+	assert.True(t, info.IsDir())
+	assert.Equal(t, "gopls-lsp", filepath.Base(h.Plugins[0].Path),
+		"plugin path basename should be the plugin directory name from the URL")
+
+	// Verify files are inside the cached directory.
+	got, err := os.ReadFile(filepath.Join(h.Plugins[0].Path, "plugin.json"))
+	require.NoError(t, err)
+	assert.Equal(t, manifestJSON, got)
+
+	gotInit, err := os.ReadFile(filepath.Join(h.Plugins[0].Path, "scripts", "init.sh"))
+	require.NoError(t, err)
+	assert.Equal(t, initSh, gotInit)
+}
+
+func TestResolveHarness_PluginLocalPassThrough(t *testing.T) {
+	h := &harness.Harness{
+		Agent:   "/abs/path/agents/test.md",
+		Plugins: []harness.PluginSpec{{Path: "/abs/path/plugins/gopls-lsp"}},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: t.TempDir(),
+	})
+	require.NoError(t, err)
+	assert.Empty(t, result.Deps)
+	assert.Equal(t, "/abs/path/plugins/gopls-lsp", h.Plugins[0].Path)
+}
+
+func TestResolveHarness_PluginMixedLocalAndURL(t *testing.T) {
+	reg := newSkillRegistry()
+	pluginHash := reg.register("plugins/remote-plugin", map[string][]byte{
+		"plugin.json": []byte(`{"name": "remote-plugin"}`),
+	})
+
+	root := t.TempDir()
+	h := &harness.Harness{
+		Agent: "/local/agents/test.md",
+		Plugins: []harness.PluginSpec{
+			{Path: "/local/plugins/local-plugin"},
+			{Path: forgeSkillURL("plugins/remote-plugin", pluginHash)},
+		},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		TreeFetcher:   reg.fetcher(),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Deps, 1)
+
+	// Local plugin unchanged.
+	assert.Equal(t, "/local/plugins/local-plugin", h.Plugins[0].Path)
+	// Remote plugin resolved to a local directory path.
+	assert.False(t, harness.IsURL(h.Plugins[1].Path))
+	assert.Equal(t, "remote-plugin", filepath.Base(h.Plugins[1].Path))
+}
+
+func TestResolveHarness_PluginHashMismatch(t *testing.T) {
+	reg := newSkillRegistry()
+	reg.register("plugins/tampered", map[string][]byte{
+		"plugin.json": []byte("wrong content"),
+	})
+
+	wrongHash := fetch.ComputeTreeHash(map[string][]byte{
+		"plugin.json": []byte("expected content"),
+	})
+
+	h := &harness.Harness{
+		Agent:                  "/local/agents/test.md",
+		Plugins:                []harness.PluginSpec{{Path: forgeSkillURL("plugins/tampered", wrongHash)}},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: t.TempDir(),
+		TreeFetcher:   reg.fetcher(),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "integrity check failed")
+}
+
+func TestResolveHarness_PluginNonForgeURLRejected(t *testing.T) {
+	srv, fetchPolicy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("plugin content"))
+	}))
+
+	fakeHash := strings.Repeat("a", 64)
+	h := &harness.Harness{
+		Agent:                  "/local/agents/test.md",
+		Plugins:                []harness.PluginSpec{{Path: fmt.Sprintf("%s/plugins/gopls-lsp#sha256=%s", srv.URL, fakeHash)}},
+		AllowedRemoteResources: []string{srv.URL + "/"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: t.TempDir(),
+		FetchPolicy:   fetchPolicy,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "supported forge")
+}
+
+// TestResolveHarness_SameTreeDifferentOptions: two entries that resolve to
+// one directory are deduped only when their env/pi options agree; a
+// differing pair is an error rather than a silent drop of the second's
+// options. An absent env and an empty one are the same options.
+func TestResolveHarness_SameTreeDifferentOptions(t *testing.T) {
+	dir := t.TempDir()
+	plugin := filepath.Join(dir, "ext")
+	require.NoError(t, os.MkdirAll(plugin, 0o755))
+
+	same := &harness.Harness{Agent: "agents/test.md", Role: "test", Plugins: []harness.PluginSpec{
+		{Path: plugin, Env: map[string]string{}},
+		{Path: plugin},
+	}}
+	_, err := ResolveHarness(context.Background(), same, ResolveOpts{WorkspaceRoot: dir})
+	require.NoError(t, err)
+	assert.Len(t, same.Plugins, 1, "identical options dedupe to one entry")
+
+	differ := &harness.Harness{Agent: "agents/test.md", Role: "test", Plugins: []harness.PluginSpec{
+		{Path: plugin},
+		{Path: plugin, Pi: &harness.PiPluginOptions{Args: []string{"--x"}}},
+	}}
+	_, err = ResolveHarness(context.Background(), differ, ResolveOpts{WorkspaceRoot: dir})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "different env/pi options")
+}
+
+func TestResolveHarness_LocalProvidersUnchanged(t *testing.T) {
+	h := &harness.Harness{
+		Agent:     "agents/test.md",
+		Role:      "test",
+		Providers: []string{"provider-a", "provider-b"},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: t.TempDir(),
+	})
+	require.NoError(t, err)
+	assert.Empty(t, result.Providers)
+	assert.Empty(t, result.Deps)
+	assert.Equal(t, []string{"provider-a", "provider-b"}, h.Providers)
+}
+
+func TestWarnLiteralCredentials(t *testing.T) {
+	tests := []struct {
+		name    string
+		creds   map[string]string
+		wantMsg string
+	}{
+		{
+			name:    "empty map",
+			creds:   map[string]string{},
+			wantMsg: "",
+		},
+		{
+			name:    "all valid refs",
+			creds:   map[string]string{"KEY": "${MY_VAR}", "OTHER": "${OTHER_VAR}"},
+			wantMsg: "",
+		},
+		{
+			name:    "empty value ignored",
+			creds:   map[string]string{"KEY": ""},
+			wantMsg: "",
+		},
+		{
+			name:    "single literal",
+			creds:   map[string]string{"API_KEY": "sk-secret-value"},
+			wantMsg: "API_KEY",
+		},
+		{
+			name:    "multiple literals sorted",
+			creds:   map[string]string{"ZEBRA": "literal", "ALPHA": "literal"},
+			wantMsg: "ALPHA, ZEBRA",
+		},
+		{
+			name:    "mixed valid and literal",
+			creds:   map[string]string{"GOOD": "${GOOD_VAR}", "BAD": "plaintext"},
+			wantMsg: "BAD",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := WarnLiteralCredentials("test-provider", tt.creds)
+			if tt.wantMsg == "" {
+				assert.Empty(t, got)
+			} else {
+				assert.Contains(t, got, tt.wantMsg)
+				assert.Contains(t, got, "test-provider")
+			}
+		})
+	}
+}
+
+// TestResolveHarness_PluginSharedURLWithSkill verifies that a plugin sharing a
+// URL with an already-resolved skill is NOT silently dropped. Both fields
+// should resolve to the same local cache path.
+func TestResolveHarness_PluginSharedURLWithSkill(t *testing.T) {
+	reg := newSkillRegistry()
+	sharedMD := []byte("---\nname: shared\n---\n# Shared resource")
+	files := map[string][]byte{"SKILL.md": sharedMD}
+	treeHash := reg.register("resources/shared", files)
+
+	root := t.TempDir()
+	sharedURL := forgeSkillURL("resources/shared", treeHash)
+	h := &harness.Harness{
+		Agent:                  "/local/agents/test.md",
+		Skills:                 []harness.SkillEntry{{Source: sharedURL}},
+		Plugins:                []harness.PluginSpec{{Path: sharedURL}},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		TreeFetcher:   reg.fetcher(),
+	})
+	require.NoError(t, err)
+
+	// The URL should appear exactly once in deps (deduplicated).
+	require.Len(t, result.Deps, 1)
+
+	// Both skills and plugins should have one entry each — the plugin
+	// must NOT be dropped just because the skill was resolved first.
+	require.Len(t, h.Skills, 1, "skill should be preserved")
+	require.Len(t, h.Plugins, 1, "plugin must not be silently dropped when sharing a URL with a skill")
+
+	// Both should point to valid local directories.
+	assert.False(t, harness.IsURL(h.Skills[0].Source))
+	assert.False(t, harness.IsURL(h.Plugins[0].Path))
+}
+
+// TestResolveHarness_PluginRepoRootURLRejected verifies that a plugin URL
+// pointing to the repo root (no path after the ref) is rejected, because
+// the URL path doesn't resolve to a valid plugin basename.
+func TestResolveHarness_PluginRepoRootURLRejected(t *testing.T) {
+	reg := newSkillRegistry()
+	files := map[string][]byte{"plugin.json": []byte(`{"name": "root-plugin"}`)}
+	// Register under empty path to simulate a repo-root reference.
+	// The URL will be https://github.com/org/repo/tree/main (no trailing path).
+	treeHash := reg.register("", files)
+
+	// Build a URL with no path after the ref: .../tree/main
+	// ParseForgeURL produces Path="" for this.
+	repoRootURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s#sha256=%s",
+		testForgeOwner, testForgeRepo, testForgeRef, treeHash)
+
+	h := &harness.Harness{
+		Agent:                  "/local/agents/test.md",
+		Plugins:                []harness.PluginSpec{{Path: repoRootURL}},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: t.TempDir(),
+		TreeFetcher:   reg.fetcher(),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "valid plugin basename")
+}
+
+// TestResolveHarness_PluginDirExecutablePermissions verifies that files in a
+// URL-fetched plugin directory have executable permissions (0755) after
+// resolution, not the cache default of 0600.
+func TestResolveHarness_PluginDirExecutablePermissions(t *testing.T) {
+	initSh := []byte("#!/bin/bash\necho init")
+	manifestJSON := []byte(`{"name": "exec-plugin"}`)
+
+	reg := newSkillRegistry()
+	treeHash := reg.register("plugins/exec-plugin", map[string][]byte{
+		"plugin.json":     manifestJSON,
+		"scripts/init.sh": initSh,
+	})
+
+	root := t.TempDir()
+	h := &harness.Harness{
+		Agent:                  "/local/agents/test.md",
+		Plugins:                []harness.PluginSpec{{Path: forgeSkillURL("plugins/exec-plugin", treeHash)}},
+		AllowedRemoteResources: []string{testForgeBase},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		TreeFetcher:   reg.fetcher(),
+	})
+	require.NoError(t, err)
+	require.Len(t, h.Plugins, 1)
+
+	// Verify the script file has executable permissions.
+	scriptPath := filepath.Join(h.Plugins[0].Path, "scripts", "init.sh")
+	info, err := os.Stat(scriptPath)
+	require.NoError(t, err)
+	assert.True(t, info.Mode()&0o100 != 0,
+		"plugin script should have executable permission, got %s", info.Mode())
+}
+
+func TestParseProfileID(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    []byte
+		wantID  string
+		wantErr string
+	}{
+		{
+			name:   "valid",
+			data:   []byte("id: my-profile\nname: My Profile\n"),
+			wantID: "my-profile",
+		},
+		{
+			name:    "missing id",
+			data:    []byte("name: No ID\n"),
+			wantErr: "no id field",
+		},
+		{
+			name:    "invalid yaml",
+			data:    []byte(":::not valid yaml\n\t{["),
+			wantErr: "parsing profile YAML",
+		},
+		{
+			name:    "empty input",
+			data:    []byte{},
+			wantErr: "no id field",
+		},
+		{
+			name:    "id with leading dash (flag injection)",
+			data:    []byte("id: -h\n"),
+			wantErr: "invalid characters",
+		},
+		{
+			name:    "id with spaces",
+			data:    []byte("id: my profile\n"),
+			wantErr: "invalid characters",
+		},
+		{
+			name:    "id with shell metacharacters",
+			data:    []byte("id: foo;rm -rf /\n"),
+			wantErr: "invalid characters",
+		},
+		{
+			name:   "valid id with underscores and digits",
+			data:   []byte("id: my_profile_2\n"),
+			wantID: "my_profile_2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id, err := ParseProfileID(tt.data)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantID, id)
+		})
+	}
+}
+
+func TestCollectProfileIDs(t *testing.T) {
+	t.Run("returns IDs from YAML files", func(t *testing.T) {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "a.yaml"), []byte("id: alpha\n"), 0o644)
+		os.WriteFile(filepath.Join(dir, "b.yml"), []byte("id: beta\n"), 0o644)
+		os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("not a profile"), 0o644)
+
+		ids, err := CollectProfileIDs(dir)
+		require.NoError(t, err)
+		sort.Strings(ids)
+		assert.Equal(t, []string{"alpha", "beta"}, ids)
+	})
+
+	t.Run("returns nil for missing directory", func(t *testing.T) {
+		ids, err := CollectProfileIDs(filepath.Join(t.TempDir(), "nonexistent"))
+		require.NoError(t, err)
+		assert.Nil(t, ids)
+	})
+
+	t.Run("returns error for invalid YAML", func(t *testing.T) {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "bad.yaml"), []byte(":::"), 0o644)
+
+		_, err := CollectProfileIDs(dir)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "bad.yaml")
+	})
+
+	t.Run("skips subdirectories", func(t *testing.T) {
+		dir := t.TempDir()
+		os.MkdirAll(filepath.Join(dir, "subdir.yaml"), 0o755)
+		os.WriteFile(filepath.Join(dir, "valid.yaml"), []byte("id: gamma\n"), 0o644)
+
+		ids, err := CollectProfileIDs(dir)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"gamma"}, ids)
+	})
+}
+
+func TestResolveHarness_LocalProfile(t *testing.T) {
+	root := t.TempDir()
+
+	profileContent := []byte("id: test-profile\nnetwork:\n  egress:\n    - host: example.com\n")
+	profilePath := filepath.Join(root, "profiles", "test-profile.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(profilePath), 0755))
+	require.NoError(t, os.WriteFile(profilePath, profileContent, 0644))
+
+	h := &harness.Harness{
+		Agent: "/abs/path/agents/test.md",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{profilePath},
+		},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, result.Profiles, 1)
+	assert.Equal(t, "test-profile", result.Profiles[0].ID)
+	assert.Equal(t, profilePath, result.Profiles[0].LocalPath)
+	assert.False(t, result.Profiles[0].FromURL, "a workspace profile is not URL content")
+
+	// Profiles slice should be cleared after resolution
+	assert.Nil(t, h.OpenShell.Profiles)
+}
+
+func TestResolveHarness_LocalAbsProvider(t *testing.T) {
+	root := t.TempDir()
+
+	providerContent := []byte("name: test-provider\ntype: custom\ncredentials:\n  TEST_KEY: \"\"\n")
+	providerPath := filepath.Join(root, "providers", "test-provider.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(providerPath), 0755))
+	require.NoError(t, os.WriteFile(providerPath, providerContent, 0644))
+
+	h := &harness.Harness{
+		Agent:     "/abs/path/agents/test.md",
+		Providers: []string{providerPath, "bare-provider-name"},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.NoError(t, err)
+
+	// Absolute path provider resolved
+	require.Len(t, result.Providers, 1)
+	assert.Equal(t, "test-provider", result.Providers[0].Def.Name)
+	assert.Equal(t, "custom", result.Providers[0].Def.Type)
+	assert.Equal(t, providerPath, result.Providers[0].LocalPath)
+	assert.False(t, result.Providers[0].FromURL, "a workspace provider is not URL content")
+
+	// Bare provider name kept in h.Providers
+	require.Len(t, h.Providers, 1)
+	assert.Equal(t, "bare-provider-name", h.Providers[0])
+}
+
+// TestResolveHarness_CacheProvider_FromURL: a URL base harness's relative
+// provider entry is rewritten by composition to a content-cache path; it is
+// URL content, so it is marked FromURL like a directly URL-resolved one.
+func TestResolveHarness_CacheProvider_FromURL(t *testing.T) {
+	root := t.TempDir()
+
+	providerContent := []byte("name: test-provider\ntype: custom\n")
+	require.NoError(t, fetch.CachePut(root, "https://example.com/providers/test-provider.yaml", providerContent))
+	cachePath, err := fetch.CachePath(root, fetch.ComputeSHA256(providerContent))
+	require.NoError(t, err)
+	contentPath := filepath.Join(cachePath, "content")
+
+	h := &harness.Harness{
+		Agent:     "/abs/path/agents/test.md",
+		Providers: []string{contentPath},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, result.Providers, 1)
+	assert.Equal(t, "test-provider", result.Providers[0].Def.Name)
+	assert.Equal(t, contentPath, result.Providers[0].LocalPath)
+	assert.True(t, result.Providers[0].FromURL)
+}
+
+func TestParseProviderDef(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{
+			"valid",
+			"name: my-provider\ntype: custom\n",
+			"",
+		},
+		{
+			"missing name",
+			"type: custom\n",
+			"provider name is required",
+		},
+		{
+			"missing type",
+			"name: my-provider\n",
+			"provider type is required",
+		},
+		{
+			"invalid name chars",
+			"name: my.provider\ntype: custom\n",
+			"invalid characters",
+		},
+		{
+			"invalid type chars",
+			"name: my-provider\ntype: my.type\n",
+			"invalid characters",
+		},
+		{
+			"invalid yaml",
+			":::not yaml",
+			"parsing provider",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			def, _, err := parseProviderDef([]byte(tt.content), 0, "test-source")
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, "my-provider", def.Name)
+				assert.Equal(t, "custom", def.Type)
+			}
+		})
+	}
+}
+
+func TestParseProviderDef_CredentialWarning(t *testing.T) {
+	content := []byte("name: my-provider\ntype: custom\ncredentials:\n  API_KEY: hardcoded-secret\n")
+	_, w, err := parseProviderDef(content, 0, "test-source")
+	require.NoError(t, err)
+	assert.Contains(t, w, "API_KEY")
+	assert.Contains(t, w, "do not look like ${VAR} references")
+}
+
+func TestResolveHarness_LocalProviderWarnings(t *testing.T) {
+	root := t.TempDir()
+
+	providerContent := []byte("name: leaky\ntype: custom\ncredentials:\n  SECRET: hardcoded-value\n")
+	providerPath := filepath.Join(root, "providers", "leaky.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(providerPath), 0755))
+	require.NoError(t, os.WriteFile(providerPath, providerContent, 0644))
+
+	h := &harness.Harness{
+		Agent:     "/abs/agents/test.md",
+		Providers: []string{providerPath},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Providers, 1)
+	require.Len(t, result.Warnings, 1)
+	assert.Contains(t, result.Warnings[0], "SECRET")
+}
+
+func TestIsContainedPath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		root string
+		want bool
+	}{
+		{"under root", "/workspace/.fullsend/profiles/net.yaml", "/workspace/.fullsend", true},
+		{"at root", "/workspace/.fullsend", "/workspace/.fullsend", true},
+		{"outside root", "/etc/passwd", "/workspace/.fullsend", false},
+		{"traversal", "/workspace/.fullsend/../../etc/passwd", "/workspace/.fullsend", false},
+		{"empty root", "/any/path", "", false},
+		{"sibling prefix", "/workspace/.fullsend-other/file", "/workspace/.fullsend", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isContainedPath(tt.path, tt.root))
+		})
+	}
+}
+
+func TestIsContainedPath_SymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+
+	// Create a real file outside the workspace root.
+	outsideFile := filepath.Join(outside, "secret.yaml")
+	require.NoError(t, os.WriteFile(outsideFile, []byte("secret"), 0o644))
+
+	// Create a symlink inside root that points outside.
+	symlink := filepath.Join(root, "escape.yaml")
+	require.NoError(t, os.Symlink(outsideFile, symlink))
+
+	// Syntactically the symlink is under root, but it resolves outside.
+	assert.False(t, isContainedPath(symlink, root),
+		"symlink pointing outside workspace root must be rejected")
+
+	// A real file under root should still pass.
+	realFile := filepath.Join(root, "legit.yaml")
+	require.NoError(t, os.WriteFile(realFile, []byte("ok"), 0o644))
+	assert.True(t, isContainedPath(realFile, root))
+}
+
+func TestResolveHarness_LocalProfile_CachePathGetsYAMLExtension(t *testing.T) {
+	root := t.TempDir()
+
+	profileContent := []byte("id: claude-code\nnetwork:\n  egress:\n    - host: api.example.com\n")
+
+	// Simulate fetchBaseFile's cache layout: content stored as extensionless
+	// "content" file inside a hash-based cache directory.
+	require.NoError(t, fetch.CachePut(root, "https://example.com/profiles/claude-code.yaml", profileContent))
+	hash := fetch.ComputeSHA256(profileContent)
+	cachePath, err := fetch.CachePath(root, hash)
+	require.NoError(t, err)
+	contentPath := filepath.Join(cachePath, "content")
+
+	h := &harness.Harness{
+		Agent: "/abs/path/agents/test.md",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{contentPath},
+		},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, result.Profiles, 1)
+	assert.Equal(t, "claude-code", result.Profiles[0].ID)
+	assert.True(t, strings.HasSuffix(result.Profiles[0].LocalPath, ".yaml"),
+		"cache-sourced profile should get .yaml extension, got %s", result.Profiles[0].LocalPath)
+	assert.NotEqual(t, contentPath, result.Profiles[0].LocalPath,
+		"extensionless cache path should have been renamed")
+	assert.True(t, result.Profiles[0].FromURL,
+		"a cache path holds URL content (a URL base harness's relative entry), not a repository file")
+
+	// Verify the symlinked file has the right content
+	got, err := os.ReadFile(result.Profiles[0].LocalPath)
+	require.NoError(t, err)
+	assert.Equal(t, profileContent, got)
+}
+
+func TestResolveHarness_LocalProfile_SymlinkEscapeRejected(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+
+	// Create a valid profile outside workspace root.
+	outsideProfile := filepath.Join(outside, "evil.yaml")
+	require.NoError(t, os.WriteFile(outsideProfile,
+		[]byte("id: evil\nnetwork:\n  egress:\n    - host: evil.com\n"), 0o644))
+
+	// Create a symlink inside root pointing to the outside profile.
+	profilesDir := filepath.Join(root, "profiles")
+	require.NoError(t, os.MkdirAll(profilesDir, 0o755))
+	symlink := filepath.Join(profilesDir, "escape.yaml")
+	require.NoError(t, os.Symlink(outsideProfile, symlink))
+
+	h := &harness.Harness{
+		Agent: "/abs/path/agents/test.md",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{symlink},
+		},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outside workspace root")
+}
+
+func TestResolveHarness_LocalProfile_YAMLExtensionUnchanged(t *testing.T) {
+	root := t.TempDir()
+
+	profileContent := []byte("id: test-profile\nnetwork:\n  egress:\n    - host: example.com\n")
+	profilePath := filepath.Join(root, "profiles", "test-profile.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(profilePath), 0755))
+	require.NoError(t, os.WriteFile(profilePath, profileContent, 0644))
+
+	h := &harness.Harness{
+		Agent: "/abs/path/agents/test.md",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{profilePath},
+		},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, result.Profiles, 1)
+	assert.Equal(t, profilePath, result.Profiles[0].LocalPath,
+		"profile with .yaml extension should keep its original path")
+}
+
+func TestResolveHarness_LocalProfile_ExtensionlessNonCacheNoSideEffect(t *testing.T) {
+	root := t.TempDir()
+
+	// Create a local extensionless profile in the user's "repo" (not cache).
+	profileDir := filepath.Join(root, "profiles")
+	require.NoError(t, os.MkdirAll(profileDir, 0o755))
+	profilePath := filepath.Join(profileDir, "mycustomprofile")
+	require.NoError(t, os.WriteFile(profilePath, []byte("id: my-custom\nnetwork:\n  egress:\n    - host: example.com\n"), 0o644))
+
+	dirBefore, err := os.ReadDir(profileDir)
+	require.NoError(t, err)
+
+	h := &harness.Harness{
+		Agent: "/abs/path/agents/test.md",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{profilePath},
+		},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Profiles, 1)
+
+	// The original path should be kept as-is (no symlink rename).
+	assert.Equal(t, profilePath, result.Profiles[0].LocalPath,
+		"non-cache extensionless profile should not be renamed")
+
+	// No new files should appear in the directory.
+	dirAfter, err := os.ReadDir(profileDir)
+	require.NoError(t, err)
+	assert.Equal(t, len(dirBefore), len(dirAfter),
+		"no stray symlink should be created next to a non-cache local profile")
+}
+
+func TestResolveHarness_LocalProfileReadError(t *testing.T) {
+	root := t.TempDir()
+
+	h := &harness.Harness{
+		Agent: "/abs/path/agents/test.md",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{filepath.Join(root, "nonexistent", "profile.yaml")},
+		},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading profile")
+}
+
+func TestResolveHarness_LocalProfileBadID(t *testing.T) {
+	root := t.TempDir()
+
+	profilePath := filepath.Join(root, "profiles", "bad.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(profilePath), 0755))
+	require.NoError(t, os.WriteFile(profilePath, []byte("network:\n  egress: []\n"), 0644))
+
+	h := &harness.Harness{
+		Agent: "/abs/path/agents/test.md",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{profilePath},
+		},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "openshell.profiles[0]")
+}
+
+func TestResolveHarness_LocalProviderReadError(t *testing.T) {
+	root := t.TempDir()
+
+	h := &harness.Harness{
+		Agent:     "/abs/path/agents/test.md",
+		Providers: []string{filepath.Join(root, "nonexistent", "provider.yaml")},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading provider")
+}
+
+func TestResolveHarness_LocalProviderParseError(t *testing.T) {
+	root := t.TempDir()
+
+	providerPath := filepath.Join(root, "providers", "bad.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(providerPath), 0755))
+	require.NoError(t, os.WriteFile(providerPath, []byte("name: valid\n"), 0644))
+
+	h := &harness.Harness{
+		Agent:     "/abs/path/agents/test.md",
+		Providers: []string{providerPath},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "provider type is required")
+}
+
+func TestResolveHarness_ProfileOutsideWorkspace(t *testing.T) {
+	root := t.TempDir()
+
+	h := &harness.Harness{
+		Agent: "/abs/path/agents/test.md",
+		OpenShell: &harness.OpenShellConfig{
+			Profiles: []string{"/etc/not-in-workspace/profile.yaml"},
+		},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outside workspace root")
+}
+
+func TestResolveHarness_ProviderOutsideWorkspace(t *testing.T) {
+	root := t.TempDir()
+
+	h := &harness.Harness{
+		Agent:     "/abs/path/agents/test.md",
+		Providers: []string{"/etc/not-in-workspace/provider.yaml"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outside workspace root")
+}
+
+func TestResolveHarness_PolicyURL_OrgAllowlist(t *testing.T) {
+	policyContent := []byte("sandbox policy yaml")
+	policyHash := fetch.ComputeSHA256(policyContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(policyContent)
+	}))
+
+	root := t.TempDir()
+	policyURL := fmt.Sprintf("%s/policies/readonly.yaml#sha256=%s", srv.URL, policyHash)
+	// No harness-level AllowedRemoteResources — only org-level.
+	h := &harness.Harness{
+		Agent:  "/local/agents/test.md",
+		Policy: policyURL,
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{srv.URL + "/"},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, policyHash, result.Deps[0].SHA256)
+
+	got, err := os.ReadFile(h.Policy)
+	require.NoError(t, err)
+	assert.Equal(t, policyContent, got)
+}
+
+func TestResolveHarness_AgentURL_OrgAllowlist(t *testing.T) {
+	agentContent := []byte("You are a coding agent.")
+	agentHash := fetch.ComputeSHA256(agentContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(agentContent)
+	}))
+
+	root := t.TempDir()
+	agentURL := fmt.Sprintf("%s/agents/code.md#sha256=%s", srv.URL, agentHash)
+	// No harness-level AllowedRemoteResources — only org-level.
+	h := &harness.Harness{
+		Agent: agentURL,
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{srv.URL + "/"},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, agentHash, result.Deps[0].SHA256)
+	assert.False(t, harness.IsURL(h.Agent))
+}
+
+func TestResolveHarness_SkillDirURL_OrgAllowlist(t *testing.T) {
+	reg := newSkillRegistry()
+	skillHash := reg.register("skills/review", map[string][]byte{
+		"SKILL.md": []byte("# Review Skill"),
+	})
+
+	root := t.TempDir()
+	// No harness-level AllowedRemoteResources — only org-level.
+	h := &harness.Harness{
+		Agent:  "/local/agents/test.md",
+		Skills: []harness.SkillEntry{{Source: forgeSkillURL("skills/review", skillHash)}},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		TreeFetcher:   reg.fetcher(),
+		OrgAllowlist:  []string{testForgeBase},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Deps, 1)
+	assert.Equal(t, "directory", result.Deps[0].Type)
+}
+
+func TestResolveHarness_URLNotInEitherAllowlist(t *testing.T) {
+	agentContent := []byte("agent")
+	agentHash := fetch.ComputeSHA256(agentContent)
+
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(agentContent)
+	}))
+
+	agentURL := fmt.Sprintf("%s/agents/code.md#sha256=%s", srv.URL, agentHash)
+	h := &harness.Harness{
+		Agent:                  agentURL,
+		AllowedRemoteResources: []string{"https://other-domain.com/"},
+	}
+
+	_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: t.TempDir(),
+		FetchPolicy:   policy,
+		OrgAllowlist:  []string{"https://another-domain.com/"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not in allowed_remote_resources")
+}
+
+func TestResolveHarness_MixedAllowlists(t *testing.T) {
+	agentContent := []byte("agent prompt")
+	agentHash := fetch.ComputeSHA256(agentContent)
+	policyContent := []byte("policy yaml")
+	policyHash := fetch.ComputeSHA256(policyContent)
+
+	srv, fetchPolicy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/agents/code.md":
+			w.Write(agentContent)
+		case "/policies/ro.yaml":
+			w.Write(policyContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	root := t.TempDir()
+	// Agent URL covered by harness-level allowlist, policy URL covered
+	// by org-level allowlist only.
+	h := &harness.Harness{
+		Agent:                  fmt.Sprintf("%s/agents/code.md#sha256=%s", srv.URL, agentHash),
+		Policy:                 fmt.Sprintf("%s/policies/ro.yaml#sha256=%s", srv.URL, policyHash),
+		AllowedRemoteResources: []string{srv.URL + "/agents/"},
+	}
+
+	result, err := ResolveHarness(context.Background(), h, ResolveOpts{
+		WorkspaceRoot: root,
+		FetchPolicy:   fetchPolicy,
+		OrgAllowlist:  []string{srv.URL + "/policies/"},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Deps, 2)
+	assert.Equal(t, "agent", result.Deps[0].Field)
+	assert.Equal(t, "policy", result.Deps[1].Field)
+}
+
+// TestResolveHarness_OverrideURLFailures checks that a URL file override
+// with a missing hash, a wrong hash, or a URL off allowed_remote_resources
+// fails resolution with the override's field named (#6158).
+func TestResolveHarness_OverrideURLFailures(t *testing.T) {
+	content := []byte("override body")
+	srv, policy := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(content)
+	}))
+	goodHash := fetch.ComputeSHA256(content)
+	wrongHash := fetch.ComputeSHA256([]byte("something else"))
+	const field = "skills[0].overrides[sub-agents/security.md]"
+
+	for name, tc := range map[string]struct {
+		url     string
+		allowed []string
+		want    string
+	}{
+		"missing hash":  {srv.URL + "/overrides/security.md", []string{srv.URL + "/"}, "integrity hash"},
+		"wrong hash":    {srv.URL + "/overrides/security.md#sha256=" + wrongHash, []string{srv.URL + "/"}, "integrity check failed"},
+		"off allowlist": {srv.URL + "/overrides/security.md#sha256=" + goodHash, []string{"https://other-domain.com/"}, "not in allowed_remote_resources"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			url := tc.url
+			h := &harness.Harness{
+				Skills: []harness.SkillEntry{{
+					Source:    "/local/skills/pr-review",
+					Overrides: map[string]*string{"sub-agents/security.md": &url},
+				}},
+				AllowedRemoteResources: tc.allowed,
+			}
+			_, err := ResolveHarness(context.Background(), h, ResolveOpts{
+				WorkspaceRoot: t.TempDir(),
+				FetchPolicy:   policy,
+			})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), field)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
 }

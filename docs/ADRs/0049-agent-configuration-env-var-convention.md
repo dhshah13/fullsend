@@ -19,6 +19,12 @@ Date: 2026-06-16
 
 Accepted
 
+*Amended by [ADR 0080](0080-config-yaml-vs-agent-env-var-scope.md), which
+decides when a knob should be an `{AGENT}_` env var at all versus a
+`config.yaml` field, and [ADR 0081](0081-reserve-workflow-env-for-infra-plumbing.md),
+which narrows the "CI workflow injection" delivery mechanism to
+infrastructure values.*
+
 ## Context
 
 Agents need behavioral knobs — settings that tune *how* they work without
@@ -71,7 +77,12 @@ documentation: config vars are behavioral knobs listed in
 ### Where config vars live in the harness
 
 Config vars are carried the same way as other agent env vars — no new schema
-fields are needed. The `.env` file and `runner_env` serve different
+fields are needed. *Note: [ADR 0055](0055-unified-env-var-delivery.md)
+introduces a unified `env:` key with `runner`/`sandbox` sub-maps that
+replaces `runner_env` and manual `.env` files. The delivery mechanism below
+still works but is deprecated in favor of `env.runner` and `env.sandbox`.*
+
+The `.env` file and `runner_env` serve different
 audiences: the `.env` file delivers vars into the sandbox for the agent at
 inference time, while `runner_env` makes vars available to pre/post scripts
 on the host. A config var needed by both must appear in both places.
@@ -88,7 +99,10 @@ on the host. A config var needed by both must appear in both places.
 
 3. **For CI workflow injection:** The CI workflow sets the value from org
    secrets, repo variables, or hardcoded defaults. This is the same mechanism
-   used for all other env vars — no change needed.
+   used for all other env vars — no change needed. *Note: [ADR 0081](0081-reserve-workflow-env-for-infra-plumbing.md)
+   narrows this to infrastructure values and CI-runtime-only computed
+   values; static agent behavior defaults go through harness composition
+   instead.*
 
 ### Defaults
 
@@ -116,8 +130,8 @@ section:
 ```markdown
 ## Configuration and extension
 
-See [Customizing with AGENTS.md](../guides/user/customizing-with-agents-md.md) and
-[Customizing with Skills](../guides/user/customizing-with-skills.md).
+See [Configuring with AGENTS.md](../guides/user/customizing-with-agents-md.md) and
+[Configuring with Skills](../guides/user/customizing-with-skills.md).
 
 ### Variables
 

@@ -1,12 +1,16 @@
+---
+description: How the fullsend triage agent inspects new GitHub issues, assesses information sufficiency, asks clarifying questions, and produces a structured triage decision.
+---
+
 # Triage Agent
 
-<img src="icons/triage.png" alt="Triage agent icon" width="80">
+![Triage agent icon](icons/triage.png)
 
 Inspects a GitHub issue, assesses information sufficiency, asks clarifying questions when needed, and produces a structured triage decision that determines whether the issue is ready for implementation.
 
 ## How the agent works
 
-The triage agent is triggered when a new issue is opened or when an existing issue is updated. It fetches the issue content — title, body, labels, comments — and reads repository context (architecture docs, existing issues, PRs) to understand the landscape. It then decides whether the issue has enough information to act on, or whether clarification is needed.
+The triage agent is triggered when a new issue is opened or when an existing issue is updated. On GitLab, opening an issue also dispatches triage when the issue author has Developer access or higher (see [Commands](#commands)). The webhook fast path starts this dispatch, and events-mode cron polling backstops it when a webhook delivery is missed. It fetches the issue content — title, body, labels, comments — and reads repository context (architecture docs, existing issues, PRs) to understand the landscape. It then decides whether the issue has enough information to act on, or whether clarification is needed.
 
 The agent runs in a read-only sandbox. It cannot modify issues, push code, or interact with external services. Its only output is a structured JSON triage result consumed by the post-script, which applies labels and posts a summary comment.
 
@@ -22,17 +26,32 @@ The agent runs in a read-only sandbox. It cannot modify issues, push code, or in
 |---------|-------|--------|
 | `/fs-triage` | Issue comment | Runs triage on the issue |
 
-Requires write-level repository permission (admin, maintain, or write).
+Requires triage-level repository permission or higher (triage, write,
+maintain, or admin). Mutation stages such as `/fs-code` still require
+write or higher.
 
 The `/fs-triage` command does not accept arguments — it re-evaluates the issue
 using current content, comments, and any prior triage analysis.
 
 Triage also runs automatically when a new issue is opened or edited by a
-repository owner, member, or collaborator, when the `ready-for-triage`
+user with triage-level permission or higher, and when the `ready-for-triage`
 label is applied to an issue (used by the [retro agent](retro.md) to
-route proposal issues into the triage pipeline), and when someone
-comments on an issue labeled `needs-info` (to re-evaluate after the
-reporter provides clarification).
+route proposal issues into the triage pipeline). To re-trigger triage
+after providing clarification on a `needs-info` issue, use the
+`/fs-triage` command.
+
+On GitLab, the triage-level rule above does not apply. The GitLab agent
+job requires the event actor to hold Developer access or higher
+([ADR 0054](../ADRs/0054-require-authorization-on-all-agent-dispatch-paths.md)),
+so automatic issue-open triage runs only for issues opened by Developer, Maintainer, or
+Owner members. The webhook fast path normally starts the dispatch; if a
+delivery is missed, events-mode cron polling recovers the issue open
+(for issues created after the poller's discovery watermark and its persisted
+issue-open cutoff) and dispatches it with the same authorization rule. When a
+Reporter, Guest, or non-member opens an issue, the
+webhook (or the polling backstop) still starts a dispatch, but the agent job exits successfully
+without running triage. A Developer-or-higher member can then comment
+`/fs-triage` on the issue to start triage.
 
 ## Control labels
 
@@ -57,26 +76,36 @@ The `issue-labels` skill may also apply contextual labels (e.g., `area/api`,
 
 The triage agent can create prerequisite issues in other repositories when it
 identifies upstream dependencies that don't have tracking issues yet. This is
-controlled by the `create_issues` section in `config.yaml`:
+controlled by the selected provider's `allowed_targets` under `tracker` in
+`config.yaml` (see the
+[Config Reference](../reference/config-reference.md#tracker) for the GitLab
+and Jira shapes):
 
 ```yaml
-create_issues:
-  allow_targets:
-    orgs:
-      - my-org
-    repos:
-      - upstream-org/specific-repo
+tracker:
+  github:
+    allowed_targets:
+      orgs:
+        - my-org
+      repos:
+        - upstream-org/specific-repo
 ```
 
-**Defaults:** At install time, fullsend populates this with your org (in org mode)
-or your repo (in per-repo mode), plus `fullsend-ai/fullsend` as an upstream target.
+**Defaults:** A fresh GitHub installation without a preset or explicit `tracker`
+setting permits `fullsend-ai/fullsend` and `fullsend-ai/agents` as upstream
+targets. Fresh GitLab installations have an explicit empty cross-project
+allowlist; configure any additional projects on the GitLab host explicitly.
+The repository the agent runs in is always allowed, so it needs no
+entry. Existing installations retain their configured permissions on upgrade;
+see [migration guidance](../guides/getting-started/migrating-from-github-setup.md#permit-agent-improvement-proposals-on-existing-installations)
+to add the agents repository explicitly.
 
 **When to expand the allowlist:** If your project depends on libraries or services
 in other GitHub orgs and you want the triage agent to automatically file
-prerequisite issues there, add those orgs or repos to `allow_targets`.
+prerequisite issues there, add those orgs or repos to `allowed_targets`.
 
 **When to restrict the allowlist:** If you don't want agents creating issues
-outside your org, remove entries. If `allow_targets` is empty, automatic
+outside your org, remove entries. If `allowed_targets` is empty, automatic
 prerequisite creation is disabled entirely — the agent will still identify
 the dependency and include a draft issue body in its comment for a human to
 file manually.
@@ -87,19 +116,22 @@ regardless of the allowlist.
 ### Skill: `issue-labels`
 
 The triage agent includes a built-in `issue-labels` skill that discovers your
-repo's labels and applies them opportunistically during triage. You can replace
-it with your own version to encode your team's labeling knowledge directly in
-the skill, keeping it out of `AGENTS.md` (where it would bloat context for
-every agent).
+repo's labels and applies them opportunistically during triage. You can encode
+your team's labeling knowledge in a skill, keeping it out of `AGENTS.md`
+(where it would bloat context for every agent).
 
-To overload the built-in skill, create your own `issue-labels` skill in
-`.agents/skills/issue-labels/SKILL.md` and symlink `.claude/skills` to
-`.agents/skills` so it's discoverable by both fullsend and local agent tooling.
-You can also overload it at the org level in your `.fullsend` config repo at
-`customized/skills/issue-labels/SKILL.md`. At runtime, your version replaces
-the upstream default — no other configuration needed.
+To **extend** the agent, add a uniquely named skill in `.agents/skills/` and
+symlink `.claude/skills` to `.agents/skills` so it is discoverable by both
+fullsend and local agent tooling. A same-named `issue-labels` skill in that
+directory is shadowed by the built-in version and is ignored.
 
-Here's an example that encodes domain-specific labeling rules:
+To **override** the built-in skill, register the triage agent with a harness
+that uses `base:` composition and include your replacement `issue-labels`
+skill in the `skills:` list — see
+[Configuring with Skills](../guides/user/customizing-with-skills.md#overriding-built-in-skills)
+and [Bring Your Own Agent](../guides/user/bring-your-own-agent.md).
+
+Here is an example replacement skill for the override path:
 
 ```markdown
 ---
@@ -166,4 +198,4 @@ None.
 
 ## Source
 
-[`internal/scaffold/fullsend-repo/harness/triage.yaml`](../../internal/scaffold/fullsend-repo/harness/triage.yaml)
+[`fullsend-ai/agents` — `harness/triage.yaml`](https://github.com/fullsend-ai/agents/blob/main/harness/triage.yaml)

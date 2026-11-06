@@ -1,6 +1,10 @@
+---
+description: How the fullsend fix agent reads PR review feedback, implements targeted fixes, runs tests and linters, and commits the result.
+---
+
 # Fix Agent
 
-<img src="icons/coder.png" alt="Fix agent icon" width="80">
+![Fix agent icon](icons/coder.png)
 
 Review-feedback specialist that reads review comments on open PRs, implements targeted fixes, runs tests and linters, and commits the result.
 
@@ -21,9 +25,9 @@ The fix agent has two operating modes with different primary inputs:
 
 | Input | Source | How it gets there |
 |-------|--------|-------------------|
-| Review body | Latest `CHANGES_REQUESTED` review from the review bot | Pre-fetched on the runner before the sandbox starts, injected as `review-body.txt` |
+| Review body | Latest `CHANGES_REQUESTED` review from a review bot | Pre-fetched on the runner before the sandbox starts, injected as `review-body.txt` |
 | PR diff | `gh pr diff` inside the sandbox | Agent calls this to understand what code changed |
-| Repository checkout | Full repo at PR HEAD | Checked out on the runner, mounted into the sandbox |
+| Repository checkout | Full repo at PR/MR HEAD | Checked out on the runner, mounted into the sandbox |
 | Repo conventions | `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md` | Read from the checkout inside the sandbox |
 
 **Human-triggered** (`/fs-fix [instruction]`):
@@ -34,10 +38,37 @@ The fix agent has two operating modes with different primary inputs:
 | PR diff | `gh pr diff` inside the sandbox | Same as bot-triggered |
 | Repository checkout | Full repo at PR HEAD | Same as bot-triggered |
 | Repo conventions | `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md` | Same as bot-triggered |
-| Review body (if any) | Prior review bot `CHANGES_REQUESTED` review | Still injected as `review-body.txt`, but human instruction takes precedence |
+| Review body (if any) | Prior `CHANGES_REQUESTED` review from a review bot | Still injected as `review-body.txt`, but human instruction takes precedence |
 
 When a human instruction is present, it supersedes the review body as the
 primary directive.
+
+On GitLab, dispatch pipelines run from the repository default branch, so
+the fix job fetches the MR source SHA into `target-repo/` and points
+`--target-repo` there before `fullsend run`. Trusted `.fullsend/` config
+continues to be read from the default-branch working tree. Fetching the
+source branch without checking it out is not sufficient: the sandbox
+inherits the runner checkout, and the agent cannot recover the reviewed
+revision from inside the sandbox.
+
+**GitLab fork and cross-project MRs:** the job-level fork gate (`IS_FORK`)
+still denies both the **code** and **fix** agents outright on a
+fork/cross-project dispatch. Code opens a new MR against the target
+project and has no analogous validated source revision to check out.
+Fix is denied for a different reason: although the pre-script
+(`checkout-mr-source.sh`) already resolves the MR's source project,
+branch, and head SHA through `fullsend resolve-mr-source` (never
+trusting the job's `IS_FORK` pipeline variable or any other unverified
+CI variable), fetches and checks out that exact revision — fetching
+from the source project even when it differs from the target project —
+and runs a pre-push safety gate, `fullsend check-protected-branch`,
+against the resolved source project and branch before the fix agent
+ever runs, the runner-side post-script that actually pushes the
+resulting fix commit still targets this job's own project and branch
+rather than the validated source project. A validated checkout alone is
+not enough to make a fork/cross-project fix dispatch safe to publish, so
+the `IS_FORK` gate stays in place for `fix` until a source-targeted
+publish path ships in a follow-up PR (#7814).
 
 ### What the agent does not read
 
@@ -88,6 +119,8 @@ The fix agent enforces iteration caps to prevent infinite review-fix loops:
   across bot and human triggers.
 - When a bot-triggered run is approaching the bot cap, the agent applies the
   `needs-human` label.
+- When the cap is exceeded, the run fails before the sandbox starts and the
+  status comment shows the escalation message (a human can still `/fs-fix`).
 - Each `/fs-fix` comment cancels any in-flight fix run for the same PR and
   starts a new one.
 
@@ -117,23 +150,110 @@ direct control over what to fix:
   ([details](#links-and-urls-in-instructions))
 
 The fix agent also triggers automatically when the [review agent](review.md) submits a
-"changes requested" review on a same-repo PR (fork PRs are blocked).
+"changes requested" review on a same-repo PR (fork PRs are blocked). On GitHub
+this is the native `pull_request_review` event; on GitLab it is an MR note that
+contains `<!-- fullsend:changes-requested -->`, dispatched through the webhook
+fast path with the poller as backstop. Both paths keep the note only when its
+author is the Poller bot user, so with distinct Analyst and Poller identities
+the Analyst-authored note does not dispatch fix automatically; comment `/fs-fix`
+instead.
+
+For **PRs authored by the fullsend code agent** (`fullsend-ai-coder[bot]`), or
+by the configured app-set coder (`${FULLSEND_APP_SET}-coder[bot]`), automatic
+fixing happens with no extra setup — the fix agent responds to review feedback
+out of the box. In `gh pr view --json author` output, the configured coder is
+identified as `app/${FULLSEND_APP_SET}-coder` and must also have
+`.author.is_bot == true`. PRs from other bots (e.g., Renovate) require the
+`fullsend-fix` label; without it, the bot-triggered fix run is dispatched but
+the eligibility check exits early with a warning. See
+[Bot identities](../contributing/bot-identities.md) for how the eligibility
+script identifies the coder bot across different API surfaces.
+
+For **human-authored PRs**, the fix agent will not auto-fix review feedback
+unless you opt in by adding the `fullsend-fix` label. This prevents the agent
+from pushing commits to your branch without your consent. You can still use
+`/fs-fix` at any time regardless of the label — the label only controls
+automatic (bot-triggered) runs.
 
 `/fs-fix-stop` adds the `fullsend-no-fix` label to the PR, preventing any
 further bot-triggered fix runs. Human-triggered `/fs-fix` commands still work.
 Remove the label or use `/fs-fix` to re-engage.
 
+**GitLab scope note:** on GitLab, the dispatch router enforces the
+`fullsend-no-fix` stop valve for the changes-requested MR-note path
+described above. The `fullsend-fix` opt-in gate for human-authored and
+non-coder-bot MRs — enforced on GitHub by
+[`check-fix-eligibility.sh`](../../.github/scripts/check-fix-eligibility.sh) —
+is not yet implemented for GitLab: the router does not currently have
+enough MR-author identity information to distinguish the fullsend code
+agent from other authors. Until that parity lands, bot-triggered fix
+runs on GitLab MRs are gated only by `fullsend-no-fix`, not by
+`fullsend-fix`.
+
 ## Control labels
 
 | Label | Meaning |
 |-------|---------|
-| `fullsend-no-fix` | Prevents bot-triggered fix runs on this PR. Applied by `/fs-fix-stop`. Human `/fs-fix` commands are unaffected. |
+| `fullsend-fix` | Enables automatic bot-triggered fix runs on human-authored PRs and PRs from bots other than the fullsend code agent. Without this label, the fix agent only runs when explicitly invoked via `/fs-fix`. PRs authored by `fullsend-ai-coder[bot]` are always eligible without this label. **GitLab:** not yet enforced — see the scope note above. |
+| `fullsend-no-fix` | Prevents bot-triggered fix runs on this PR. Applied by `/fs-fix-stop`. Human `/fs-fix` commands are unaffected. Takes priority over `fullsend-fix`. Enforced on both GitHub and GitLab. |
 | `needs-human` | The fix agent is approaching its iteration cap and needs human direction. Applied automatically when a bot-triggered fix iteration reaches the warning threshold. |
 
 ## Configuration and extension
 
-See [Customizing with AGENTS.md](../guides/user/customizing-with-agents-md.md) and
-[Customizing with Skills](../guides/user/customizing-with-skills.md).
+See [Configuring with AGENTS.md](../guides/user/customizing-with-agents-md.md) and
+[Configuring with Skills](../guides/user/customizing-with-skills.md).
+
+### Image and network policy synchronization
+
+By default, the fix and [code agent](code.md) use the same upstream container
+image and overlapping sandbox policies (`policies/code.yaml` and
+`policies/fix.yaml` in [fullsend-ai/agents](https://github.com/fullsend-ai/agents)).
+They are separate harnesses, though — you can override each independently when
+their needs diverge. For example, you might keep Jira endpoints out of the code
+agent's policy while allowing them on the fix agent when reviewers ask you to
+verify something against a ticket during PR feedback.
+
+> **Warning:** If you customize image, `policy:`, or `providers:` on only one
+> agent by mistake, the other may fail with no obvious reason (for example, a
+> package manager or registry endpoint allowed in code but not fix).
+
+**Recommended configuration**
+
+If you want both agents to share one behavior set — one place to edit image,
+policy, providers, and runner scripts — put the same overrides in both harness
+files in your repo's `.fullsend/` directory:
+
+```yaml
+# .fullsend/harness/code.yaml  (register as source: harness/code.yaml in config.yaml)
+base: https://raw.githubusercontent.com/fullsend-ai/agents/<tag>/harness/code.yaml#sha256=…
+image: ghcr.io/your-org/your-fullsend-image@sha256:…
+policy: policies/base.yaml
+providers:
+  - vertex-ai
+  - github
+  - package-registries
+
+# .fullsend/harness/fix.yaml  (register as source: harness/fix.yaml in config.yaml)
+base: https://raw.githubusercontent.com/fullsend-ai/agents/<tag>/harness/fix.yaml#sha256=…
+image: ghcr.io/your-org/your-fullsend-image@sha256:…
+policy: policies/base.yaml   # same file — edit once, both agents use it
+providers:
+  - vertex-ai
+  - github
+  - package-registries
+```
+
+Keep the shared policy at `.fullsend/policies/base.yaml`. The policy file
+defines non-network sandbox restrictions only — filesystem access, landlock, and
+process identity. Network access is controlled through `providers:` profiles
+listed in the harness (see [Architecture](../architecture.md#agent-sandbox) for details on
+provider-backed policy composition) — when
+unifying configuration, keep the `providers:` list the same on both harnesses
+too. The same pattern applies to `pre_script` and `post_script` when you want a
+single place to maintain runner-side behavior.
+
+See [Customizing Agents](../guides/user/customizing-agents.md) for harness
+composition.
 
 ### Variables
 
@@ -141,4 +261,4 @@ None.
 
 ## Source
 
-[`internal/scaffold/fullsend-repo/harness/fix.yaml`](../../internal/scaffold/fullsend-repo/harness/fix.yaml)
+[`fullsend-ai/agents` — `harness/fix.yaml`](https://github.com/fullsend-ai/agents/blob/main/harness/fix.yaml)

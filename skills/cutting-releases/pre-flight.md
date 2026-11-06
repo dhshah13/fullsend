@@ -49,6 +49,45 @@ Classify each change as:
 - **Breaking** (removed/renamed inputs, outputs, jobs, new required
   secrets) — block the release until resolved.
 
+## A2. Check agents repo state
+
+Agents is not just tagged by the release workflow — it gates it. Agents'
+functional tests run against the release tag *before* GoReleaser
+publishes anything, so an unhealthy agents `main` blocks the whole
+release, not only the agents tag. Verify agents is in a healthy state:
+
+```
+gh run list --repo fullsend-ai/agents --limit=5
+```
+
+Check for open PRs that should be merged before releasing:
+
+```
+gh pr list --repo fullsend-ai/agents --state=open --limit=5
+```
+
+If there are critical open PRs, resolve them before proceeding.
+
+## A3. Check the functional-tests gate pin
+
+`.github/workflows/release.yml` pins `validate-agents` to a commit of
+agents' `functional-tests.yml`, and pull requests never run that pin, so
+a stale one only fails at tag time (as on `v0.44.0-rc.1`). Show what
+changed in the file since the pin:
+
+```
+grep -oE 'functional-tests\.yml@[a-f0-9]{40}' .github/workflows/release.yml
+gh api "repos/fullsend-ai/agents/compare/<pin-sha>...main" \
+  --jq '.files[] | select(.filename == ".github/workflows/functional-tests.yml") | .patch'
+```
+
+`<pin-sha>` is the 40-character SHA after the `@`.
+
+Bump the pin before `rc.1` only if the pinned copy lacks something the
+gate needs: tool versions, schema, secrets or permissions. Additive
+changes, such as a new optional input or a longer timeout, do not need a
+bump.
+
 ## B. Audit scaffold and template changes
 
 ```
@@ -59,13 +98,8 @@ Scaffold files are deployed at `github setup` time, not consumed live
 via `@v0`. Changes here affect **new installs and re-scaffolds only**.
 Review for:
 
-- **Agent definitions** (`agents/`): Changed models, tools, or
-  instructions alter agent behavior on next scaffold.
-- **Harness configs** (`harness/`): Changed resource limits, allowed
-  tools, or validation rules.
-- **Hook scripts** (`scripts/`): Changed pre/post hooks run inside
-  agent sandboxes.
-- **Skill files** (`skills/`): New or changed agent skills.
+- **Infrastructure scripts** (`scripts/`): Changed scripts that run
+  inside agent sandboxes or during setup.
 - **Workflow templates** (`.github/workflows/`): Templates that get
   copied into target repos at scaffold time.
 
@@ -145,6 +179,7 @@ Summarize findings to the user in a table:
 | Area | Changes | Breaking? |
 |------|---------|-----------|
 | Reusable workflows | ... | No/Yes |
+| Functional-tests gate pin | current / needs bump | — |
 | Scaffold templates | ... | No/Yes |
 | CLI / internal | ... | No/Yes |
 

@@ -18,44 +18,48 @@ func TestParseForgeURL(t *testing.T) {
 			name:  "valid GitHub tree URL with commit SHA",
 			input: "https://github.com/fullsend-ai/library/tree/8cd3799abc/skills/pr-review",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "fullsend-ai",
-				Repo:  "library",
-				Ref:   "8cd3799abc",
-				Path:  "skills/pr-review",
+				Forge:    "github",
+				Owner:    "fullsend-ai",
+				Repo:     "library",
+				Ref:      "8cd3799abc",
+				Path:     "skills/pr-review",
+				PathType: "tree",
 			},
 		},
 		{
 			name:  "valid GitHub blob URL",
 			input: "https://github.com/fullsend-ai/library/blob/8cd3799abc/agents/code.md",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "fullsend-ai",
-				Repo:  "library",
-				Ref:   "8cd3799abc",
-				Path:  "agents/code.md",
+				Forge:    "github",
+				Owner:    "fullsend-ai",
+				Repo:     "library",
+				Ref:      "8cd3799abc",
+				Path:     "agents/code.md",
+				PathType: "blob",
 			},
 		},
 		{
 			name:  "URL with sha256 fragment stripped",
 			input: "https://github.com/fullsend-ai/library/tree/abc123/skills/rust#sha256=def456abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "fullsend-ai",
-				Repo:  "library",
-				Ref:   "abc123",
-				Path:  "skills/rust",
+				Forge:    "github",
+				Owner:    "fullsend-ai",
+				Repo:     "library",
+				Ref:      "abc123",
+				Path:     "skills/rust",
+				PathType: "tree",
 			},
 		},
 		{
 			name:  "root path with no path after ref",
 			input: "https://github.com/fullsend-ai/library/tree/abc123",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "fullsend-ai",
-				Repo:  "library",
-				Ref:   "abc123",
-				Path:  "",
+				Forge:    "github",
+				Owner:    "fullsend-ai",
+				Repo:     "library",
+				Ref:      "abc123",
+				Path:     "",
+				PathType: "tree",
 			},
 		},
 		{
@@ -82,23 +86,78 @@ func TestParseForgeURL(t *testing.T) {
 			name:  "deep nested path",
 			input: "https://github.com/org/repo/tree/main/a/b/c/d",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "org",
-				Repo:  "repo",
-				Ref:   "main",
-				Path:  "a/b/c/d",
+				Forge:    "github",
+				Owner:    "org",
+				Repo:     "repo",
+				Ref:      "main",
+				Path:     "a/b/c/d",
+				PathType: "tree",
 			},
 		},
 		{
 			name:  "tag as ref",
 			input: "https://github.com/org/repo/tree/v1.2.3/skills/foo",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "org",
-				Repo:  "repo",
-				Ref:   "v1.2.3",
-				Path:  "skills/foo",
+				Forge:    "github",
+				Owner:    "org",
+				Repo:     "repo",
+				Ref:      "v1.2.3",
+				Path:     "skills/foo",
+				PathType: "tree",
 			},
+		},
+		{
+			name:  "GitLab tree URL",
+			input: "https://gitlab.com/my-group/my-repo/-/tree/main/src/lib",
+			want: &ForgeURLInfo{
+				Forge:    "gitlab",
+				Owner:    "my-group",
+				Repo:     "my-repo",
+				Ref:      "main",
+				Path:     "src/lib",
+				PathType: "tree",
+			},
+		},
+		{
+			name:  "GitLab blob URL",
+			input: "https://gitlab.com/my-group/my-repo/-/blob/abc123/README.md",
+			want: &ForgeURLInfo{
+				Forge:    "gitlab",
+				Owner:    "my-group",
+				Repo:     "my-repo",
+				Ref:      "abc123",
+				Path:     "README.md",
+				PathType: "blob",
+			},
+		},
+		{
+			name:  "GitLab nested groups",
+			input: "https://gitlab.com/top/sub/deep/my-repo/-/tree/v1.0/docs",
+			want: &ForgeURLInfo{
+				Forge:    "gitlab",
+				Owner:    "top/sub/deep",
+				Repo:     "my-repo",
+				Ref:      "v1.0",
+				Path:     "docs",
+				PathType: "tree",
+			},
+		},
+		{
+			name:  "GitLab root path no trailing path",
+			input: "https://gitlab.com/group/repo/-/tree/main",
+			want: &ForgeURLInfo{
+				Forge:    "gitlab",
+				Owner:    "group",
+				Repo:     "repo",
+				Ref:      "main",
+				Path:     "",
+				PathType: "tree",
+			},
+		},
+		{
+			name:    "GitLab URL missing dash separator",
+			input:   "https://gitlab.com/group/repo",
+			wantErr: "URL path too short",
 		},
 	}
 	for _, tt := range tests {
@@ -126,44 +185,48 @@ func TestParseRawContentURL(t *testing.T) {
 			name:  "valid raw URL with SHA ref and path",
 			input: "https://raw.githubusercontent.com/fullsend-ai/fullsend/a06f8626/skills/pr-review",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "fullsend-ai",
-				Repo:  "fullsend",
-				Ref:   "a06f8626",
-				Path:  "skills/pr-review",
+				Forge:    "github",
+				Owner:    "fullsend-ai",
+				Repo:     "fullsend",
+				Ref:      "a06f8626",
+				Path:     "skills/pr-review",
+				PathType: "blob",
 			},
 		},
 		{
 			name:  "URL with fragment stripped",
 			input: "https://raw.githubusercontent.com/org/repo/abc123/path/to/file#sha256=def456",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "org",
-				Repo:  "repo",
-				Ref:   "abc123",
-				Path:  "path/to/file",
+				Forge:    "github",
+				Owner:    "org",
+				Repo:     "repo",
+				Ref:      "abc123",
+				Path:     "path/to/file",
+				PathType: "blob",
 			},
 		},
 		{
 			name:  "ref only, no path",
 			input: "https://raw.githubusercontent.com/owner/repo/main",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "owner",
-				Repo:  "repo",
-				Ref:   "main",
-				Path:  "",
+				Forge:    "github",
+				Owner:    "owner",
+				Repo:     "repo",
+				Ref:      "main",
+				Path:     "",
+				PathType: "blob",
 			},
 		},
 		{
 			name:  "deep nested path",
 			input: "https://raw.githubusercontent.com/org/repo/v1.0.0/a/b/c/d/e",
 			want: &ForgeURLInfo{
-				Forge: "github",
-				Owner: "org",
-				Repo:  "repo",
-				Ref:   "v1.0.0",
-				Path:  "a/b/c/d/e",
+				Forge:    "github",
+				Owner:    "org",
+				Repo:     "repo",
+				Ref:      "v1.0.0",
+				Path:     "a/b/c/d/e",
+				PathType: "blob",
 			},
 		},
 		{
@@ -201,6 +264,35 @@ func TestParseRawContentURL(t *testing.T) {
 	}
 }
 
+func TestForgeURLInfo_CloneURL(t *testing.T) {
+	tests := []struct {
+		name string
+		info ForgeURLInfo
+		want string
+	}{
+		{
+			name: "github",
+			info: ForgeURLInfo{Forge: "github", Owner: "fullsend-ai", Repo: "library"},
+			want: "https://github.com/fullsend-ai/library.git",
+		},
+		{
+			name: "gitlab",
+			info: ForgeURLInfo{Forge: "gitlab", Owner: "my-org", Repo: "my-repo"},
+			want: "https://gitlab.com/my-org/my-repo.git",
+		},
+		{
+			name: "unknown forge uses forge as host",
+			info: ForgeURLInfo{Forge: "gitea.example.com", Owner: "org", Repo: "repo"},
+			want: "https://gitea.example.com/org/repo.git",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.info.CloneURL())
+		})
+	}
+}
+
 func TestIsSupportedForge(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -208,7 +300,7 @@ func TestIsSupportedForge(t *testing.T) {
 		want     bool
 	}{
 		{"github.com", "github.com", true},
-		{"gitlab.com not yet supported", "gitlab.com", false},
+		{"gitlab.com — recognized but no fetch support yet", "gitlab.com", false},
 		{"example.com", "example.com", false},
 		{"empty string", "", false},
 	}

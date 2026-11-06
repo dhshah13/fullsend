@@ -1,6 +1,18 @@
 # Contributing to Fullsend
 
-Thank you for your interest in contributing! This document covers the social norms and processes we follow. For where to place your contribution (problem docs, ADRs, etc.), see the [README](README.md#how-to-contribute).
+Thank you for your interest in contributing! This document covers the social norms and processes we follow.
+
+## First-Time Contributors
+
+This project uses a **vouch system**. AI tools make it trivial to generate plausible-looking but low-quality contributions, so we require first-time contributors to be vouched by a maintainer before submitting pull requests.
+
+1. Open a [Vouch Request](https://github.com/fullsend-ai/fullsend/discussions/new?category=vouch-request) discussion.
+2. Describe what you want to change and why.
+3. Write in your own words — do not have an AI generate the request. Requests that read like LLM output will be denied.
+4. A maintainer will comment `/vouch` if approved.
+5. Once vouched, you can submit pull requests.
+
+**If you are not vouched, any pull request you open will be automatically closed.** Org members and collaborators with write access bypass this check.
 
 ## Commit messages
 
@@ -12,14 +24,35 @@ This project uses the [Probot DCO app](https://github.com/apps/dco) to enforce s
 
 **Human-driven agent sessions** (e.g., using Claude Code locally) should sign off — the human directing the session is the one certifying the DCO, just as they would for any other commit.
 
-**Autonomous agent commits are exempt.** The fullsend code and fix agents run without a human in the loop at commit time. The DCO is a human attestation — it certifies personhood and legal authority to contribute. No one is present to make that certification in an autonomous session. These agents commit using the GitHub App's bot identity (`<id>+<slug>[bot]@users.noreply.github.com`), which GitHub recognizes as `author.type: "Bot"`. The Probot DCO app auto-skips bot-authored commits. The human who merges an agent PR accepts responsibility for the contribution.
+**Autonomous agent commits are exempt** and must never supply the DCO with
+`-s` or with `Signed-off-by`. The fullsend code and fix agents run without a
+human in the loop at commit time. The DCO is a human attestation — it certifies
+personhood and legal authority to contribute. No one is present to make that
+certification in an autonomous session. These agents commit using the GitHub
+App's bot identity (`<id>+<slug>[bot]@users.noreply.github.com`), which GitHub
+recognizes as `author.type: "Bot"`. The Probot DCO app auto-skips bot-authored
+commits. The human who merges an agent PR accepts responsibility for the
+contribution.
 
 ## Pull request workflow
 
 ### Opening a PR
 
 - Stage your changes, then run `make lint` before pushing and fix any failures.
-- For Go changes, run `make go-test` and add tests for new or modified logic. CI uploads coverage to Codecov and enforces the thresholds in [`.codecov.yml`](.codecov.yml): **80% patch coverage** on changed lines (5% tolerance) and **no more than 1% drop** in overall project coverage relative to the base branch.
+- For Go changes, run `make go-test` and add tests for new or modified logic. CI uploads coverage to Codecov and enforces the thresholds in [`.codecov.yml`](.codecov.yml): **80% patch coverage target** on changed lines (**75% enforced floor**, 5% threshold) and **no more than 1% drop** in overall project coverage relative to the base branch.
+- On macOS or a Linux distribution other than Ubuntu, `make ci-local` runs the
+  same checks in a container that matches the CI runner, so local results
+  predict CI (see [`hack/ci-local`](hack/ci-local/README.md)).
+- **If your PR introduces a breaking change**, the PR title and every breaking
+  commit's subject must carry the `!` suffix (e.g., `feat(harness)!: require
+  role field`). GoReleaser builds release notes from commit subjects, not the
+  PR title — a missing `!` on a breaking commit means users get no warning
+  before upgrading. See [COMMITS.md](COMMITS.md#breaking-changes) for how to
+  identify breaking changes and what to include in the commit body.
+- Wrap prose in Markdown files at about 80 columns, so diffs show only the
+  lines you changed. Tables, code blocks, headings, and long URLs are
+  exceptions. See
+  [Documentation § Line wrapping](docs/contributing/documentation.md#line-wrapping).
 - Keep PRs focused. One problem area or decision per PR is easier to review than a grab-bag.
 - If your change touches a problem doc, make sure the "Open questions" section still makes sense after your edit.
 
@@ -60,6 +93,67 @@ Human contributors may include an ADR and its implementation in the same PR when
 
 ADR filenames use a four-digit number (`NNNN-short-description.md`). When multiple PRs add ADRs concurrently, number collisions can happen. Before merging, use the `/renumber-adr` skill to check whether your ADR number is still available on the target branch and renumber if needed.
 
+## Deprecation notices in documentation
+
+When a feature, field, command, or workflow is deprecated, label it clearly in
+the user-facing documentation so readers can distinguish current functionality
+from deprecated functionality. Use the following conventions consistently.
+
+### Blockquote notice (preferred for sections)
+
+Place a blockquote at the top of the section that describes the deprecated
+feature. Use this format:
+
+```markdown
+> **Deprecated:** `<feature>` is deprecated. Use `<replacement>` instead.
+> <Migration guidance — one or two sentences explaining how to migrate.>
+```
+
+Key elements:
+- Start with **`> **Deprecated:**`** (bold, followed by a colon).
+- Name the deprecated feature explicitly.
+- Describe the replacement and how to migrate.
+
+### Inline annotation (for field references and tables)
+
+When a deprecated item appears in a table, code block, or field reference,
+add a short inline annotation:
+
+```yaml
+runner_env:    # ⚠ Deprecated: use env.runner instead
+```
+
+```markdown
+| `env`, `runner_env` (deprecated) | Merged; child keys win |
+```
+
+### Sidebar or guide index entry
+
+When an entire guide page is deprecated, annotate the link in the index:
+
+```markdown
+- [Building custom agents](path) — _(deprecated — see [Replacement](path))_
+```
+
+### What to include
+
+Every deprecation notice should answer three questions:
+1. **What** is deprecated?
+2. **What replaces it?** (link to the replacement feature or guide)
+3. **How do I migrate?** (command, config change, or link to migration docs)
+
+If there is no replacement yet, say so explicitly (e.g., "removal is planned
+for a future release; no migration is needed").
+
+### When to add notices
+
+- When a feature is deprecated, update the affected user-facing docs in the
+  same PR or a follow-up.
+- When touching a doc page that references a deprecated feature without a
+  notice, add one.
+- Do not remove deprecated content from docs — label it so users on older
+  versions can still find the reference material.
+
 ## Building from source
 
 ```bash
@@ -68,11 +162,39 @@ make go-build
 
 The binary is written to `./bin/fullsend`. To run agents locally with the built binary, see [Running agents locally](docs/guides/user/running-agents-locally.md).
 
+When working from this checkout (especially mint-mutating commands), prefer
+`go run ./cmd/fullsend …` over a preinstalled binary so the CLI matches the
+branch under edit. See [Running the fullsend CLI](docs/contributing/go-code.md#running-the-fullsend-cli). End-user and operator guides continue to document the released `fullsend` binary.
+
 ## Issues
 
 When in doubt about whether something warrants a PR, start with an issue. Issues are low-friction and can graduate into PRs, problem docs, or ADRs later.
 
 To find open issues for human contribution, use the [contributor issue search](https://github.com/fullsend-ai/fullsend/issues?q=is%3Aissue%20is%3Aopen%20-author%3Aapp%2Ffullsend-ai-fullsend%20-author%3Aapp%2Ffullsend-ai-triage%20-author%3Aapp%2Ffullsend-ai-review%20-author%3Aapp%2Ffullsend-ai-prioritize%20-author%3Aapp%2Ffullsend-ai-coder%20-author%3Aapp%2Ffullsend-ai-retro%20-label%3Aready-to-code). This search excludes issues reserved for agents.
+
+### Where to file experiments-related issues
+
+> **Status: proposed, pending maintainer confirmation.** The split below documents the de facto filing pattern observed since `fullsend-ai/experiments` became a submodule of this repository. A maintainer has not yet confirmed it as the intended policy — see [#588](https://github.com/fullsend-ai/fullsend/issues/588). Treat this section as a proposal until that confirmation lands.
+
+[`fullsend-ai/experiments`](https://github.com/fullsend-ai/experiments) is a separate repository, vendored here as the `experiments/` git submodule and published on the docs site. File issues in the repository that owns the code or configuration being changed:
+
+| File in | When the work is |
+|---------|------------------|
+| [`fullsend-ai/experiments`](https://github.com/fullsend-ai/experiments/issues) | Experiment source, conventions, lint scripts, CI, or config **inside** the experiments repository (the `experiments/` tree), including new spikes and prototypes. |
+| [`fullsend-ai/fullsend`](https://github.com/fullsend-ai/fullsend/issues) | How this repository consumes the submodule: `.gitmodules`, CODEOWNERS entries, Renovate bump/auto-merge policy, the `docs/experiments` symlink, ignore rules, and docs-site wiring. Also file here for fullsend product or platform work that cites an experiment as evidence. |
+
+When the right tracker is unclear, file in this repository and link the [experiments issue tracker](https://github.com/fullsend-ai/experiments/issues) in the body. Search both repositories before filing — the same topic may already exist in the other tracker.
+
+The [`filing-issues`](skills/filing-issues/SKILL.md) skill encodes this split for automated filing.
+
+## Contributor ladder
+
+This project defines five contributor roles — Vouched, Triage, Write,
+Maintainer, and Admin — each granting additional capabilities. See
+[LADDER.md](LADDER.md) for the full ladder and how to request each role.
+
+For the Maintainer role specifically, see
+[MAINTAINERS.md](MAINTAINERS.md).
 
 ## License
 

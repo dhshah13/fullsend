@@ -1,0 +1,41 @@
+name: Prepare Workspace
+description: >-
+  Layer upstream defaults with per-repo overrides and validate the repository.
+  Must be called AFTER the caller repository and upstream defaults have been
+  checked out (the checkout steps must be inline in the job because this
+  action is only available once .defaults/ exists on disk).
+
+inputs:
+  source_repo:
+    description: Target repository in owner/name form
+    required: true
+
+outputs:
+  repo_name:
+    description: Short repo name extracted by validate-enrollment
+    value: ${{ steps.repo-parts.outputs.name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare workspace (upstream defaults + repo overrides)
+      shell: bash
+      run: |
+        set -euo pipefail
+        SRC=".defaults/internal/scaffold/fullsend-repo"
+        LAYERED_DIRS="agents skills schemas harness plugins scripts env"
+        DEST=".fullsend/"
+        for dir in ${LAYERED_DIRS}; do
+          if [[ -d "${SRC}/${dir}" ]]; then
+            mkdir -p "${DEST}${dir}"
+            cp -r "${SRC}/${dir}/." "${DEST}${dir}/"
+          fi
+        done
+        mkdir -p .github/scripts
+        cp "${SRC}/.github/scripts/setup-agent-env.sh" .github/scripts/setup-agent-env.sh
+
+    - name: Validate enrollment and extract repo metadata
+      id: repo-parts
+      uses: ./.defaults/.github/actions/validate-enrollment
+      with:
+        source_repo: ${{ inputs.source_repo }}

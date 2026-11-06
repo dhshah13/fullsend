@@ -1,0 +1,769 @@
+package runtime
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/fullsend-ai/fullsend/internal/sandbox"
+	"github.com/fullsend-ai/fullsend/internal/ui"
+)
+
+// codexHooksMissingExit is the exit code the run command uses when the hook
+// adapter, the hook wiring or the manifest is not where Bootstrap put it, or
+// the adapter no longer matches the copy embedded in this binary. codex loads
+// hooks.json silently — a missing file is simply "no hooks" — so without this
+// guard a deleted or edited adapter would give a hookless iteration that looks
+// perfectly healthy.
+const codexHooksMissingExit = 97
+
+// codexConfigTamperedExit is the exit code of the config-dir integrity guard:
+// config.toml or the auth script was changed in a way that could redirect the
+// model call or replace the credential. Distinct from codexHooksMissingExit so
+// Run can name the actual cause.
+const codexConfigTamperedExit = 98
+
+// codexBinaryVar holds the absolute path of the codex binary, resolved before
+// .env is sourced and marked read-only.
+const codexBinaryVar = "FULLSEND_CODEX_BIN"
+
+// codexNodeVar holds the node that starts codex: `codex` on PATH is npm's
+// `#!/usr/bin/env node` launcher, so binaryPin pins node by the same rule.
+const codexNodeVar = "FULLSEND_CODEX_NODE"
+
+// codexRuntimeEnv tells skills running inside the sandbox which runtime they
+// are on, so a skill can take a runtime-specific path deliberately.
+const codexRuntimeEnv = "FULLSEND_RUNTIME"
+
+// codexPathVar holds the PATH captured before the agent-writable .env is
+// sourced, so it can be restored before codex is launched. The hook adapter's
+// children take envDataTrustedPathVar instead (see buildCodexRunCommand).
+const codexPathVar = "FULLSEND_CODEX_PATH"
+
+// codexHookDigestsEnv carries the hook scripts' expected digests to the
+// adapter as "<name>:<sha256>" pairs, space separated.
+//
+// The run command exports it after .env and immediately before codex starts,
+// so its value is fixed in the codex process's environment for the whole
+// iteration: the agent can rewrite a hook script mid-run, but it cannot reach
+// into an already-running process's environment to move the digest it will be
+// checked against. That is what lets the adapter re-verify each script at
+// every invocation rather than trusting the once-per-launch shell guard —
+// closing the intra-iteration window that Claude Code and pi leave open.
+const codexHookDigestsEnv = "FULLSEND_CODEX_HOOK_DIGESTS"
+
+// codexSpawnDigestsEnv carries the files the spawn guard re-checks before it
+// admits a child, as space-separated "<path>:<sha256>" pairs relative to
+// CODEX_HOME: hooks.json and every registered role file, which codex re-reads
+// when a child starts. Its keys are also the guard's role registry.
+const codexSpawnDigestsEnv = "FULLSEND_CODEX_SPAWN_DIGESTS"
+
+// codexHookDigestsValue renders the map for the environment. Sorted so the
+// launch command is stable across iterations.
+func codexHookDigestsValue(scripts map[string]string) string {
+	names := make([]string, 0, len(scripts))
+	for name := range scripts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	pairs := make([]string, 0, len(names))
+	for _, name := range names {
+		pairs = append(pairs, name+":"+scripts[name])
+	}
+	return strings.Join(pairs, " ")
+}
+
+// codexSpawnDigestsValue renders the spawn guard's digest map: hooks.json
+// plus agents/<role>.toml per registered role, keyed by path relative to
+// CODEX_HOME, which is where the adapter resolves the file from.
+func codexSpawnDigestsValue(d codexRunnerHeldDigestSet) string {
+	entries := map[string]string{codexHooksFile: d.HooksJSON}
+	for role, digest := range d.RoleFiles {
+		entries["agents/"+role+".toml"] = digest
+	}
+	return codexHookDigestsValue(entries)
+}
+
+// codexOpenAIProvider is the only model provider prefix codex accepts in a
+// fullsend model spec. codex speaks the OpenAI Responses API and has no
+// Vertex, Anthropic or Gemini path, so any other prefix is a configuration
+// error rather than something to translate.
+const codexOpenAIProvider = "openai"
+
+// codexReasoningEfforts are the values codex accepts for
+// model_reasoning_effort (codex-rs/protocol/src/openai_models.rs
+// ReasoningEffort, rust-v0.152.1). fullsend's own effort vocabulary
+// (config.ValidEffortLevels: low, medium, high, xhigh, max) is a subset, so
+// the mapping is the identity — an earlier draft remapped max to xhigh, which
+// 0.152.1 makes unnecessary. "off" is accepted as an alias for codex's "none"
+// because pi's thinking vocabulary uses it.
+var codexReasoningEfforts = map[string]string{
+	"off":     "none",
+	"none":    "none",
+	"minimal": "minimal",
+	"low":     "low",
+	"medium":  "medium",
+	"high":    "high",
+	"xhigh":   "xhigh",
+	"max":     "max",
+}
+
+// codexEffortFor returns the model_reasoning_effort override for a harness
+// effort value, and whether it was recognised. An empty effort yields "" so
+// the override is omitted and codex's own default (medium) applies — codex
+// resolves the default per model, so pinning one here would override a
+// model's own preference for no reason.
+func codexEffortFor(effort string) (string, bool) {
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		return "", true
+	}
+	if mapped, ok := codexReasoningEfforts[strings.ToLower(effort)]; ok {
+		return mapped, true
+	}
+	return "", false
+}
+
+// codexClaudeAliases are the Claude-vocabulary model aliases a fleet harness
+// or an agents: entry may carry (docs/runtimes.md). They are Claude models and
+// deliberately do not apply to codex: a repo on `runtime: codex` names an
+// OpenAI id instead. Keeping them out is a decision, not an omission — codex
+// must not consult the per-repo `models.aliases` overrides either, so a Claude
+// alias can never resolve to a GPT model behind the operator's back.
+var codexClaudeAliases = map[string]bool{"opus": true, "sonnet": true, "haiku": true, "fable": true}
+
+// codexModelHelp names both ways to give codex a model it can serve.
+const codexModelHelp = "set FULLSEND_CODEX_MODEL=" + codexOpenAIProvider +
+	"/<id> for the repo, or model: " + codexOpenAIProvider +
+	"/<id> on the agent's agents: entry or the harness (or " + codexGatewayModelProvider +
+	"/<model> with an inference.gateway block)"
+
+// ValidateCodexModel reports whether model is one fullsend's codex
+// integration can serve. Empty, a Claude alias, or a provider prefix other
+// than openai/ or gateway/ are errors; the message names both ways to set a
+// valid id. Used by `agent new` so `--runtime codex` cannot generate a harness
+// the runtime will refuse (#7264). A gateway/ model is accepted by shape:
+// whether an inference.gateway block applies is known only at run time.
+func ValidateCodexModel(model string) error {
+	_, err := translateCodexModel(model, true)
+	return err
+}
+
+// codexModel is a resolved codex model: the --model value and whether it is
+// served through the inference gateway route (the fullsend-gateway
+// provider) rather than the direct OpenAI one (fullsend-openai).
+type codexModel struct {
+	ID      string
+	Gateway bool
+}
+
+// translateCodexModel resolves a model spec into codex's --model value: a bare
+// id passes through and an `openai/` prefix is stripped. A Claude alias or any
+// other provider prefix is an error naming both fixes, because codex would
+// otherwise send the whole string as a model id and get a 404 from OpenAI with
+// nothing to tune — which is exactly what the local smoke showed: five error
+// reconnects and a turn.failed carrying "Model not found".
+//
+// `gateway/<model>` selects the inference gateway route (ADR 0137) and passes
+// everything after the first slash to codex, so a multi-segment id such as
+// `gateway/vendor/org/model` reaches the gateway as `vendor/org/model`. It is
+// accepted only when gateway is true — an inference.gateway block applies and
+// Bootstrap rendered the gateway provider — and is an error otherwise.
+func translateCodexModel(model string, gateway bool) (codexModel, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return codexModel{}, fmt.Errorf("codex takes OpenAI model ids or gateway/<model> only and no model was named: %s", codexModelHelp)
+	}
+	provider, id, hasSlash := strings.Cut(model, "/")
+	if !hasSlash {
+		if codexClaudeAliases[strings.ToLower(model)] {
+			return codexModel{}, fmt.Errorf(
+				"codex takes OpenAI model ids or gateway/<model> only, and the Claude model aliases do not apply to it: %q is one of them. To run this agent on codex, %s",
+				model, codexModelHelp)
+		}
+		return codexModel{ID: model}, nil
+	}
+	if strings.EqualFold(provider, codexGatewayModelProvider) {
+		if !gateway {
+			return codexModel{}, fmt.Errorf(
+				"model %q selects the inference gateway route, but no inference.gateway block applies to this run: add one to .fullsend/config.yaml (with auth: oidc it applies on a run with a forge OIDC endpoint, with auth: api-key on every run), or %s",
+				model, codexModelHelp)
+		}
+		id = strings.TrimSpace(id)
+		if id == "" || strings.HasPrefix(id, "/") || strings.HasSuffix(id, "/") {
+			return codexModel{}, fmt.Errorf("model %q has an empty model id after the %q prefix", model, codexGatewayModelProvider)
+		}
+		return codexModel{ID: id, Gateway: true}, nil
+	}
+	if !strings.EqualFold(provider, codexOpenAIProvider) {
+		return codexModel{}, fmt.Errorf(
+			"codex takes OpenAI model ids or gateway/<model> only, so %q is not available on it: %s",
+			model, codexModelHelp)
+	}
+	if strings.TrimSpace(id) == "" {
+		return codexModel{}, fmt.Errorf("model %q has an empty model id after the %q prefix: %s", model, codexOpenAIProvider, codexModelHelp)
+	}
+	return codexModel{ID: id}, nil
+}
+
+// codexBinaryPin is the POSIX sh fragment that records where codex is; see
+// binaryPin for why it holds. The launch below uses the path, which no
+// function or alias can shadow. This matters more on codex than on pi:
+// `codex` on PATH is npm's node launcher, so a planted shim would run before
+// the native binary ever starts, and the node that runs the launcher is
+// pinned with it.
+func codexBinaryPin() string {
+	return binaryPin(codexBinaryVar, codexNodeVar, "codex")
+}
+
+// codexAssetGuard is the POSIX sh fragment run before codex: the runner-owned
+// files must exist, and the two whose contents are fixed at compile time — the
+// hook adapter and the provider auth script — must be byte-identical to the
+// copies embedded in this binary. The config directory is agent-writable
+// between iterations, exactly as Claude Code's hooks.json and its scripts are.
+//
+// `command -p` bypasses shell functions and uses the system default PATH, so
+// nothing left in the environment can stand in for sha256sum or cut; test, [
+// and echo are builtins.
+func codexAssetGuard(r CodexRuntime, hooksEnabled bool, digests codexRunnerHeldDigestSet) string {
+	checks := []string{
+		"test -f " + shellQuote(r.codexConfigPath()),
+		"test -f " + shellQuote(r.codexAuthScriptPath()),
+		codexSHACheck(r.codexAuthScriptPath(), codexAssetSHA256(codexAuthScriptSH)),
+	}
+	if digests.GatewayBaseURL != "" {
+		// The gateway provider's auth.command, pinned exactly as the OpenAI
+		// one is: Bootstrap uploads it only when a block applies.
+		checks = append(checks,
+			"test -f "+shellQuote(r.codexGatewayAuthScriptPath()),
+			codexSHACheck(r.codexGatewayAuthScriptPath(), codexAssetSHA256(codexGatewayAuthScriptSH)),
+		)
+	}
+	if hooksEnabled {
+		checks = append(checks,
+			"test -f "+shellQuote(r.codexHooksPath()),
+			"test -f "+shellQuote(r.codexManifestPath()),
+			"test -f "+shellQuote(r.codexAdapterPath()),
+			codexSHACheck(r.codexAdapterPath(), codexAssetSHA256(codexHookAdapterPy)),
+			// The wiring is rendered per run, so it cannot be pinned by a
+			// compile-time hash. Instead every handler line must carry both the
+			// "command" key and this adapter's path, so the two counts are
+			// equal: replacing one handler's command with something else, or
+			// adding a handler of the agent's own, breaks the equality.
+			//
+			// What it does not catch is deletion — removing whole handlers
+			// keeps the counts equal and narrows the wiring. That residue is
+			// the same one Claude Code has with its own hooks.json, which is
+			// likewise written once at Bootstrap and agent-writable after.
+			codexHooksAdapterCheck(r.codexHooksPath(), r.codexAdapterPath()),
+			// Every script in the hooks directory must be one this binary
+			// installed: the scripts are agent-writable between iterations,
+			// and a tirith_check.py rewritten to exit 0 would disable a
+			// control while every other check still passed.
+			codexHookScriptsGuard(r.codexHooksDir(), digests.HookScripts),
+		)
+	}
+	return fmt.Sprintf(
+		`{ %s || { echo 'fullsend: codex config, hook adapter or auth script missing or modified; refusing to run' >&2; exit %d; }; }`,
+		strings.Join(checks, " && "), codexHooksMissingExit)
+}
+
+// codexHooksAdapterCheck asserts that every command handler in hooks.json
+// still invokes adapter.
+//
+// This is **defense in depth, not the boundary**. On its own the count
+// comparison is bypassable — swap one handler's command and pad the adapter's
+// path into the free-form `description` field to restore parity. What actually
+// makes hooks.json tamper-evident is codexConfigGuard's whole-file digest,
+// a runner-held digest; this check survives as a cheap, readable
+// assertion that fails first and names the wiring rather than the file.
+//
+// The grouping braces are load-bearing: `&&` and `||` are left-associative in
+// sh, so an ungrouped alternation inside the guard's chain would rescue every
+// earlier failure and make the whole guard fail open.
+func codexHooksAdapterCheck(hooksPath, adapter string) string {
+	// `grep -o | wc -l` counts occurrences rather than matching lines: the
+	// runner writes one handler per line, but an agent rewriting the file is
+	// under no such obligation, and a compacted single-line hooks.json would
+	// make a line count collapse to 1 = 1 and pass.
+	count := func(pattern string) string {
+		return fmt.Sprintf(`$(command -p grep -o %s %s | command -p wc -l)`,
+			shellQuote(pattern), shellQuote(hooksPath))
+	}
+	// The key, with its colon: a bare `"command"` would also match the value
+	// in `"type": "command"` and double every handler's count.
+	return fmt.Sprintf(`[ "%s" = "%s" ]`, count(`"command":`), count(adapter))
+}
+
+// codexModelsCacheRemoval is the POSIX sh fragment that deletes
+// $CODEX_HOME/models_cache.json, so every run starts from codex's bundled model
+// catalog. The runner never writes this file, so deleting it is always safe.
+// `command -p` keeps a shell function or PATH entry from .env from replacing
+// `rm`.
+func codexModelsCacheRemoval(r CodexRuntime) string {
+	return "command -p rm -f " + shellQuote(r.codexModelsCachePath())
+}
+
+func codexSHACheck(path, sum string) string {
+	return fmt.Sprintf(`[ "$(command -p sha256sum %s | command -p cut -d' ' -f1)" = %s ]`,
+		shellQuote(path), shellQuote(sum))
+}
+
+// codexConfigGuard is the POSIX sh fragment that fails closed when a
+// runner-owned, per-run file under CODEX_HOME is no longer byte-for-byte what
+// Bootstrap uploaded. The expected values are runner-held digests
+// (codex_integrity.go), so nothing in the agent-writable config directory
+// contributes to the answer.
+//
+// An earlier version checked config.toml with grep line patterns instead —
+// that base_url is the pinned one, that no `[projects` header appears — and it
+// was wrong in a way worth recording: TOML's dotted-key form,
+// `projects."<repo>".trust_level = "trusted"`, sets the same value with no
+// bracket header and slipped straight past it. That line makes codex load the
+// target repo's own `.codex/config.toml`, which then supplies
+// `developer_instructions`, `model` and, under
+// `--dangerously-bypass-hook-trust`, repo-authored hooks. Verified against
+// codex 0.152.1: with the line the repo layer applied, without it it did not,
+// and `-c projects={}` and a `-c` scalar `trust_level="untrusted"` both failed
+// to override it. A whole-file digest has no such blind spot.
+func codexConfigGuard(r CodexRuntime, digests codexRunnerHeldDigestSet) string {
+	checks := []string{codexSHACheck(r.codexConfigPath(), digests.ConfigTOML)}
+	if digests.HooksJSON != "" {
+		checks = append(checks, codexSHACheck(r.codexHooksPath(), digests.HooksJSON))
+	}
+	return fmt.Sprintf(
+		`{ %s || { echo 'fullsend: codex config.toml or hooks.json is not the file fullsend wrote; refusing to run (a rewritten config can trust the target repo, which loads its .codex/ layer and its hooks)' >&2; exit %d; }; }`,
+		strings.Join(checks, " && "), codexConfigTamperedExit)
+}
+
+// buildCodexRunCommand renders the in-sandbox command line.
+//
+// Security-relevant choices, in the order they appear:
+//
+//   - the binary is resolved and pinned read-only before the agent-writable
+//     .env is sourced, and the guards run there too, where nothing can shadow
+//     the shell builtins they use;
+//   - the credential is seeded into a runner-owned file before .env can
+//     replace OPENAI_API_KEY with another provider's placeholder;
+//   - after .env, CODEX_HOME is re-pinned and the variables that could
+//     redirect the endpoint (OPENAI_BASE_URL), supply a second credential
+//     (CODEX_API_KEY, OPENAI_API_KEY) or load code into the node launcher
+//     (NODE_OPTIONS, NODE_PATH) are unset, then the config guard runs again;
+//   - approval policy, sandbox mode and the model provider are passed as `-c`
+//     SessionFlag overrides, which sit above every config layer, so no
+//     rewritten file can move them;
+//   - the project's trust is pinned to untrusted in config.toml, so the target
+//     repo's own .codex/ layer — including repo-owned hooks — never loads;
+//   - whether the hook adapter is required is decided from the runner's own
+//     signal (params.HooksSettingsPath, the same one ClaudeRuntime uses for
+//     --settings), never from the agent-writable manifest;
+//   - models_cache.json is removed before .env and again just before launch,
+//     so codex starts from its bundled model catalog.
+//
+// A gateway/ model (model.Gateway, ADR 0137) swaps the route, never the
+// guards: the gateway token is seeded instead of the OpenAI one, the
+// gateway placeholder is unset after .env as well, and the `-c` overrides
+// select and pin fullsend-gateway — its base_url and auth.command — in
+// place of fullsend-openai. The gateway values come from the runner
+// (digests.GatewayBaseURL, the rendered config.toml), never from .env.
+func buildCodexRunCommand(params RunParams, model codexModel, effort string, hooksEnabled bool, digests codexRunnerHeldDigestSet) string {
+	r := CodexRuntime{}
+	envFile := sandbox.SandboxWorkspace + "/.env"
+
+	providerID := codexProviderID
+	baseURL := codexBaseURL
+	authScript := r.codexAuthScriptPath()
+	seed := r.OpenAIAuthSeed()
+	unset := "OPENAI_BASE_URL OPENAI_API_KEY CODEX_API_KEY"
+	if model.Gateway {
+		providerID = codexGatewayProviderID
+		baseURL = digests.GatewayBaseURL
+		authScript = r.codexGatewayAuthScriptPath()
+		seed = r.gatewayAuthSeed()
+		unset += " " + codexGatewayCredentialEnv
+	}
+
+	parts := []string{"cd " + shellQuote(params.RepoDir)}
+	parts = append(parts,
+		"&& "+codexBinaryPin(),
+		// PATH is captured before .env and restored after it for codex
+		// itself, so a .env cannot change the PATH codex runs with; the hook
+		// children take envDataTrustedPathVar instead. `readonly` means a
+		// .env that assigns the same name aborts the sourcing shell under a
+		// POSIX sh rather than winning.
+		"&& readonly "+codexPathVar+`="$PATH"`,
+		"&& "+codexAssetGuard(r, hooksEnabled, digests),
+		"&& "+codexConfigGuard(r, digests),
+		"&& "+codexModelsCacheRemoval(r),
+		"&& "+seed,
+		// .env is read as data, never sourced (envDataLoad, #8498).
+		"&& "+envDataLoad(envFile, codexBinaryVar, codexNodeVar, codexPathVar),
+		// .env is agent-writable; re-pin the runner-owned config location
+		// after it so a rewritten .env cannot move codex's home out from
+		// under the guards.
+		"&& "+strings.Join(r.EnvExports(), " && "),
+		// Restored for codex itself. The hook adapter sets its children's
+		// PATH from envDataTrustedPathVar instead: the same launch PATH,
+		// recorded read-only before .env by codexBinaryPin, without the
+		// directories the agent can write. It is exported from a value that
+		// never passed through .env, rather than trusting whatever PATH the
+		// adapter happens to inherit.
+		"&& export PATH=\"$"+codexPathVar+"\" && export "+envDataTrustedPathVar,
+		"&& export "+codexRuntimeEnv+"=codex",
+		// NODE_* would load code into npm's codex launcher; PYTHON* would do
+		// the same to the hook adapter's interpreter, which `-I` in hooks.json
+		// already isolates — belt and braces, since the adapter is the one
+		// process that decides whether a tool call is allowed.
+		// LD_* would load code into any dynamically linked binary the run
+		// starts — codex's own native binary, tirith, git — before its main
+		// runs, which no digest of ours would see.
+		"&& unset "+unset+" NODE_OPTIONS NODE_PATH PYTHONPATH PYTHONHOME PYTHONSTARTUP LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT",
+		// `unset -f` is a special builtin, which a function .env defined
+		// cannot shadow, so it restores the real utilities before the second
+		// pass; `command -p` inside the guard defeats a PATH swap.
+		"&& unset -f test command grep cut wc sha256sum printf codex",
+		"&& "+codexAssetGuard(r, hooksEnabled, digests),
+		"&& "+codexConfigGuard(r, digests),
+		// Again after .env, which runs in this shell and could recreate it.
+		"&& "+codexModelsCacheRemoval(r),
+	)
+	// codex exec has no --debug flag. Its tracing goes to stderr, at error
+	// level by default — a codex run is not silent there the way pi is — and
+	// RUST_LOG sets the level. It is set here outright, after .env, so neither
+	// .env nor the environment can lower it below what codexStderrDrops
+	// needs: exec and the in-process module at warn, where codex reports a
+	// dropped stream notification and a failed backfill; a value codex
+	// cannot parse would silently drop it to the default filter.
+	filter := codexStderrDefaultFilter + ",codex_exec=warn,codex_app_server::in_process=warn"
+	if params.Debug != "" {
+		filter = "info"
+	}
+	parts = append(parts, `&& export RUST_LOG=`+shellQuote(filter))
+
+	prompt := DefaultAgentPrompt
+	if params.Prompt != "" {
+		prompt = params.Prompt
+	}
+	// The prompt goes in on stdin, never argv: it is attacker-influenced text
+	// on a retry iteration (the validation loop injects the previous failure,
+	// #1050/#6494) and argv is world-readable in the sandbox. `-` is codex's
+	// explicit read-the-prompt-from-stdin sentinel; the pipe closes as soon as
+	// printf is done, so the read cannot hang the way pi's does.
+	if hooksEnabled {
+		// Exported after .env so nothing the agent wrote there can move it,
+		// and read by the adapter before every hook script it spawns.
+		parts = append(parts, "&& export "+codexHookDigestsEnv+"="+
+			shellQuote(codexHookDigestsValue(digests.HookScripts)))
+		parts = append(parts, "&& export "+codexSpawnDigestsEnv+"="+
+			shellQuote(codexSpawnDigestsValue(digests)))
+		// The hook scripts' own configuration, re-asserted from what the
+		// runner recorded at Bootstrap (hookEnvExports): the workspace .env
+		// carries the same values and is agent-writable, so without this,
+		// iteration 1 could widen the SSRF allowlist or clear TIRITH_REQUIRED
+		// for iteration 2. A name the runner has no value for is unset.
+		parts = append(parts, "&& "+hookEnvExports(digests.SecurityEnv))
+	}
+	parts = append(parts,
+		"&& printf '%s' "+shellQuote(prompt)+" | "+cliLaunch(codexBinaryVar, codexNodeVar),
+		"exec",
+		"--json",
+		"--skip-git-repo-check",
+		"--dangerously-bypass-approvals-and-sandbox",
+	)
+	if hooksEnabled {
+		// Unmanaged hooks otherwise run only when their recorded trusted_hash
+		// matches. fullsend's own SHA-256 guard above already vets the adapter
+		// the handlers invoke, and the alternative — baking a managed hook
+		// layer into /etc/codex at image build — would tie hook wiring to
+		// image releases (ADR 0099).
+		parts = append(parts, "--dangerously-bypass-hook-trust")
+	}
+	parts = append(parts,
+		"-C "+shellQuote(params.RepoDir),
+		"--model "+shellQuote(model.ID),
+		"-c "+shellQuote("model_provider="+providerID),
+		"-c "+shellQuote("approval_policy=never"),
+		"-c "+shellQuote("sandbox_mode=danger-full-access"),
+		// The endpoint and the credential command as SessionFlags too, so
+		// even an edit that somehow satisfied the digest guard could not move
+		// them. Verified against codex 0.152.1: a `-c` override of these two
+		// beats the value in config.toml (a file naming an unreachable host
+		// still reached api.openai.com). There is no such pin for project
+		// trust — `-c projects={}` and a scalar `trust_level="untrusted"` were
+		// both tried and neither overrides the file — so the untrusted entry
+		// lives in config.toml, whose integrity is enforced by digest.
+		"-c "+shellQuote(fmt.Sprintf("model_providers.%s.base_url=%q", providerID, baseURL)),
+		"-c "+shellQuote(fmt.Sprintf("model_providers.%s.auth.command=%q", providerID, authScript)),
+	)
+	if effort != "" {
+		parts = append(parts, "-c "+shellQuote("model_reasoning_effort="+effort))
+	}
+	parts = append(parts,
+		"-o "+shellQuote(r.ConfigDir()+"/"+codexLastMessageFile),
+		"-",
+	)
+	if params.Debug != "" {
+		parts = append(parts, "2>>"+shellQuote(sandbox.SandboxWorkspace+"/"+codexDebugLogFile))
+	}
+	return strings.Join(parts, " ")
+}
+
+// Run executes one agent iteration and normalizes codex's `exec --json` stream
+// into AgentEvents. The stream's verdict overrides a zero exit code, as it
+// does for pi, so a failed turn fails the run whatever codex exits.
+func (r CodexRuntime) Run(ctx context.Context, params RunParams, printer *ui.Printer, start time.Time, metrics *RunMetrics) (int, error) {
+	m, err := readCodexManifest(params.SandboxName, r.codexManifestPath())
+	if err != nil {
+		return -1, err
+	}
+	hooksEnabled := params.HooksSettingsPath != ""
+	if hooksEnabled && (m.Hooks == nil || m.Hooks.Groups == nil) {
+		return -1, fmt.Errorf(
+			"security is enabled but the codex manifest at %s carries no hook plan (Bootstrap ran without the sandbox hook config, or the manifest was modified)",
+			r.codexManifestPath())
+	}
+
+	digests, ok := lookupRunnerHeldDigests(params.SandboxName)
+	if !ok {
+		// The digests are runner-held because the sandbox has no trustworthy
+		// place to keep them; the runner calls Bootstrap and Run in one
+		// invocation, so a miss means the config was never written by this
+		// process and the guards would have nothing to compare against.
+		return -1, fmt.Errorf(
+			"no runner-held config digests for sandbox %s: CodexRuntime.Run requires Bootstrap to have run in the same process (internal/cli/run.go does), because the expected digests cannot be read back from the agent-writable config directory",
+			params.SandboxName)
+	}
+	// Both sides derive from the harness's SecurityEnabled() today — the
+	// runner passes HooksSettingsPath, Bootstrap writes hooks.json — but
+	// nothing asserted it, and a refactor that split them would silently drop
+	// the hooks.json digest from the guard while the adapter still loaded.
+	// nil, not empty: a harness may enable security and disable every
+	// individual hook, which leaves HookFiles empty but the hooks path taken —
+	// legal on pi too, whose check distinguishes a nil groups array from an
+	// empty one for the same reason. A nil map means Bootstrap never ran the
+	// hooks path at all, which contradicts the runner's signal.
+	if hooksEnabled && digests.HookScripts == nil {
+		return -1, fmt.Errorf(
+			"codex hook wiring is inconsistent: the runner expects hooks but Bootstrap recorded no hook-script digests; refusing to run rather than fall back to the weaker checks")
+	}
+	if hooksEnabled != (digests.HooksJSON != "") {
+		return -1, fmt.Errorf(
+			"codex hook wiring is inconsistent: the runner %s hooks but Bootstrap %s a hooks.json digest; refusing to run rather than fall back to the weaker checks",
+			map[bool]string{true: "expects", false: "does not expect"}[hooksEnabled],
+			map[bool]string{true: "recorded", false: "recorded no"}[digests.HooksJSON != ""])
+	}
+	// The same fallback chain NeedsOpenAIProvider decides from, so the launch
+	// and the provider decision cannot disagree about which model this run
+	// calls — a disagreement would either strand a frontmatter-pinned OpenAI
+	// agent without a credential or attach one to a run that never uses it.
+	//
+	// The fallback is the runner-held copy of the agent definition's model,
+	// not the manifest's: the manifest sits in the agent-writable config
+	// directory and carries no digest, so reading the model from there would
+	// let an agent move a validation retry onto a different model, and a
+	// different cost tier, than the one the run was authorised for.
+	//
+	// Whether a gateway/ model is admitted comes from the runner-held
+	// record of what Bootstrap rendered, so the route and config.toml
+	// cannot disagree.
+	model, err := translateCodexModel(EffectiveModel(params.Model, digests.AgentModel), digests.GatewayBaseURL != "")
+	if err != nil {
+		return -1, err
+	}
+	modelID := model.ID
+	effort, ok := codexEffortFor(params.Effort)
+	if !ok {
+		printer.StepWarn(fmt.Sprintf(
+			"effort %q is not a codex reasoning effort; running at the model's default",
+			sanitizeOutput(params.Effort)))
+	}
+	if len(params.FallbackModels) > 0 {
+		// codex has no fallback chain. Say so rather than silently dropping it.
+		printer.StepWarn(fmt.Sprintf(
+			"fallback models %s are not supported on codex and are ignored",
+			sanitizeOutput(strings.Join(params.FallbackModels, ","))))
+	}
+
+	cmd := buildCodexRunCommand(params, model, effort, hooksEnabled, digests)
+
+	stderr := &codexStderrDrops{w: os.Stderr}
+	stdout, execCmd, cancel, err := sandbox.ExecStreamReader(ctx, params.SandboxName, cmd, params.Timeout, stderr)
+	if err != nil {
+		return -1, err
+	}
+	defer cancel()
+
+	var reader io.Reader = stdout
+	if params.OutputPath != "" {
+		f, ferr := os.Create(params.OutputPath)
+		if ferr != nil {
+			printer.StepWarn(fmt.Sprintf("Failed to create %s: ", params.OutputPath) + ferr.Error())
+		} else {
+			defer f.Close()
+			// The stream keeps each command's raw aggregated_output even when
+			// a hook blocked the result, and this file is uploaded as a run
+			// artifact — so it is redacted on the way to disk while the parser
+			// still sees the original (codex_redact.go).
+			redacting := newCodexRedactingWriter(f)
+			defer func() {
+				if err := redacting.Flush(); err != nil {
+					printer.StepWarn("Failed to flush " + params.OutputPath + ": " + err.Error())
+				}
+			}()
+			reader = io.TeeReader(stdout, redacting)
+		}
+	}
+
+	childIDs := &codexChildIDs{}
+	reader = io.TeeReader(reader, childIDs)
+
+	handler := params.OnEvent
+	if handler == nil {
+		renderer := NewEventRenderer(printer)
+		handler = renderer.Handle
+	}
+
+	// The stream carries neither the CLI version nor the model, so the
+	// InitEvent is emitted here from what the runner already knows and the
+	// parser emits none.
+	metrics.Model = modelID
+	handler(InitEvent{Model: modelID, Version: m.CodexVersion})
+
+	var lastResult *ResultEvent
+	innerHandler := handler
+	handler = func(evt AgentEvent) {
+		if e, ok := evt.(ResultEvent); ok {
+			lastResult = &e
+		}
+		applyCodexMetrics(metrics, evt)
+		innerHandler(evt)
+	}
+
+	primaryThreadID, parseErr := parseCodexStream(reader, handler)
+	if parseErr != nil {
+		fmt.Fprintf(os.Stderr, "  progress parser: %v\n", sanitizeOutput(parseErr.Error()))
+		cancel()
+		io.Copy(io.Discard, reader)
+	}
+
+	waitErr := execCmd.Wait()
+	exitCode := -1
+	if execCmd.ProcessState != nil {
+		exitCode = execCmd.ProcessState.ExitCode()
+	}
+	childIDs.flush()
+	stderr.flush()
+	if params.Debug != "" {
+		// Under --debug codex's stderr went to the sandbox log instead.
+		dropped, backfillFailed, derr := codexCountDroppedInLog(params.SandboxName)
+		if derr != nil {
+			printer.StepWarn("Could not read codex's log for dropped stream notifications: " + redactSummary(sanitizeOutput(derr.Error())))
+		}
+		stderr.Dropped += dropped
+		stderr.BackfillFailed += backfillFailed
+	}
+	if waitErr != nil && execCmd.ProcessState == nil {
+		return exitCode, fmt.Errorf("openshell exec failed: %w", waitErr)
+	}
+	if exitCode == codexHooksMissingExit {
+		return exitCode, fmt.Errorf(
+			"codex config, hook adapter or auth script missing or modified in %s; refusing to run (was Bootstrap run, or did the agent change it?)",
+			r.ConfigDir())
+	}
+	if exitCode == codexConfigTamperedExit {
+		return exitCode, fmt.Errorf(
+			"codex config.toml in %s no longer pins the run-scoped provider endpoint, its auth command, or leaves the project untrusted; refusing to run because any of those can redirect or replace the runner's credential (did the agent write there between iterations?)",
+			r.ConfigDir())
+	}
+
+	// The children on disk are read whatever the exit code, for a delegating
+	// agent and whenever the stream shows a spawn: a child that started a turn
+	// leaves a rollout even when the stream lost its spawn item, which is how
+	// the admission check below and the usage fold see it.
+	checkSpawns := digests.delegating() || len(childIDs.Senders) > 0
+	diskChildren, diskIDs := 0, []string(nil)
+	var rolloutsErr error
+	if checkSpawns {
+		diskChildren, diskIDs, rolloutsErr = r.readCodexChildRollouts(params.SandboxName, primaryThreadID, childIDs.Receivers)
+	}
+	foldIDs := slices.Compact(slices.Sorted(slices.Values(slices.Concat(childIDs.IDs, diskIDs))))
+
+	// The fold runs whatever the exit code: codex writes a child's usage as
+	// each response completes, and the parent's entry keeps per_model_usage
+	// summing to the totals across a retry. A read failure is a warning.
+	if digests.delegating() || len(foldIDs) > 0 {
+		n, ferr := r.foldCodexChildUsage(params.SandboxName, foldIDs, metrics)
+		if ferr != nil {
+			printer.StepWarn("Sub-agent usage not fully counted: " + redactSummary(sanitizeOutput(ferr.Error())))
+		}
+		if n > 0 {
+			printer.StepInfo(fmt.Sprintf("%d sub-agent thread(s) folded into the run metrics", n))
+		}
+		// At the budget or on a cancel OpenShell kills nothing, so codex's
+		// children can record more after the read.
+		if len(foldIDs) > 0 && (ctx.Err() != nil || exitCode == 124 || exitCode == -1) {
+			printer.StepWarn("Sub-agent usage may be undercounted: codex was stopped, and its children can record more after the read")
+		}
+	}
+
+	// Checked whatever the exit code: with a validation loop an iteration's
+	// non-zero exit does not fail the run; an error from Run does, and a
+	// failed read or an unread spawn item is one too, unlike the usage read
+	// above. Each iteration adds its spawns seen on either side, each counted
+	// once per thread: the stream's spawn items (completed or failed: each
+	// passed the guard) and the children on disk. A dropped stream
+	// notification is a warning, as settled on #8712: most drops hide no
+	// spawn.
+	if stderr.Dropped > 0 {
+		msg := fmt.Sprintf("codex dropped %d stream notification(s) under backpressure", stderr.Dropped)
+		if stderr.BackfillFailed > 0 {
+			msg += ", and its backfill of the turn's items failed, so a dropped completed item stayed lost"
+		}
+		printer.StepWarn(msg + "; the progress log is incomplete")
+	}
+	if childIDs.UnreadSpawn {
+		return exitCode, fmt.Errorf("%s: a spawn_agent item longer than %d bytes could not be read", codexSpawnWithoutAdmission, streamBufSize)
+	}
+	if rolloutsErr != nil {
+		return exitCode, fmt.Errorf("%s: counting the child rollouts: %w", codexSpawnWithoutAdmission, rolloutsErr)
+	}
+	spawned := slices.Compact(slices.Sorted(slices.Values(slices.Concat(childIDs.Receivers, diskIDs))))
+	union := len(spawned) + childIDs.NoReceiver + (diskChildren - len(diskIDs))
+	if children := max(len(childIDs.Senders), diskChildren, union); checkSpawns && children > 0 {
+		digests.CompletedSpawns += children
+		recordRunnerHeldDigests(params.SandboxName, digests)
+		if err := checkCodexSpawnAdmissions(params.SandboxName, primaryThreadID, childIDs.Senders, digests.CompletedSpawns); err != nil {
+			return exitCode, err
+		}
+	}
+
+	if exitCode == 0 && lastResult != nil && lastResult.IsError {
+		msg := lastResult.ErrorMessage
+		if msg == "" {
+			msg = "stream ended without a completed turn (" + lastResult.Subtype + ")"
+		}
+		printer.StepWarn("codex exited 0 but the stream reports an error: " + sanitizeOutput(msg))
+		return 1, nil
+	}
+	return exitCode, nil
+}
+
+// ClearIterationArtifacts terminates processes the previous iteration left
+// running (see killStrayProcesses), then removes its outputs, the rollout
+// sessions and the debug log so transcripts and output files are
+// per-iteration.
+func (r CodexRuntime) ClearIterationArtifacts(sandboxName string) error {
+	clearStrayProcesses(sandbox.Exec, sandboxName, os.Stderr, "the previous iteration")
+	clearCmd := fmt.Sprintf("rm -rf %s/output/* %s/* %s %s",
+		shellQuote(r.WorkspaceDir()),
+		shellQuote(r.codexSessionsDir()),
+		shellQuote(r.WorkspaceDir()+"/"+codexDebugLogFile),
+		shellQuote(r.ConfigDir()+"/"+codexLastMessageFile))
+	_, _, _, err := sandbox.Exec(sandboxName, clearCmd, 10*time.Second)
+	return err
+}

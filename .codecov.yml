@@ -12,18 +12,28 @@ coverage:
         threshold: 1%
     patch:
       default:
+        # Target 80%. threshold 5% => codecov/patch PASSES at >= 75%.
+        # PR comments still mark X below the 80% target even when green.
         target: 80%
         threshold: 5%
 
 ignore:
   - "**/*_test.go"
   - "**/testdata/**"
+  # Behaviour-test harness and scenarios: integration-only, exercised by the
+  # behaviour/e2e CI jobs against real repos (not by the unit coverage upload).
+  - "e2e/behaviour/**"
+  - "pkg/behaviourtest/**"
+  - "internal/e2etest/cleanup.go"
+  - "internal/e2etest/build.go"
   - "docs/**"
   - "hack/**"
   - "experiments/**"
   - "images/**"
   - "**/*.md"
   - "**/*.sh"
+  # See https://github.com/fullsend-ai/fullsend/issues/2831
+  - "internal/cli/run.go"
 
 comment:
   layout: "reach,diff,flags,files,footer"

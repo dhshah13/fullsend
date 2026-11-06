@@ -1,0 +1,1086 @@
+package dispatch
+
+import (
+	"slices"
+	"testing"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
+)
+
+func TestHarnessRouter_SlashCommand(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "code", "review", "fix", "retro", "custom-agent"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-triage", Body: "/fs-triage please look"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "triage" {
+		t.Fatalf("expected [triage], got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandCustomAgent(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "custom-agent"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-custom-agent", Body: "/fs-custom-agent do the thing"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "custom-agent" {
+		t.Fatalf("expected [custom-agent], got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandUnknownAgent(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "code"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-unknown", Body: "/fs-unknown"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandInsufficientRole(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "code"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-triage", Body: "/fs-triage"}},
+		Actor:      Actor{ID: "guest", Role: "read"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for Guest actor, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_LabelReadyToCode(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "review"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "label_changed", Label: &TransitionLabel{Name: "ready-to-code", Action: "added"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "code" {
+		t.Fatalf("expected [code], got %v", stages)
+	}
+}
+
+func TestHarnessRouter_LabelReadyForReview(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "review"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "label_changed", Label: &TransitionLabel{Name: "ready-for-review", Action: "added"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "review" {
+		t.Fatalf("expected [review], got %v", stages)
+	}
+}
+
+func TestHarnessRouter_LabelCodeAgentNotInValidSet(t *testing.T) {
+	r := NewHarnessRouter([]string{"review", "triage"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "label_changed", Label: &TransitionLabel{Name: "ready-to-code", Action: "added"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages when code agent disabled, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_LabelRemovedIgnored(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "review"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "label_changed", Label: &TransitionLabel{Name: "ready-to-code", Action: "removed"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for label removal, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_LabelForkMRBlocked(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "review"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "label_changed", Label: &TransitionLabel{Name: "ready-to-code", Action: "added"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+		State:      State{ChangeProposal: &ChangeProposalState{IsFork: true}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for fork MR label, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_LabelSameProjectMRAllowed(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "review"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "label_changed", Label: &TransitionLabel{Name: "ready-to-code", Action: "added"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+		State:      State{ChangeProposal: &ChangeProposalState{IsFork: false}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "code" {
+		t.Fatalf("expected [code] for same-project MR label, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_Merged(t *testing.T) {
+	r := NewHarnessRouter([]string{"retro", "code"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 42},
+		Transition: Transition{Kind: "merged"},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "retro" {
+		t.Fatalf("expected [retro], got %v", stages)
+	}
+}
+
+func TestHarnessRouter_Closed(t *testing.T) {
+	r := NewHarnessRouter([]string{"retro", "code"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 42},
+		Transition: Transition{Kind: "closed"},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "retro" {
+		t.Fatalf("expected [retro] for closed-unmerged, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_ClosedWorkItemNotRouted(t *testing.T) {
+	r := NewHarnessRouter([]string{"retro", "code"})
+
+	for _, kind := range []string{"closed", "merged"} {
+		event := &NormalizedEvent{
+			Entity:     Entity{Kind: "work_item", ID: 42},
+			Transition: Transition{Kind: kind},
+			Actor:      Actor{ID: "alice", Role: "write"},
+		}
+		stages, err := r.Route(event)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(stages) != 0 {
+			t.Fatalf("expected no stages for %s work_item, got %v", kind, stages)
+		}
+	}
+}
+
+func TestHarnessRouter_Opened(t *testing.T) {
+	r := NewHarnessRouter([]string{"review", "retro"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 8},
+		Transition: Transition{Kind: "opened"},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "review" {
+		t.Fatalf("expected [review], got %v", stages)
+	}
+}
+
+func TestHarnessRouter_OpenedWorkItemTriaged(t *testing.T) {
+	r := NewHarnessRouter([]string{"review", "triage"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "opened"},
+		Actor:      Actor{ID: "alice", Role: "write"},
+		Source:     Source{System: "gitlab"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "triage" {
+		t.Fatalf("expected [triage] for work_item opened, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_OpenedWorkItemTriageNotInValidSet(t *testing.T) {
+	r := NewHarnessRouter([]string{"review"})
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "opened"},
+		Source:     Source{System: "gitlab"},
+	}
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages when triage is disabled, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_OpenedJiraWorkItemIgnored(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "opened"},
+		Source:     Source{System: "jira"},
+	}
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("Jira issue open must not route to triage, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_OpenedReviewNotInValidSet(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "retro"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 8},
+		Transition: Transition{Kind: "opened"},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages when review not in valid set, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_Synchronized(t *testing.T) {
+	tests := []struct {
+		name   string
+		agents []string
+		kind   string
+		state  State
+		want   []string
+	}{
+		{name: "same-project change proposal routes to review", agents: []string{"review", "fix"}, kind: "change_proposal", state: State{ChangeProposal: &ChangeProposalState{}}, want: []string{"review"}},
+		{name: "fork change proposal denied", agents: []string{"review", "fix"}, kind: "change_proposal", state: State{ChangeProposal: &ChangeProposalState{IsFork: true}}, want: nil},
+		{name: "unknown change proposal origin denied", agents: []string{"review", "fix"}, kind: "change_proposal", want: nil},
+		{name: "review not in valid set", agents: []string{"fix", "retro"}, kind: "change_proposal", state: State{ChangeProposal: &ChangeProposalState{}}, want: nil},
+		{name: "work item ignored", agents: []string{"review", "triage"}, kind: "work_item", want: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewHarnessRouter(tt.agents)
+			event := &NormalizedEvent{
+				Entity:     Entity{Kind: tt.kind, ID: 8},
+				Transition: Transition{Kind: "synchronized"},
+				Actor:      Actor{ID: "fullsend-bot", Kind: "bot", Role: "write"},
+				Source:     Source{System: "gitlab"},
+				State:      tt.state,
+			}
+			stages, err := r.Route(event)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !slices.Equal(stages, tt.want) {
+				t.Fatalf("stages = %v, want %v", stages, tt.want)
+			}
+		})
+	}
+}
+
+func TestChangesRequestedMarkerMatchesSharedConstant(t *testing.T) {
+	if changesRequestedMarker != forge.ChangesRequestedMarker {
+		t.Fatalf("dispatch marker %q != forge.ChangesRequestedMarker %q", changesRequestedMarker, forge.ChangesRequestedMarker)
+	}
+}
+
+func TestHarnessRouter_ChangesRequestedMarker(t *testing.T) {
+	r := NewHarnessRouter([]string{"fix", "review"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "Changes needed " + forge.ChangesRequestedMarker + " please fix",
+		}},
+		Actor: Actor{ID: "bot", Kind: "bot", Role: "write"},
+		State: State{ChangeProposal: &ChangeProposalState{IsFork: false}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "fix" {
+		t.Fatalf("expected [fix], got %v", stages)
+	}
+}
+
+func TestHarnessRouter_ChangesRequestedNoFixLabelBlocked(t *testing.T) {
+	r := NewHarnessRouter([]string{"fix", "review"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "Changes needed " + forge.ChangesRequestedMarker + " please fix",
+		}},
+		Actor: Actor{ID: "bot", Kind: "bot", Role: "write"},
+		State: State{
+			Labels:         []string{"fullsend-no-fix"},
+			ChangeProposal: &ChangeProposalState{IsFork: false},
+		},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages when fullsend-no-fix label is present, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_ChangesRequestedOtherLabelsAllowed(t *testing.T) {
+	r := NewHarnessRouter([]string{"fix", "review"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "Changes needed " + forge.ChangesRequestedMarker + " please fix",
+		}},
+		Actor: Actor{ID: "bot", Kind: "bot", Role: "write"},
+		State: State{
+			Labels:         []string{"fullsend-fix", "some-other-label"},
+			ChangeProposal: &ChangeProposalState{IsFork: false},
+		},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "fix" {
+		t.Fatalf("expected [fix] when fullsend-no-fix is absent, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_CommentOnlyReviewDoesNotDispatchFix(t *testing.T) {
+	r := NewHarnessRouter([]string{"fix", "review"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "Please consider this suggestion <!-- fullsend:review-agent -->",
+		}},
+		Actor: Actor{ID: "bot", Kind: "bot", Role: "write"},
+		State: State{ChangeProposal: &ChangeProposalState{IsFork: false}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for comment-only review, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_ChangesRequestedForkBlocked(t *testing.T) {
+	r := NewHarnessRouter([]string{"fix"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "<!-- fullsend:changes-requested -->",
+		}},
+		Actor: Actor{ID: "bot", Kind: "bot", Role: "write"},
+		State: State{ChangeProposal: &ChangeProposalState{IsFork: true}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for fork MR changes-requested, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_ChangesRequestedNilChangeProposal(t *testing.T) {
+	r := NewHarnessRouter([]string{"fix"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "<!-- fullsend:changes-requested -->",
+		}},
+		Actor: Actor{ID: "bot", Kind: "bot", Role: "write"},
+		State: State{},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages when ChangeProposal is nil, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_NeedsInfoCommentNoDispatch(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "work_item", ID: 5},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "Here is the info you asked for",
+		}},
+		Actor: Actor{ID: "reporter", Role: "triage"},
+		State: State{Labels: []string{"needs-info", "bug"}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for non-command comment on needs-info issue, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_NeedsInfoCommentByGuestNoDispatch(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "work_item", ID: 5},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "Here is some info",
+		}},
+		Actor: Actor{ID: "guest", Role: "read"},
+		State: State{Labels: []string{"needs-info"}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for non-command comment on needs-info issue, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_NeedsInfoCommentByEntityAuthorNoDispatch(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "work_item", ID: 5},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "I can clarify",
+		}},
+		Actor: Actor{ID: "author", Role: "read", IsEntityAuthor: true},
+		State: State{Labels: []string{"needs-info"}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for non-command comment on needs-info issue (even from entity author), got %v", stages)
+	}
+}
+
+func TestHarnessRouter_NeedsInfoWithFsTriageCommand(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "work_item", ID: 5},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Command: "/fs-triage",
+			Body:    "/fs-triage please re-evaluate",
+		}},
+		Actor: Actor{ID: "dev", Role: "write"},
+		State: State{Labels: []string{"needs-info"}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "triage" {
+		t.Fatalf("expected [triage] for /fs-triage on needs-info issue, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_NonCommandCommentNoRoute(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "work_item", ID: 5},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "Just a comment",
+		}},
+		Actor: Actor{ID: "dev", Role: "write"},
+		State: State{Labels: []string{"bug"}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages without needs-info label, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_NilEvent(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	stages, err := r.Route(nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for nil event, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandMixedCaseNormalized(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-TRIAGE", Body: "/fs-TRIAGE please"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "triage" {
+		t.Fatalf("expected [triage] (lowercase), got %v", stages)
+	}
+}
+
+func TestHarnessRouter_ChangesRequestedHumanIgnored(t *testing.T) {
+	r := NewHarnessRouter([]string{"fix"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "<!-- fullsend:changes-requested -->",
+		}},
+		Actor: Actor{ID: "human", Kind: "human", Role: "write"},
+		State: State{ChangeProposal: &ChangeProposalState{IsFork: false}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for human-authored marker, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_LabelInsufficientRole(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "review"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "label_changed", Label: &TransitionLabel{Name: "ready-to-code", Action: "added"}},
+		Actor:      Actor{ID: "reporter", Role: "triage"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for triage-role label event, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_CaseInsensitiveAgentNames(t *testing.T) {
+	r := NewHarnessRouter([]string{"Triage", "CODE"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-triage", Body: "/fs-triage"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "triage" {
+		t.Fatalf("expected [triage], got %v", stages)
+	}
+}
+
+func TestHarnessRouter_MergedRetroNotInValidSet(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "review"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 42},
+		Transition: Transition{Kind: "merged"},
+		Actor:      Actor{ID: "alice", Role: "maintain"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages when retro not in valid set, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_UnknownTransitionKind(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "code"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "status_changed"},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for unknown transition, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_CommentNilComment(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "comment_added"},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for nil comment, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandEmptyAfterPrefix(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "work_item", ID: 1},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-", Body: "/fs-"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for empty command suffix, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_ChangesRequestedFixNotInValidSet(t *testing.T) {
+	r := NewHarnessRouter([]string{"code", "review"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "<!-- fullsend:changes-requested -->",
+		}},
+		Actor: Actor{ID: "bot", Kind: "bot", Role: "write"},
+		State: State{ChangeProposal: &ChangeProposalState{IsFork: false}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages when fix not in valid set, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_NeedsInfoCommentWriteRoleNoDispatch(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "code", "review"})
+
+	event := &NormalizedEvent{
+		Entity: Entity{Kind: "work_item", ID: 5},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{
+			Body: "Here is the info",
+		}},
+		Actor: Actor{ID: "dev", Role: "write"},
+		State: State{Labels: []string{"needs-info"}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for non-command comment on needs-info issue, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandForkMRBlocked(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "code", "custom-agent"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-code", Body: "/fs-code"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+		State:      State{ChangeProposal: &ChangeProposalState{IsFork: true}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for slash command on fork MR, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandCustomAgentForkMRBlocked(t *testing.T) {
+	r := NewHarnessRouter([]string{"custom-agent"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-custom-agent", Body: "/fs-custom-agent"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+		State:      State{ChangeProposal: &ChangeProposalState{IsFork: true}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for custom agent slash command on fork MR, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandNilChangeProposalBlocked(t *testing.T) {
+	r := NewHarnessRouter([]string{"code"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-code", Body: "/fs-code"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+		State:      State{},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("expected no stages for slash command with nil ChangeProposal, got %v", stages)
+	}
+}
+
+func TestHarnessRouter_SlashCommandTriageRoleObservationStage(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "code", "review", "fix"})
+
+	tests := []struct {
+		name    string
+		command string
+		entity  Entity
+		actor   Actor
+		want    []string
+	}{
+		{
+			name:    "triage role dispatches /fs-triage on work_item",
+			command: "/fs-triage",
+			entity:  Entity{Kind: "work_item", ID: 1},
+			actor:   Actor{ID: "triager", Role: "triage"},
+			want:    []string{"triage"},
+		},
+		{
+			name:    "triage role dispatches /fs-review on work_item",
+			command: "/fs-review",
+			entity:  Entity{Kind: "work_item", ID: 1},
+			actor:   Actor{ID: "triager", Role: "triage"},
+			want:    []string{"review"},
+		},
+		{
+			name:    "triage role rejected for /fs-code on work_item",
+			command: "/fs-code",
+			entity:  Entity{Kind: "work_item", ID: 1},
+			actor:   Actor{ID: "triager", Role: "triage"},
+			want:    nil,
+		},
+		{
+			name:    "triage role rejected for /fs-fix on change_proposal",
+			command: "/fs-fix",
+			entity:  Entity{Kind: "change_proposal", ID: 10},
+			actor:   Actor{ID: "triager", Role: "triage"},
+			want:    nil,
+		},
+		{
+			name:    "triage role dispatches /fs-review on same-project change_proposal",
+			command: "/fs-review",
+			entity:  Entity{Kind: "change_proposal", ID: 10},
+			actor:   Actor{ID: "triager", Role: "triage"},
+			want:    []string{"review"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := &NormalizedEvent{
+				Entity:     tt.entity,
+				Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: tt.command, Body: tt.command}},
+				Actor:      tt.actor,
+				State:      State{ChangeProposal: &ChangeProposalState{IsFork: false}},
+			}
+			stages, err := r.Route(event)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.want == nil {
+				if len(stages) != 0 {
+					t.Fatalf("expected no stages, got %v", stages)
+				}
+				return
+			}
+			if len(stages) != len(tt.want) {
+				t.Fatalf("expected %v, got %v", tt.want, stages)
+			}
+			for i, s := range stages {
+				if s != tt.want[i] {
+					t.Fatalf("expected %v, got %v", tt.want, stages)
+				}
+			}
+		})
+	}
+}
+
+func TestHarnessRouter_SlashCommandEntityAuthorBypass(t *testing.T) {
+	r := NewHarnessRouter([]string{"triage", "code", "review"})
+
+	tests := []struct {
+		name    string
+		command string
+		entity  Entity
+		actor   Actor
+		want    []string
+	}{
+		{
+			name:    "read-only entity author dispatches /fs-triage on work_item",
+			command: "/fs-triage",
+			entity:  Entity{Kind: "work_item", ID: 5},
+			actor:   Actor{ID: "author", Role: "read", IsEntityAuthor: true},
+			want:    []string{"triage"},
+		},
+		{
+			name:    "read-only entity author dispatches /fs-review on work_item",
+			command: "/fs-review",
+			entity:  Entity{Kind: "work_item", ID: 5},
+			actor:   Actor{ID: "author", Role: "read", IsEntityAuthor: true},
+			want:    []string{"review"},
+		},
+		{
+			name:    "read-only entity author rejected for /fs-triage on change_proposal",
+			command: "/fs-triage",
+			entity:  Entity{Kind: "change_proposal", ID: 10},
+			actor:   Actor{ID: "author", Role: "read", IsEntityAuthor: true},
+			want:    nil,
+		},
+		{
+			name:    "read-only entity author rejected for /fs-code on work_item",
+			command: "/fs-code",
+			entity:  Entity{Kind: "work_item", ID: 5},
+			actor:   Actor{ID: "author", Role: "read", IsEntityAuthor: true},
+			want:    nil,
+		},
+		{
+			name:    "read-only non-author rejected for /fs-triage on work_item",
+			command: "/fs-triage",
+			entity:  Entity{Kind: "work_item", ID: 5},
+			actor:   Actor{ID: "other", Role: "read", IsEntityAuthor: false},
+			want:    nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := &NormalizedEvent{
+				Entity:     tt.entity,
+				Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: tt.command, Body: tt.command}},
+				Actor:      tt.actor,
+				State:      State{ChangeProposal: &ChangeProposalState{IsFork: false}},
+			}
+			stages, err := r.Route(event)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.want == nil {
+				if len(stages) != 0 {
+					t.Fatalf("expected no stages, got %v", stages)
+				}
+				return
+			}
+			if len(stages) != len(tt.want) {
+				t.Fatalf("expected %v, got %v", tt.want, stages)
+			}
+			for i, s := range stages {
+				if s != tt.want[i] {
+					t.Fatalf("expected %v, got %v", tt.want, stages)
+				}
+			}
+		})
+	}
+}
+
+func TestHarnessRouter_SlashCommandSameProjectMRAllowed(t *testing.T) {
+	r := NewHarnessRouter([]string{"code"})
+
+	event := &NormalizedEvent{
+		Entity:     Entity{Kind: "change_proposal", ID: 10},
+		Transition: Transition{Kind: "comment_added", Comment: &TransitionComment{Command: "/fs-code", Body: "/fs-code"}},
+		Actor:      Actor{ID: "alice", Role: "write"},
+		State:      State{ChangeProposal: &ChangeProposalState{IsFork: false}},
+	}
+
+	stages, err := r.Route(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "code" {
+		t.Fatalf("expected [code] for same-project MR slash command, got %v", stages)
+	}
+}
+
+func TestRoleLevel(t *testing.T) {
+	tests := []struct {
+		role  string
+		level int
+	}{
+		{"", 0},
+		{"unknown", 0},
+		{"read", 1},
+		{"triage", 2},
+		{"write", 3},
+		{"maintain", 4},
+		{"admin", 5},
+	}
+	for _, tt := range tests {
+		if got := RoleLevel(tt.role); got != tt.level {
+			t.Errorf("RoleLevel(%q) = %d, want %d", tt.role, got, tt.level)
+		}
+	}
+}
+
+func TestHasRole(t *testing.T) {
+	tests := []struct {
+		actor    string
+		required string
+		want     bool
+	}{
+		{"admin", "write", true},
+		{"write", "write", true},
+		{"triage", "write", false},
+		{"read", "triage", false},
+		{"", "read", false},
+		{"admin", "admin", true},
+		{"maintain", "admin", false},
+		{"admin", "typo", false},
+		{"write", "", false},
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		if got := HasRole(tt.actor, tt.required); got != tt.want {
+			t.Errorf("HasRole(%q, %q) = %v, want %v", tt.actor, tt.required, got, tt.want)
+		}
+	}
+}

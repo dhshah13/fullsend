@@ -19,6 +19,12 @@ for f in "$SRC"/*; do
     if [[ "$name" == *_test.go ]]; then
         continue
     fi
+    # Only process Go source files and module metadata; skip non-source
+    # artifacts (coverage profiles, test binaries, editor temporaries, etc.)
+    case "$name" in
+        *.go|go.mod|go.sum) ;;
+        *) continue ;;
+    esac
 
     # "go.mod" special case since commit eecac658c
     if [[ "$name" == "go.mod" ]]; then
@@ -44,6 +50,12 @@ for f in "$SRC"/*; do
     if [[ "$name" == *_test.go ]]; then
         continue
     fi
+    # Only process Go source files and module metadata; skip non-source
+    # artifacts (coverage profiles, test binaries, editor temporaries, etc.)
+    case "$name" in
+        *.go|go.mod|go.sum) ;;
+        *) continue ;;
+    esac
 
     if ! cmp -s "$f" "$DST/$name.embed"; then
         echo "DESYNC: internal/mintcore/$name != internal/dispatch/gcf/mintsrc/mintcore/$name.embed" >&2

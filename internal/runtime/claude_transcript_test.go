@@ -246,6 +246,111 @@ func TestEmitTranscriptErrors_NoSummaries(t *testing.T) {
 	}
 }
 
+// TestTranscriptError_DisplayMessage pins the one rendering every sink
+// shares: sanitized ErrorMessage, or the sanitized subtype fallback when
+// it comes up empty.
+func TestTranscriptError_DisplayMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		te   TranscriptError
+		want string
+	}{
+		{"plain message", TranscriptError{ErrorMessage: "Agent reached maximum turns"}, "Agent reached maximum turns"},
+		{"injection is sanitized", TranscriptError{ErrorMessage: "API Error\n::error::forged\x1b[31mred"}, "API Error : :error: :forgedred"},
+		{"empty message falls back to subtype", TranscriptError{Subtype: "error_max_turns"}, "agent terminated with error (subtype: error_max_turns)"},
+		{"subtype is sanitized too", TranscriptError{Subtype: "x::y\n"}, "agent terminated with error (subtype: x: :y )"},
+		{"message that sanitizes to empty falls back", TranscriptError{ErrorMessage: "\x1b[31m", Subtype: "error_unknown"}, "agent terminated with error (subtype: error_unknown)"},
+		// A colon run must not reconstitute "::" at a replacement seam.
+		{"colon run stays broken", TranscriptError{ErrorMessage: "x::::y"}, "x: : : :y"},
+		// Subtype is not truncated at parse time the way ErrorMessage is,
+		// and a transcript line can be up to 1MB — the fallback bounds it
+		// with the same truncateError treatment.
+		{"huge subtype is bounded", TranscriptError{Subtype: strings.Repeat("s", 1<<20)},
+			"agent terminated with error (subtype: " + strings.Repeat("s", 2000) + "… (truncated))"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.te.DisplayMessage(); got != tc.want {
+				t.Errorf("DisplayMessage() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseTranscriptFile_APIErrorExitZero covers the scenario from #2786:
+// Claude Code exits 0 with is_error:true and subtype "success" on API errors
+// (e.g., invalid_grant from a stale OIDC token).
+func TestParseTranscriptFile_APIErrorExitZero(t *testing.T) {
+	dir := t.TempDir()
+	// Real-world transcript shape: subtype is "success" but is_error is true.
+	content := `{"type":"system","subtype":"init","session_id":"abc123"}
+{"type":"result","subtype":"success","is_error":true,"result":"API Error: Error code invalid_grant: ID Token issued at 1782810237 is stale to sign-in.","session_id":"abc123"}
+`
+	path := filepath.Join(dir, "output.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, ok := parseTranscriptFile(path)
+	if !ok {
+		t.Fatal("expected result event to be found")
+	}
+	if !summary.IsError {
+		t.Error("expected IsError to be true for API error with exit 0")
+	}
+	if summary.Subtype != "success" {
+		t.Errorf("expected subtype 'success', got %q", summary.Subtype)
+	}
+	if !strings.Contains(summary.ErrorMessage, "invalid_grant") {
+		t.Errorf("expected error message to contain 'invalid_grant', got %q", summary.ErrorMessage)
+	}
+}
+
+// TestParseTranscriptErrors_SurfacesErrorRegardlessOfExitCode verifies that
+// parseTranscriptErrors returns errors from transcripts where is_error:true,
+// which is the key fix from #2786 — errors must be surfaced even when the
+// process exit code was 0.
+func TestParseTranscriptErrors_SurfacesErrorRegardlessOfExitCode(t *testing.T) {
+	dir := t.TempDir()
+
+	// Transcript with is_error:true but subtype "success" (API error scenario).
+	content := `{"type":"result","subtype":"success","is_error":true,"result":"API Error: quota exhausted"}`
+	if err := os.WriteFile(filepath.Join(dir, "agent.jsonl"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summaries := parseTranscriptErrors(dir)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 error summary, got %d", len(summaries))
+	}
+	if !summaries[0].IsError {
+		t.Error("expected IsError to be true")
+	}
+	if !strings.Contains(summaries[0].ErrorMessage, "quota exhausted") {
+		t.Errorf("unexpected error message: %q", summaries[0].ErrorMessage)
+	}
+}
+
+// TestClaudeRuntime_ParseTranscriptFile verifies the exported method on
+// ClaudeRuntime satisfies the TranscriptHandler interface.
+func TestClaudeRuntime_ParseTranscriptFile(t *testing.T) {
+	dir := t.TempDir()
+	content := `{"type":"result","subtype":"success","is_error":true,"result":"infrastructure error"}`
+	path := filepath.Join(dir, "output.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var handler TranscriptHandler = ClaudeRuntime{}
+	summary, ok := handler.ParseTranscriptFile(path)
+	if !ok {
+		t.Fatal("expected result event to be found")
+	}
+	if !summary.IsError {
+		t.Error("expected IsError to be true")
+	}
+}
+
 func TestIsResultLine(t *testing.T) {
 	tests := []struct {
 		line string

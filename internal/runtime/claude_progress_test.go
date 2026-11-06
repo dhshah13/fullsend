@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -13,30 +14,28 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
-func TestExtractBinaryName(t *testing.T) {
+func TestCollapseCommand(t *testing.T) {
 	tests := []struct {
 		cmd  string
 		want string
 	}{
-		{"make test", "make"},
-		{"git commit -s -m 'msg'", "git"},
-		{"/usr/bin/make lint", "make"},
-		{"  go test ./...", "go"},
+		{"make test", "make test"},
+		{"git commit -s -m 'msg'", "git commit -s -m 'msg'"},
+		{"/usr/bin/make lint", "/usr/bin/make lint"},
+		{"  go test ./...", "go test ./..."},
 		{"", ""},
-		{"gh pr create --title 'x'", "gh"},
-		{"curl -H 'Authorization: Bearer SECRET' https://api.example.com", "curl"},
-		// KEY=VALUE env var prefixes are skipped.
-		{"SECRET=val make test", "make"},
-		{"FOO=bar BAZ=qux /usr/bin/go test", "go"},
-		// All tokens are KEY=VALUE — return empty.
-		{"FOO=bar BAZ=qux", ""},
+		{"gh pr create --title 'x'", "gh pr create --title 'x'"},
+		// Multi-line commands are collapsed.
+		{"echo hello\necho world", "echo hello echo world"},
 		// Whitespace-only input.
 		{"   \t  ", ""},
+		// Long commands are truncated.
+		{"echo " + strings.Repeat("x", 200), "echo " + strings.Repeat("x", 115) + "…"},
 	}
 	for _, tt := range tests {
-		got := extractBinaryName(tt.cmd)
+		got := collapseCommand(tt.cmd)
 		if got != tt.want {
-			t.Errorf("extractBinaryName(%q) = %q, want %q", tt.cmd, got, tt.want)
+			t.Errorf("collapseCommand(%q) = %q, want %q", tt.cmd, got, tt.want)
 		}
 	}
 }
@@ -52,19 +51,19 @@ func TestExtractSafeContext(t *testing.T) {
 			name:     "bash command",
 			toolName: "Bash",
 			input:    map[string]interface{}{"command": "make test"},
-			want:     "make",
+			want:     "make test",
 		},
 		{
-			name:     "bash with secret in args",
+			name:     "bash with short arg (no redaction)",
 			toolName: "Bash",
-			input:    map[string]interface{}{"command": "curl -H 'Bearer token123' https://api.example.com"},
-			want:     "curl",
+			input:    map[string]interface{}{"command": "curl -H 'Bearer short' https://api.example.com"},
+			want:     "curl -H 'Bearer short' https://api.example.com",
 		},
 		{
-			name:     "bash with env var prefix",
+			name:     "bash with github token redacted",
 			toolName: "Bash",
-			input:    map[string]interface{}{"command": "API_KEY=secret123 curl https://api.example.com"},
-			want:     "curl",
+			input:    map[string]interface{}{"command": "curl -H 'Authorization: Bearer ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' https://api.github.com"},
+			want:     "curl -H 'Authorization: Bearer ghp_...' https://api.github.com",
 		},
 		{
 			name:     "read file",
@@ -115,9 +114,9 @@ func TestExtractSafeContext(t *testing.T) {
 			want:     "**/*.go",
 		},
 		{
-			name:     "unknown tool returns empty",
-			toolName: "Agent",
-			input:    map[string]interface{}{"prompt": "do something"},
+			name:     "unrecognized tool returns empty",
+			toolName: "Skill",
+			input:    map[string]interface{}{"skill_name": "issue-labels"},
 			want:     "",
 		},
 		{
@@ -149,10 +148,9 @@ func TestProgressParser(t *testing.T) {
 	input := strings.NewReader(strings.Join(lines, "\n"))
 	var buf bytes.Buffer
 	printer := ui.New(&buf)
-	start := time.Now()
 	metrics := &RunMetrics{}
 
-	if err := progressParser(input, printer, start, metrics); err != nil {
+	if err := progressParser(input, printer, metrics); err != nil {
 		t.Fatalf("progressParser returned error: %v", err)
 	}
 
@@ -169,10 +167,11 @@ func TestProgressParser(t *testing.T) {
 	}
 }
 
-func TestProgressParserIgnoresStreamEvents(t *testing.T) {
+func TestProgressParserStreamEventsProcessed(t *testing.T) {
 	lines := []string{
-		`{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","name":"Edit"}}}`,
-		`{"type":"stream_event","event":{"type":"content_block_stop"}}`,
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Edit"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/main.go\"}"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
 		`{"type":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/src/main.go"}}]}`,
 	}
 
@@ -181,12 +180,13 @@ func TestProgressParserIgnoresStreamEvents(t *testing.T) {
 	printer := ui.New(&buf)
 	metrics := &RunMetrics{}
 
-	if err := progressParser(input, printer, time.Now(), metrics); err != nil {
+	if err := progressParser(input, printer, metrics); err != nil {
 		t.Fatalf("progressParser returned error: %v", err)
 	}
 
+	// Tool counted once from stream_event, not again from assistant fallback
 	if metrics.ToolCalls.Load() != 1 {
-		t.Errorf("expected 1 tool call (stream_event ignored), got %d", metrics.ToolCalls.Load())
+		t.Errorf("expected 1 tool call (from stream_event, assistant suppressed), got %d", metrics.ToolCalls.Load())
 	}
 }
 
@@ -202,7 +202,7 @@ func TestProgressParserMalformedJSON(t *testing.T) {
 	printer := ui.New(&buf)
 	metrics := &RunMetrics{}
 
-	if err := progressParser(input, printer, time.Now(), metrics); err != nil {
+	if err := progressParser(input, printer, metrics); err != nil {
 		t.Fatalf("progressParser returned error: %v", err)
 	}
 
@@ -211,9 +211,9 @@ func TestProgressParserMalformedJSON(t *testing.T) {
 	}
 }
 
-func TestProgressParserUnknownToolAllowlisted(t *testing.T) {
+func TestProgressParserUnknownToolShowsNameNoContext(t *testing.T) {
 	lines := []string{
-		`{"type":"assistant","content":[{"type":"tool_use","name":"EvilTool","input":{"secret":"should-not-appear"}}]}`,
+		`{"type":"assistant","content":[{"type":"tool_use","name":"CustomTool","input":{"secret":"should-not-appear"}}]}`,
 		`{"type":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/main.go"}}]}`,
 	}
 
@@ -222,7 +222,7 @@ func TestProgressParserUnknownToolAllowlisted(t *testing.T) {
 	printer := ui.New(&buf)
 	metrics := &RunMetrics{}
 
-	if err := progressParser(input, printer, time.Now(), metrics); err != nil {
+	if err := progressParser(input, printer, metrics); err != nil {
 		t.Fatalf("progressParser returned error: %v", err)
 	}
 
@@ -231,32 +231,11 @@ func TestProgressParserUnknownToolAllowlisted(t *testing.T) {
 	}
 
 	output := buf.String()
-	if strings.Contains(output, "EvilTool") {
-		t.Errorf("unknown tool name should not appear in output, got: %s", output)
+	if !strings.Contains(output, "CustomTool") {
+		t.Errorf("expected tool name in output, got: %s", output)
 	}
-	if !strings.Contains(output, "tool") {
-		t.Errorf("expected generic 'tool' label for unknown tool, got: %s", output)
-	}
-}
-
-func TestProgressParserUnknownToolAssistantNoContext(t *testing.T) {
-	lines := []string{
-		`{"type":"assistant","content":[{"type":"tool_use","name":"CustomTool","input":{"secret":"should-not-appear"}}]}`,
-	}
-
-	input := strings.NewReader(strings.Join(lines, "\n"))
-	var buf bytes.Buffer
-	printer := ui.New(&buf)
-	metrics := &RunMetrics{}
-
-	_ = progressParser(input, printer, time.Now(), metrics)
-
-	output := buf.String()
 	if strings.Contains(output, "should-not-appear") {
-		t.Errorf("non-allowlisted tool should not extract context, got: %s", output)
-	}
-	if strings.Contains(output, "CustomTool") {
-		t.Errorf("non-allowlisted tool name should not appear, got: %s", output)
+		t.Errorf("unknown tool should not extract context, got: %s", output)
 	}
 }
 
@@ -272,7 +251,7 @@ func TestProgressParserReaderError(t *testing.T) {
 	printer := ui.New(&buf)
 	metrics := &RunMetrics{}
 
-	err := progressParser(pr, printer, time.Now(), metrics)
+	err := progressParser(pr, printer, metrics)
 
 	if err == nil {
 		t.Error("expected error from broken reader, got nil")
@@ -292,7 +271,7 @@ func TestProgressParserOversizedLineSkipped(t *testing.T) {
 	printer := ui.New(&buf)
 	metrics := &RunMetrics{}
 
-	if err := progressParser(input, printer, time.Now(), metrics); err != nil {
+	if err := progressParser(input, printer, metrics); err != nil {
 		t.Fatalf("progressParser returned error: %v", err)
 	}
 
@@ -334,6 +313,24 @@ func TestSanitizeOutput(t *testing.T) {
 			name:  "double colon in path",
 			input: "Edit: /src/config::default.go",
 			want:  "Edit: /src/config: :default.go",
+		},
+		{
+			// A single non-overlapping ReplaceAll pass turns ":::" into
+			// ": ::" — the replacement seam reconstitutes a literal "::".
+			// Colon runs must break to a fixed point.
+			name:  "three-colon run",
+			input: ":::",
+			want:  ": : :",
+		},
+		{
+			name:  "four-colon run reconstitution guard",
+			input: "::::",
+			want:  ": : : :",
+		},
+		{
+			name:  "colon run around a workflow command",
+			input: "safe text\n::::error::injected annotation",
+			want:  "safe text : : : :error: :injected annotation",
 		},
 		{
 			name:  "url-encoded newline",
@@ -406,11 +403,107 @@ func TestSanitizeOutput(t *testing.T) {
 	}
 }
 
+// TestSanitize_ColonBreakIsIdempotent pins the guard property itself: no
+// sanitized output contains "::", and sanitizing twice equals sanitizing
+// once — for both variants, across colon runs long enough to reconstitute
+// a pair at a ReplaceAll seam.
+func TestSanitize_ColonBreakIsIdempotent(t *testing.T) {
+	inputs := []string{
+		"::", ":::", "::::", ":::::", "::::::",
+		"a::::b\n::::::c",
+		strings.Repeat(":", 100),
+		"::::error::forged",
+	}
+	for _, variant := range []struct {
+		name string
+		fn   func(string) string
+	}{
+		{"sanitizeOutput", sanitizeOutput},
+		{"sanitizeStreamText", sanitizeStreamText},
+	} {
+		for _, in := range inputs {
+			once := variant.fn(in)
+			if strings.Contains(once, "::") {
+				t.Errorf("%s(%q) = %q still contains \"::\"", variant.name, in, once)
+			}
+			if twice := variant.fn(once); twice != once {
+				t.Errorf("%s not idempotent on %q: %q -> %q", variant.name, in, once, twice)
+			}
+		}
+	}
+}
+
+func TestSanitizeStreamText(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "preserves newlines",
+			input: "line one\nline two\nline three",
+			want:  "line one\nline two\nline three",
+		},
+		{
+			name:  "strips ANSI but preserves newlines",
+			input: "\x1b[31mred\x1b[0m\nclean",
+			want:  "red\nclean",
+		},
+		{
+			name:  "breaks GHA commands across newlines",
+			input: "text\n::error::pwned",
+			want:  "text\n: :error: :pwned",
+		},
+		{
+			name:  "strips control chars except newline",
+			input: "hello\x00\tworld\nok",
+			want:  "hello  world\nok",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeStreamText(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeStreamText(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRendererSanitizesThinkingAndText(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	// Thinking with ANSI escape should be stripped
+	r.Handle(ThinkingEvent{Text: "\x1b[31minjected\x1b[0m"})
+	r.Handle(ToolUseEvent{Name: "Read", Summary: "/a.go"}) // force block transition
+
+	output := buf.String()
+	if strings.Contains(output, "\x1b[") {
+		t.Errorf("ANSI escape leaked through thinking event: %q", output)
+	}
+	if !strings.Contains(output, "injected") {
+		t.Errorf("expected sanitized thinking text, got: %s", output)
+	}
+
+	buf.Reset()
+	r2 := newTestRenderer(&buf)
+
+	// Text with GHA command injection
+	r2.Handle(TextEvent{Text: "hello\n::error::pwned"})
+	r2.Handle(ToolUseEvent{Name: "Read", Summary: "/b.go"})
+
+	output = buf.String()
+	if strings.Contains(output, "::error::") {
+		t.Errorf("GHA workflow command leaked through text event: %q", output)
+	}
+}
+
 func TestProgressParserCapturesResultMetrics(t *testing.T) {
 	lines := []string{
 		`{"type":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/main.go"}}]}`,
 		`{"type":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"make test"}}]}`,
-		`{"type":"result","num_turns":8,"total_cost_usd":0.42,"usage":{"input_tokens":12000,"output_tokens":3400}}`,
+		`{"type":"result","num_turns":8,"total_cost_usd":0.42,"usage":{"input_tokens":12000,"output_tokens":3400,"cache_creation_input_tokens":8000,"cache_read_input_tokens":5000}}`,
 	}
 
 	input := strings.NewReader(strings.Join(lines, "\n"))
@@ -418,7 +511,7 @@ func TestProgressParserCapturesResultMetrics(t *testing.T) {
 	printer := ui.New(&buf)
 	metrics := &RunMetrics{}
 
-	if err := progressParser(input, printer, time.Now(), metrics); err != nil {
+	if err := progressParser(input, printer, metrics); err != nil {
 		t.Fatalf("progressParser returned error: %v", err)
 	}
 
@@ -437,6 +530,86 @@ func TestProgressParserCapturesResultMetrics(t *testing.T) {
 	if metrics.OutputTokens != 3400 {
 		t.Errorf("expected 3400 output tokens, got %d", metrics.OutputTokens)
 	}
+	if metrics.CacheCreationInputTokens != 8000 {
+		t.Errorf("expected 8000 cache_creation input tokens, got %d", metrics.CacheCreationInputTokens)
+	}
+	if metrics.CacheReadInputTokens != 5000 {
+		t.Errorf("expected 5000 cache_read input tokens, got %d", metrics.CacheReadInputTokens)
+	}
+}
+
+// TestProgressParserCountsToolCallsFromNestedMessage pins the real Claude Code
+// stream-json shape: assistant events carry their content under "message",
+// not at the top level. The earlier flat-shaped fixtures never exercised this,
+// which let tool_use blocks go uncounted in production (every real run reported
+// tool_calls: 0). See internal/runtime/claude_progress.go.
+func TestProgressParserCountsToolCallsFromNestedMessage(t *testing.T) {
+	lines := []string{
+		`{"type":"system","subtype":"init","model":"claude-opus-4-6"}`,
+		`{"type":"assistant","message":{"model":"claude-opus-4-6","content":[{"type":"text","text":"ok"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`,
+		`{"type":"assistant","message":{"model":"claude-opus-4-6","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a.go"}}]}}`,
+		`{"type":"assistant","message":{"model":"claude-opus-4-6","content":[{"type":"tool_use","name":"Skill","input":{}}]}}`,
+		`{"type":"result","num_turns":6}`,
+	}
+
+	input := strings.NewReader(strings.Join(lines, "\n"))
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	metrics := &RunMetrics{}
+
+	if err := progressParser(input, printer, metrics); err != nil {
+		t.Fatalf("progressParser returned error: %v", err)
+	}
+
+	if got := metrics.ToolCalls.Load(); got != 3 {
+		t.Errorf("expected 3 tool calls from nested message.content, got %d", got)
+	}
+}
+
+// TestProgressParserCapturesModelFromAssistantWhenSystemLacksIt verifies the
+// model falls back to the assistant message.model when the system init event
+// carries no model, so gen_ai.request.model stays populated for all streams.
+func TestProgressParserCapturesModelFromAssistantWhenSystemLacksIt(t *testing.T) {
+	lines := []string{
+		`{"type":"system","subtype":"init"}`, // no model field
+		`{"type":"assistant","message":{"model":"claude-opus-4-6","content":[{"type":"text","text":"hi"}]}}`,
+		`{"type":"result","num_turns":1}`,
+	}
+
+	input := strings.NewReader(strings.Join(lines, "\n"))
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	metrics := &RunMetrics{}
+
+	if err := progressParser(input, printer, metrics); err != nil {
+		t.Fatalf("progressParser returned error: %v", err)
+	}
+
+	if metrics.Model != "claude-opus-4-6" {
+		t.Errorf("expected model from assistant message.model fallback, got %q", metrics.Model)
+	}
+}
+
+// TestProgressParserCapturesModelFromSystemEvent verifies the resolved model is
+// read from the system init event (the result event does not carry it).
+func TestProgressParserCapturesModelFromSystemEvent(t *testing.T) {
+	lines := []string{
+		`{"type":"system","subtype":"init","model":"claude-opus-4-6"}`,
+		`{"type":"result","num_turns":1}`,
+	}
+
+	input := strings.NewReader(strings.Join(lines, "\n"))
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	metrics := &RunMetrics{}
+
+	if err := progressParser(input, printer, metrics); err != nil {
+		t.Fatalf("progressParser returned error: %v", err)
+	}
+
+	if metrics.Model != "claude-opus-4-6" {
+		t.Errorf("expected model claude-opus-4-6 from system event, got %q", metrics.Model)
+	}
 }
 
 func TestProgressParserNoResultEvent(t *testing.T) {
@@ -449,7 +622,7 @@ func TestProgressParserNoResultEvent(t *testing.T) {
 	printer := ui.New(&buf)
 	metrics := &RunMetrics{}
 
-	if err := progressParser(input, printer, time.Now(), metrics); err != nil {
+	if err := progressParser(input, printer, metrics); err != nil {
 		t.Fatalf("progressParser returned error: %v", err)
 	}
 
@@ -503,5 +676,1421 @@ func TestHeartbeatConcurrency(t *testing.T) {
 	output := buf.String()
 	if !strings.Contains(output, "main goroutine") {
 		t.Errorf("expected main goroutine output, got: %s", output)
+	}
+}
+
+// --- parseClaudeStream tests ---
+
+func collectEvents(t *testing.T, input string) []AgentEvent {
+	t.Helper()
+	var events []AgentEvent
+	err := parseClaudeStream(strings.NewReader(input), func(evt AgentEvent) {
+		events = append(events, evt)
+	})
+	if err != nil {
+		t.Fatalf("parseClaudeStream returned error: %v", err)
+	}
+	return events
+}
+
+func TestParseClaudeStreamInitEvent(t *testing.T) {
+	input := `{"type":"system","subtype":"init","model":"claude-opus-4-6","claude_code_version":"1.0.50"}`
+	events := collectEvents(t, input)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	init, ok := events[0].(InitEvent)
+	if !ok {
+		t.Fatalf("expected InitEvent, got %T", events[0])
+	}
+	if init.Model != "claude-opus-4-6" {
+		t.Errorf("expected model claude-opus-4-6, got %q", init.Model)
+	}
+	if init.Version != "1.0.50" {
+		t.Errorf("expected version 1.0.50, got %q", init.Version)
+	}
+}
+
+func TestParseClaudeStreamInitEventPluginErrors(t *testing.T) {
+	input := `{"type":"system","subtype":"init","model":"claude-opus-4-6","plugin_errors":[` +
+		`{"plugin":"demo@inline","type":"path-not-found","message":"Plugin directory not found","path":"/sandbox/plugins/demo"},` +
+		`{"plugin":"legacy@inline","type":"manifest-validation-error","message":"invalid manifest"}` +
+		`]}`
+	events := collectEvents(t, input)
+	want := []AgentEvent{
+		InitEvent{Model: "claude-opus-4-6"},
+		PluginErrorEvent{Plugin: "demo@inline", Type: "path-not-found", Path: "/sandbox/plugins/demo", Message: "Plugin directory not found"},
+		PluginErrorEvent{Plugin: "legacy@inline", Type: "manifest-validation-error", Message: "invalid manifest"},
+	}
+	if len(events) != len(want) {
+		t.Fatalf("expected %d events, got %d: %+v", len(want), len(events), events)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Errorf("event %d: got %+v, want %+v", i, events[i], want[i])
+		}
+	}
+}
+
+func TestParseClaudeStreamInitEventNoPluginErrors(t *testing.T) {
+	for name, input := range map[string]string{
+		"absent": `{"type":"system","subtype":"init","model":"claude-opus-4-6"}`,
+		"empty":  `{"type":"system","subtype":"init","model":"claude-opus-4-6","plugin_errors":[]}`,
+		"null":   `{"type":"system","subtype":"init","model":"claude-opus-4-6","plugin_errors":null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			events := collectEvents(t, input)
+			if len(events) != 1 {
+				t.Fatalf("expected only the InitEvent, got %+v", events)
+			}
+			if _, ok := events[0].(InitEvent); !ok {
+				t.Fatalf("expected InitEvent, got %T", events[0])
+			}
+		})
+	}
+}
+
+func TestParseClaudeStreamInitEventMalformedPluginErrors(t *testing.T) {
+	t.Run("not an array", func(t *testing.T) {
+		input := `{"type":"system","subtype":"init","model":"claude-opus-4-6","plugin_errors":"boom"}`
+		events := collectEvents(t, input)
+		if len(events) != 1 {
+			t.Fatalf("expected only the InitEvent, got %+v", events)
+		}
+		if init, ok := events[0].(InitEvent); !ok || init.Model != "claude-opus-4-6" {
+			t.Fatalf("expected InitEvent with model, got %+v", events[0])
+		}
+	})
+
+	t.Run("bad entries skipped", func(t *testing.T) {
+		lines := []string{
+			`{"type":"system","subtype":"init","model":"claude-opus-4-6","plugin_errors":[` +
+				`42,{"plugin":7},null,{},{"plugin":"ok@inline","type":"generic-error","message":"failed"}]}`,
+			`{"type":"system","subtype":"api_retry","attempt":1,"max_retries":3,"retry_delay_ms":10,"error":"x"}`,
+		}
+		events := collectEvents(t, strings.Join(lines, "\n"))
+		want := []AgentEvent{
+			InitEvent{Model: "claude-opus-4-6"},
+			PluginErrorEvent{Plugin: "ok@inline", Type: "generic-error", Message: "failed"},
+			RetryEvent{Attempt: 1, MaxRetries: 3, DelayMs: 10, Error: "x"},
+		}
+		if len(events) != len(want) {
+			t.Fatalf("expected %d events, got %d: %+v", len(want), len(events), events)
+		}
+		for i := range want {
+			if events[i] != want[i] {
+				t.Errorf("event %d: got %+v, want %+v", i, events[i], want[i])
+			}
+		}
+	})
+}
+
+func TestProgressParserPluginErrorsWarn(t *testing.T) {
+	render := func(input string) string {
+		var buf bytes.Buffer
+		if err := progressParser(strings.NewReader(input), ui.New(&buf), &RunMetrics{}); err != nil {
+			t.Fatalf("progressParser returned error: %v", err)
+		}
+		return buf.String()
+	}
+
+	clean := render(`{"type":"system","subtype":"init","model":"claude-opus-4-6"}`)
+	if got := render(`{"type":"system","subtype":"init","model":"claude-opus-4-6","plugin_errors":[]}`); got != clean {
+		t.Errorf("empty plugin_errors changed output:\n got: %q\nwant: %q", got, clean)
+	}
+	if strings.Contains(clean, "Plugin") {
+		t.Errorf("unexpected plugin warning without plugin_errors: %q", clean)
+	}
+
+	out := render(`{"type":"system","subtype":"init","model":"claude-opus-4-6","plugin_errors":[` +
+		`{"plugin":"de\u001b[31mmo@inline","type":"path-not-found","message":"gone\n::error::forged","path":"/sandbox/plu\rgins/demo"}]}`)
+	if !strings.Contains(out, "demo@inline") {
+		t.Errorf("expected plugin name in warning, got: %q", out)
+	}
+	if !strings.Contains(out, "/sandbox/plu") || !strings.Contains(out, "gins/demo") {
+		t.Errorf("expected plugin path in warning, got: %q", out)
+	}
+	if strings.Contains(out, "\x1b[31m") || strings.Contains(out, "\r") || strings.Contains(out, "::error::") {
+		t.Errorf("warning not sanitized: %q", out)
+	}
+	if strings.Count(out, "failed to load") != 1 {
+		t.Errorf("expected exactly one warning line, got: %q", out)
+	}
+}
+
+func TestParseClaudeStreamRetryEvent(t *testing.T) {
+	input := `{"type":"system","subtype":"api_retry","attempt":2,"max_retries":5,"retry_delay_ms":1000,"error":"overloaded"}`
+	events := collectEvents(t, input)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	retry, ok := events[0].(RetryEvent)
+	if !ok {
+		t.Fatalf("expected RetryEvent, got %T", events[0])
+	}
+	if retry.Attempt != 2 || retry.MaxRetries != 5 || retry.DelayMs != 1000 || retry.Error != "overloaded" {
+		t.Errorf("unexpected retry event: %+v", retry)
+	}
+}
+
+func TestParseClaudeStreamTextDeltas(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+	var texts []string
+	for _, e := range events {
+		if te, ok := e.(TextEvent); ok {
+			texts = append(texts, te.Text)
+		}
+	}
+	if len(texts) != 2 || texts[0] != "hello " || texts[1] != "world" {
+		t.Errorf("expected two text deltas [hello ] [world], got %v", texts)
+	}
+}
+
+func TestParseClaudeStreamThinkingDeltas(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+	var thinking []string
+	for _, e := range events {
+		if te, ok := e.(ThinkingEvent); ok {
+			thinking = append(thinking, te.Text)
+		}
+	}
+	if len(thinking) != 1 || thinking[0] != "hmm" {
+		t.Errorf("expected one thinking delta [hmm], got %v", thinking)
+	}
+}
+
+func TestParseClaudeStreamToolUse(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Read"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\""}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":":\"/src/main.go\"}"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+	var tools []ToolUseEvent
+	for _, e := range events {
+		if te, ok := e.(ToolUseEvent); ok {
+			tools = append(tools, te)
+		}
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(tools))
+	}
+	if tools[0].Name != "Read" {
+		t.Errorf("expected tool name Read, got %q", tools[0].Name)
+	}
+	if tools[0].Summary != "/src/main.go" {
+		t.Errorf("expected summary /src/main.go, got %q", tools[0].Summary)
+	}
+}
+
+func TestParseClaudeStreamToolUseCarriesID(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01AbCdEf","name":"Read"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/src/main.go\"}"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+	var tools []ToolUseEvent
+	for _, e := range events {
+		if te, ok := e.(ToolUseEvent); ok {
+			tools = append(tools, te)
+		}
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(tools))
+	}
+	if tools[0].ID != "toolu_01AbCdEf" {
+		t.Errorf("expected tool ID toolu_01AbCdEf, got %q", tools[0].ID)
+	}
+}
+
+func TestParseClaudeStreamAssistantFallbackToolUseCarriesID(t *testing.T) {
+	input := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_02XyZ","name":"Bash","input":{"command":"ls"}}]}}`
+	events := collectEvents(t, input)
+	var tools []ToolUseEvent
+	for _, e := range events {
+		if te, ok := e.(ToolUseEvent); ok {
+			tools = append(tools, te)
+		}
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(tools))
+	}
+	if tools[0].ID != "toolu_02XyZ" {
+		t.Errorf("expected tool ID toolu_02XyZ, got %q", tools[0].ID)
+	}
+}
+
+func collectToolUses(t *testing.T, input string) []ToolUseEvent {
+	t.Helper()
+	var tools []ToolUseEvent
+	for _, e := range collectEvents(t, input) {
+		if te, ok := e.(ToolUseEvent); ok {
+			tools = append(tools, te)
+		}
+	}
+	return tools
+}
+
+func TestParseClaudeStreamToolUseCarriesArguments(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"Read"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\""}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":":\"/src/main.go\"}"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+	tools := collectToolUses(t, strings.Join(lines, "\n"))
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(tools))
+	}
+	if want := `{"file_path":"/src/main.go"}`; tools[0].Arguments != want {
+		t.Errorf("expected the joined input deltas %q, got %q", want, tools[0].Arguments)
+	}
+}
+
+func TestParseClaudeStreamArgumentsStopAtTheInputCap(t *testing.T) {
+	// Each delta fits a stream line; the third crosses maxToolInputSize.
+	delta := `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"` + strings.Repeat("x", 400*1024) + `"}}}`
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"Write"}}}`,
+		delta, delta, delta,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+	tools := collectToolUses(t, strings.Join(lines, "\n"))
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(tools))
+	}
+	if got := len(tools[0].Arguments); got != maxToolInputSize {
+		t.Errorf("expected the arguments cut at the %d-byte cap, got %d bytes", maxToolInputSize, got)
+	}
+}
+
+func TestParseClaudeStreamAssistantToolUseCarriesArguments(t *testing.T) {
+	// Key order, escapes and spacing are the wire's: the parser passes the
+	// input through without decoding it.
+	const input = `{"timeout": 5, "command":"grep -n \"a\u003cb\" x\nls"}`
+	tools := collectToolUses(t, `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_02","name":"Bash","input":`+input+`}]}}`)
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(tools))
+	}
+	if tools[0].Arguments != input {
+		t.Errorf("expected the input as written %q, got %q", input, tools[0].Arguments)
+	}
+}
+
+func TestParseClaudeStreamToolUseWithoutInputHasNoArguments(t *testing.T) {
+	tools := collectToolUses(t, `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_03","name":"Bash"}]}}`)
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(tools))
+	}
+	if tools[0].Arguments != "" {
+		t.Errorf("expected no arguments, got %q", tools[0].Arguments)
+	}
+}
+
+func collectToolResults(t *testing.T, input string) []ToolResultEvent {
+	t.Helper()
+	var results []ToolResultEvent
+	for _, e := range collectEvents(t, input) {
+		if tr, ok := e.(ToolResultEvent); ok {
+			results = append(results, tr)
+		}
+	}
+	return results
+}
+
+func TestParseClaudeStreamToolResultStringContent(t *testing.T) {
+	input := `{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01DULm","type":"tool_result","content":"main.go\nutil.go\n"}]}}`
+	results := collectToolResults(t, input)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 tool result event, got %d", len(results))
+	}
+	if results[0].ID != "toolu_01DULm" {
+		t.Errorf("expected ID toolu_01DULm, got %q", results[0].ID)
+	}
+	if results[0].Result != "main.go\nutil.go\n" {
+		t.Errorf("expected raw result text, got %q", results[0].Result)
+	}
+}
+
+func TestParseClaudeStreamToolResultArrayContent(t *testing.T) {
+	input := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_03Arr","content":[{"type":"text","text":"first block"},{"type":"image","source":{"type":"base64","data":"aGk="}},{"type":"text","text":"second block"}]}]}}`
+	results := collectToolResults(t, input)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 tool result event, got %d", len(results))
+	}
+	if results[0].ID != "toolu_03Arr" {
+		t.Errorf("expected ID toolu_03Arr, got %q", results[0].ID)
+	}
+	if results[0].Result != "first block\nsecond block" {
+		t.Errorf("expected text blocks joined by newline with image skipped, got %q", results[0].Result)
+	}
+	if !results[0].Partial {
+		t.Errorf("skipping the image block loses content — the event must say so")
+	}
+}
+
+func TestParseClaudeStreamToolResultPureTextNotPartial(t *testing.T) {
+	for name, input := range map[string]string{
+		"string content":     `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_s","content":"plain"}]}}`,
+		"text-only array":    `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_a","content":[{"type":"text","text":"only text"}]}]}}`,
+		"absent content key": `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_n","is_error":true}]}}`,
+	} {
+		results := collectToolResults(t, input)
+		if len(results) != 1 {
+			t.Fatalf("%s: expected 1 event, got %d", name, len(results))
+		}
+		if results[0].Partial {
+			t.Errorf("%s: nothing was skipped; Partial must be false", name)
+		}
+	}
+}
+
+func TestParseClaudeStreamToolResultFlatContent(t *testing.T) {
+	// Older/flat shape: content at the top level, no "message" nesting —
+	// the same dual-shape contract assistantMessage supports.
+	input := `{"type":"user","content":[{"type":"tool_result","tool_use_id":"toolu_04Flat","content":"flat shape"}]}`
+	results := collectToolResults(t, input)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 tool result event, got %d", len(results))
+	}
+	if results[0].ID != "toolu_04Flat" {
+		t.Errorf("expected ID toolu_04Flat, got %q", results[0].ID)
+	}
+	if results[0].Result != "flat shape" {
+		t.Errorf("expected flat-shape result, got %q", results[0].Result)
+	}
+}
+
+func TestParseClaudeStreamUserTextContentIgnored(t *testing.T) {
+	// User messages can carry plain text (e.g. runner-composed feedback
+	// prompts); only tool_result blocks produce events.
+	input := `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"please fix the validation errors"}]}}`
+	events := collectEvents(t, input)
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events for text-only user message, got %d: %#v", len(events), events)
+	}
+}
+
+func TestParseClaudeStreamUserMalformedShapesIgnored(t *testing.T) {
+	// Defensive branches: a user line whose message is not an object, and
+	// one whose content is a plain string (a real wire shape for user
+	// turns) carry no tool_result blocks — both are skipped without error.
+	lines := []string{
+		`{"type":"user","message":5}`,
+		`{"type":"user","message":{"role":"user","content":"just text, not an array"}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events for malformed/plain user lines, got %d: %#v", len(events), events)
+	}
+}
+
+func TestParseClaudeStreamToolResultNonTextContent(t *testing.T) {
+	// A tool_result whose content is neither a string nor a block array
+	// (e.g. an object) flattens to empty; the event still carries the ID.
+	input := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_08obj","content":{"unexpected":true}}]}}`
+	results := collectToolResults(t, input)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 tool result event, got %d", len(results))
+	}
+	if results[0].ID != "toolu_08obj" {
+		t.Errorf("expected ID toolu_08obj, got %q", results[0].ID)
+	}
+	if results[0].Result != "" {
+		t.Errorf("expected empty result for non-text content, got %q", results[0].Result)
+	}
+	if !results[0].Partial {
+		t.Errorf("undecodable content was skipped; Partial must be true")
+	}
+}
+
+func TestParseClaudeStreamToolResultIsError(t *testing.T) {
+	// Failed tool calls carry is_error on the wire; the event surfaces it
+	// so consumers can tell an errored call from a successful one.
+	input := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_09err","content":"command not found","is_error":true}]}}`
+	results := collectToolResults(t, input)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 tool result event, got %d", len(results))
+	}
+	if !results[0].IsError {
+		t.Errorf("expected IsError=true for an is_error tool_result")
+	}
+}
+
+func TestParseClaudeStreamToolResultEmptyContent(t *testing.T) {
+	// A tool_result with empty content still marks completion; the event
+	// is emitted with its ID and an empty Result.
+	input := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_05Empty","content":""}]}}`
+	results := collectToolResults(t, input)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 tool result event, got %d", len(results))
+	}
+	if results[0].ID != "toolu_05Empty" {
+		t.Errorf("expected ID toolu_05Empty, got %q", results[0].ID)
+	}
+	if results[0].Result != "" {
+		t.Errorf("expected empty result, got %q", results[0].Result)
+	}
+}
+
+// oversizedToolResultLine builds a user tool_result line longer than
+// streamBufSize in Claude Code's measured key order: the block's
+// tool_use_id ahead of its content, parent_tool_use_id after the message.
+func oversizedToolResultLine(id string) string {
+	return `{"type":"user","message":{"role":"user","content":[{"tool_use_id":"` + id +
+		`","type":"tool_result","content":"` + strings.Repeat("x", streamBufSize+1024) +
+		`"}]},"parent_tool_use_id":null}`
+}
+
+func TestParseClaudeStreamOversizedToolResultEmitsDegradedEvent(t *testing.T) {
+	// A tool_result line past streamBufSize cannot be decoded, but its id
+	// sits in the retained prefix: the call is answered, its content lost.
+	lines := []string{
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_before","type":"tool_result","content":"a"}]}}`,
+		oversizedToolResultLine("toolu_big"),
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_after","type":"tool_result","content":"b"}]}}`,
+	}
+	results := collectToolResults(t, strings.Join(lines, "\n"))
+	want := []ToolResultEvent{
+		{ID: "toolu_before", Result: "a"},
+		{ID: "toolu_big", Oversized: true},
+		{ID: "toolu_after", Result: "b"},
+	}
+	if len(results) != len(want) {
+		t.Fatalf("expected %d tool result events, got %d: %+v", len(want), len(results), results)
+	}
+	for i := range want {
+		if results[i] != want[i] {
+			t.Errorf("event %d: want %+v, got %+v", i, want[i], results[i])
+		}
+	}
+}
+
+func TestParseClaudeStreamOversizedToolResultAtEOFStillEmits(t *testing.T) {
+	// No trailing newline. bufio returns a short final chunk with a nil
+	// error, so the skip loop ends on io.EOF itself only when the line is
+	// an exact multiple of streamBufSize. Both exits must emit.
+	line := oversizedToolResultLine("toolu_last")
+	for name, in := range map[string]string{
+		"short final chunk":     line,
+		"exact buffer multiple": line + strings.Repeat(" ", 2*streamBufSize-len(line)),
+	} {
+		results := collectToolResults(t, in)
+		if len(results) != 1 || results[0] != (ToolResultEvent{ID: "toolu_last", Oversized: true}) {
+			t.Errorf("%s: want one oversized event for toolu_last, got %+v", name, results)
+		}
+	}
+}
+
+func TestParseClaudeStreamOversizedLineEmitsOnlyTheFirstBlockID(t *testing.T) {
+	// One result per user line is the measured shape; a second id in the
+	// prefix must never close a second span on a guess.
+	line := `{"type":"user","message":{"role":"user","content":[` +
+		`{"tool_use_id":"toolu_first","type":"tool_result","content":"small"},` +
+		`{"tool_use_id":"toolu_second","type":"tool_result","content":"` + strings.Repeat("x", streamBufSize+1024) + `"}]}}`
+	results := collectToolResults(t, line)
+	if len(results) != 1 || results[0] != (ToolResultEvent{ID: "toolu_first", Oversized: true}) {
+		t.Fatalf("want exactly one oversized event for toolu_first, got %+v", results)
+	}
+}
+
+func TestParseClaudeStreamOversizedLineNeverFallsThroughToASecondID(t *testing.T) {
+	// Only the line's first id is considered. When it is unusable the
+	// parser reports nothing, rather than answer a later block's call on
+	// the strength of a line it never decoded.
+	for name, first := range map[string]string{
+		"empty":    "",
+		"too long": strings.Repeat("i", 257),
+		"escaped":  `toolu_\u0041`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			line := `{"type":"user","message":{"role":"user","content":[` +
+				`{"tool_use_id":"` + first + `","type":"tool_result","content":"small"},` +
+				`{"tool_use_id":"toolu_second","type":"tool_result","content":"` + strings.Repeat("x", streamBufSize+1024) + `"}]}}`
+			if got := collectToolResults(t, line); len(got) != 0 {
+				t.Fatalf("want no event, got %+v", got)
+			}
+		})
+	}
+}
+
+func TestParseClaudeStreamOversizedLineWithoutSalvageableIDEmitsNothing(t *testing.T) {
+	big := strings.Repeat("x", streamBufSize+1024)
+	cases := map[string]string{
+		"id serialized after the content":   `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"` + big + `","is_error":true,"tool_use_id":"toolu_late"}]}}`,
+		"system line":                       `{"type":"system","subtype":"x","tool_use_id":"toolu_sys","data":"` + big + `"}`,
+		"assistant line":                    `{"type":"assistant","message":{"content":[{"tool_use_id":"toolu_asst","type":"text","text":"` + big + `"}]}}`,
+		"a type that only starts with user": `{"type":"user_note","message":{"role":"user","content":[{"tool_use_id":"toolu_note","type":"tool_result","content":"` + big + `"}]}}`,
+		"user is not the first key":         `{"session_id":"s","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_reordered","type":"tool_result","content":"` + big + `"}]}}`,
+		"only a parent_tool_use_id":         `{"type":"user","parent_tool_use_id":"toolu_parent","message":{"role":"user","content":[{"type":"text","text":"` + big + `"}]}}`,
+		"an id quoted inside content":       `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"\"tool_use_id\":\"toolu_forged\" ` + big + `"}]}}`,
+		"an id past 256 bytes":              oversizedToolResultLine(strings.Repeat("i", 257)),
+		"an id holding an escape":           oversizedToolResultLine(`toolu_\u0041`),
+		"an empty id":                       oversizedToolResultLine(""),
+	}
+	for name, line := range cases {
+		t.Run(name, func(t *testing.T) {
+			events := collectEvents(t, line+"\n"+`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_next","type":"tool_result","content":"ok"}]}}`)
+			if len(events) != 1 {
+				t.Fatalf("want only the following line's event, got %+v", events)
+			}
+			if got, ok := events[0].(ToolResultEvent); !ok || got != (ToolResultEvent{ID: "toolu_next", Result: "ok"}) {
+				t.Fatalf("want the following line parsed untouched, got %+v", events[0])
+			}
+		})
+	}
+}
+
+func TestParseClaudeStreamOversizedLineNeverEmitsACutID(t *testing.T) {
+	// The parser keeps exactly streamBufSize bytes of the line. An id that
+	// ends inside them is salvaged wherever it sits; one the boundary cuts
+	// is not — a shortened id could collide with another call's.
+	head := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"`
+	key := `","tool_use_id":"`
+	const id = "toolu_0123456789abcdef"
+	line := func(idBytesInsidePrefix int) string {
+		pad := streamBufSize - len(head) - len(key) - idBytesInsidePrefix
+		return head + strings.Repeat("x", pad) + key + id + `"}]},"tool_use_result":"` + strings.Repeat("y", 4096) + `"}`
+	}
+
+	whole := collectToolResults(t, line(len(id)+1)) // the closing quote is the prefix's last byte
+	if len(whole) != 1 || whole[0] != (ToolResultEvent{ID: id, Oversized: true}) {
+		t.Fatalf("an id that ends inside the prefix must be salvaged, got %+v", whole)
+	}
+	for _, inside := range []int{len(id), len(id) - 1, 1, 0} {
+		if got := collectToolResults(t, line(inside)); len(got) != 0 {
+			t.Errorf("%d id bytes inside the prefix: want no event, got %+v", inside, got)
+		}
+	}
+}
+
+func TestParseClaudeStreamOversizedLineAcceptsA256ByteID(t *testing.T) {
+	id := strings.Repeat("i", 256)
+	results := collectToolResults(t, oversizedToolResultLine(id))
+	if len(results) != 1 || results[0] != (ToolResultEvent{ID: id, Oversized: true}) {
+		t.Fatalf("want one oversized event carrying the 256-byte id, got %d events", len(results))
+	}
+}
+
+func TestParseClaudeStreamUnknownToolShowsNameNoContext(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Skill"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"skill_name\":\"issue-labels\"}"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+	var tools []ToolUseEvent
+	for _, e := range events {
+		if te, ok := e.(ToolUseEvent); ok {
+			tools = append(tools, te)
+		}
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event, got %d", len(tools))
+	}
+	if tools[0].Name != "Skill" {
+		t.Errorf("expected real tool name 'Skill', got %q", tools[0].Name)
+	}
+	if tools[0].Summary != "" {
+		t.Errorf("expected empty summary for unrecognized tool, got %q", tools[0].Summary)
+	}
+}
+
+func TestParseClaudeStreamResultEvent(t *testing.T) {
+	input := `{"type":"result","num_turns":8,"total_cost_usd":0.42,"is_error":false,"subtype":"success","usage":{"input_tokens":12000,"output_tokens":3400,"cache_creation_input_tokens":8000,"cache_read_input_tokens":5000}}`
+	events := collectEvents(t, input)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	result, ok := events[0].(ResultEvent)
+	if !ok {
+		t.Fatalf("expected ResultEvent, got %T", events[0])
+	}
+	if result.NumTurns != 8 || result.TotalCostUSD != 0.42 {
+		t.Errorf("unexpected result: %+v", result)
+	}
+	if result.InputTokens != 12000 || result.OutputTokens != 3400 {
+		t.Errorf("unexpected token counts: %+v", result)
+	}
+}
+
+func TestParseClaudeStreamErrorEvent(t *testing.T) {
+	input := `{"type":"stream_event","event":{"type":"error","error":{"type":"overloaded_error","message":"rate limited"}}}`
+	events := collectEvents(t, input)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	errEvt, ok := events[0].(ErrorEvent)
+	if !ok {
+		t.Fatalf("expected ErrorEvent, got %T", events[0])
+	}
+	if errEvt.ErrorType != "overloaded_error" || errEvt.Message != "rate limited" {
+		t.Errorf("unexpected error event: %+v", errEvt)
+	}
+}
+
+func TestParseClaudeStreamResultEventWithError(t *testing.T) {
+	input := `{"type":"result","num_turns":3,"total_cost_usd":0.10,"is_error":true,"subtype":"error_max_turns","result":"Max turns reached","usage":{"input_tokens":5000,"output_tokens":1000}}`
+	events := collectEvents(t, input)
+
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	result, ok := events[0].(ResultEvent)
+	if !ok {
+		t.Fatalf("expected ResultEvent, got %T", events[0])
+	}
+	if !result.IsError {
+		t.Error("expected IsError to be true")
+	}
+	if result.ErrorMessage != "Max turns reached" {
+		t.Errorf("expected error message 'Max turns reached', got %q", result.ErrorMessage)
+	}
+	if result.Subtype != "error_max_turns" {
+		t.Errorf("expected subtype error_max_turns, got %q", result.Subtype)
+	}
+}
+
+func TestParseClaudeStreamAssistantFallback(t *testing.T) {
+	lines := []string{
+		`{"type":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/main.go"}}]}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+	var tools []ToolUseEvent
+	for _, e := range events {
+		if te, ok := e.(ToolUseEvent); ok {
+			tools = append(tools, te)
+		}
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool event from assistant fallback, got %d", len(tools))
+	}
+	if tools[0].Name != "Read" || tools[0].Summary != "/src/main.go" {
+		t.Errorf("unexpected tool event: %+v", tools[0])
+	}
+}
+
+func TestParseClaudeStreamAssistantFallbackTextAndThinking(t *testing.T) {
+	lines := []string{
+		`{"type":"assistant","message":{"model":"claude-opus-4-6","content":[{"type":"thinking","thinking":"Let me analyze this."}]}}`,
+		`{"type":"assistant","message":{"model":"claude-opus-4-6","content":[{"type":"text","text":"I'll read the file now."}]}}`,
+		`{"type":"assistant","message":{"model":"claude-opus-4-6","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/a.go"}}]}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var thinking []ThinkingEvent
+	var texts []TextEvent
+	var tools []ToolUseEvent
+	for _, e := range events {
+		switch ev := e.(type) {
+		case ThinkingEvent:
+			thinking = append(thinking, ev)
+		case TextEvent:
+			texts = append(texts, ev)
+		case ToolUseEvent:
+			tools = append(tools, ev)
+		}
+	}
+	if len(thinking) != 1 || thinking[0].Text != "Let me analyze this." {
+		t.Errorf("expected 1 thinking event with correct text, got %v", thinking)
+	}
+	if len(texts) != 1 || texts[0].Text != "I'll read the file now." {
+		t.Errorf("expected 1 text event with correct text, got %v", texts)
+	}
+	if len(tools) != 1 {
+		t.Errorf("expected 1 tool event, got %d", len(tools))
+	}
+}
+
+func TestParseClaudeStreamTokensEvent(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":1000}}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var tokens []TokensEvent
+	for _, e := range events {
+		if te, ok := e.(TokensEvent); ok {
+			tokens = append(tokens, te)
+		}
+	}
+	// Total = 4000 + 1000 + 500 + 200 = 5700, crosses 5k threshold
+	if len(tokens) != 1 {
+		t.Fatalf("expected 1 tokens event, got %d", len(tokens))
+	}
+	if tokens[0].InputTokens != 4000 || tokens[0].OutputTokens != 1000 {
+		t.Errorf("unexpected token counts: %+v", tokens[0])
+	}
+	if tokens[0].CacheRead != 500 || tokens[0].CacheWrite != 200 {
+		t.Errorf("unexpected cache counts: %+v", tokens[0])
+	}
+}
+
+func TestParseClaudeStreamTokensEventWithReasoningTokens(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":1000,"output_tokens_details":{"thinking_tokens":300}}}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var tokens []TokensEvent
+	for _, e := range events {
+		if te, ok := e.(TokensEvent); ok {
+			tokens = append(tokens, te)
+		}
+	}
+	// Total = 4000 + 1000 + 300 + 500 + 200 = 6000, crosses 5k threshold
+	if len(tokens) != 1 {
+		t.Fatalf("expected 1 tokens event, got %d", len(tokens))
+	}
+	if tokens[0].ReasoningTokens != 300 {
+		t.Errorf("expected 300 reasoning tokens, got %d", tokens[0].ReasoningTokens)
+	}
+	if tokens[0].OutputTokens != 1000 {
+		t.Errorf("expected 1000 output tokens, got %d", tokens[0].OutputTokens)
+	}
+}
+
+func TestParseClaudeStreamResultEventAccumulatesReasoningTokens(t *testing.T) {
+	lines := []string{
+		// First message turn with 200 thinking tokens.
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":1000,"output_tokens_details":{"thinking_tokens":200}}}}`,
+		// Second message turn with 150 thinking tokens.
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":6000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":800,"output_tokens_details":{"thinking_tokens":150}}}}`,
+		// Result event.
+		`{"type":"result","num_turns":2,"total_cost_usd":0.50,"usage":{"input_tokens":10000,"output_tokens":1800,"cache_creation_input_tokens":400,"cache_read_input_tokens":1000}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var results []ResultEvent
+	for _, e := range events {
+		if re, ok := e.(ResultEvent); ok {
+			results = append(results, re)
+		}
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result event, got %d", len(results))
+	}
+	// Accumulated: 200 + 150 = 350.
+	if results[0].ReasoningTokens != 350 {
+		t.Errorf("expected 350 accumulated reasoning tokens, got %d", results[0].ReasoningTokens)
+	}
+}
+
+func TestParseClaudeStreamNoThinkingTokensBackwardCompat(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":1000}}}`,
+		`{"type":"result","num_turns":1,"total_cost_usd":0.10,"usage":{"input_tokens":4000,"output_tokens":1000,"cache_creation_input_tokens":200,"cache_read_input_tokens":500}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var tokens []TokensEvent
+	var results []ResultEvent
+	for _, e := range events {
+		switch ev := e.(type) {
+		case TokensEvent:
+			tokens = append(tokens, ev)
+		case ResultEvent:
+			results = append(results, ev)
+		}
+	}
+	// TokensEvent: reasoning should be 0 when no thinking tokens present.
+	if len(tokens) == 1 && tokens[0].ReasoningTokens != 0 {
+		t.Errorf("expected 0 reasoning tokens when absent, got %d", tokens[0].ReasoningTokens)
+	}
+	// ResultEvent: reasoning should be 0.
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result event, got %d", len(results))
+	}
+	if results[0].ReasoningTokens != 0 {
+		t.Errorf("expected 0 reasoning tokens in result when absent, got %d", results[0].ReasoningTokens)
+	}
+}
+
+func TestProgressParserCapturesReasoningTokensInMetrics(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":1000,"output_tokens_details":{"thinking_tokens":250}}}}`,
+		`{"type":"result","num_turns":1,"total_cost_usd":0.10,"usage":{"input_tokens":4000,"output_tokens":1000,"cache_creation_input_tokens":200,"cache_read_input_tokens":500}}`,
+	}
+
+	input := strings.NewReader(strings.Join(lines, "\n"))
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	metrics := &RunMetrics{}
+
+	if err := progressParser(input, printer, metrics); err != nil {
+		t.Fatalf("progressParser returned error: %v", err)
+	}
+
+	if metrics.ReasoningTokens != 250 {
+		t.Errorf("expected 250 reasoning tokens in metrics, got %d", metrics.ReasoningTokens)
+	}
+}
+
+func TestParseClaudeStreamTokensEventThrottled(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":200}}}`,
+		// ResultEvent prevents the deferred EOF emission so this test
+		// isolates the in-stream throttle behavior.
+		`{"type":"result","num_turns":1,"total_cost_usd":0.01,"usage":{"input_tokens":4000,"output_tokens":200}}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var tokens []TokensEvent
+	for _, e := range events {
+		if te, ok := e.(TokensEvent); ok {
+			tokens = append(tokens, te)
+		}
+	}
+	// Total = 4200, below 5k threshold — no in-stream TokensEvent emitted.
+	if len(tokens) != 0 {
+		t.Fatalf("expected 0 tokens events (below threshold), got %d", len(tokens))
+	}
+}
+
+func TestParseClaudeStreamAssistantSuppressedWhenStreaming(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+		`{"type":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/main.go"}}]}`,
+	}
+	events := collectEvents(t, strings.Join(lines, "\n"))
+	for _, e := range events {
+		if _, ok := e.(ToolUseEvent); ok {
+			t.Error("assistant message should not emit ToolUseEvent when stream_events are active")
+		}
+	}
+}
+
+// TestProgressParserCancelledRunCapturesTokens verifies that cancelled runs
+// (stream with TokensEvents but no ResultEvent) produce non-zero token
+// metrics. This is the core regression test for #6905.
+func TestProgressParserCancelledRunCapturesTokens(t *testing.T) {
+	lines := []string{
+		`{"type":"system","subtype":"init","model":"claude-opus-4-6"}`,
+		// Two tool calls (already works before fix)
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Read"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+		`{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"Bash"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":1}}`,
+		// One API call with token usage that crosses the threshold
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":2000}}}`,
+		// No result event — simulates SIGTERM cancellation.
+	}
+
+	input := strings.NewReader(strings.Join(lines, "\n"))
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	metrics := &RunMetrics{}
+
+	if err := progressParser(input, printer, metrics); err != nil {
+		t.Fatalf("progressParser returned error: %v", err)
+	}
+
+	// Tool calls are already tracked incrementally (not affected by this bug).
+	if got := metrics.ToolCalls.Load(); got != 2 {
+		t.Errorf("expected 2 tool calls, got %d", got)
+	}
+
+	// Token metrics must be non-zero — this was the #6905 regression.
+	if metrics.InputTokens == 0 {
+		t.Error("expected non-zero InputTokens on cancelled run")
+	}
+	if metrics.OutputTokens == 0 {
+		t.Error("expected non-zero OutputTokens on cancelled run")
+	}
+	if metrics.InputTokens != 4000 {
+		t.Errorf("expected 4000 input tokens, got %d", metrics.InputTokens)
+	}
+	if metrics.OutputTokens != 2000 {
+		t.Errorf("expected 2000 output tokens, got %d", metrics.OutputTokens)
+	}
+	if metrics.CacheReadInputTokens != 500 {
+		t.Errorf("expected 500 cache read tokens, got %d", metrics.CacheReadInputTokens)
+	}
+	if metrics.CacheCreationInputTokens != 200 {
+		t.Errorf("expected 200 cache creation tokens, got %d", metrics.CacheCreationInputTokens)
+	}
+}
+
+// TestProgressParserResultOverwritesIncrementalTokens verifies that when a
+// ResultEvent is present (successful run), its authoritative totals overwrite
+// the incremental TokensEvent snapshot.
+func TestProgressParserResultOverwritesIncrementalTokens(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":2000}}}`,
+		// ResultEvent with authoritative totals (different from stream values).
+		`{"type":"result","num_turns":8,"total_cost_usd":0.42,"usage":{"input_tokens":12000,"output_tokens":3400,"cache_creation_input_tokens":8000,"cache_read_input_tokens":5000}}`,
+	}
+
+	input := strings.NewReader(strings.Join(lines, "\n"))
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+	metrics := &RunMetrics{}
+
+	if err := progressParser(input, printer, metrics); err != nil {
+		t.Fatalf("progressParser returned error: %v", err)
+	}
+
+	// ResultEvent values must win over the incremental TokensEvent snapshot.
+	if metrics.InputTokens != 12000 {
+		t.Errorf("expected 12000 input tokens from ResultEvent, got %d", metrics.InputTokens)
+	}
+	if metrics.OutputTokens != 3400 {
+		t.Errorf("expected 3400 output tokens from ResultEvent, got %d", metrics.OutputTokens)
+	}
+	if metrics.TotalCostUSD != 0.42 {
+		t.Errorf("expected cost 0.42 from ResultEvent, got %f", metrics.TotalCostUSD)
+	}
+	if metrics.NumTurns != 8 {
+		t.Errorf("expected 8 turns from ResultEvent, got %d", metrics.NumTurns)
+	}
+}
+
+// TestParseClaudeStreamCumulativeTokensAcrossMessages verifies that
+// TokensEvent carries cumulative token counts across multiple API calls,
+// not just the current message's counts.
+func TestParseClaudeStreamCumulativeTokensAcrossMessages(t *testing.T) {
+	lines := []string{
+		// First API call: input=3000, output=2000, cache_r=500, cache_w=200
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":3000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":2000}}}`,
+		// Second API call: input=4000, output=3000, cache_r=600, cache_w=100
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":600,"cache_creation_input_tokens":100}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":3000}}}`,
+		// No result event — cancelled.
+	}
+
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var lastTokens TokensEvent
+	for _, e := range events {
+		if te, ok := e.(TokensEvent); ok {
+			lastTokens = te
+		}
+	}
+
+	// The final TokensEvent (emitted at EOF for cancelled runs) should
+	// contain cumulative totals: input=3000+4000=7000, output=2000+3000=5000,
+	// cache_r=500+600=1100, cache_w=200+100=300.
+	if lastTokens.InputTokens != 7000 {
+		t.Errorf("expected cumulative input 7000, got %d", lastTokens.InputTokens)
+	}
+	if lastTokens.OutputTokens != 5000 {
+		t.Errorf("expected cumulative output 5000, got %d", lastTokens.OutputTokens)
+	}
+	if lastTokens.CacheRead != 1100 {
+		t.Errorf("expected cumulative cache read 1100, got %d", lastTokens.CacheRead)
+	}
+	if lastTokens.CacheWrite != 300 {
+		t.Errorf("expected cumulative cache write 300, got %d", lastTokens.CacheWrite)
+	}
+}
+
+// TestParseClaudeStreamNoFinalTokensEventAfterResult verifies that when
+// a ResultEvent is present, no extra TokensEvent is emitted at EOF — the
+// authoritative ResultEvent data must not be overwritten.
+func TestParseClaudeStreamNoFinalTokensEventAfterResult(t *testing.T) {
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":2000}}}`,
+		`{"type":"result","num_turns":8,"total_cost_usd":0.42,"usage":{"input_tokens":12000,"output_tokens":3400,"cache_creation_input_tokens":8000,"cache_read_input_tokens":5000}}`,
+	}
+
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	// Find the ResultEvent and check no TokensEvent comes after it.
+	seenResult := false
+	for _, e := range events {
+		switch e.(type) {
+		case ResultEvent:
+			seenResult = true
+		case TokensEvent:
+			if seenResult {
+				t.Error("TokensEvent must not be emitted after ResultEvent")
+			}
+		}
+	}
+	if !seenResult {
+		t.Error("expected ResultEvent in the stream")
+	}
+}
+
+// TestParseClaudeStreamBrokenPipeCapturesTokens verifies that when the
+// stream is interrupted mid-read (broken pipe, simulating process kill),
+// the deferred TokensEvent fires and metrics are captured. This is the
+// regression test for #6936: GitHub Actions cancellation kills the sandbox
+// subprocess, causing a broken pipe on the stream reader.
+func TestParseClaudeStreamBrokenPipeCapturesTokens(t *testing.T) {
+	pr, pw := io.Pipe()
+
+	// Write usage-bearing events then break the pipe (simulates SIGKILL).
+	go func() {
+		lines := []string{
+			`{"type":"system","subtype":"init","model":"claude-opus-4-6"}`,
+			`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":4000,"cache_read_input_tokens":500,"cache_creation_input_tokens":200}}}}`,
+			`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":2000}}}`,
+		}
+		for _, l := range lines {
+			pw.Write([]byte(l + "\n"))
+		}
+		pw.CloseWithError(errors.New("broken pipe"))
+	}()
+
+	var metrics RunMetrics
+	var buf bytes.Buffer
+	printer := ui.New(&buf)
+
+	// progressParser wraps parseClaudeStream and populates metrics.
+	err := progressParser(pr, printer, &metrics)
+	if err == nil {
+		t.Fatal("expected error from broken pipe, got nil")
+	}
+
+	// Token metrics must be non-zero despite the broken pipe (#6936).
+	if metrics.InputTokens == 0 {
+		t.Error("expected non-zero InputTokens after broken pipe")
+	}
+	if metrics.OutputTokens == 0 {
+		t.Error("expected non-zero OutputTokens after broken pipe")
+	}
+	if metrics.InputTokens != 4000 {
+		t.Errorf("InputTokens = %d, want 4000", metrics.InputTokens)
+	}
+	if metrics.OutputTokens != 2000 {
+		t.Errorf("OutputTokens = %d, want 2000", metrics.OutputTokens)
+	}
+	if metrics.CacheReadInputTokens != 500 {
+		t.Errorf("CacheReadInputTokens = %d, want 500", metrics.CacheReadInputTokens)
+	}
+	if metrics.CacheCreationInputTokens != 200 {
+		t.Errorf("CacheCreationInputTokens = %d, want 200", metrics.CacheCreationInputTokens)
+	}
+	if metrics.Model != "claude-opus-4-6" {
+		t.Errorf("Model = %q, want claude-opus-4-6", metrics.Model)
+	}
+}
+
+// TestParseClaudeStreamFinalTokensEventOnCancel verifies that a deferred
+// TokensEvent is emitted at EOF when the stream ends without a ResultEvent,
+// even when the per-message total is below the throttle threshold.
+func TestParseClaudeStreamFinalTokensEventOnCancel(t *testing.T) {
+	// Total per-message tokens: 2000+500+100+50 = 2650, below the 5000 threshold.
+	// Without the deferred emission, no TokensEvent would be emitted at all.
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":2000,"cache_read_input_tokens":100,"cache_creation_input_tokens":50}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":500}}}`,
+		// No result event — cancelled.
+	}
+
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var tokens []TokensEvent
+	for _, e := range events {
+		if te, ok := e.(TokensEvent); ok {
+			tokens = append(tokens, te)
+		}
+	}
+
+	if len(tokens) != 1 {
+		t.Fatalf("expected 1 deferred TokensEvent at EOF, got %d", len(tokens))
+	}
+	if tokens[0].InputTokens != 2000 {
+		t.Errorf("expected 2000 input tokens, got %d", tokens[0].InputTokens)
+	}
+	if tokens[0].OutputTokens != 500 {
+		t.Errorf("expected 500 output tokens, got %d", tokens[0].OutputTokens)
+	}
+}
+
+// TestParseClaudeStreamMalformedResultFallsBackToTokensEvent verifies that
+// when a result event has valid outer JSON (type: "result") but invalid inner
+// fields (e.g., usage is a string instead of an object), the deferred
+// TokensEvent still fires with the cumulative snapshot. This is a regression
+// test for the flag-before-validation ordering bug (#6932): seenResult must
+// not be set before the unmarshal succeeds.
+//
+// Total per-message tokens: 1000+300+200+50 = 1550, below the 5000
+// tokenThreshold, so the message_delta handler does not emit an incremental
+// TokensEvent. This ensures the only TokensEvent observed is the deferred
+// one, which fires solely based on seenResult's value. If seenResult were
+// set before the unmarshal (reintroducing the #6932 bug), the deferred
+// TokensEvent would never fire and this test would correctly fail.
+func TestParseClaudeStreamMalformedResultFallsBackToTokensEvent(t *testing.T) {
+	lines := []string{
+		// Token data from a normal API call, kept below tokenThreshold so no
+		// incremental TokensEvent is emitted during message_delta.
+		`{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":200,"cache_creation_input_tokens":50}}}}`,
+		`{"type":"stream_event","event":{"type":"message_delta","usage":{"output_tokens":300}}}`,
+		// Malformed result event: valid outer JSON with type "result", but
+		// usage is a string instead of an object, causing unmarshal to fail.
+		`{"type":"result","num_turns":5,"total_cost_usd":0.30,"usage":"not-an-object"}`,
+	}
+
+	events := collectEvents(t, strings.Join(lines, "\n"))
+
+	var tokens []TokensEvent
+	var results []ResultEvent
+	for _, e := range events {
+		switch ev := e.(type) {
+		case TokensEvent:
+			tokens = append(tokens, ev)
+		case ResultEvent:
+			results = append(results, ev)
+		}
+	}
+
+	// The malformed result should not produce a ResultEvent.
+	if len(results) != 0 {
+		t.Errorf("expected 0 ResultEvents from malformed result, got %d", len(results))
+	}
+
+	// Exactly one TokensEvent should fire: the deferred one. Because the
+	// fixture total stays under tokenThreshold, this can only be the
+	// deferred event, which fires only when seenResult was NOT set.
+	if len(tokens) != 1 {
+		t.Fatalf("expected exactly 1 deferred TokensEvent when result unmarshal fails, got %d", len(tokens))
+	}
+
+	last := tokens[0]
+	if last.InputTokens != 1000 {
+		t.Errorf("expected 1000 input tokens, got %d", last.InputTokens)
+	}
+	if last.OutputTokens != 300 {
+		t.Errorf("expected 300 output tokens, got %d", last.OutputTokens)
+	}
+	if last.CacheRead != 200 {
+		t.Errorf("expected 200 cache read tokens, got %d", last.CacheRead)
+	}
+	if last.CacheWrite != 50 {
+		t.Errorf("expected 50 cache write tokens, got %d", last.CacheWrite)
+	}
+}
+
+func TestParseClaudeStream_AssistantLineServerToolUseProducesNoEvent(t *testing.T) {
+	// The live path (no --include-partial-messages): a server_tool_use block
+	// on an assistant line is not a client tool call — no event, no part,
+	// not counted — while the tool_use beside it is reported with its id.
+	input := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"server_tool_use","id":"srvtoolu_01","name":"web_search","input":{"query":"otel"}},{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"/x"}}]}}`
+	events := collectEvents(t, input)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly one event (the client tool_use), got %d: %+v", len(events), events)
+	}
+	use, ok := events[0].(ToolUseEvent)
+	if !ok || use.ID != "toolu_01" || use.Name != "Read" {
+		t.Fatalf("expected the client tool_use with its id, got %+v", events[0])
+	}
+}
+
+func TestParseClaudeStream_ServerToolUseCarriesNoID(t *testing.T) {
+	// A server-side tool's result arrives inside the assistant message, never
+	// as a user tool_result, so the call must not carry an id that a result
+	// could match — an id-less ToolUseEvent gets no execute_tool span.
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_01","name":"web_search"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"otel\"}"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+		`{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"Read"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":1}}`,
+	}
+	var uses []ToolUseEvent
+	if err := parseClaudeStream(strings.NewReader(strings.Join(lines, "\n")), func(e AgentEvent) {
+		if u, ok := e.(ToolUseEvent); ok {
+			uses = append(uses, u)
+		}
+	}); err != nil {
+		t.Fatalf("parseClaudeStream: %v", err)
+	}
+	if len(uses) != 2 {
+		t.Fatalf("expected 2 tool-use events, got %d: %+v", len(uses), uses)
+	}
+	if uses[0].Name != "web_search" || uses[0].ID != "" {
+		t.Errorf("server_tool_use must keep its name and carry no id, got %+v", uses[0])
+	}
+	if uses[1].Name != "Read" || uses[1].ID != "toolu_01" {
+		t.Errorf("client tool_use must keep its id, got %+v", uses[1])
+	}
+}
+
+// claudeModelUsageResult is a result event whose usage block is parent-only
+// while modelUsage covers an opus parent and a haiku sub-agent. The costs sum
+// to total_cost_usd.
+const claudeModelUsageResult = `{"type":"result","num_turns":5,"total_cost_usd":0.5166,"usage":{"input_tokens":100,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":400},` +
+	`"modelUsage":{` +
+	`"claude-opus-4-6":{"inputTokens":1000,"outputTokens":2000,"cacheReadInputTokens":3000,"cacheCreationInputTokens":4000,"thinkingTokens":10,"costUSD":0.5,"canonicalModel":"claude-opus-4-6","provider":"vertex","costBasis":"list"},` +
+	`"claude-haiku-4-5@20251001":{"inputTokens":15,"outputTokens":182,"cacheReadInputTokens":43982,"cacheCreationInputTokens":9023,"thinkingTokens":79,"costUSD":0.0166,"canonicalModel":"claude-haiku-4-5","provider":"vertex","costBasis":"list"}}}`
+
+func TestParseClaudeStreamResultModelUsageSumsTotals(t *testing.T) {
+	events := collectEvents(t, claudeModelUsageResult)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	res, ok := events[0].(ResultEvent)
+	if !ok {
+		t.Fatalf("expected ResultEvent, got %T", events[0])
+	}
+	if res.InputTokens != 1015 || res.OutputTokens != 2182 ||
+		res.CacheReadInputTokens != 46982 || res.CacheCreationInputTokens != 13023 {
+		t.Errorf("token totals are not the modelUsage sum: %+v", res)
+	}
+	if res.ReasoningTokens != 89 {
+		t.Errorf("ReasoningTokens = %d, want 89 (sum of thinkingTokens)", res.ReasoningTokens)
+	}
+	want := map[string]ModelUsage{
+		"claude-opus-4-6": {
+			InputTokens: 1000, OutputTokens: 2000,
+			CacheReadInputTokens: 3000, CacheCreationInputTokens: 4000, CostUSD: 0.5,
+		},
+		"claude-haiku-4-5@20251001": {
+			InputTokens: 15, OutputTokens: 182,
+			CacheReadInputTokens: 43982, CacheCreationInputTokens: 9023, CostUSD: 0.0166,
+		},
+	}
+	if len(res.PerModelUsage) != len(want) {
+		t.Fatalf("expected %d per-model entries, got %+v", len(want), res.PerModelUsage)
+	}
+	var costSum float64
+	for model, w := range want {
+		got, ok := res.PerModelUsage[model]
+		if !ok {
+			t.Fatalf("missing per-model entry %q in %+v", model, res.PerModelUsage)
+		}
+		if got != w {
+			t.Errorf("PerModelUsage[%q] = %+v, want %+v", model, got, w)
+		}
+		costSum += got.CostUSD
+	}
+	if math.Abs(costSum-res.TotalCostUSD) > 1e-9 {
+		t.Errorf("per-model cost sum %v != total_cost_usd %v", costSum, res.TotalCostUSD)
+	}
+}
+
+func TestProgressParserModelUsageFillsMetrics(t *testing.T) {
+	var buf bytes.Buffer
+	metrics := &RunMetrics{}
+	if err := progressParser(strings.NewReader(claudeModelUsageResult), ui.New(&buf), metrics); err != nil {
+		t.Fatalf("progressParser returned error: %v", err)
+	}
+	if metrics.InputTokens != 1015 || metrics.OutputTokens != 2182 ||
+		metrics.CacheReadInputTokens != 46982 || metrics.CacheCreationInputTokens != 13023 {
+		t.Errorf("metrics token totals are not the modelUsage sum: in=%d out=%d cr=%d cw=%d",
+			metrics.InputTokens, metrics.OutputTokens, metrics.CacheReadInputTokens, metrics.CacheCreationInputTokens)
+	}
+	if metrics.ReasoningTokens != 89 {
+		t.Errorf("metrics.ReasoningTokens = %d, want 89", metrics.ReasoningTokens)
+	}
+	if len(metrics.PerModelUsage) != 2 {
+		t.Fatalf("expected 2 per_model_usage entries, got %+v", metrics.PerModelUsage)
+	}
+	data, err := json.Marshal(metrics)
+	if err != nil {
+		t.Fatalf("marshal metrics: %v", err)
+	}
+	if !strings.Contains(string(data), `"per_model_usage":{`) {
+		t.Errorf("metrics JSON lacks per_model_usage: %s", data)
+	}
+}
+
+// TestParseClaudeStreamResultWithoutModelUsageKeepsUsage pins today's
+// behaviour when modelUsage is absent or empty: the usage block supplies the
+// totals and no per-model breakdown is recorded.
+func TestParseClaudeStreamResultWithoutModelUsageKeepsUsage(t *testing.T) {
+	for name, extra := range map[string]string{
+		"absent": ``,
+		"empty":  `,"modelUsage":{}`,
+		"null":   `,"modelUsage":null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := `{"type":"result","num_turns":8,"total_cost_usd":0.42,"usage":{"input_tokens":12000,"output_tokens":3400,"cache_creation_input_tokens":8000,"cache_read_input_tokens":5000}` + extra + `}`
+			var buf bytes.Buffer
+			metrics := &RunMetrics{}
+			if err := progressParser(strings.NewReader(input), ui.New(&buf), metrics); err != nil {
+				t.Fatalf("progressParser returned error: %v", err)
+			}
+			if metrics.NumTurns != 8 || metrics.TotalCostUSD != 0.42 ||
+				metrics.InputTokens != 12000 || metrics.OutputTokens != 3400 ||
+				metrics.CacheCreationInputTokens != 8000 || metrics.CacheReadInputTokens != 5000 {
+				t.Errorf("unexpected metrics: turns=%d cost=%v in=%d out=%d cw=%d cr=%d",
+					metrics.NumTurns, metrics.TotalCostUSD, metrics.InputTokens, metrics.OutputTokens,
+					metrics.CacheCreationInputTokens, metrics.CacheReadInputTokens)
+			}
+			if metrics.PerModelUsage != nil {
+				t.Errorf("expected no per-model breakdown, got %+v", metrics.PerModelUsage)
+			}
+			if metrics.ReasoningTokens != 0 {
+				t.Errorf("ReasoningTokens = %d, want 0", metrics.ReasoningTokens)
+			}
+		})
+	}
+}
+
+// TestNewClaudeResultEventReasoningTokens pins where ReasoningTokens comes
+// from: the parser's accumulated thinking when modelUsage is absent or empty,
+// the modelUsage thinkingTokens sum (sub-agents included) otherwise.
+func TestNewClaudeResultEventReasoningTokens(t *testing.T) {
+	const parserReasoning = 7
+	var absent, empty resultEvent
+	empty.ModelUsage = map[string]claudeModelUsage{}
+	for name, re := range map[string]resultEvent{"absent": absent, "empty": empty} {
+		if got := newClaudeResultEvent(re, parserReasoning).ReasoningTokens; got != parserReasoning {
+			t.Errorf("%s modelUsage: ReasoningTokens = %d, want parser value %d", name, got, parserReasoning)
+		}
+	}
+	present := resultEvent{ModelUsage: map[string]claudeModelUsage{
+		"claude-sonnet": {ThinkingTokens: 10},
+		"claude-haiku":  {ThinkingTokens: 44},
+	}}
+	if got := newClaudeResultEvent(present, parserReasoning).ReasoningTokens; got != 54 {
+		t.Errorf("present modelUsage: ReasoningTokens = %d, want 54", got)
+	}
+}
+
+// TestProgressParserMultiResultModelUsageNotDoubleCounted: modelUsage is a
+// session running total, so a steered or retried session with two results
+// records the last one, not their sum.
+func TestProgressParserMultiResultModelUsageNotDoubleCounted(t *testing.T) {
+	lines := []string{
+		`{"type":"result","num_turns":2,"total_cost_usd":0.2,"usage":{"input_tokens":10,"output_tokens":20},"modelUsage":{"claude-opus-4-6":{"inputTokens":100,"outputTokens":200,"cacheReadInputTokens":300,"cacheCreationInputTokens":400,"costUSD":0.15},"claude-haiku-4-5":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":3,"cacheCreationInputTokens":4,"costUSD":0.05}}}`,
+		`{"type":"result","num_turns":4,"total_cost_usd":0.3,"usage":{"input_tokens":30,"output_tokens":40},"modelUsage":{"claude-opus-4-6":{"inputTokens":150,"outputTokens":250,"cacheReadInputTokens":350,"cacheCreationInputTokens":450,"costUSD":0.3}}}`,
+	}
+	var buf bytes.Buffer
+	metrics := &RunMetrics{}
+	if err := progressParser(strings.NewReader(strings.Join(lines, "\n")), ui.New(&buf), metrics); err != nil {
+		t.Fatalf("progressParser returned error: %v", err)
+	}
+	if metrics.InputTokens != 150 || metrics.OutputTokens != 250 ||
+		metrics.CacheReadInputTokens != 350 || metrics.CacheCreationInputTokens != 450 {
+		t.Errorf("expected last result's modelUsage totals, got in=%d out=%d cr=%d cw=%d",
+			metrics.InputTokens, metrics.OutputTokens, metrics.CacheReadInputTokens, metrics.CacheCreationInputTokens)
+	}
+	if metrics.TotalCostUSD != 0.3 {
+		t.Errorf("expected cost 0.3, got %v", metrics.TotalCostUSD)
+	}
+	want := map[string]ModelUsage{
+		"claude-opus-4-6": {InputTokens: 150, OutputTokens: 250, CacheReadInputTokens: 350, CacheCreationInputTokens: 450, CostUSD: 0.3},
+	}
+	if len(metrics.PerModelUsage) != len(want) || metrics.PerModelUsage["claude-opus-4-6"] != want["claude-opus-4-6"] {
+		t.Errorf("PerModelUsage = %+v, want %+v (replaced, not merged)", metrics.PerModelUsage, want)
 	}
 }

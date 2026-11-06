@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -319,6 +322,95 @@ func TestCacheGetDir_IntegrityVerification(t *testing.T) {
 	assert.Nil(t, entry)
 }
 
+func TestCacheGetDir_IgnoresAtomicWriteTempFiles(t *testing.T) {
+	root := t.TempDir()
+	files := map[string][]byte{
+		"SKILL.md":          []byte("# Skill"),
+		"scripts/helper.sh": []byte("#!/bin/bash\necho helper"),
+	}
+
+	treeHash, err := CachePutDir(root, "https://example.com/skill", files)
+	require.NoError(t, err)
+
+	// Plant leftover atomicWrite temp files, as a concurrent (or crashed)
+	// writer materializing the same entry would: one at the tree root and one
+	// in a subdirectory.
+	dir, err := CachePath(root, treeHash)
+	require.NoError(t, err)
+	for _, stale := range []string{
+		filepath.Join(dir, "tree", "SKILL.md.tmp.1337760552"),
+		filepath.Join(dir, "tree", "scripts", "helper.sh.tmp.42"),
+	} {
+		require.NoError(t, os.WriteFile(stale, []byte("partial write"), 0o600))
+	}
+
+	treeDir, entry, err := CacheGetDir(root, treeHash)
+	require.NoError(t, err)
+	require.NotNil(t, entry)
+	assert.Equal(t, treeHash, entry.SHA256)
+	assert.NotEmpty(t, treeDir)
+}
+
+func TestSkipVanished(t *testing.T) {
+	assert.NoError(t, skipVanished(fs.ErrNotExist))
+	assert.NoError(t, skipVanished(fmt.Errorf("lstat foo.tmp.42: %w", fs.ErrNotExist)))
+	sentinel := errors.New("permission denied")
+	assert.ErrorIs(t, skipVanished(sentinel), sentinel)
+}
+
+func TestCacheGetDir_NonVanishedWalkErrorPropagates(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("chmod-based access denial does not apply to root")
+	}
+	root := t.TempDir()
+	files := map[string][]byte{
+		"SKILL.md":          []byte("# Skill"),
+		"scripts/helper.sh": []byte("#!/bin/bash\necho helper"),
+	}
+
+	treeHash, err := CachePutDir(root, "https://example.com/skill", files)
+	require.NoError(t, err)
+
+	dir, err := CachePath(root, treeHash)
+	require.NoError(t, err)
+
+	// An unreadable subdirectory produces a non-ErrNotExist walk error,
+	// which must propagate rather than be tolerated.
+	locked := filepath.Join(dir, "tree", "scripts")
+	require.NoError(t, os.Chmod(locked, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+
+	_, _, err = CacheGetDir(root, treeHash)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "walking cache tree")
+}
+
+func TestCacheGetDir_UnreadableFileErrorPropagates(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("chmod-based access denial does not apply to root")
+	}
+	root := t.TempDir()
+	files := map[string][]byte{
+		"SKILL.md": []byte("# Skill"),
+	}
+
+	treeHash, err := CachePutDir(root, "https://example.com/skill", files)
+	require.NoError(t, err)
+
+	dir, err := CachePath(root, treeHash)
+	require.NoError(t, err)
+
+	// An unreadable file fails os.ReadFile with a non-ErrNotExist error,
+	// which must propagate rather than be tolerated.
+	locked := filepath.Join(dir, "tree", "SKILL.md")
+	require.NoError(t, os.Chmod(locked, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o600) })
+
+	_, _, err = CacheGetDir(root, treeHash)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "walking cache tree")
+}
+
 func TestCachePutDir_NestedDirectories(t *testing.T) {
 	root := t.TempDir()
 	files := map[string][]byte{
@@ -372,4 +464,283 @@ func TestCacheConcurrentPut(t *testing.T) {
 	require.NotNil(t, entry)
 	assert.Equal(t, content, got)
 	assert.Equal(t, hash, entry.SHA256)
+}
+
+func TestCacheNamedSymlink(t *testing.T) {
+	t.Run("creates symlink with skill name", func(t *testing.T) {
+		dir := t.TempDir()
+		treePath := filepath.Join(dir, "tree")
+		require.NoError(t, os.Mkdir(treePath, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(treePath, "SKILL.md"), []byte("hi"), 0o600))
+
+		got, err := CacheNamedSymlink(treePath, "pr-review")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(dir, "pr-review"), got)
+		assert.FileExists(t, filepath.Join(got, "SKILL.md"))
+	})
+
+	t.Run("idempotent on second call", func(t *testing.T) {
+		dir := t.TempDir()
+		treePath := filepath.Join(dir, "tree")
+		require.NoError(t, os.Mkdir(treePath, 0o755))
+
+		_, err := CacheNamedSymlink(treePath, "review")
+		require.NoError(t, err)
+		got, err := CacheNamedSymlink(treePath, "review")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(dir, "review"), got)
+	})
+
+	t.Run("reserved names fall back to tree", func(t *testing.T) {
+		for _, name := range []string{"", ".", "..", "metadata.json"} {
+			dir := t.TempDir()
+			treePath := filepath.Join(dir, "tree")
+			require.NoError(t, os.Mkdir(treePath, 0o755))
+
+			got, err := CacheNamedSymlink(treePath, name)
+			require.NoError(t, err)
+			assert.Equal(t, treePath, got, "reserved name %q should return treePath unchanged", name)
+		}
+	})
+
+	t.Run("concurrent creation tolerates EEXIST", func(t *testing.T) {
+		dir := t.TempDir()
+		treePath := filepath.Join(dir, "tree")
+		require.NoError(t, os.Mkdir(treePath, 0o755))
+
+		var wg sync.WaitGroup
+		errs := make([]error, 10)
+		for i := range errs {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				_, errs[idx] = CacheNamedSymlink(treePath, "skill")
+			}(i)
+		}
+		wg.Wait()
+		for i, err := range errs {
+			assert.NoError(t, err, "goroutine %d", i)
+		}
+	})
+
+	t.Run("creates symlink for content file", func(t *testing.T) {
+		dir := t.TempDir()
+		contentPath := filepath.Join(dir, "content")
+		require.NoError(t, os.WriteFile(contentPath, []byte("id: my-profile\n"), 0o600))
+
+		got, err := CacheNamedSymlink(contentPath, "my-profile.yaml")
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join(dir, "my-profile.yaml"), got)
+
+		// Verify the symlink target is readable.
+		data, err := os.ReadFile(got)
+		require.NoError(t, err)
+		assert.Equal(t, "id: my-profile\n", string(data))
+	})
+
+	t.Run("reserved names fall back to content for content paths", func(t *testing.T) {
+		for _, name := range []string{"", ".", "..", "metadata.json"} {
+			dir := t.TempDir()
+			contentPath := filepath.Join(dir, "content")
+			require.NoError(t, os.WriteFile(contentPath, []byte("data"), 0o600))
+
+			got, err := CacheNamedSymlink(contentPath, name)
+			require.NoError(t, err)
+			assert.Equal(t, contentPath, got,
+				"reserved name %q with content path should return contentPath unchanged", name)
+		}
+	})
+
+	t.Run("recreates a symlink pointing at the wrong target", func(t *testing.T) {
+		dir := t.TempDir()
+		contentPath := filepath.Join(dir, "content")
+		require.NoError(t, os.WriteFile(contentPath, []byte("id: my-profile\n"), 0o600))
+
+		namedPath := filepath.Join(dir, "my-profile.yaml")
+		require.NoError(t, os.Symlink("some-other-file", namedPath))
+
+		got, err := CacheNamedSymlink(contentPath, "my-profile.yaml")
+		require.NoError(t, err)
+		assert.Equal(t, namedPath, got)
+
+		target, err := os.Readlink(namedPath)
+		require.NoError(t, err)
+		assert.Equal(t, "content", target, "stale symlink should be recreated to point at content")
+
+		data, err := os.ReadFile(got)
+		require.NoError(t, err)
+		assert.Equal(t, "id: my-profile\n", string(data))
+	})
+
+	t.Run("concurrent replacement of a stale symlink converges without error", func(t *testing.T) {
+		dir := t.TempDir()
+		contentPath := filepath.Join(dir, "content")
+		require.NoError(t, os.WriteFile(contentPath, []byte("id: my-profile\n"), 0o600))
+
+		namedPath := filepath.Join(dir, "my-profile.yaml")
+		require.NoError(t, os.Symlink("some-other-file", namedPath))
+
+		var wg sync.WaitGroup
+		errs := make([]error, 30)
+		for i := range errs {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				_, errs[idx] = CacheNamedSymlink(contentPath, "my-profile.yaml")
+			}(i)
+		}
+		wg.Wait()
+		for i, err := range errs {
+			assert.NoError(t, err, "goroutine %d", i)
+		}
+
+		target, err := os.Readlink(namedPath)
+		require.NoError(t, err)
+		assert.Equal(t, "content", target)
+	})
+
+	t.Run("recreates when a non-symlink file occupies the named path", func(t *testing.T) {
+		dir := t.TempDir()
+		contentPath := filepath.Join(dir, "content")
+		require.NoError(t, os.WriteFile(contentPath, []byte("id: my-profile\n"), 0o600))
+
+		namedPath := filepath.Join(dir, "my-profile.yaml")
+		require.NoError(t, os.WriteFile(namedPath, []byte("stale regular file, not a symlink"), 0o600))
+
+		got, err := CacheNamedSymlink(contentPath, "my-profile.yaml")
+		require.NoError(t, err)
+		assert.Equal(t, namedPath, got)
+
+		info, err := os.Lstat(namedPath)
+		require.NoError(t, err)
+		assert.True(t, info.Mode()&os.ModeSymlink != 0, "foreign regular file should be replaced with a symlink")
+
+		data, err := os.ReadFile(got)
+		require.NoError(t, err)
+		assert.Equal(t, "id: my-profile\n", string(data))
+	})
+
+	t.Run("returns an error when the cache directory is not writable", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("running as root bypasses directory permission checks")
+		}
+		dir := t.TempDir()
+		contentPath := filepath.Join(dir, "content")
+		require.NoError(t, os.WriteFile(contentPath, []byte("data"), 0o600))
+		require.NoError(t, os.Chmod(dir, 0o500)) // read+execute, no write
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+		_, err := CacheNamedSymlink(contentPath, "my-profile.yaml")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "named symlink")
+	})
+
+	t.Run("rejects link names containing a path separator", func(t *testing.T) {
+		dir := t.TempDir()
+		contentPath := filepath.Join(dir, "content")
+		require.NoError(t, os.WriteFile(contentPath, []byte("data"), 0o600))
+
+		_, err := CacheNamedSymlink(contentPath, filepath.Join("sub", "evil.yaml"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "single path segment")
+
+		// No entry should have been created for the rejected name.
+		_, statErr := os.Lstat(filepath.Join(dir, "sub"))
+		assert.True(t, os.IsNotExist(statErr))
+	})
+}
+
+func TestCacheFindNewest(t *testing.T) {
+	root := t.TempDir()
+	put := func(url string, content []byte, fetched time.Time) string {
+		t.Helper()
+		require.NoError(t, CachePut(root, url, content))
+		hash := ComputeSHA256(content)
+		dir, err := CachePath(root, hash)
+		require.NoError(t, err)
+		meta, err := json.Marshal(CacheEntry{URL: url, FetchTime: fetched, SHA256: hash})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "metadata.json"), meta, 0o600))
+		return hash
+	}
+	isWanted := func(url string) bool { return strings.HasSuffix(url, "/wanted.yaml") }
+	now := time.Now().UTC()
+
+	t.Run("missing cache is a miss", func(t *testing.T) {
+		content, entry, err := CacheFindNewest(t.TempDir(), isWanted)
+		require.NoError(t, err)
+		assert.Nil(t, content)
+		assert.Nil(t, entry)
+	})
+
+	t.Run("empty workspace root is a miss", func(t *testing.T) {
+		_, entry, err := CacheFindNewest("", isWanted)
+		require.NoError(t, err)
+		assert.Nil(t, entry)
+	})
+
+	put("https://example.com/v1/wanted.yaml", []byte("v1"), now.Add(-2*time.Hour))
+	put("https://example.com/v2/wanted.yaml", []byte("v2"), now.Add(-time.Hour))
+	put("https://example.com/v3/other.yaml", []byte("other"), now)
+	_, err := CachePutDir(root, "https://example.com/v4/wanted.yaml", map[string][]byte{"a": []byte("dir")})
+	require.NoError(t, err)
+
+	t.Run("newest matching single-file entry wins", func(t *testing.T) {
+		content, entry, err := CacheFindNewest(root, isWanted)
+		require.NoError(t, err)
+		require.NotNil(t, entry)
+		assert.Equal(t, []byte("v2"), content)
+		assert.Equal(t, "https://example.com/v2/wanted.yaml", entry.URL)
+	})
+
+	t.Run("corrupted candidate falls back to next newest", func(t *testing.T) {
+		hash := put("https://example.com/v5/wanted.yaml", []byte("v5"), now.Add(time.Hour))
+		dir, err := CachePath(root, hash)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "content"), []byte("tampered"), 0o600))
+
+		content, entry, err := CacheFindNewest(root, isWanted)
+		require.NoError(t, err)
+		require.NotNil(t, entry)
+		assert.Equal(t, []byte("v2"), content)
+	})
+
+	t.Run("no match", func(t *testing.T) {
+		_, entry, err := CacheFindNewest(root, func(string) bool { return false })
+		require.NoError(t, err)
+		assert.Nil(t, entry)
+	})
+}
+
+func TestCacheFindNewest_SkipsMalformedEntries(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, ".fullsend-cache", "resources", "sha256")
+	require.NoError(t, os.MkdirAll(filepath.Join(base, "not-a-hash"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(base, "stray-file"), nil, 0o600))
+	missingMeta := ComputeSHA256([]byte("no metadata"))
+	require.NoError(t, os.MkdirAll(filepath.Join(base, missingMeta), 0o700))
+	badJSON := ComputeSHA256([]byte("bad json"))
+	require.NoError(t, os.MkdirAll(filepath.Join(base, badJSON), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(base, badJSON, "metadata.json"), []byte("{"), 0o600))
+	// Metadata whose hash does not match its directory.
+	mismatch := ComputeSHA256([]byte("mismatch"))
+	require.NoError(t, os.MkdirAll(filepath.Join(base, mismatch), 0o700))
+	meta, err := json.Marshal(CacheEntry{URL: "https://example.com/x", SHA256: ComputeSHA256([]byte("other"))})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(base, mismatch, "metadata.json"), meta, 0o600))
+
+	_, entry, err := CacheFindNewest(root, func(string) bool { return true })
+	require.NoError(t, err)
+	assert.Nil(t, entry)
+}
+
+func TestCacheFindNewest_UnreadableCacheDir(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, ".fullsend-cache", "resources")
+	require.NoError(t, os.MkdirAll(base, 0o700))
+	// A file where the sha256 directory should be.
+	require.NoError(t, os.WriteFile(filepath.Join(base, "sha256"), nil, 0o600))
+
+	_, _, err := CacheFindNewest(root, func(string) bool { return true })
+	require.Error(t, err)
 }

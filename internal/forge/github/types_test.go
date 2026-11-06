@@ -55,6 +55,7 @@ func TestAgentAppConfig_Coder(t *testing.T) {
 	assert.Equal(t, "fullsend-coder", cfg.Name)
 	assert.Equal(t, "write", cfg.Permissions.Issues)
 	assert.Equal(t, "write", cfg.Permissions.Contents)
+	assert.Equal(t, "read", cfg.Permissions.Packages)
 	assert.Equal(t, "write", cfg.Permissions.PullRequests)
 	assert.Equal(t, "read", cfg.Permissions.Checks)
 
@@ -104,12 +105,26 @@ func TestAgentAppConfig_Retro(t *testing.T) {
 	assert.Empty(t, cfg.Events)
 }
 
+func TestAgentAppConfig_Scribe(t *testing.T) {
+	cfg := AgentAppConfig("myorg", "scribe", "fullsend")
+
+	assert.Equal(t, "fullsend-scribe", cfg.Name)
+	assert.Equal(t, "read", cfg.Permissions.Contents)
+	assert.Equal(t, "write", cfg.Permissions.Issues)
+	assert.Empty(t, cfg.Permissions.OrganizationProjects)
+	assert.Empty(t, cfg.Permissions.PullRequests)
+
+	// Scribe is schedule / workflow_dispatch driven, no webhook events.
+	assert.Empty(t, cfg.Events)
+}
+
 func TestAgentAppConfig_E2e(t *testing.T) {
 	cfg := AgentAppConfig("myorg", "e2e", "fullsend-ai")
 
 	assert.Equal(t, "fullsend-ai-e2e", cfg.Name)
 	assert.Equal(t, "write", cfg.Permissions.Actions)
-	assert.Equal(t, "read", cfg.Permissions.Variables)
+	assert.Equal(t, "write", cfg.Permissions.Variables)
+	assert.Equal(t, "write", cfg.Permissions.OrganizationActionsVariables)
 	assert.Equal(t, "write", cfg.Permissions.Administration)
 	assert.Equal(t, "write", cfg.Permissions.Contents)
 	assert.Equal(t, "write", cfg.Permissions.Issues)
@@ -157,6 +172,12 @@ func appPermissionsAsMap(p AppPermissions) map[string]string {
 	if p.OrganizationAdministration != "" {
 		out["organization_administration"] = p.OrganizationAdministration
 	}
+	if p.OrganizationActionsVariables != "" {
+		out["organization_actions_variables"] = p.OrganizationActionsVariables
+	}
+	if p.Packages != "" {
+		out["packages"] = p.Packages
+	}
 	if p.Secrets != "" {
 		out["secrets"] = p.Secrets
 	}
@@ -164,7 +185,8 @@ func appPermissionsAsMap(p AppPermissions) map[string]string {
 }
 
 func TestAgentAppConfig_E2eMatchesMintcorePermissions(t *testing.T) {
-	canonical := mintcore.RolePermissionsFor("e2e")
+	canonical, err := mintcore.RolePermissionsForLevel("e2e", mintcore.LevelWrite)
+	require.NoError(t, err)
 	require.NotNil(t, canonical)
 
 	manifest := appPermissionsAsMap(AgentAppConfig("myorg", "e2e", "fullsend-ai").Permissions)
@@ -176,6 +198,72 @@ func TestAgentAppConfig_E2eMatchesMintcorePermissions(t *testing.T) {
 		}
 		got, ok := manifest[key]
 		assert.True(t, ok, "AgentAppConfig(e2e) missing permission %q from mintcore canonicalRolePermissions", key)
+		assert.Equal(t, want, got, "permission %q mismatch between AgentAppConfig and mintcore", key)
+	}
+}
+
+func TestAgentAppConfig_ScribeMatchesMintcorePermissions(t *testing.T) {
+	canonical, err := mintcore.RolePermissionsForLevel("scribe", mintcore.LevelWrite)
+	require.NoError(t, err)
+	require.NotNil(t, canonical)
+
+	manifest := appPermissionsAsMap(AgentAppConfig("myorg", "scribe", "fullsend-ai").Permissions)
+
+	// metadata is added at mint token time; GitHub App manifests omit it explicitly.
+	for key, want := range canonical {
+		if key == "metadata" {
+			continue
+		}
+		got, ok := manifest[key]
+		assert.True(t, ok, "AgentAppConfig(scribe) missing permission %q from mintcore canonicalRolePermissions", key)
+		assert.Equal(t, want, got, "permission %q mismatch between AgentAppConfig and mintcore", key)
+	}
+}
+
+func TestAgentAppConfig_Fix(t *testing.T) {
+	cfg := AgentAppConfig("myorg", "fix", "fullsend")
+
+	assert.Equal(t, "fullsend-fix", cfg.Name)
+	assert.Equal(t, "write", cfg.Permissions.Contents)
+	assert.Equal(t, "read", cfg.Permissions.Packages)
+	assert.Equal(t, "write", cfg.Permissions.PullRequests)
+	assert.Equal(t, "write", cfg.Permissions.Issues)
+
+	assert.Contains(t, cfg.Events, "issues")
+	assert.Contains(t, cfg.Events, "issue_comment")
+	assert.Contains(t, cfg.Events, "pull_request")
+}
+
+func TestAgentAppConfig_CoderMatchesMintcorePermissions(t *testing.T) {
+	canonical := mintcore.RolePermissionsFor("coder")
+	require.NotNil(t, canonical)
+
+	manifest := appPermissionsAsMap(AgentAppConfig("myorg", "coder", "fullsend-ai").Permissions)
+
+	// metadata is added at mint token time; GitHub App manifests omit it explicitly.
+	for key, want := range canonical {
+		if key == "metadata" {
+			continue
+		}
+		got, ok := manifest[key]
+		assert.True(t, ok, "AgentAppConfig(coder) missing permission %q from mintcore canonicalRolePermissions", key)
+		assert.Equal(t, want, got, "permission %q mismatch between AgentAppConfig and mintcore", key)
+	}
+}
+
+func TestAgentAppConfig_FixMatchesMintcorePermissions(t *testing.T) {
+	canonical := mintcore.RolePermissionsFor("fix")
+	require.NotNil(t, canonical)
+
+	manifest := appPermissionsAsMap(AgentAppConfig("myorg", "fix", "fullsend-ai").Permissions)
+
+	// metadata is added at mint token time; GitHub App manifests omit it explicitly.
+	for key, want := range canonical {
+		if key == "metadata" {
+			continue
+		}
+		got, ok := manifest[key]
+		assert.True(t, ok, "AgentAppConfig(fix) missing permission %q from mintcore canonicalRolePermissions", key)
 		assert.Equal(t, want, got, "permission %q mismatch between AgentAppConfig and mintcore", key)
 	}
 }

@@ -7,8 +7,8 @@
 package function
 
 import (
+	"context"
 	"log"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -17,13 +17,19 @@ import (
 	"github.com/fullsend-ai/fullsend/internal/mintcore"
 )
 
+// traceHeadersTimeout bounds the cold-start read of the collector
+// headers secret, so a slow Secret Manager cannot hold up the mint.
+const traceHeadersTimeout = 5 * time.Second
+
+// secretReader reads the latest version of a Secret Manager secret.
+// Production uses mintcore.AccessGCPSecret.
+type secretReader func(ctx context.Context, gcpProjectNum, secretID string) ([]byte, error)
+
 var requiredEnvVars = []string{
-	"ALLOWED_ORGS",
 	"GCP_PROJECT_NUMBER",
 	"WIF_POOL_NAME",
 	"WIF_PROVIDER_NAME",
 	"ROLE_APP_IDS",
-	"OIDC_AUDIENCE",
 }
 
 func init() {
@@ -41,24 +47,6 @@ func init() {
 		log.Fatalf("required environment variables not set: %s", strings.Join(missing, ", "))
 	}
 
-	oidcAudience := os.Getenv("OIDC_AUDIENCE")
-
-	var allowedOrgs []string
-	for _, entry := range strings.Split(os.Getenv("ALLOWED_ORGS"), ",") {
-		if trimmed := strings.TrimSpace(entry); trimmed != "" {
-			allowedOrgs = append(allowedOrgs, trimmed)
-		}
-	}
-
-	var allowedWorkflows []string
-	if wf := os.Getenv("ALLOWED_WORKFLOW_FILES"); wf != "" {
-		for _, entry := range strings.Split(wf, ",") {
-			if trimmed := strings.TrimSpace(entry); trimmed != "" {
-				allowedWorkflows = append(allowedWorkflows, trimmed)
-			}
-		}
-	}
-
 	perRepoWIFRepos := make(map[string]bool)
 	if raw := os.Getenv("PER_REPO_WIF_REPOS"); raw != "" {
 		for _, entry := range strings.Split(raw, ",") {
@@ -69,27 +57,54 @@ func init() {
 	}
 
 	gcpProjectNum := os.Getenv("GCP_PROJECT_NUMBER")
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	wifPoolName := os.Getenv("WIF_POOL_NAME")
+	defaultWIFProvider := os.Getenv("WIF_PROVIDER_NAME")
 
-	verifier := mintcore.NewSTSVerifier(mintcore.STSVerifierConfig{
-		HTTPClient:         httpClient,
+	verifier, err := mintcore.NewSTSVerifier(mintcore.STSVerifierConfig{
 		GCPProjectNum:      gcpProjectNum,
-		WIFPoolName:        os.Getenv("WIF_POOL_NAME"),
-		DefaultWIFProvider: os.Getenv("WIF_PROVIDER_NAME"),
-		AllowedOrgs:        allowedOrgs,
-		AllowedWorkflows:   allowedWorkflows,
+		WIFPoolName:        wifPoolName,
+		DefaultWIFProvider: defaultWIFProvider,
 		PerRepoWIFRepos:    perRepoWIFRepos,
-		OIDCAudience:       oidcAudience,
 	})
+	if err != nil {
+		log.Fatalf("creating OIDC verifier: %v", err)
+	}
 
-	pemAccessor := mintcore.NewGCPSecretPEMAccessor(
-		&http.Client{Timeout: 10 * time.Second},
-		gcpProjectNum,
-	)
+	pemAccessor := mintcore.NewGCPSecretPEMAccessor(gcpProjectNum)
 
 	handler, err := mintcore.NewHandler(pemAccessor, verifier)
 	if err != nil {
 		log.Fatalf("initializing handler: %v", err)
 	}
+	handler.SetTracer(buildTracer(context.Background(), gcpProjectNum, otlpTracesEndpoint, traceDeployment, otlpHeadersSecret, mintcore.AccessGCPSecret))
 	functions.HTTP("ServeHTTP", handler.ServeHTTP)
+}
+
+// buildTracer configures tracing from the stamped endpoint and deployment
+// identity, reading collector headers from the stamped Secret Manager
+// secret. Tracing is fail-open: a bad configuration or an unreadable
+// secret is logged (without header values) and leaves tracing disabled
+// rather than failing mint initialization. It returns nil when no
+// endpoint is stamped, without touching Secret Manager.
+func buildTracer(ctx context.Context, gcpProjectNum, endpoint, deployment, headersSecret string, readSecret secretReader) *mintcore.Tracer {
+	if endpoint == "" {
+		return nil
+	}
+	rawHeaders := ""
+	if headersSecret != "" {
+		readCtx, cancel := context.WithTimeout(ctx, traceHeadersTimeout)
+		defer cancel()
+		data, err := readSecret(readCtx, gcpProjectNum, headersSecret)
+		if err != nil {
+			log.Printf("warning: mint tracing disabled: reading collector headers secret %s: %v", headersSecret, err)
+			return nil
+		}
+		rawHeaders = string(data)
+	}
+	tracer, err := mintcore.NewStampedTracer(mintcore.TraceBackendGCF, deployment, endpoint, rawHeaders)
+	if err != nil {
+		log.Printf("warning: mint tracing disabled: %v", err)
+		return nil
+	}
+	return tracer
 }

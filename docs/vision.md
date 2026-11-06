@@ -1,13 +1,17 @@
+---
+description: The fullsend vision — fully autonomous agentic software development across a GitHub organization, with humans setting strategic intent and guardrails.
+---
+
 # Vision
 
 ## The goal
 
-A GitHub organization's repos operate with fully autonomous agents handling the routine software development lifecycle: issue triage, implementation, code review, testing, and merge-to-production. Humans participate at two points:
+Everything autonomous is the goal. A GitHub organization's repos operate with agents handling the full software development lifecycle: issue triage, implementation, code review, testing, and merge-to-production. Humans participate at two points:
 
 1. **Strategic intent** — defining what the system should do and become. Features, architecture, direction.
-2. **Guarded paths** — CODEOWNERS-enforced human approval for security-critical, API-changing, or architecturally significant code paths.
+2. **Guardrails** — CODEOWNERS-enforced human approval for security-critical, API-changing, or architecturally significant code paths.
 
-Everything else is autonomous.
+Getting there is incremental. Each phase and transition in the [agentic SDLC](#the-agentic-sdlc) can be configured — per workflow — as human-driven, agent-driven, or both. A bugfix workflow might run fully autonomously while a feature workflow keeps a human in the loop at refinement and review. Teams adopt at whatever pace builds confidence, shifting one phase at a time rather than flipping a giant switch.
 
 ## The agentic SDLC
 
@@ -35,7 +39,7 @@ The current bugfix workflow spans three phases. The remaining phases are planned
                 ***Feedback*** ◄─── Monitor ◄─────── Delivery
 ```
 
-**Current (bugfix workflow):** An issue reports a bug (***feedback***). An agent triages, implements a fix (***execution***), and validates it against tests and review (***verification***). Humans set strategic intent and approve guarded paths; everything else is autonomous.
+**Current (bugfix workflow):** An issue reports a bug (***feedback***). An agent triages, implements a fix (***execution***), and validates it against tests and review (***verification***). Humans must set strategic intent and approve guardrails; everything else may be fully autonomous based on configuration.
 
 **Planned:** Discovery (identifying what needs work from production signals and tech debt), refinement (scoping and decomposing work), prioritization (ordering the backlog), delivery (merge-to-production with graduated autonomy), and monitor (production observability feeding back into the loop).
 
@@ -49,7 +53,7 @@ Modern coding agents have largely solved the code generation problem. Given a we
 - **Authority and governance** — who decides what agents can do?
 - **Security** — how do we prevent the autonomous system from being exploited?
 
-This project exists to explore these problems in a way that's applicable to any GitHub-hosted organization, though the patterns may need adaptation for specific organizational contexts. See [docs/problems/applied/](problems/applied/) for organization-specific considerations.
+This project exists to explore these problems in a way that's applicable to any Git-hosted organization, though the patterns may need adaptation for specific organizational contexts. See [docs/problems/applied/](problems/applied/) for organization-specific considerations.
 
 ## Principles
 

@@ -1,0 +1,286 @@
+package tracker
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/forge/jira"
+)
+
+// FakeJiraClient is an in-memory fake implementing the jiraClient
+// interface, exported (unlike its ecosystem forge.FakeClient
+// counterpart, which lives alongside it) so tests in other packages can
+// exercise tracker.Client's Jira path — including its real
+// jira.MarkdownToADF/ADFToMarkdown round-trip — without a live Jira
+// instance. CreateComment/UpdateComment store the body as real ADF
+// (mirroring Jira echoing back what it stored), so ListComments/GetIssue
+// read it back through the same escaping/decoding logic a live Jira
+// instance would apply.
+type FakeJiraClient struct {
+	Issues   map[string]*jira.Issue
+	Comments map[string][]jira.Comment
+	// ProjectIDs supplies immutable project IDs for created issue reads.
+	ProjectIDs map[string]string
+
+	// CommentProperties maps "issueKey/commentID" to a map of
+	// propertyKey -> value, mirroring Jira's per-comment entity
+	// property store.
+	CommentProperties map[string]map[string]json.RawMessage
+
+	CreatedBody      string
+	UpdatedIssueKey  string
+	UpdatedCommentID string
+	UpdatedBody      string
+
+	// CreatedIssues records every CreateIssue input, in call order.
+	// CreateIssueError, when non-nil, is returned by CreateIssue.
+	CreatedIssues    []jira.CreateIssueInput
+	CreateIssueError error
+
+	// PropertyError, when non-nil, is returned by SetCommentProperty
+	// to simulate permission failures.
+	PropertyError error
+
+	// PropertyWrites counts SetCommentProperty calls, including ones
+	// that fail with PropertyError.
+	PropertyWrites int
+
+	// UpdateError, when non-nil, is returned by UpdateComment to
+	// simulate update failures.
+	UpdateError error
+
+	// Myself is the account GetMyself returns and new comments are
+	// authored by; the zero value means FakeJiraBot. MyselfError, when
+	// non-nil, is returned by GetMyself.
+	Myself      jira.User
+	MyselfError error
+
+	// Links records every LinkIssues call in order. LinkError, when
+	// non-nil, is returned by LinkIssues instead of recording the link.
+	Links     []FakeJiraLink
+	LinkError error
+}
+
+// FakeJiraLink is an issue link recorded by FakeJiraClient.LinkIssues.
+type FakeJiraLink struct {
+	Type         string
+	InwardIssue  string
+	OutwardIssue string
+}
+
+// FakeJiraBot is the account a FakeJiraClient posts as by default.
+var FakeJiraBot = jira.User{AccountID: "fake-bot-account-id", DisplayName: "fullsend-bot"}
+
+func (f *FakeJiraClient) myself() jira.User {
+	if f.Myself.AccountID == "" && f.Myself.DisplayName == "" {
+		return FakeJiraBot
+	}
+	return f.Myself
+}
+
+func (f *FakeJiraClient) GetMyself(_ context.Context) (*jira.User, error) {
+	if f.MyselfError != nil {
+		return nil, f.MyselfError
+	}
+	me := f.myself()
+	return &me, nil
+}
+
+func (f *FakeJiraClient) GetIssue(_ context.Context, issueIDOrKey string) (*jira.Issue, error) {
+	issue, ok := f.Issues[issueIDOrKey]
+	if !ok {
+		return nil, fmt.Errorf("get issue %s: %w", issueIDOrKey, forge.ErrNotFound)
+	}
+	return issue, nil
+}
+
+// CreateIssue stores a new issue under the first unused key
+// "<ProjectKey>-<n>" (n counting up from 1), with its description stored
+// as real ADF so GetIssue reads it back the way a live Jira instance would.
+func (f *FakeJiraClient) CreateIssue(_ context.Context, in jira.CreateIssueInput) (*jira.CreatedIssue, error) {
+	if f.CreateIssueError != nil {
+		return nil, f.CreateIssueError
+	}
+	f.CreatedIssues = append(f.CreatedIssues, in)
+	var description any
+	if strings.TrimSpace(in.Description) != "" {
+		adf, err := jira.MarkdownToADF(in.Description)
+		if err != nil {
+			return nil, err
+		}
+		description = adf
+	}
+	if f.Issues == nil {
+		f.Issues = make(map[string]*jira.Issue)
+	}
+	n := 1
+	for f.Issues[fmt.Sprintf("%s-%d", in.ProjectKey, n)] != nil {
+		n++
+	}
+	key := fmt.Sprintf("%s-%d", in.ProjectKey, n)
+	issueType := &jira.IssueType{}
+	isID := in.IssueType != ""
+	for _, r := range in.IssueType {
+		if r < '0' || r > '9' {
+			isID = false
+			break
+		}
+	}
+	if isID {
+		issueType.ID = in.IssueType
+	} else {
+		issueType.Name = in.IssueType
+	}
+	f.Issues[key] = &jira.Issue{
+		ID:  fmt.Sprintf("%d", 10000+len(f.CreatedIssues)),
+		Key: key,
+		Fields: jira.IssueFields{
+			Summary: in.Summary, Description: description, IssueType: issueType,
+			Project: &jira.ProjectRef{ID: f.ProjectIDs[in.ProjectKey], Key: in.ProjectKey},
+		},
+	}
+	return &jira.CreatedIssue{ID: fmt.Sprintf("%d", 10000+len(f.CreatedIssues)), Key: key}, nil
+}
+
+func (f *FakeJiraClient) ListComments(_ context.Context, issueIDOrKey string) ([]jira.Comment, error) {
+	comments := f.Comments[issueIDOrKey]
+	// Attach properties to each comment, mirroring the
+	// ?expand=properties behavior of the real API.
+	result := make([]jira.Comment, len(comments))
+	copy(result, comments)
+	for i := range result {
+		propKey := issueIDOrKey + "/" + result[i].ID
+		if props, ok := f.CommentProperties[propKey]; ok {
+			for k, v := range props {
+				result[i].Properties = append(result[i].Properties, jira.CommentProperty{
+					Key:   k,
+					Value: v,
+				})
+			}
+		}
+	}
+	return result, nil
+}
+
+func (f *FakeJiraClient) CreateComment(ctx context.Context, issueIDOrKey, body string) (*jira.Comment, error) {
+	return f.CreateCommentWithProperties(ctx, issueIDOrKey, body, nil)
+}
+
+func (f *FakeJiraClient) CreateCommentWithProperties(_ context.Context, issueIDOrKey, body string, properties []jira.CommentProperty) (*jira.Comment, error) {
+	f.CreatedBody = body
+	adf, err := jira.MarkdownToADF(body) // mirrors Jira echoing back the ADF it stored
+	if err != nil {
+		return nil, err
+	}
+	comment := jira.Comment{
+		ID:      fmt.Sprintf("%d", len(f.Comments[issueIDOrKey])+1),
+		Body:    adf,
+		Author:  f.myself(),
+		Created: "2026-08-06T00:00:00.000+0000",
+	}
+	if f.Comments == nil {
+		f.Comments = make(map[string][]jira.Comment)
+	}
+	f.Comments[issueIDOrKey] = append(f.Comments[issueIDOrKey], comment)
+
+	// Store properties if provided.
+	if len(properties) > 0 {
+		if f.CommentProperties == nil {
+			f.CommentProperties = make(map[string]map[string]json.RawMessage)
+		}
+		propKey := issueIDOrKey + "/" + comment.ID
+		if f.CommentProperties[propKey] == nil {
+			f.CommentProperties[propKey] = make(map[string]json.RawMessage)
+		}
+		for _, p := range properties {
+			f.CommentProperties[propKey][p.Key] = p.Value
+		}
+	}
+
+	return &comment, nil
+}
+
+func (f *FakeJiraClient) UpdateComment(_ context.Context, issueIDOrKey, commentID, body string) error {
+	if f.UpdateError != nil {
+		return f.UpdateError
+	}
+	f.UpdatedIssueKey = issueIDOrKey
+	f.UpdatedCommentID = commentID
+	f.UpdatedBody = body
+	adf, err := jira.MarkdownToADF(body) // mirrors Jira echoing back the ADF it stored
+	if err != nil {
+		return err
+	}
+	for i, c := range f.Comments[issueIDOrKey] {
+		if c.ID == commentID {
+			f.Comments[issueIDOrKey][i].Body = adf
+			break
+		}
+	}
+	return nil
+}
+
+func (f *FakeJiraClient) SetCommentProperty(_ context.Context, issueIDOrKey, commentID, propertyKey string, value any) error {
+	f.PropertyWrites++
+	if f.PropertyError != nil {
+		return f.PropertyError
+	}
+	if f.CommentProperties == nil {
+		f.CommentProperties = make(map[string]map[string]json.RawMessage)
+	}
+	propKey := issueIDOrKey + "/" + commentID
+	if f.CommentProperties[propKey] == nil {
+		f.CommentProperties[propKey] = make(map[string]json.RawMessage)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	f.CommentProperties[propKey][propertyKey] = raw
+	return nil
+}
+
+func (f *FakeJiraClient) DeleteComment(_ context.Context, issueIDOrKey, commentID string) error {
+	comments := f.Comments[issueIDOrKey]
+	for i, c := range comments {
+		if c.ID == commentID {
+			f.Comments[issueIDOrKey] = append(comments[:i], comments[i+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("delete comment %s on %s: %w", commentID, issueIDOrKey, forge.ErrNotFound)
+}
+
+func (f *FakeJiraClient) LinkIssues(_ context.Context, inwardIssueKey, outwardIssueKey, linkTypeName string) error {
+	if f.LinkError != nil {
+		return f.LinkError
+	}
+	f.Links = append(f.Links, FakeJiraLink{Type: linkTypeName, InwardIssue: inwardIssueKey, OutwardIssue: outwardIssueKey})
+	return nil
+}
+
+var _ jiraClient = (*FakeJiraClient)(nil)
+
+// NewFakeJiraClient returns a tracker.Client backed by an in-memory fake
+// that round-trips comment bodies through the real
+// jira.MarkdownToADF/ADFToMarkdown conversions, for tests that need to
+// exercise Jira-specific markdown quirks (e.g. mdEscaper) without a live
+// Jira instance.
+func NewFakeJiraClient(baseURL string) (*JiraClient, error) {
+	return NewJiraClient(&FakeJiraClient{}, baseURL)
+}
+
+// NewFakeJiraClientWithFake returns both the tracker.Client and the
+// underlying FakeJiraClient, giving tests access to the fake's control
+// fields (e.g. PropertyError for permission failure simulation).
+func NewFakeJiraClientWithFake(baseURL string) (*JiraClient, *FakeJiraClient, error) {
+	fc := &FakeJiraClient{}
+	tc, err := NewJiraClient(fc, baseURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tc, fc, nil
+}

@@ -40,6 +40,9 @@ type fakeGCFClient struct {
 	// Captured env vars from the last CreateFunction or UpdateFunction call.
 	lastCreateFunctionEnvVars map[string]string
 
+	// Captured zip from the last UploadFunctionSource call.
+	lastUploadedSource []byte
+
 	// Captured env vars from the last UpdateServiceEnvVars call.
 	lastUpdateServiceEnvVars map[string]string
 
@@ -81,8 +84,14 @@ func (f *fakeGCFClient) record(method string) error {
 func (f *fakeGCFClient) CreateServiceAccount(_ context.Context, _, _, _ string) error {
 	return f.record("CreateServiceAccount")
 }
+func (f *fakeGCFClient) DeleteServiceAccount(_ context.Context, _, _ string) error {
+	return f.record("DeleteServiceAccount")
+}
 func (f *fakeGCFClient) CreateWIFPool(_ context.Context, _, _, _ string) error {
 	return f.record("CreateWIFPool")
+}
+func (f *fakeGCFClient) DeleteWIFPool(_ context.Context, _, _ string) error {
+	return f.record("DeleteWIFPool")
 }
 func (f *fakeGCFClient) CreateWIFProvider(_ context.Context, _, _, providerID string, cfg OIDCProviderConfig) error {
 	f.lastWIFProviderConfig = cfg
@@ -162,12 +171,18 @@ func (f *fakeGCFClient) DeleteWIFProvider(_ context.Context, _, _, _ string) err
 func (f *fakeGCFClient) SetSecretIAMBinding(_ context.Context, _, _, _ string) error {
 	return f.record("SetSecretIAMBinding")
 }
+func (f *fakeGCFClient) ReplaceSecretIAMBinding(_ context.Context, _, _, _ string) error {
+	return f.record("ReplaceSecretIAMBinding")
+}
 func (f *fakeGCFClient) SetProjectIAMBinding(_ context.Context, projectID, member, role string) error {
 	f.projectIAMBindings = append(f.projectIAMBindings, projectIAMBinding{projectID, member, role})
 	return f.record("SetProjectIAMBinding")
 }
 func (f *fakeGCFClient) SetCloudRunInvoker(_ context.Context, _, _, _ string) error {
 	return f.record("SetCloudRunInvoker")
+}
+func (f *fakeGCFClient) DeleteFunction(_ context.Context, _, _, _ string) error {
+	return f.record("DeleteFunction")
 }
 func (f *fakeGCFClient) GetFunction(_ context.Context, _, _, _ string) (*FunctionInfo, error) {
 	f.calls = append(f.calls, "GetFunction")
@@ -181,8 +196,19 @@ func (f *fakeGCFClient) GetFunction(_ context.Context, _, _, _ string) (*Functio
 	}
 	return f.functionInfo, nil
 }
-func (f *fakeGCFClient) UploadFunctionSource(_ context.Context, _, _ string, _ []byte) (json.RawMessage, error) {
+func (f *fakeGCFClient) GetCloudRunServiceURI(_ context.Context, _, _, _ string) (string, error) {
+	f.calls = append(f.calls, "GetCloudRunServiceURI")
+	if err := f.errs["GetCloudRunServiceURI"]; err != nil {
+		return "", err
+	}
+	if f.functionInfo != nil && f.functionInfo.URI != "" {
+		return f.functionInfo.URI, nil
+	}
+	return f.functionURL, nil
+}
+func (f *fakeGCFClient) UploadFunctionSource(_ context.Context, _, _ string, source []byte) (json.RawMessage, error) {
 	f.calls = append(f.calls, "UploadFunctionSource")
+	f.lastUploadedSource = source
 	if err := f.errs["UploadFunctionSource"]; err != nil {
 		return nil, err
 	}
@@ -289,10 +315,61 @@ func WithFakeSecrets(secrets map[string]bool) FakeGCFOption {
 	return func(f *fakeGCFClient) { f.secrets = secrets }
 }
 
+// WithFakeSecretData backs AddSecretVersion and AccessSecretVersion with
+// data (secretID → latest payload). The caller keeps the map and can
+// inspect what was written.
+func WithFakeSecretData(data map[string][]byte) FakeGCFOption {
+	return func(f *fakeGCFClient) { f.secretData = data }
+}
+
 func WithFakeErrors(errs map[string]error) FakeGCFOption {
 	return func(f *fakeGCFClient) { f.errs = errs }
 }
 
 func WithFakeWIFProvider(p *WIFProviderInfo) FakeGCFOption {
 	return func(f *fakeGCFClient) { f.wifProvider = p }
+}
+
+// LastWIFProviderCondition returns the AttributeCondition passed to the most
+// recent CreateWIFProvider or UpdateWIFProvider call on a fake client, for
+// cross-package test assertions. Returns "" if client isn't a fake or no
+// call was made yet.
+func LastWIFProviderCondition(client GCFClient) string {
+	f, ok := client.(*fakeGCFClient)
+	if !ok {
+		return ""
+	}
+	return f.lastWIFProviderConfig.AttributeCondition
+}
+
+// ProjectIAMBindingCount returns the number of SetProjectIAMBinding calls
+// recorded on a fake client, for cross-package test assertions. Returns 0 if
+// client isn't a fake.
+func ProjectIAMBindingCount(client GCFClient) int {
+	f, ok := client.(*fakeGCFClient)
+	if !ok {
+		return 0
+	}
+	return len(f.projectIAMBindings)
+}
+
+// DeletedSecretIDs returns the secret IDs passed to DeleteSecret calls on a
+// fake client, for cross-package test assertions. Returns nil if client isn't
+// a fake.
+func DeletedSecretIDs(client GCFClient) []string {
+	f, ok := client.(*fakeGCFClient)
+	if !ok {
+		return nil
+	}
+	return f.deletedSecretIDs
+}
+
+// RecordedCalls returns the method names recorded on a fake client, for
+// cross-package test assertions. Returns nil if client isn't a fake.
+func RecordedCalls(client GCFClient) []string {
+	f, ok := client.(*fakeGCFClient)
+	if !ok {
+		return nil
+	}
+	return f.calls
 }

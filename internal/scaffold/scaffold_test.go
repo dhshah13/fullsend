@@ -1,19 +1,18 @@
 package scaffold
 
 import (
+	"embed"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
-
-	"github.com/fullsend-ai/fullsend/internal/harness"
 )
 
 func TestFileModeMatchesFilesystem(t *testing.T) {
@@ -51,50 +50,11 @@ func TestFileModeMatchesFilesystem(t *testing.T) {
 
 func TestFullsendRepoFilesExist(t *testing.T) {
 	expected := []string{
-		".github/workflows/dispatch.yml",
-		".github/workflows/triage.yml",
-		".github/workflows/code.yml",
-		".github/workflows/review.yml",
-		".github/workflows/fix.yml",
-		".github/workflows/repo-maintenance.yml",
 		".github/scripts/setup-agent-env.sh",
-		"agents/triage.md",
-		"agents/code.md",
-		"env/gcp-vertex.env",
-		"env/triage.env",
-		"env/code-agent.env",
-		"harness/triage.yaml",
-		"harness/code.yaml",
-		"policies/triage.yaml",
-		"plugins/gopls-lsp/plugin.json",
-		"policies/code.yaml",
-		"schemas/triage-result.schema.json",
-		"scripts/post-triage.sh",
-		"scripts/pre-triage.sh",
-		"scripts/scan-secrets",
-		"scripts/pre-code.sh",
-		"scripts/pre-review.sh",
-		"scripts/post-code.sh",
-		"scripts/reconcile-repos.sh",
-		"scripts/validate-output-schema.sh",
 		"scripts/fullsend-check-output",
-		"scripts/validate-source-repo.sh",
-		"skills/autonomy-readiness/SKILL.md",
-		"skills/code-implementation/SKILL.md",
-		"skills/issue-labels/SKILL.md",
-		"templates/shim-workflow-call.yaml",
-		"agents/prioritize.md",
-		"env/prioritize.env",
-		"harness/prioritize.yaml",
-		"policies/prioritize.yaml",
-		"schemas/prioritize-result.schema.json",
-		"scripts/setup-prioritize.sh",
-		"scripts/pre-prioritize.sh",
-		"scripts/post-prioritize.sh",
-		"scripts/lib/github-api-csma.sh",
-		"scripts/post-prioritize-test.sh",
+		"scripts/prepare-sandbox-credentials.sh",
+		"templates/shim-per-repo.yaml",
 		".github/workflows/prioritize.yml",
-		".github/workflows/prioritize-scheduler.yml",
 	}
 
 	for _, path := range expected {
@@ -104,46 +64,27 @@ func TestFullsendRepoFilesExist(t *testing.T) {
 	}
 }
 
-func TestShimWorkflowCallTemplateContent(t *testing.T) {
-	content, err := FullsendRepoFile("templates/shim-workflow-call.yaml")
-	require.NoError(t, err)
-	s := string(content)
-	// yamllint document-start rule requires --- at the top
-	assert.True(t, strings.HasPrefix(s, "---\n"), "shim workflow must start with YAML document start marker")
-	// ADR 34: shim has 2 jobs (dispatch + stop-fix), not per-stage jobs
-	assert.Contains(t, s, "dispatch:")
-	assert.Contains(t, s, "stop-fix:")
-	assert.Contains(t, s, "event_action:")
-	assert.Contains(t, s, "id-token: write")
-	assert.Contains(t, s, "__ORG__/.fullsend/.github/workflows/dispatch.yml@main")
-	// Dispatch concurrency group (no cancel — thin callers handle per-stage cancellation)
-	assert.Contains(t, s, "fullsend-dispatch-${{")
-	assert.Contains(t, s, "cancel-in-progress: false")
-	// Event triggers
-	assert.Contains(t, s, "pull_request_target")
-	assert.Contains(t, s, "pull_request_review")
-	assert.Contains(t, s, "issue_comment")
-	assert.Contains(t, s, "issues:")
-	// Bot filter
-	assert.Contains(t, s, "comment.user.type != 'Bot'")
-	// stop-fix authorization
-	assert.Contains(t, s, "/fs-fix-stop")
-	assert.Contains(t, s, "fullsend-no-fix")
-	// Per-stage jobs removed
-	assert.NotContains(t, s, "dispatch-triage")
-	assert.NotContains(t, s, "dispatch-code")
-	assert.NotContains(t, s, "dispatch-review")
-	assert.NotContains(t, s, "dispatch-fix-bot")
-	assert.NotContains(t, s, "dispatch-fix-human")
-	assert.NotContains(t, s, "dispatch-retro")
-	assert.NotContains(t, s, "stage: triage")
-	assert.NotContains(t, s, "stage: code")
-	assert.NotContains(t, s, "stage: review")
-	assert.NotContains(t, s, "stage: fix")
-	assert.NotContains(t, s, "stage: retro")
-	assert.NotContains(t, s, "FULLSEND_DISPATCH_TOKEN")
-	assert.NotContains(t, s, "FULLSEND_DISPATCH_URL")
-	assert.NotContains(t, s, "curl")
+// TestPerOrgScaffoldFilesRemoved guards against reintroducing per-org-only
+// scaffold assets (ADR 0044): the org dispatch and maintenance workflows,
+// the org-routed thin stage callers, the workflow-call shim template, and
+// the enrollment reconciliation and source-repo validation scripts.
+func TestPerOrgScaffoldFilesRemoved(t *testing.T) {
+	for _, path := range []string{
+		".github/workflows/dispatch.yml",
+		".github/workflows/repo-maintenance.yml",
+		".github/workflows/triage.yml",
+		".github/workflows/code.yml",
+		".github/workflows/review.yml",
+		".github/workflows/fix.yml",
+		".github/workflows/retro.yml",
+		"templates/shim-workflow-call.yaml",
+		"scripts/reconcile-repos.sh",
+		"scripts/reconcile-repos-test.sh",
+		"scripts/validate-source-repo.sh",
+	} {
+		_, err := FullsendRepoFile(path)
+		assert.Error(t, err, "per-org scaffold file %s must not be embedded", path)
+	}
 }
 
 func TestShimPerRepoTemplateContent(t *testing.T) {
@@ -154,126 +95,368 @@ func TestShimPerRepoTemplateContent(t *testing.T) {
 	assert.Contains(t, s, "dispatch:")
 	assert.Contains(t, s, "stop-fix:")
 	assert.Contains(t, s, "__REUSABLE_DISPATCH__")
-	assert.Contains(t, s, "install_mode: per-repo")
+	// reusable-dispatch.yml defaults install_mode to per-repo; the shim
+	// must not pass it explicitly (#2887).
+	assert.NotContains(t, s, "install_mode")
+	assert.Contains(t, s, "FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}")
+	assert.Contains(t, s, "FULLSEND_OPENAI_API_KEY: ${{ secrets.FULLSEND_OPENAI_API_KEY }}")
+	assert.Contains(t, s, "FULLSEND_INFERENCE_GATEWAY_API_KEY: ${{ secrets.FULLSEND_INFERENCE_GATEWAY_API_KEY }}")
 	// Per-role concurrency lives in reusable-dispatch.yml, not a monolithic shim group (#2452).
 	assert.NotContains(t, s, "fullsend-dispatch-${{")
 	assert.NotRegexp(t, `(?m)^\s+concurrency:`, s)
 	assert.Contains(t, s, "per-role cancel-in-progress groups live in reusable-dispatch.yml")
+
+	// Permissions assertions (YAML-parsed, not string-contains) — #5785
+	var pr struct {
+		Permissions map[string]string `yaml:"permissions"`
+		Jobs        struct {
+			Dispatch struct {
+				Permissions map[string]string `yaml:"permissions"`
+			} `yaml:"dispatch"`
+			StopFix struct {
+				Permissions map[string]string `yaml:"permissions"`
+			} `yaml:"stop-fix"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal(content, &pr))
+
+	// Workflow-level: least-privilege default must be empty permissions
+	require.NotNil(t, pr.Permissions,
+		"workflow-level permissions must be present (permissions: {})")
+	assert.Empty(t, pr.Permissions,
+		"workflow-level permissions must be empty (least-privilege default)")
+
+	// Dispatch job: per-repo mode needs broader permissions than
+	// workflow-call because the agent runs in this repo's context.
+	assert.Equal(t, map[string]string{
+		"actions":       "write",
+		"id-token":      "write",
+		"contents":      "write",
+		"issues":        "write",
+		"packages":      "read",
+		"pull-requests": "write",
+	}, pr.Jobs.Dispatch.Permissions, "dispatch job permissions")
+
+	// Stop-fix job permissions
+	assert.Equal(t, map[string]string{
+		"contents":      "read",
+		"issues":        "write",
+		"pull-requests": "write",
+	}, pr.Jobs.StopFix.Permissions, "stop-fix job permissions")
 }
 
-func TestShimTriggerParity(t *testing.T) {
-	// Both shim templates must declare the same event trigger types so that
-	// per-repo and workflow-call installation modes have identical behavior.
-	perRepo, err := FullsendRepoFile("templates/shim-per-repo.yaml")
-	require.NoError(t, err)
-	workflowCall, err := FullsendRepoFile("templates/shim-workflow-call.yaml")
-	require.NoError(t, err)
+// TestShimStopFixAuthorization verifies the stop-fix job authorizes the
+// /fs-fix-stop command via the collaborator permission API (ADR 0054) rather
+// than author_association. See issue #5421: author_association grants
+// CONTRIBUTOR to anyone with a single merged PR, which let an unauthorized
+// external contributor disable the fix agent on another user's PR.
+func TestShimStopFixAuthorization(t *testing.T) {
+	for _, tmpl := range []string{
+		"templates/shim-per-repo.yaml",
+	} {
+		t.Run(tmpl, func(t *testing.T) {
+			content, err := FullsendRepoFile(tmpl)
+			require.NoError(t, err)
+			s := string(content)
 
-	type onSection struct {
-		On map[string]struct {
-			Types []string `yaml:"types"`
-		} `yaml:"on"`
-	}
+			// CONTRIBUTOR must not gate any command — it is granted to anyone
+			// with a single merged PR (the DoS vector from #5421).
+			assert.NotContains(t, s, "CONTRIBUTOR",
+				"stop-fix must not authorize based on the CONTRIBUTOR association")
 
-	var prOn, wcOn onSection
-	require.NoError(t, yaml.Unmarshal(perRepo, &prOn))
-	require.NoError(t, yaml.Unmarshal(workflowCall, &wcOn))
+			// The label step must call the collaborator permission API and
+			// require an admin|maintain|write role (ADR 0054).
+			assert.Contains(t, s, "collaborators/$COMMENT_USER_LOGIN/permission",
+				"stop-fix must check permission via the collaborator API")
+			assert.Contains(t, s, "admin|maintain|write",
+				"stop-fix must require admin/maintain/write access")
 
-	// Check that each shared event has matching sub-types.
-	for event, wcTrigger := range wcOn.On {
-		prTrigger, ok := prOn.On[event]
-		require.True(t, ok, "per-repo shim is missing event trigger %q", event)
-		assert.ElementsMatch(t, wcTrigger.Types, prTrigger.Types,
-			"event %q types differ between shim templates", event)
-	}
-	for event := range prOn.On {
-		_, ok := wcOn.On[event]
-		assert.True(t, ok, "per-repo shim has extra event trigger %q not in workflow-call shim", event)
+			// The PR author retains an escape hatch on their own PR regardless
+			// of their permission level.
+			assert.Contains(t, s, `"$COMMENT_USER_LOGIN" == "$ISSUE_USER_LOGIN"`,
+				"stop-fix must allow the PR author")
+
+			// Unauthorized callers exit before the label is applied.
+			assert.Contains(t, s, `if [[ "$authorized" != "true" ]]; then`,
+				"stop-fix must gate labeling on the authorization result")
+
+			// The authorization gate must precede the label mutation, not just
+			// coexist with it — moving the gate below the label would fail open.
+			gateIdx := strings.Index(s, `if [[ "$authorized" != "true" ]]; then`)
+			labelIdx := strings.Index(s, "gh label create")
+			require.GreaterOrEqual(t, gateIdx, 0)
+			require.GreaterOrEqual(t, labelIdx, 0)
+			assert.Less(t, gateIdx, labelIdx,
+				"the authorization exit gate must come before the label mutation")
+
+			// The coarse job-level if: must not resurrect author_association
+			// gating (the false-negative ADR 0054 exists to avoid).
+			assert.NotContains(t, s, "author_association ==",
+				"stop-fix job if: must not gate on author_association")
+		})
 	}
 }
 
-func TestDispatchWorkflowContent(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/dispatch.yml")
+// TestShimStopFixAuthorizationRuntime executes the stop-fix job's embedded
+// bash against a stubbed `gh` binary to verify the authorization logic at
+// runtime (not just by static string matching): the PR-author escape hatch,
+// approval for write+ collaborators, denial for read-only collaborators, and
+// fail-closed behavior when the permission API errors.
+func TestShimStopFixAuthorizationRuntime(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+
+	extractRun := func(t *testing.T, tmpl string) string {
+		t.Helper()
+		content, err := FullsendRepoFile(tmpl)
+		require.NoError(t, err)
+		var doc struct {
+			Jobs struct {
+				StopFix struct {
+					Steps []struct {
+						Run string `yaml:"run"`
+					} `yaml:"steps"`
+				} `yaml:"stop-fix"`
+			} `yaml:"jobs"`
+		}
+		require.NoError(t, yaml.Unmarshal(content, &doc))
+		require.NotEmpty(t, doc.Jobs.StopFix.Steps, "stop-fix must have a step")
+		run := doc.Jobs.StopFix.Steps[0].Run
+		require.NotEmpty(t, run, "stop-fix step must have a run script")
+		return run
+	}
+
+	// runScenario runs the script with a stub gh that logs its invocations and
+	// applies the script's --jq expression to the given permission response
+	// (or fails when response == "FAIL"). It returns the combined output and
+	// whether the label mutation (`gh pr edit`) ran.
+	runScenario := func(t *testing.T, script, commentUser, issueUser, response string) (string, bool) {
+		t.Helper()
+		dir := t.TempDir()
+		logPath := filepath.Join(dir, "gh.log")
+		stub := "#!/usr/bin/env bash\n" +
+			"echo \"$@\" >> \"$GH_STUB_LOG\"\n" +
+			"if [[ \"$1\" == \"api\" ]]; then\n" +
+			"  if [[ \"$GH_STUB_RESPONSE\" == \"FAIL\" ]]; then echo 'simulated api failure' >&2; exit 1; fi\n" +
+			"  [[ \"$3\" == \"--jq\" ]] || exit 1\n" +
+			"  jq -r \"$4\" <<<\"$GH_STUB_RESPONSE\"; exit\n" +
+			"fi\n" +
+			"exit 0\n"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "gh"), []byte(stub), 0o755))
+		scriptPath := filepath.Join(dir, "stop-fix.sh")
+		require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o644))
+
+		cmd := exec.Command("bash", scriptPath)
+		cmd.Env = append(os.Environ(),
+			"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"GH_STUB_LOG="+logPath,
+			"GH_STUB_RESPONSE="+response,
+			"COMMENT_USER_LOGIN="+commentUser,
+			"ISSUE_USER_LOGIN="+issueUser,
+			"REPO=octo/repo",
+			"PR_NUMBER=1",
+			"GH_TOKEN=stub",
+		)
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "script must exit 0 (fail-closed, not error): %s", out)
+
+		logBytes, _ := os.ReadFile(logPath)
+		labeled := strings.Contains(string(logBytes), "pr edit")
+		return string(out) + string(logBytes), labeled
+	}
+
+	for _, tmpl := range []string{
+		"templates/shim-per-repo.yaml",
+	} {
+		t.Run(tmpl, func(t *testing.T) {
+			script := extractRun(t, tmpl)
+
+			t.Run("pr author escape hatch", func(t *testing.T) {
+				// Author with only read access can still stop on their own PR,
+				// and the permission API is never consulted.
+				out, labeled := runScenario(t, script, "alice", "alice", `{"role_name":"read"}`)
+				assert.True(t, labeled, "PR author must be able to stop the fix agent")
+				assert.NotContains(t, out, "api repos/", "author hatch must skip the permission API")
+			})
+
+			t.Run("write collaborator authorized", func(t *testing.T) {
+				_, labeled := runScenario(t, script, "bob", "alice", `{"role_name":"write"}`)
+				assert.True(t, labeled, "write-access collaborator must be authorized")
+			})
+
+			t.Run("custom role with maintain flags authorized", func(t *testing.T) {
+				_, labeled := runScenario(t, script, "bob", "alice",
+					`{"permission":"write","user":{"login":"custom-role-maintainer","type":"User","permissions":{"admin":false,"maintain":true,"push":true,"triage":true,"pull":true},"role_name":"Repo Maintainer"},"role_name":"Repo Maintainer"}`)
+				assert.True(t, labeled, "custom role with effective maintain must be authorized")
+			})
+
+			t.Run("custom role with triage flags denied", func(t *testing.T) {
+				_, labeled := runScenario(t, script, "bob", "alice",
+					`{"permission":"read","role_name":"Helper","user":{"permissions":{"triage":true,"pull":true}}}`)
+				assert.False(t, labeled, "stop-fix requires write; effective triage must be denied")
+			})
+
+			t.Run("custom role without effective permission denied", func(t *testing.T) {
+				_, labeled := runScenario(t, script, "bob", "alice", `{"role_name":"Mystery"}`)
+				assert.False(t, labeled, "custom role with no effective permission must be denied")
+			})
+
+			t.Run("read collaborator denied", func(t *testing.T) {
+				out, labeled := runScenario(t, script, "bob", "alice", `{"role_name":"read"}`)
+				assert.False(t, labeled, "read-only collaborator must be denied")
+				assert.Contains(t, out, "not authorized")
+			})
+
+			t.Run("api failure fails closed", func(t *testing.T) {
+				out, labeled := runScenario(t, script, "bob", "alice", "FAIL")
+				assert.False(t, labeled, "API failure must fail closed (deny)")
+				assert.Contains(t, out, "Permission API call failed",
+					"API failure must emit a diagnostic warning")
+			})
+		})
+	}
+}
+
+// TestCollaboratorPermissionJQ checks that reusable-dispatch.yml and the
+// stop-fix shims share one --jq role resolution and that it maps custom roles
+// to their effective base role (#7834).
+func TestCollaboratorPermissionJQ(t *testing.T) {
+	jqExpr := regexp.MustCompile(`(?s)/permission" \\\s*--jq '(.*?)' 2>`)
+	extract := func(t *testing.T, content []byte) string {
+		t.Helper()
+		m := jqExpr.FindSubmatch(content)
+		require.NotNil(t, m, "collaborator permission --jq expression not found")
+		return strings.Join(strings.Fields(string(m[1])), " ")
+	}
+
+	dispatch, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "reusable-dispatch.yml"))
+	require.NoError(t, err)
+	shim, err := FullsendRepoFile("templates/shim-per-repo.yaml")
+	require.NoError(t, err)
+	expr := extract(t, dispatch)
+	require.Equal(t, expr, extract(t, shim), "dispatch and stop-fix shim must resolve roles identically")
+	managed, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "fullsend.yaml"))
+	require.NoError(t, err)
+	require.Equal(t, expr, extract(t, managed), "this repo's managed shim must match the template")
+
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+
+	cases := []struct{ name, response, want string }{
+		{"built-in role", `{"permission":"read","role_name":"triage"}`, "triage"},
+		{"custom maintain", `{"permission":"write","user":{"login":"custom-role-maintainer","type":"User","permissions":{"admin":false,"maintain":true,"push":true,"triage":true,"pull":true},"role_name":"Repo Maintainer"},"role_name":"Repo Maintainer"}`, "maintain"},
+		{"custom triage", `{"permission":"read","role_name":"Helper","user":{"permissions":{"triage":true,"pull":true}}}`, "triage"},
+		{"custom legacy write", `{"permission":"write","role_name":"Dev"}`, "write"},
+		{"custom legacy read stays read", `{"permission":"read","role_name":"Helper"}`, "read"},
+		{"custom non-boolean flag ignores legacy", `{"permission":"write","role_name":"Dev","user":{"permissions":{"push":"true"}}}`, "none"},
+		{"custom all flags false ignores legacy", `{"permission":"write","role_name":"Dev","user":{"permissions":{"admin":false,"maintain":false,"push":false,"triage":false,"pull":false}}}`, "none"},
+		{"custom null flags use legacy", `{"permission":"write","role_name":"Dev","user":{"permissions":null}}`, "write"},
+		{"custom empty flags ignore legacy", `{"permission":"write","role_name":"Dev","user":{"permissions":{}}}`, "none"},
+		{"custom non-object flags ignore legacy", `{"permission":"write","role_name":"Dev","user":{"permissions":[]}}`, "none"},
+		{"missing role_name", `{"permission":"write","user":{"permissions":{"push":true,"pull":true}}}`, "none"},
+		{"non-string role_name", `{"permission":"write","role_name":7}`, "none"},
+		{"custom no signals", `{"role_name":"Mystery"}`, "none"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("jq", "-r", expr)
+			cmd.Stdin = strings.NewReader(tc.response)
+			out, err := cmd.Output()
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, strings.TrimSpace(string(out)))
+		})
+	}
+}
+
+// TestShimStopFixShellCheck verifies the stop-fix script in the shim template
+// passes ShellCheck as downstream repos run it (#8780). This repo's actionlint
+// hook ignores SC2016 globally, but repos that receive the generated shim do
+// not, so the single-quoted --jq program (which uses the jq variable $p) needs
+// a directive placed directly before the command it covers.
+func TestShimStopFixShellCheck(t *testing.T) {
+	content, err := FullsendRepoFile("templates/shim-per-repo.yaml")
+	require.NoError(t, err)
+	var doc struct {
+		Jobs struct {
+			StopFix struct {
+				Steps []struct {
+					Run string `yaml:"run"`
+				} `yaml:"steps"`
+			} `yaml:"stop-fix"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal(content, &doc))
+	require.NotEmpty(t, doc.Jobs.StopFix.Steps, "stop-fix must have a step")
+	run := doc.Jobs.StopFix.Steps[0].Run
+	require.NotEmpty(t, run, "stop-fix step must have a run script")
+
+	// ShellCheck applies a directive to the next command only, so the
+	// directive must sit on the line directly above the gh api call.
+	lines := strings.Split(run, "\n")
+	cmdIdx := -1
+	for i, line := range lines {
+		if strings.Contains(line, `role=$(gh api "repos/$REPO/collaborators/$COMMENT_USER_LOGIN/permission"`) {
+			cmdIdx = i
+			break
+		}
+	}
+	require.Greater(t, cmdIdx, 0, "stop-fix permission gh api command not found")
+	assert.Equal(t, "# shellcheck disable=SC2016", strings.TrimSpace(lines[cmdIdx-1]),
+		"SC2016 directive must directly precede the permission gh api command")
+	assert.Contains(t, run, ".user.permissions as $p",
+		"the custom-role --jq resolution must be preserved")
+
+	if _, err := exec.LookPath("shellcheck"); err != nil {
+		t.Skip("shellcheck not available")
+	}
+	script := filepath.Join(t.TempDir(), "stop-fix.sh")
+	require.NoError(t, os.WriteFile(script, []byte(run), 0o600))
+	out, err := exec.Command("shellcheck", "--shell=bash", script).CombinedOutput()
+	assert.NoError(t, err, "shellcheck reported issues in the stop-fix script:\n%s", out)
+}
+
+// TestManagedShimStopFixNotStale guards against drift between the shim
+// template and this repo's own rendered managed workflow
+// (.github/workflows/fullsend.yaml). That file is generated from
+// shim-per-repo.yaml at deploy time; if a template security fix lands
+// without regenerating it, the repo keeps running the vulnerable logic. See
+// issue #5421.
+func TestManagedShimStopFixNotStale(t *testing.T) {
+	// Walk up from the package dir to the repo root that holds the managed file.
+	dir, err := os.Getwd()
+	require.NoError(t, err)
+	var managedPath string
+	for i := 0; i < 6; i++ {
+		candidate := filepath.Join(dir, ".github", "workflows", "fullsend.yaml")
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			managedPath = candidate
+			break
+		}
+		dir = filepath.Dir(dir)
+	}
+	if managedPath == "" {
+		t.Skip("managed .github/workflows/fullsend.yaml not found from test dir")
+	}
+
+	content, err := os.ReadFile(managedPath)
 	require.NoError(t, err)
 	s := string(content)
-	assert.Contains(t, s, "workflow_call:")
-	assert.NotContains(t, s, "workflow_dispatch:")
-	// ADR 34: event_action input replaces stage input
-	assert.Contains(t, s, "event_action:")
-	assert.Contains(t, s, "required: true")
-	// Routing logic
-	assert.Contains(t, s, "Determine stage")
-	assert.Contains(t, s, "/fs-triage")
-	assert.Contains(t, s, "/fs-code")
-	assert.Contains(t, s, "/fs-review")
-	assert.Contains(t, s, "/fs-fix")
-	assert.Contains(t, s, "/fs-retro")
-	assert.Contains(t, s, "/fs-prioritize")
-	assert.Contains(t, s, "ready-for-triage")
-	assert.Contains(t, s, "ready-to-code")
-	assert.Contains(t, s, "ready-for-review")
-	assert.Contains(t, s, "TRIGGERING_LABEL")
-	assert.Contains(t, s, "pull_request_target")
-	assert.Contains(t, s, "pull_request_review")
-	assert.Contains(t, s, "changes_requested")
-	assert.Contains(t, s, "needs-info")
-	assert.Contains(t, s, `! has_label "feature"`)
-	assert.Contains(t, s, "opened|synchronize|ready_for_review")
-	// /code must only run on issues, not PRs
-	assert.Contains(t, s, "ISSUE_HAS_PR")
-	// Authorization checks (collaborator permission API using .role_name)
-	assert.Contains(t, s, "is_authorized")
-	assert.Contains(t, s, "has_write_permission")
-	assert.Contains(t, s, ".role_name")
-	assert.Contains(t, s, "admin|maintain|write")
-	assert.Contains(t, s, `COMMENT_AUTHOR_ASSOC`)
-	// Auto-triage requires assoc != NONE or issue author
-	assert.Contains(t, s, "is_issue_author")
-	// Bot filtering
-	assert.Contains(t, s, `COMMENT_USER_TYPE`)
-	assert.Contains(t, s, `!= "Bot"`)
-	// No-fix label check (uses PR_LABELS for pull_request_review events)
-	assert.Contains(t, s, "fullsend-no-fix")
-	assert.Contains(t, s, "PR_LABELS")
-	// Fork PR detection
-	assert.Contains(t, s, "PR_HEAD_REPO")
-	assert.Contains(t, s, "PR_BASE_REPO")
-	// Kill switch and role check
-	assert.Contains(t, s, "kill_switch")
-	assert.Contains(t, s, "defaults.roles")
-	// Stage output
-	assert.Contains(t, s, "steps.route.outputs.stage")
-	assert.Contains(t, s, "trigger_source")
-	// Fan-out (unchanged)
-	assert.Contains(t, s, "# fullsend-stage:")
-	assert.Contains(t, s, "gh workflow run")
-	assert.Contains(t, s, "permissions: {}")
-	assert.Contains(t, s, "permissions:")
-	assert.Contains(t, s, "actions: write")
-	assert.Contains(t, s, "contents: read")
-	assert.Contains(t, s, "id-token: write")
-	assert.Contains(t, s, "set -euo pipefail")
-	assert.Contains(t, s, "dispatched=0")
-	assert.Contains(t, s, "No workflows found for stage")
-	assert.Contains(t, s, "|| true")
-	assert.Contains(t, s, "Invalid stage name")
-	assert.Contains(t, s, `^[a-z][a-z0-9_-]*$`)
-	assert.Contains(t, s, "dispatch.yml")
-	assert.Contains(t, s, "self-dispatch guard")
-	assert.Contains(t, s, "Scanned")
-	assert.Contains(t, s, "skipped")
-	// Verify OIDC mint is the sole token path
-	assert.Contains(t, s, "FULLSEND_MINT_URL")
-	assert.Contains(t, s, "oidc-mint")
-	assert.Contains(t, s, "/v1/token")
-	assert.Contains(t, s, "fullsend-mint")
-	assert.Contains(t, s, "job.workflow_repository")
-	// Verify both OIDC token and minted token are masked
-	assert.Contains(t, s, "::add-mask::$OIDC_TOKEN")
-	assert.Contains(t, s, "::add-mask::$TOKEN")
-	assert.NotContains(t, s, "create-github-app-token")
-	assert.NotContains(t, s, "FULLSEND_FULLSEND_APP_PRIVATE_KEY")
-	assert.NotContains(t, s, "FULLSEND_FULLSEND_CLIENT_ID")
+
+	assert.NotContains(t, s, "CONTRIBUTOR",
+		"managed shim must not authorize based on the CONTRIBUTOR association")
+	assert.NotContains(t, s, "author_association ==",
+		"managed shim job if: must not gate on author_association")
+	assert.Contains(t, s, "collaborators/$COMMENT_USER_LOGIN/permission",
+		"managed shim must check permission via the collaborator API")
+	assert.Contains(t, s, "admin|maintain|write",
+		"managed shim must require admin/maintain/write access")
+	assert.Contains(t, s, `"$COMMENT_USER_LOGIN" == "$ISSUE_USER_LOGIN"`,
+		"managed shim must preserve the PR-author escape hatch")
 }
 
 func TestWalkFullsendRepo(t *testing.T) {
@@ -283,7 +466,54 @@ func TestWalkFullsendRepo(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
-	assert.True(t, len(paths) >= 15, "expected at least 15 installed files, got %d", len(paths))
+	assert.Contains(t, paths, ".github/workflows/prioritize.yml")
+	assert.Contains(t, paths, "templates/shim-per-repo.yaml")
+}
+
+// vestigialLayeredDirs are layeredDirs entries the embed has shipped nothing
+// under since #5552 moved agent content to fullsend-ai/agents. Nothing may
+// rely on CI layering them (#6689, #6834). Drop an entry once it ships content.
+var vestigialLayeredDirs = map[string]bool{
+	"agents/":  true,
+	"skills/":  true,
+	"schemas/": true,
+	"harness/": true,
+	"plugins/": true,
+	"env/":     true,
+}
+
+// TestLayeredDirsShipContent: every non-vestigial layered directory has
+// embedded files, so workspace preparation's [[ -d ]] guard never skips one a
+// consumer relies on, and no vestigial entry hides a directory that ships.
+func TestLayeredDirsShipContent(t *testing.T) {
+	counts := make(map[string]int, len(layeredDirs))
+	require.NoError(t, WalkLayeredContent(func(path string, _ []byte) error {
+		for _, dir := range layeredDirs {
+			if strings.HasPrefix(path, dir) {
+				counts[dir]++
+			}
+		}
+		return nil
+	}))
+
+	for _, dir := range layeredDirs {
+		if vestigialLayeredDirs[dir] {
+			assert.Zero(t, counts[dir],
+				"%s ships %d embedded file(s) but is listed as vestigial; remove it from vestigialLayeredDirs", dir, counts[dir])
+			continue
+		}
+		assert.NotZero(t, counts[dir],
+			"%s is layered but the embed has no files under it, so CI never layers it (#6834); ship content or drop the entry", dir)
+	}
+	for dir := range vestigialLayeredDirs {
+		assert.Contains(t, layeredDirs, dir, "vestigialLayeredDirs entry %s is not in layeredDirs", dir)
+	}
+
+	// An empty policies/ entry is #6834; a file behind it would be a second
+	// fleet policy with no drift guard (#7268).
+	assert.NotContains(t, layeredDirs, "policies/")
+	_, err := FullsendRepoFile("policies/base.yaml")
+	assert.Error(t, err, "scaffold must not ship policies/base.yaml; see #7268")
 }
 
 func TestLayeredDirsNotInstalled(t *testing.T) {
@@ -293,7 +523,8 @@ func TestLayeredDirsNotInstalled(t *testing.T) {
 		"schemas/",
 		"harness/",
 		"plugins/",
-		"policies/",
+		"profiles/",
+		"providers/",
 		"scripts/",
 		"env/",
 		".github/actions/",
@@ -310,27 +541,13 @@ func TestLayeredDirsNotInstalled(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestCustomizedDirsInstalled(t *testing.T) {
-	expected := map[string]bool{
-		"customized/agents/.gitkeep":   false,
-		"customized/skills/.gitkeep":   false,
-		"customized/schemas/.gitkeep":  false,
-		"customized/harness/.gitkeep":  false,
-		"customized/plugins/.gitkeep":  false,
-		"customized/policies/.gitkeep": false,
-		"customized/scripts/.gitkeep":  false,
-		"customized/env/.gitkeep":      false,
-	}
+func TestNoCustomizedDirsInstalled(t *testing.T) {
 	err := WalkFullsendRepo(func(path string, _ []byte) error {
-		if _, ok := expected[path]; ok {
-			expected[path] = true
-		}
+		assert.False(t, strings.HasPrefix(path, "customized/"),
+			"WalkFullsendRepo should not include deprecated customized/ paths, got: %s", path)
 		return nil
 	})
 	require.NoError(t, err)
-	for path, found := range expected {
-		assert.True(t, found, "WalkFullsendRepo should include %s", path)
-	}
 }
 
 func TestWalkFullsendRepoAllIncludesEverything(t *testing.T) {
@@ -359,402 +576,17 @@ func TestWalkFullsendRepoAllIncludesEverything(t *testing.T) {
 	}
 }
 
-func TestTriageWorkflowContent(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/triage.yml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "# fullsend-stage: triage")
-	assert.Contains(t, s, "workflow_dispatch")
-	assert.Contains(t, s, "event_type")
-	assert.Contains(t, s, "source_repo")
-	assert.Contains(t, s, "event_payload")
-	assert.Contains(t, s, "__REUSABLE_WORKFLOW__")
-	assert.NotContains(t, s, "distribution_mode")
-	assert.Contains(t, s, "FULLSEND_MINT_URL")
-	assert.NotContains(t, s, "secrets: inherit")
-	assert.Contains(t, s, "FULLSEND_GCP_WIF_PROVIDER: ${{ secrets.FULLSEND_GCP_WIF_PROVIDER }}")
-	assert.Contains(t, s, "FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}")
-	assert.Contains(t, s, "concurrency:")
-	assert.Contains(t, s, "fullsend-triage-")
-	assert.Contains(t, s, "cancel-in-progress: true")
-	// Permissions required by the reusable workflow
-	assert.Contains(t, s, "permissions:")
-	assert.Contains(t, s, "actions: write")
-	assert.Contains(t, s, "id-token: write")
-	assert.Contains(t, s, "issues: write")
-	assert.Contains(t, s, "contents: read")
-}
-
-func TestCodeAgentContent(t *testing.T) {
-	content, err := FullsendRepoFile("agents/code.md")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "code")
-	assert.Contains(t, s, "disallowedTools")
-	assert.Contains(t, s, "code-implementation")
-}
-
-func TestCodeImplementationSkillAPIContractGuidance(t *testing.T) {
-	content, err := FullsendRepoFile("skills/code-implementation/SKILL.md")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "Verify API contracts per code path")
-	assert.Contains(t, s, "or changes a parameter sent to an external API")
-}
-
-func TestCodeWorkflowContent(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/code.yml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "# fullsend-stage: code")
-	assert.Contains(t, s, "workflow_dispatch")
-	assert.Contains(t, s, "__REUSABLE_WORKFLOW__")
-	assert.NotContains(t, s, "distribution_mode")
-	assert.Contains(t, s, "FULLSEND_MINT_URL")
-	assert.NotContains(t, s, "secrets: inherit")
-	assert.Contains(t, s, "FULLSEND_GCP_WIF_PROVIDER: ${{ secrets.FULLSEND_GCP_WIF_PROVIDER }}")
-	assert.Contains(t, s, "FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}")
-	assert.NotContains(t, s, "GCP_WIF_SA_EMAIL")
-	assert.Contains(t, s, "concurrency:")
-	assert.Contains(t, s, "fullsend-code-")
-	assert.Contains(t, s, "cancel-in-progress: true")
-	// Permissions required by the reusable workflow
-	assert.Contains(t, s, "permissions:")
-	assert.Contains(t, s, "actions: write")
-	assert.Contains(t, s, "contents: write")
-	assert.Contains(t, s, "id-token: write")
-	assert.Contains(t, s, "issues: write")
-	assert.Contains(t, s, "packages: read")
-	assert.Contains(t, s, "pull-requests: write")
-}
-
-func TestReviewWorkflowContent(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/review.yml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "# fullsend-stage: review")
-	assert.Contains(t, s, "workflow_dispatch")
-	assert.Contains(t, s, "__REUSABLE_WORKFLOW__")
-	assert.NotContains(t, s, "distribution_mode")
-	assert.Contains(t, s, "FULLSEND_MINT_URL")
-	assert.NotContains(t, s, "secrets: inherit")
-	assert.Contains(t, s, "FULLSEND_GCP_WIF_PROVIDER: ${{ secrets.FULLSEND_GCP_WIF_PROVIDER }}")
-	assert.Contains(t, s, "FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}")
-	assert.Contains(t, s, "concurrency:")
-	assert.Contains(t, s, "fullsend-review-")
-	assert.Contains(t, s, "cancel-in-progress: true")
-	// Permissions required by the reusable workflow
-	assert.Contains(t, s, "permissions:")
-	assert.Contains(t, s, "actions: write")
-	assert.Contains(t, s, "contents: read")
-	assert.Contains(t, s, "id-token: write")
-	assert.Contains(t, s, "issues: write")
-	assert.Contains(t, s, "pull-requests: write")
-}
-
-func TestFixWorkflowContent(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/fix.yml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "# fullsend-stage: fix")
-	assert.Contains(t, s, "workflow_dispatch")
-	assert.Contains(t, s, "trigger_source")
-	assert.Contains(t, s, "__REUSABLE_WORKFLOW__")
-	assert.NotContains(t, s, "distribution_mode")
-	assert.Contains(t, s, "FULLSEND_MINT_URL")
-	assert.NotContains(t, s, "secrets: inherit")
-	assert.Contains(t, s, "FULLSEND_GCP_WIF_PROVIDER: ${{ secrets.FULLSEND_GCP_WIF_PROVIDER }}")
-	assert.Contains(t, s, "FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}")
-	assert.Contains(t, s, "concurrency:")
-	assert.Contains(t, s, "fullsend-fix-")
-	assert.Contains(t, s, "cancel-in-progress: true")
-	// Permissions required by the reusable workflow
-	assert.Contains(t, s, "permissions:")
-	assert.Contains(t, s, "actions: write")
-	assert.Contains(t, s, "contents: write")
-	assert.Contains(t, s, "id-token: write")
-	assert.Contains(t, s, "issues: write")
-	assert.Contains(t, s, "packages: read")
-	assert.Contains(t, s, "pull-requests: write")
-}
-
-func TestRetroWorkflowContent(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/retro.yml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "# fullsend-stage: retro")
-	assert.Contains(t, s, "workflow_dispatch")
-	assert.Contains(t, s, "__REUSABLE_WORKFLOW__")
-	assert.NotContains(t, s, "distribution_mode")
-	assert.Contains(t, s, "FULLSEND_MINT_URL")
-	assert.NotContains(t, s, "secrets: inherit")
-	assert.Contains(t, s, "FULLSEND_GCP_WIF_PROVIDER: ${{ secrets.FULLSEND_GCP_WIF_PROVIDER }}")
-	assert.Contains(t, s, "FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}")
-	assert.Contains(t, s, "concurrency:")
-	assert.Contains(t, s, "fullsend-retro-")
-	assert.Contains(t, s, "cancel-in-progress: true")
-	// Permissions required by the reusable workflow
-	assert.Contains(t, s, "permissions:")
-	assert.Contains(t, s, "actions: write")
-	assert.Contains(t, s, "contents: read")
-	assert.Contains(t, s, "id-token: write")
-	assert.Contains(t, s, "issues: write")
-}
-
-func TestValidateSourceRepoContent(t *testing.T) {
-	content, err := FullsendRepoFile("scripts/validate-source-repo.sh")
-	require.NoError(t, err)
-	s := string(content)
-	// Verify security-critical format regex
-	assert.Contains(t, s, "^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
-	assert.Contains(t, s, "Invalid source_repo format")
-	// Verify owner check
-	assert.Contains(t, s, "REPO_OWNER=\"${SOURCE_REPO%%/*}\"")
-	assert.Contains(t, s, "source_repo owner does not match org")
-	// Verify allowlist check
-	assert.Contains(t, s, "REPO_NAME=\"${SOURCE_REPO#*/}\"")
-	assert.Contains(t, s, "repo is not enabled in config.yaml")
-	// Verify required environment variables
-	assert.Contains(t, s, "${SOURCE_REPO:?SOURCE_REPO is required}")
-	assert.Contains(t, s, "${GITHUB_REPOSITORY_OWNER:?GITHUB_REPOSITORY_OWNER is required}")
-	// Verify error messages use ::error:: format
-	assert.Contains(t, s, "::error::")
-	// Verify config.yaml existence check (not masked by 2>/dev/null)
-	assert.Contains(t, s, "config.yaml not found")
-	// Verify yq availability check
-	assert.Contains(t, s, "yq command not found")
-}
-
-func TestCodeHarnessContent(t *testing.T) {
-	content, err := FullsendRepoFile("harness/code.yaml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "agents/code.md")
-	assert.Contains(t, s, "pre_script")
-	assert.Contains(t, s, "post_script")
-	assert.Contains(t, s, "runner_env")
-	assert.Contains(t, s, "PUSH_TOKEN")
-}
-
-func TestScanSecretsContent(t *testing.T) {
-	content, err := FullsendRepoFile("scripts/scan-secrets")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "gitleaks")
-	assert.Contains(t, s, "scan-secrets")
-}
-
-func TestScanSecretsImageMatchesScaffold(t *testing.T) {
-	imageContent, err := os.ReadFile("../../images/code/scan-secrets")
-	require.NoError(t, err)
-	scaffoldContent, err := FullsendRepoFile("scripts/scan-secrets")
-	require.NoError(t, err)
-	assert.Equal(t, string(imageContent), string(scaffoldContent),
-		"images/code/scan-secrets must stay in sync with scaffold scripts/scan-secrets")
-}
-
 func TestSetupAgentEnvContent(t *testing.T) {
 	content, err := FullsendRepoFile(".github/scripts/setup-agent-env.sh")
 	require.NoError(t, err)
 	s := string(content)
 	assert.Contains(t, s, "AGENT_PREFIX")
 	assert.Contains(t, s, "GITHUB_ENV")
-}
-
-func TestTriageAgentPromptContent(t *testing.T) {
-	content, err := FullsendRepoFile("agents/triage.md")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "agent-result.json")
-	assert.Contains(t, s, "clarity_scores")
-	assert.Contains(t, s, "Anti-premature-resolution")
-}
-
-func TestTriageSchemaContent(t *testing.T) {
-	content, err := FullsendRepoFile("schemas/triage-result.schema.json")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "$schema")
-	assert.Contains(t, s, "insufficient")
-	assert.Contains(t, s, "duplicate")
-	assert.Contains(t, s, "sufficient")
-}
-
-func TestHarnessesLoadAndValidate(t *testing.T) {
-	// Extract the full scaffold to a temp dir so harness.Load can resolve
-	// relative paths and validate that referenced files exist. This catches
-	// harness validation errors (e.g., missing fields, invalid combinations)
-	// the same way the runner would at startup.
-	dir := t.TempDir()
-	err := WalkFullsendRepoAll(func(path string, content []byte) error {
-		dest := filepath.Join(dir, path)
-		if mkErr := os.MkdirAll(filepath.Dir(dest), 0o755); mkErr != nil {
-			return mkErr
-		}
-		return os.WriteFile(dest, content, 0o644)
-	})
-	require.NoError(t, err, "extracting scaffold")
-
-	// Find all harness YAML files.
-	entries, err := os.ReadDir(filepath.Join(dir, "harness"))
-	require.NoError(t, err)
-
-	var loaded int
-	for _, e := range entries {
-		if e.IsDir() || (!strings.HasSuffix(e.Name(), ".yaml") && !strings.HasSuffix(e.Name(), ".yml")) {
-			continue
-		}
-		t.Run(e.Name(), func(t *testing.T) {
-			harnessPath := filepath.Join(dir, "harness", e.Name())
-
-			t.Run("Load", func(t *testing.T) {
-				h, loadErr := harness.Load(harnessPath)
-				require.NoError(t, loadErr, "Load should succeed")
-
-				// Top-level pre/post scripts serve as defaults even
-				// without forge resolution (local dev without --forge).
-				assert.NotEmpty(t, h.PreScript, "PreScript should be set at top level as default")
-				assert.NotEmpty(t, h.PostScript, "PostScript should be set at top level as default")
-				assert.NotNil(t, h.Forge, "Forge map should be present")
-				assert.Contains(t, h.Forge, "github", "Forge should have a github key")
-
-				resolveErr := h.ResolveRelativeTo(dir)
-				require.NoError(t, resolveErr, "ResolveRelativeTo should succeed")
-
-				existErr := h.ValidateFilesExist()
-				require.NoError(t, existErr, "ValidateFilesExist should succeed")
-			})
-
-			t.Run("LoadWithOpts_github", func(t *testing.T) {
-				h, loadErr := harness.LoadWithOpts(harnessPath, harness.LoadOpts{ForgePlatform: "github"})
-				require.NoError(t, loadErr, "LoadWithOpts should succeed")
-
-				assert.Nil(t, h.Forge, "Forge should be nil after resolution")
-				assert.NotEmpty(t, h.PreScript, "PreScript should be set after forge resolution")
-				assert.NotEmpty(t, h.PostScript, "PostScript should be set after forge resolution")
-				assert.NotEmpty(t, h.RunnerEnv, "RunnerEnv should be non-empty after merge")
-
-				resolveErr := h.ResolveRelativeTo(dir)
-				require.NoError(t, resolveErr, "ResolveRelativeTo should succeed")
-
-				existErr := h.ValidateFilesExist()
-				require.NoError(t, existErr, "ValidateFilesExist should succeed")
-			})
-		})
-		loaded++
+	// Per-run override passthrough from repository variables (#6526).
+	assert.Contains(t, s, "FULLSEND_REPO_VARS")
+	for _, key := range []string{"FULLSEND_RUNTIME", "FULLSEND_MODEL", "FULLSEND_EFFORT", "FULLSEND_FALLBACK_MODELS", "FULLSEND_PI_PROVIDER", "FULLSEND_PI_MODEL", "FULLSEND_CODEX_MODEL"} {
+		assert.Contains(t, s, key)
 	}
-	assert.True(t, loaded >= 2, "expected at least 2 harnesses, got %d", loaded)
-}
-
-func TestHarnessForgeRunnerEnvMerge(t *testing.T) {
-	dir := t.TempDir()
-	err := WalkFullsendRepoAll(func(path string, content []byte) error {
-		dest := filepath.Join(dir, path)
-		if mkErr := os.MkdirAll(filepath.Dir(dest), 0o755); mkErr != nil {
-			return mkErr
-		}
-		return os.WriteFile(dest, content, 0o644)
-	})
-	require.NoError(t, err, "extracting scaffold")
-
-	tests := []struct {
-		file            string
-		topLevelKeys    []string
-		forgeGithubKeys []string
-	}{
-		{
-			file:            "triage.yaml",
-			topLevelKeys:    []string{"FULLSEND_OUTPUT_SCHEMA"},
-			forgeGithubKeys: []string{"GITHUB_ISSUE_URL", "GH_TOKEN"},
-		},
-		{
-			file:            "code.yaml",
-			topLevelKeys:    []string{"CODE_ALLOWED_TARGET_BRANCHES", "FULLSEND_OUTPUT_SCHEMA", "FULLSEND_OUTPUT_FILE"},
-			forgeGithubKeys: []string{"PUSH_TOKEN", "PUSH_TOKEN_SOURCE", "REPO_FULL_NAME", "ISSUE_NUMBER", "REPO_DIR"},
-		},
-		{
-			file:            "review.yaml",
-			topLevelKeys:    []string{"FULLSEND_OUTPUT_SCHEMA"},
-			forgeGithubKeys: []string{"REVIEW_TOKEN", "REPO_FULL_NAME", "PR_NUMBER", "GITHUB_PR_URL"},
-		},
-		{
-			file:            "fix.yaml",
-			topLevelKeys:    []string{"TARGET_BRANCH", "TRIGGER_SOURCE", "HUMAN_INSTRUCTION", "FIX_ITERATION", "REVIEW_BODY_FILE", "PRE_AGENT_HEAD", "FULLSEND_OUTPUT_SCHEMA", "FULLSEND_OUTPUT_FILE"},
-			forgeGithubKeys: []string{"PUSH_TOKEN", "PUSH_TOKEN_SOURCE", "REPO_FULL_NAME", "PR_NUMBER", "REPO_DIR"},
-		},
-		{
-			file:            "retro.yaml",
-			topLevelKeys:    []string{"FULLSEND_OUTPUT_SCHEMA"},
-			forgeGithubKeys: []string{"ORIGINATING_URL", "REPO_FULL_NAME", "GH_TOKEN"},
-		},
-		{
-			file:            "prioritize.yaml",
-			topLevelKeys:    []string{"FULLSEND_OUTPUT_SCHEMA"},
-			forgeGithubKeys: []string{"GITHUB_ISSUE_URL", "GH_TOKEN", "ORG", "PROJECT_NUMBER"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.file, func(t *testing.T) {
-			harnessPath := filepath.Join(dir, "harness", tt.file)
-			h, loadErr := harness.LoadWithOpts(harnessPath, harness.LoadOpts{ForgePlatform: "github"})
-			require.NoError(t, loadErr)
-
-			for _, key := range tt.topLevelKeys {
-				assert.Contains(t, h.RunnerEnv, key, "merged RunnerEnv should contain top-level key %s", key)
-			}
-			for _, key := range tt.forgeGithubKeys {
-				assert.Contains(t, h.RunnerEnv, key, "merged RunnerEnv should contain forge.github key %s", key)
-			}
-		})
-	}
-}
-
-func TestRepoMaintenanceWorkflowContent(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/repo-maintenance.yml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "config.yaml")
-	assert.Contains(t, s, "templates/shim-workflow-call.yaml",
-		"push trigger must include workflow_call shim template so changes propagate to enrolled repos")
-	assert.NotContains(t, s, "templates/shim-workflow.yaml",
-		"PAT shim template reference should be removed")
-	assert.Contains(t, s, "fullsend-ai/fullsend/.github/actions/mint-token@__FULLSEND_AI_REF__")
-	assert.Contains(t, s, "Checkout upstream scripts")
-	assert.Contains(t, s, "Prepare scripts")
-	assert.Contains(t, s, "customized/scripts")
-	assert.Contains(t, s, "role: fullsend")
-	assert.Contains(t, s, "id-token: write")
-	assert.NotContains(t, s, "create-github-app-token")
-	assert.NotContains(t, s, "FULLSEND_FULLSEND_CLIENT_ID")
-	assert.NotContains(t, s, "./.github/actions/")
-}
-
-func TestRepoMaintenanceTokenCoversAllRepos(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/repo-maintenance.yml")
-	require.NoError(t, err)
-	s := string(content)
-
-	// The mint-token step must request access to ALL repos (enabled + disabled),
-	// not just enabled ones. Without access to disabled repos, the reconcile
-	// script can't check for or remove the shim workflow, and silently skips
-	// unenrollment (gh api fails, 2>/dev/null hides it, script thinks "already
-	// unenrolled").
-	assert.Contains(t, s, "select(.value.enabled == true or .value.enabled == false)",
-		"repo-list step must extract both enabled and disabled repos so the minted token covers them for unenrollment")
-}
-
-func TestReconcileReposContent(t *testing.T) {
-	content, err := FullsendRepoFile("scripts/reconcile-repos.sh")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "shim-workflow-call.yaml")
-	assert.NotContains(t, s, "shim-workflow.yaml\"",
-		"reconcile-repos.sh should not reference deleted PAT shim template")
-	assert.NotContains(t, s, "dispatch.mode",
-		"reconcile-repos.sh should not parse dispatch mode")
-	assert.Contains(t, s, "private repos cannot be enrolled",
-		"reconcile-repos.sh should skip private repos to prevent log exposure")
 }
 
 func TestPrioritizeWorkflowContent(t *testing.T) {
@@ -773,6 +605,8 @@ func TestPrioritizeWorkflowContent(t *testing.T) {
 	assert.NotContains(t, s, "secrets: inherit")
 	assert.Contains(t, s, "FULLSEND_GCP_WIF_PROVIDER: ${{ secrets.FULLSEND_GCP_WIF_PROVIDER }}")
 	assert.Contains(t, s, "FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}")
+	assert.Contains(t, s, "FULLSEND_OPENAI_API_KEY: ${{ secrets.FULLSEND_OPENAI_API_KEY }}")
+	assert.Contains(t, s, "FULLSEND_INFERENCE_GATEWAY_API_KEY: ${{ secrets.FULLSEND_INFERENCE_GATEWAY_API_KEY }}")
 	assert.Contains(t, s, "concurrency:")
 	assert.Contains(t, s, "fullsend-prioritize-")
 	assert.Contains(t, s, "cancel-in-progress: true")
@@ -783,122 +617,26 @@ func TestPrioritizeWorkflowContent(t *testing.T) {
 	assert.Contains(t, s, "contents: read")
 }
 
-func TestPrioritizeSchedulerWorkflowContent(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/prioritize-scheduler.yml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "# schedule:", "cron trigger should be commented out by default (#778)")
-	assert.Contains(t, s, "#   - cron:", "cron trigger should be commented out by default (#778)")
-	assert.Contains(t, s, "workflow_dispatch")
-	assert.Contains(t, s, "fullsend-prioritize-scheduler")
-	assert.Contains(t, s, "RICE Score")
-	assert.Contains(t, s, "prioritize.yml")
-	assert.Contains(t, s, "FULLSEND_PROJECT_NUMBER")
-	assert.Contains(t, s, "FULLSEND_PROJECT_NUMBER is not set; skipping prioritize scheduler")
-	guardIndex := strings.Index(s, `if [[ -z "${PROJECT_NUMBER}" ]]; then`)
-	projectViewIndex := strings.Index(s, `gh project view "${PROJECT_NUMBER}"`)
-	require.NotEqual(t, -1, guardIndex)
-	require.NotEqual(t, -1, projectViewIndex)
-	assert.Less(t, guardIndex, projectViewIndex, "PROJECT_NUMBER must be checked before gh project view")
-	assert.Contains(t, s, "fullsend-ai/fullsend/.github/actions/mint-token@__FULLSEND_AI_REF__")
-	assert.Contains(t, s, "role: fullsend")
-	assert.Contains(t, s, "id-token: write")
-	assert.NotContains(t, s, "create-github-app-token")
-	assert.NotContains(t, s, "FULLSEND_FULLSEND_CLIENT_ID")
-}
-
-func TestPrioritizeSchedulerSkipsWhenProjectNumberUnset(t *testing.T) {
-	content, err := FullsendRepoFile(".github/workflows/prioritize-scheduler.yml")
-	require.NoError(t, err)
-
-	var workflow struct {
-		Jobs map[string]struct {
-			Steps []struct {
-				Name string `yaml:"name"`
-				Run  string `yaml:"run"`
-			} `yaml:"steps"`
-		} `yaml:"jobs"`
-	}
-	require.NoError(t, yaml.Unmarshal(content, &workflow))
-
-	dispatchJob, ok := workflow.Jobs["dispatch"]
-	require.True(t, ok, "dispatch job should exist")
-
-	var runScript string
-	for _, step := range dispatchJob.Steps {
-		if step.Name == "Find issues and dispatch prioritize runs" {
-			runScript = step.Run
-			break
+func TestScaffoldShimsForwardOpenAIAPIKey(t *testing.T) {
+	const gcpForward = "FULLSEND_GCP_PROJECT_ID: ${{ secrets.FULLSEND_GCP_PROJECT_ID }}"
+	const openAIForward = "FULLSEND_OPENAI_API_KEY: ${{ secrets.FULLSEND_OPENAI_API_KEY }}"
+	var checked int
+	err := WalkFullsendRepoAll(func(path string, content []byte) error {
+		if !strings.HasSuffix(path, ".yml") && !strings.HasSuffix(path, ".yaml") {
+			return nil
 		}
-	}
-	require.NotEmpty(t, runScript, "prioritize scheduler dispatch script should exist")
-
-	tmpDir := t.TempDir()
-	binDir := filepath.Join(tmpDir, "bin")
-	require.NoError(t, os.Mkdir(binDir, 0o755))
-
-	ghLog := filepath.Join(tmpDir, "gh-calls.log")
-	fakeGH := "#!/usr/bin/env bash\n" +
-		"printf 'gh called: %s\\n' \"$*\" >> " + strconv.Quote(ghLog) + "\n" +
-		"exit 99\n"
-	ghPath := filepath.Join(binDir, "gh")
-	require.NoError(t, os.WriteFile(ghPath, []byte(fakeGH), 0o755))
-
-	scriptPath := filepath.Join(tmpDir, "prioritize-scheduler-run.sh")
-	require.NoError(t, os.WriteFile(scriptPath, []byte(runScript), 0o755))
-
-	cmd := exec.Command("bash", scriptPath)
-	cmd.Env = []string{
-		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
-		"PROJECT_NUMBER=",
-		"ORG=test-org",
-		"GH_TOKEN=test-token",
-		"WIP_LIMIT=5",
-		"STALE_THRESHOLD=7d",
-		"GITHUB_REPOSITORY=test-org/.fullsend",
-	}
-
-	output, err := cmd.CombinedOutput()
-	require.NoError(t, err, string(output))
-	assert.Contains(t, string(output), "FULLSEND_PROJECT_NUMBER is not set; skipping prioritize scheduler")
-	_, statErr := os.Stat(ghLog)
-	assert.True(t, os.IsNotExist(statErr), "gh should not be called when PROJECT_NUMBER is unset")
-}
-
-func TestPrioritizeAgentPromptContent(t *testing.T) {
-	content, err := FullsendRepoFile("agents/prioritize.md")
+		s := string(content)
+		if !strings.Contains(s, gcpForward) {
+			return nil
+		}
+		checked++
+		assert.Contains(t, s, openAIForward,
+			"%s forwards FULLSEND_GCP_PROJECT_ID but not FULLSEND_OPENAI_API_KEY", path)
+		return nil
+	})
 	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "agent-result.json")
-	assert.Contains(t, s, "RICE")
-	assert.Contains(t, s, "Reach")
-	assert.Contains(t, s, "Impact")
-	assert.Contains(t, s, "Confidence")
-	assert.Contains(t, s, "Effort")
-	assert.Contains(t, s, "customer-research skill")
-}
-
-func TestPrioritizeSchemaContent(t *testing.T) {
-	content, err := FullsendRepoFile("schemas/prioritize-result.schema.json")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "$schema")
-	assert.Contains(t, s, "reach")
-	assert.Contains(t, s, "impact")
-	assert.Contains(t, s, "confidence")
-	assert.Contains(t, s, "effort")
-	assert.Contains(t, s, "reasoning")
-}
-
-func TestPrioritizeHarnessContent(t *testing.T) {
-	content, err := FullsendRepoFile("harness/prioritize.yaml")
-	require.NoError(t, err)
-	s := string(content)
-	assert.Contains(t, s, "agents/prioritize.md")
-	assert.Contains(t, s, "pre_script")
-	assert.Contains(t, s, "post_script")
-	assert.Contains(t, s, "runner_env")
-	assert.Contains(t, s, "PROJECT_NUMBER")
+	assert.GreaterOrEqual(t, checked, 2,
+		"expected at least the prioritize thin caller and the per-repo shim to forward GCP_PROJECT_ID")
 }
 
 func TestAllScaffoldYAMLDocumentStartMarker(t *testing.T) {
@@ -915,7 +653,7 @@ func TestAllScaffoldYAMLDocumentStartMarker(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
-	assert.True(t, checked >= 20, "expected at least 20 YAML files, got %d", checked)
+	assert.True(t, checked >= 10, "expected at least 10 YAML files, got %d", checked)
 }
 
 func TestManagedHeader(t *testing.T) {
@@ -925,8 +663,8 @@ func TestManagedHeader(t *testing.T) {
 	}{
 		// YAML workflow files get a header
 		{
-			path:   ".github/workflows/triage.yml",
-			expect: "# This file is managed by fullsend. Do not edit it directly.\n# Upstream: https://github.com/fullsend-ai/fullsend/blob/main/internal/scaffold/fullsend-repo/.github/workflows/triage.yml\n",
+			path:   ".github/workflows/prioritize.yml",
+			expect: "# This file is managed by fullsend. Do not edit it directly.\n# Upstream: https://github.com/fullsend-ai/fullsend/blob/main/internal/scaffold/fullsend-repo/.github/workflows/prioritize.yml\n",
 		},
 		// YAML template files get a header
 		{
@@ -935,12 +673,10 @@ func TestManagedHeader(t *testing.T) {
 		},
 		// Markdown files are skipped (user-readable docs)
 		{path: "AGENTS.md", expect: ""},
-		// .gitkeep files are skipped
-		{path: "customized/agents/.gitkeep", expect: ""},
 		// JSON files are skipped (no comment syntax)
-		{path: "schemas/triage-result.schema.json", expect: ""},
+		{path: "data/example.json", expect: ""},
 		// Shell scripts get a header
-		{path: "scripts/pre-triage.sh", expect: "# This file is managed by fullsend. Do not edit it directly.\n# Upstream: https://github.com/fullsend-ai/fullsend/blob/main/internal/scaffold/fullsend-repo/scripts/pre-triage.sh\n"},
+		{path: "scripts/setup-prioritize.sh", expect: "# This file is managed by fullsend. Do not edit it directly.\n# Upstream: https://github.com/fullsend-ai/fullsend/blob/main/internal/scaffold/fullsend-repo/scripts/setup-prioritize.sh\n"},
 	}
 
 	for _, tc := range tests {
@@ -954,8 +690,8 @@ func TestManagedHeader(t *testing.T) {
 func TestManagedHeaderPreservesShebang(t *testing.T) {
 	// When content starts with #!, the header should go after the shebang line
 	content := []byte("#!/bin/bash\nset -euo pipefail\n")
-	header := ManagedHeader("scripts/pre-triage.sh")
-	result := PrependManagedHeader("scripts/pre-triage.sh", content)
+	header := ManagedHeader("scripts/setup-prioritize.sh")
+	result := PrependManagedHeader("scripts/setup-prioritize.sh", content)
 
 	assert.True(t, strings.HasPrefix(string(result), "#!/bin/bash\n"))
 	assert.Contains(t, string(result), header)
@@ -968,7 +704,134 @@ func TestPrependManagedHeaderNoHeader(t *testing.T) {
 	assert.Equal(t, content, result, "files without headers should be returned unchanged")
 }
 
-func TestValidateTriageDeleted(t *testing.T) {
-	_, err := FullsendRepoFile("scripts/validate-triage.sh")
-	assert.Error(t, err, "validate-triage.sh should have been deleted")
+func TestScaffoldGitHubROProfile_GraphQLEndpoint(t *testing.T) {
+	data, err := FullsendRepoFile("profiles/fullsend-github-ro.yaml")
+	require.NoError(t, err)
+
+	var profile struct {
+		Endpoints []struct {
+			Host        string `yaml:"host"`
+			Port        int    `yaml:"port"`
+			Protocol    string `yaml:"protocol"`
+			Access      string `yaml:"access"`
+			Enforcement string `yaml:"enforcement"`
+			Path        string `yaml:"path"`
+		} `yaml:"endpoints"`
+	}
+	require.NoError(t, yaml.Unmarshal(data, &profile))
+
+	// The scaffold copy must include exactly one GraphQL endpoint for
+	// api.github.com so that generated agents can use `gh --json`,
+	// `gh issue view`, etc. without an egress policy denial. Its shape
+	// matches the fullsend-ai/agents copy of this profile. See #7014.
+	var found int
+	for _, ep := range profile.Endpoints {
+		if ep.Host != "api.github.com" || ep.Protocol != "graphql" {
+			continue
+		}
+		found++
+		assert.Equal(t, 443, ep.Port,
+			"GraphQL endpoint port must be 443")
+		assert.Equal(t, "/graphql", ep.Path,
+			"GraphQL endpoint path must be /graphql")
+		assert.Equal(t, "read-only", ep.Access,
+			"GraphQL endpoint access must be read-only")
+		assert.Equal(t, "enforce", ep.Enforcement,
+			"GraphQL endpoint enforcement must be enforce")
+	}
+	assert.Equal(t, 1, found,
+		"scaffold fullsend-github-ro profile must include exactly one GraphQL endpoint for api.github.com")
+}
+
+func TestScaffoldPackageRegistriesProfile_Permissions(t *testing.T) {
+	data, err := FullsendRepoFile("profiles/fullsend-package-registries.yaml")
+	require.NoError(t, err)
+
+	var profile struct {
+		Endpoints []struct {
+			Host              string `yaml:"host"`
+			AllowEncodedSlash bool   `yaml:"allow_encoded_slash"`
+		} `yaml:"endpoints"`
+		Binaries []string `yaml:"binaries"`
+	}
+	require.NoError(t, yaml.Unmarshal(data, &profile))
+
+	// The embedded copy is the authoritative definition of this built-in
+	// provider, so it must keep the permissions the fullsend-ai/agents copy
+	// has. Scoped npm package metadata requests use a %2F-encoded slash,
+	// which the proxy rejects unless allow_encoded_slash is set. See #8007.
+	encodedSlash := map[string]bool{}
+	for _, ep := range profile.Endpoints {
+		encodedSlash[ep.Host] = ep.AllowEncodedSlash
+	}
+	npmHosts := map[string]bool{"registry.npmjs.org": true, "registry.yarnpkg.com": true}
+	for host := range npmHosts {
+		require.Contains(t, encodedSlash, host,
+			"scaffold package-registries profile must include endpoint %s", host)
+	}
+	require.Contains(t, encodedSlash, "pypi.org",
+		"scaffold package-registries profile must include endpoint pypi.org")
+	// allow_encoded_slash is scoped to the npm registries only.
+	for host, allowed := range encodedSlash {
+		assert.Equal(t, npmHosts[host], allowed,
+			"endpoint %s: allow_encoded_slash must be set exactly on the npm registries", host)
+	}
+
+	for _, bin := range []string{"**/uv", "**/uvx"} {
+		assert.Contains(t, profile.Binaries, bin,
+			"scaffold package-registries profile must allow binary %s", bin)
+	}
+}
+
+func TestScaffoldGitleaksProfile_Permissions(t *testing.T) {
+	data, err := FullsendRepoFile("profiles/fullsend-gitleaks.yaml")
+	require.NoError(t, err)
+
+	var profile struct {
+		Binaries []string `yaml:"binaries"`
+	}
+	require.NoError(t, yaml.Unmarshal(data, &profile))
+
+	// pre-commit uses git to clone the gitleaks hook repository from
+	// github.com; the fullsend-ai/agents copy allowed it. See #8007.
+	assert.Contains(t, profile.Binaries, "**/git",
+		"scaffold gitleaks profile must allow binary **/git")
+}
+
+func TestScaffoldVertexProfile_BinaryAllowlist(t *testing.T) {
+	data, err := FullsendRepoFile("profiles/fullsend-vertex-ai.yaml")
+	require.NoError(t, err)
+
+	var profile struct {
+		Binaries []string `yaml:"binaries"`
+	}
+	require.NoError(t, yaml.Unmarshal(data, &profile))
+
+	// Pin the whole list, not just the two entries #6971 added: this copy
+	// must stay in sync with profiles/fullsend-vertex-ai.yaml in
+	// fullsend-ai/agents (the fleet copy), which is what the sandbox
+	// actually enforces. Claude Code 2.1.2xx installs its native binary at
+	// bin/claude.exe even on Linux, so **/claude alone denies it STS access.
+	assert.ElementsMatch(t, []string{"**/claude", "**/claude.exe", "**/node", "**/opencode", "**/pi"}, profile.Binaries,
+		"scaffold Vertex profile binaries drifted from the pinned allowlist; keep it in sync with the fullsend-ai/agents copy")
+}
+
+// walkFixture holds .fullsend-cache dirs (force-added past the root
+// .gitignore) so the skip runs against a real embed.FS (#5184).
+//
+//go:embed all:testdata/walkembedfs
+var walkFixture embed.FS
+
+func TestWalkEmbedFSSkipsFullsendCache(t *testing.T) {
+	var got []string
+	// nil skip matches WalkGitLabPerRepo: the exclusion must not depend on it.
+	err := walkEmbedFS(walkFixture, "testdata/walkembedfs", func(path string, _ []byte) error {
+		got = append(got, path)
+		return nil
+	}, nil)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{
+		".fullsend/config.yaml",
+		"notes/.fullsend-cache",
+	}, got)
 }

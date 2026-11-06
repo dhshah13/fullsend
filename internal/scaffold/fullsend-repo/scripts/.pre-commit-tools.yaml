@@ -32,17 +32,12 @@
 #   language: node    → pre-commit handles via npm (DO NOT add)
 #   language: docker_image → pre-commit handles via docker pull (DO NOT add)
 #
-# Customization (three layers, highest priority wins):
-#   L1 full replacement:
-#     Per-org:  customized/scripts/.pre-commit-tools.yaml in .fullsend config repo
-#     Per-repo: .fullsend/customized/scripts/.pre-commit-tools.yaml in target repo
-#     The customized file completely replaces these defaults.
-#   L2 additive merge:
-#     Per-repo: .pre-commit-tools.yaml at target repo root
-#     Entries are merged with upstream/org defaults. New entries extend,
-#     matching (repo, hook_id) entries override, exclude: true suppresses.
-#     Read from the base branch only (not the PR head) for security.
-#     See ADR 0056 for details.
+# Customization (per-repo additive merge):
+#   Place a .pre-commit-tools.yaml at the target repo root.
+#   Entries are merged with upstream/org defaults. New entries extend,
+#   matching (repo, hook_id) entries override, exclude: true suppresses.
+#   Read from the base branch only (not the PR head) for security.
+#   See ADR 0056 for details.
 
 tools:
   # ── lychee (markdown link checker) ────────────────────────────────

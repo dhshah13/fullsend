@@ -11,10 +11,100 @@
       "automerge": true
     },
     {
+      "description": "Automerge minor GitHub Actions updates (SHA-pinned, low-risk)",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor"],
+      "automerge": true
+    },
+    {
+      "description": "Auto-merge submodule bumps (low-risk digest updates)",
+      "matchManagers": ["git-submodules"],
+      "automerge": true
+    },
+    {
       "description": "Ignore fullsend self-references (own reusable workflows and actions)",
       "matchManagers": ["github-actions"],
       "matchPackageNames": ["/^fullsend-ai\\//"],
       "enabled": false
+    },
+    {
+      "description": "Group OpenShell base image and version pin into one PR. After a version bump, fetch and update OPENSHELL_SHA from the matching release tag (the github-releases datasource can't resolve a digest here because extractVersionTemplate strips the 'v' prefix that GitHub's tag lookup needs). Hold updates for 2 days so a release pulled upstream soon after publishing never becomes a PR (#4076, #3967). minimumReleaseAgeBehaviour=timestamp-optional is required: Renovate age-checks digest updates too, but ghcr gives it no release dates for the digest-pinned base image, so under the default timestamp-required every base-image update would be held forever. The version pin has a GitHub release date and is still held for 2 days.",
+      "matchPackageNames": [
+        "ghcr.io/nvidia/openshell-community/sandboxes/base",
+        "NVIDIA/OpenShell"
+      ],
+      "groupName": "openshell",
+      "automerge": false,
+      "minimumReleaseAge": "2 days",
+      "minimumReleaseAgeBehaviour": "timestamp-optional",
+      "postUpgradeTasks": {
+        "commands": ["bash scripts/renovate/update-openshell-sha.sh"],
+        "fileFilters": [".github/scripts/openshell-version.sh"],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "description": "Group Cloudflare Worker packages to prevent broken lockfile-only PRs from peer dependency conflicts",
+      "matchPackageNames": ["/^@cloudflare\\//", "wrangler", "miniflare"],
+      "groupName": "cloudflare-workers"
+    },
+    {
+      "description": "Red Hat rebuilds the UBI 10 base images (images/runner/Containerfile) almost daily. Group their digest bumps into one PR and only open it on Mondays (UTC) to cut the daily churn of protected-path PRs (#8187). Tag/version bumps are not affected.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["/^registry\\.access\\.redhat\\.com\\/ubi10\\//"],
+      "matchUpdateTypes": ["digest"],
+      "groupName": "ubi10 base images",
+      "schedule": ["* * * * 1"]
+    },
+    {
+      "description": "After cosign version bump, verify the new binary's sigstore signature and update COSIGN_SHA256",
+      "matchPackageNames": ["sigstore/cosign"],
+      "automerge": false,
+      "postUpgradeTasks": {
+        "commands": ["bash scripts/renovate/update-cosign-checksum.sh"],
+        "fileFilters": ["scripts/renovate/update-tirith-checksums.sh"],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "description": "After tirith version bump, fetch and update SHA256 checksums from the release",
+      "matchPackageNames": ["sheeki03/tirith"],
+      "automerge": false,
+      "postUpgradeTasks": {
+        "commands": ["bash scripts/renovate/update-tirith-checksums.sh"],
+        "fileFilters": ["images/sandbox/Containerfile"],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "description": "After a Go toolchain bump in the code and runner images, fetch and update GO_SHA256_{AMD64,ARM64} in both Containerfiles from https://go.dev/dl/?mode=json&include=all (#8617)",
+      "matchDatasources": ["golang-version"],
+      "matchPackageNames": ["golang"],
+      "postUpgradeTasks": {
+        "commands": ["bash scripts/renovate/update-go-checksums.sh"],
+        "fileFilters": ["images/code/Containerfile", "images/runner/Containerfile"],
+        "executionMode": "branch"
+      }
+    },
+    {
+      "description": "pi releases ~weekly minors and has changed its --mode json wire shape within a minor before (0.84.0); require manual review so the stream parser fixtures (#6464) are re-verified before a pin bump lands, even for patch/pin updates",
+      "matchPackageNames": ["@earendil-works/pi-coding-agent"],
+      "automerge": false
+    },
+    {
+      "description": "Vendored pi-anthropic-vertex extension (fullsend-ai/pi-anthropic-vertex, #7019): tag pin + manual SHA256 refresh from the release notes.",
+      "matchPackageNames": ["fullsend-ai/pi-anthropic-vertex"],
+      "automerge": false
+    },
+    {
+      "description": "Vendored pi-inference-gateway extension (fullsend-ai/pi-inference-gateway, #8262): tag pin + manual SHA256 refresh from the release notes.",
+      "matchPackageNames": ["fullsend-ai/pi-inference-gateway"],
+      "automerge": false
+    },
+    {
+      "description": "codex minor bumps change the `codex exec --json` wire shape and the hook payloads, so the stream fixtures under internal/runtime/testdata/codex and the hook adapter must be re-verified before a pin move lands, even for patch/pin updates — the same reason pi is not automerged (#6920)",
+      "matchPackageNames": ["@openai/codex"],
+      "automerge": false
     }
   ],
   "postUpdateOptions": ["gomodTidy"],
@@ -29,13 +119,176 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Track OpenShell version pin in openshell-version.sh",
+      "description": "Track the OpenShell version pin in openshell-version.sh. OPENSHELL_SHA is updated automatically by postUpgradeTasks (scripts/renovate/update-openshell-sha.sh) since the github-releases datasource can't resolve a digest for the version-only (no 'v' prefix) value produced by extractVersionTemplate.",
       "managerFilePatterns": ["/^\\.github/scripts/openshell-version\\.sh$/"],
       "matchStrings": [
-        "OPENSHELL_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)\\nOPENSHELL_SHA=(?<currentDigest>[0-9a-f]{40})"
+        "OPENSHELL_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
       ],
       "depNameTemplate": "NVIDIA/OpenShell",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the OpenShell version copies in the local agents guide (install snippet and supervisor image example) so they bump in the same openshell group PR as openshell-version.sh (#4808).",
+      "managerFilePatterns": ["/^docs/guides/user/running-agents-locally\\.md$/"],
+      "matchStrings": [
+        "export OPENSHELL_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "ghcr\\.io/nvidia/openshell/supervisor:(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "NVIDIA/OpenShell",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the OpenShell tag in the gateway configuration link of the harness reference (migrating proxy and certificate settings), so the link follows the pin in the same openshell group PR instead of pointing at a tag the pinned gateway does not match (#3373).",
+      "managerFilePatterns": ["/^docs/reference/harness-reference\\.md$/"],
+      "matchStrings": [
+        "github\\.com/NVIDIA/OpenShell/blob/v(?<currentValue>\\d+\\.\\d+\\.\\d+)/"
+      ],
+      "depNameTemplate": "NVIDIA/OpenShell",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the gcloud CLI version pin in the runner image. GCLOUD_SHA256_{AMD64,ARM64} must be refreshed manually from https://cloud.google.com/sdk/docs/install — the runner-image PR build fails on checksum mismatch until they are.",
+      "managerFilePatterns": ["/^images/runner/Containerfile$/"],
+      "matchStrings": [
+        "ARG GCLOUD_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "gcr.io/google.com/cloudsdktool/google-cloud-cli",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the Go toolchain version pin baked into the code and runner sandbox images (images/code/Containerfile and images/runner/Containerfile, which must stay in sync per their own comments). GO_SHA256_{AMD64,ARM64} in both files are updated automatically by postUpgradeTasks (scripts/renovate/update-go-checksums.sh).",
+      "managerFilePatterns": [
+        "/^images/code/Containerfile$/",
+        "/^images/runner/Containerfile$/"
+      ],
+      "matchStrings": [
+        "ARG GO_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "golang",
+      "datasourceTemplate": "golang-version"
+    },
+    {
+      "customType": "regex",
+      "description": "Track wranglerVersion pins in site-deploy.yml so they bump with the cloudflare-workers group",
+      "managerFilePatterns": ["/^\\.github/workflows/site-deploy\\.yml$/"],
+      "matchStrings": [
+        "wranglerVersion: \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "wrangler",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track Claude Code version pin in sandbox Containerfile",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "CLAUDE_CODE_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "@anthropic-ai/claude-code",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the pi-anthropic-vertex extension tag pinned in the sandbox image (fullsend-ai/pi-anthropic-vertex, #7019). Refresh PI_ANTHROPIC_VERTEX_SHA256 by hand from the release notes \u2014 the image build fails on checksum mismatch until then. The extension's own CI matrix (pinned PI_VERSION + latest pi) is the compatibility check.",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG PI_ANTHROPIC_VERTEX_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "fullsend-ai/pi-anthropic-vertex",
       "datasourceTemplate": "github-tags",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the pi-xai-vertex extension tag pinned in the sandbox image (#6571). PI_XAI_VERTEX_SHA256 must be refreshed manually (sha256sum of the GitHub tag tarball) — the sandbox-image PR build fails on checksum mismatch until it is. Like pi-anthropic-vertex this extension mirrors no pi internals, so there is no sync/compat.json to re-check; confirm its peerDependencies floor still covers PI_VERSION instead (declared only — it installs with --omit=peer, so nothing enforces the floor at build time).",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG PI_XAI_VERTEX_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "fullsend-ai/pi-xai-vertex",
+      "datasourceTemplate": "github-tags",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the pi-inference-gateway extension tag pinned in the sandbox image (fullsend-ai/pi-inference-gateway, #8262). PI_INFERENCE_GATEWAY_SHA256 must be refreshed manually from the release notes (sha256sum of the GitHub tag tarball) — the sandbox-image PR build fails on checksum mismatch until it is. Like the Vertex extensions it mirrors no pi internals; the extension's own CI matrix (pinned PI_VERSION + latest pi) is the compatibility check.",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG PI_INFERENCE_GATEWAY_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "fullsend-ai/pi-inference-gateway",
+      "datasourceTemplate": "github-tags",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the ripgrep pin in the sandbox image (pi's grep backend). Not automerged: RIPGREP_SHA256_{AMD64,ARM64} must be refreshed by hand from the release's .tar.gz.sha256 assets; the image build fails on a mismatch until they are.",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG RIPGREP_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "BurntSushi/ripgrep",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the fd pin in the sandbox image (pi's find backend). Not automerged: FD_SHA256_{AMD64,ARM64} must be refreshed by hand (fd publishes no checksum assets, so the value is sha256sum of the release tarball); the image build fails on a mismatch until they are.",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG FD_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "sharkdp/fd",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Track pi CLI version pin in the sandbox image (#6464). Bumps must re-verify the pi stream parser fixtures — the --mode json wire shape changed within a minor before (0.84.0).",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG PI_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "@earendil-works/pi-coding-agent",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the Codex CLI version pin in the sandbox image (#6920). The OpenShell base image ships its own @openai/codex under the same npm prefix, so the pinned install replaces it and the build asserts `codex --version`; a bump must re-verify the codex stream parser fixtures once they land (#6920).",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG CODEX_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "@openai/codex",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track tirith CLI version pin in the sandbox image. SHA256 checksums are updated automatically by postUpgradeTasks (scripts/renovate/update-tirith-checksums.sh).",
+      "managerFilePatterns": ["/^images/sandbox/Containerfile$/"],
+      "matchStrings": [
+        "ARG TIRITH_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "sheeki03/tirith",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Track cosign version pin in update-tirith-checksums.sh. COSIGN_SHA256 is updated automatically by postUpgradeTasks (scripts/renovate/update-cosign-checksum.sh).",
+      "managerFilePatterns": ["/^scripts/renovate/update-tirith-checksums\\.sh$/"],
+      "matchStrings": [
+        "COSIGN_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "sigstore/cosign",
+      "datasourceTemplate": "github-releases",
       "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ]

@@ -1,0 +1,570 @@
+// Unit tests for the fullsend pi hook extension. Run with:
+//   node --test internal/runtime/pi_extension/fullsend-hooks.test.mjs
+// The hook scripts are faked through the injectable spawn so the tests need
+// no python; one test exercises a real python3 script when available.
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { test } from "node:test";
+
+import defaultExport, {
+  HOOK_PATH_ENV,
+  HOOK_PYTHON_ENV,
+  MANIFEST_SHA256_ENV,
+  bashAllowlistViolation,
+  claudeToolInput,
+  claudeToolName,
+  createHooks,
+  hookPath,
+  hookPython,
+  manifestDigestError,
+  runScript,
+} from "./fullsend-hooks.js";
+
+const manifest = {
+  agentName: "triage",
+  tools: ["bash"],
+  bashAllowlist: ["gh", "jq"],
+  hooks: {
+    dir: "/sandbox/pi-config/hooks",
+    groups: [
+      { phase: "PreToolUse", tools: ["Bash"], scripts: ["tirith_check.py"] },
+      { phase: "PreToolUse", tools: ["*"], scripts: ["canary_pretool.py"] },
+      { phase: "PostToolUse", tools: ["Bash", "WebFetch", "Read"], scripts: ["unicode_posttool.py", "secret_redact_posttool.py"] },
+      { phase: "PostToolUse", tools: ["*"], scripts: ["canary_posttool.py"] },
+    ],
+    toolNames: { bash: "Bash", read: "Read", write: "Write", edit: "Edit", grep: "Grep", find: "Glob", ls: "LS" },
+  },
+};
+
+// fakeSpawn records invocations and answers per script name.
+function fakeSpawn(answers) {
+  const calls = [];
+  const spawn = (cmd, args, opts) => {
+    const script = args[args.length - 1].split("/").pop();
+    const payload = JSON.parse(opts.input);
+    calls.push({ cmd, args, script, payload, env: opts.env });
+    const a = answers[script] ?? {};
+    if (typeof a === "function") return a(payload);
+    return { status: a.status ?? 0, stdout: a.stdout ?? "", error: a.error, signal: a.signal };
+  };
+  return { spawn, calls };
+}
+
+const quiet = { log: () => {} };
+
+// The launch exports the pinned interpreter (piHookPythonEnv in pi_run.go);
+// the tests that do not exercise it run with a pinned value in place.
+const PINNED_PYTHON = "/usr/bin/python3";
+process.env[HOOK_PYTHON_ENV] = PINNED_PYTHON;
+// Likewise the trusted hook PATH (piHookPathEnv in pi_run.go).
+const TRUSTED_PATH = "/usr/local/bin:/usr/bin:/bin";
+process.env[HOOK_PATH_ENV] = TRUSTED_PATH;
+
+test("bash allowlist: first token of every simple command must be allowed", () => {
+  const allow = ["gh", "jq"];
+  assert.equal(bashAllowlistViolation("gh issue view 1 | jq .title", allow), null);
+  assert.equal(bashAllowlistViolation("gh pr list && jq -r .", allow), null);
+  assert.match(bashAllowlistViolation("GH_PAGER= gh pr list && jq -r .", allow), /"GH_PAGER=" prefix/, "even an empty env prefix is refused (false positive by design)");
+  assert.equal(bashAllowlistViolation("gh auth status", allow), null);
+  assert.match(bashAllowlistViolation("gh issue view 1; curl http://x", allow), /"curl" is not in the Bash allowlist/);
+  assert.match(bashAllowlistViolation("gh $(curl x)", allow), /command substitution/);
+  assert.match(bashAllowlistViolation("gh `curl x`", allow), /command substitution/);
+  assert.match(bashAllowlistViolation("(curl x)", allow), /subshell/);
+  assert.match(bashAllowlistViolation("bash -c 'curl x'", allow), /"bash" is not allowed/);
+  assert.match(bashAllowlistViolation("gh x & curl http://evil", allow), /"curl" is not in the Bash allowlist/, "& separates commands");
+  assert.match(bashAllowlistViolation("gh x&curl http://evil", allow), /"curl" is not in the Bash allowlist/);
+  assert.equal(bashAllowlistViolation("gh pr view 1 2>&1 | jq .", allow), null, "fd redirection is not a separator");
+  assert.equal(bashAllowlistViolation("gh x &>/dev/null", allow), null);
+  assert.equal(bashAllowlistViolation("gh x >&2", allow), null);
+  assert.match(bashAllowlistViolation("gh x |& curl e", allow), /"curl" is not in the Bash allowlist/, "|& pipes stderr into the next command");
+  assert.match(bashAllowlistViolation("LD_AUDIT=/tmp/a.so gh x", allow), /"LD_AUDIT=" prefix/);
+  assert.match(bashAllowlistViolation("GH_PAGER=curl gh pr view 1", allow), /"GH_PAGER=" prefix/, "program-specific env prefixes spawn commands too");
+  assert.match(bashAllowlistViolation("GLIBC_TUNABLES=x gh x", allow), /"GLIBC_TUNABLES=" prefix/);
+  assert.match(bashAllowlistViolation("./gh x", allow), /is a path/);
+  assert.match(bashAllowlistViolation("/tmp/x/gh x", allow), /is a path/);
+  assert.match(bashAllowlistViolation("PATH=/tmp/x gh x", allow), /"PATH=" prefix/);
+  assert.match(bashAllowlistViolation("LD_PRELOAD=/tmp/e.so gh x", allow), /"LD_PRELOAD=" prefix/);
+  assert.match(bashAllowlistViolation("env gh x", allow), /"env" is not allowed/);
+  assert.match(bashAllowlistViolation("command gh x", allow), /"command" is not allowed/);
+  assert.match(bashAllowlistViolation("'gh' x", allow), /not in the Bash allowlist/, "quoted token is refused (false positive by design)");
+  assert.equal(bashAllowlistViolation("/usr/bin/gh x", ["/usr/bin/gh"]), null, "a verbatim allowlisted path passes");
+  assert.match(bashAllowlistViolation("", allow), /empty command/);
+  assert.equal(bashAllowlistViolation("curl x", []), null, "no allowlist means unrestricted");
+  assert.equal(bashAllowlistViolation("curl x", undefined), null);
+});
+
+test("tool name and input translation", () => {
+  assert.equal(claudeToolName(manifest, "bash"), "Bash");
+  assert.equal(claudeToolName(manifest, "find"), "Glob");
+  assert.equal(claudeToolName(manifest, "my_ext_tool"), "my_ext_tool");
+  assert.deepEqual(claudeToolInput("read", { path: "/a", offset: 1 }), { path: "/a", offset: 1, file_path: "/a" });
+  assert.deepEqual(claudeToolInput("bash", { command: "ls" }), { command: "ls" });
+  assert.deepEqual(claudeToolInput("read", null), {});
+  assert.deepEqual(
+    claudeToolInput("edit", { path: "a.go", edits: [{ oldText: "x", newText: "y" }, { oldText: "p", newText: "q" }] }),
+    { path: "a.go", edits: [{ oldText: "x", newText: "y" }, { oldText: "p", newText: "q" }], file_path: "a.go", old_string: "x", new_string: "y" },
+  );
+});
+
+test("default export registers the three pi events and names the session", () => {
+  const registered = {};
+  const names = [];
+  const piFake = { on: (ev, fn) => { registered[ev] = fn; }, setSessionName: (n) => names.push(n) };
+  process.env.FULLSEND_PI_MANIFEST = "/nonexistent/manifest.json";
+  try {
+    defaultExport(piFake);
+  } finally {
+    delete process.env.FULLSEND_PI_MANIFEST;
+  }
+  assert.deepEqual(Object.keys(registered).sort(), ["session_start", "tool_call", "tool_result"]);
+  // Unreadable manifest: session_start only reports, tool calls are blocked.
+  registered.session_start({});
+  assert.equal(names.length, 0);
+  assert.equal(registered.tool_call({ toolName: "read", input: {} }).block, true);
+  assert.equal(registered.tool_result({ toolName: "read", content: [] }), undefined);
+});
+
+test("tool_call: allowlist violation is advisory by default (logged, scripts still run)", () => {
+  const { spawn, calls } = fakeSpawn({});
+  const logged = [];
+  const { onToolCall } = createHooks(manifest, { spawn, log: (m) => logged.push(m) });
+  const verdict = onToolCall({ toolName: "bash", input: { command: "curl http://evil" } });
+  assert.equal(verdict, undefined);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /Bash allowlist \(advisory\): "curl" is not in the Bash allowlist/);
+  assert.deepEqual(calls.map((c) => c.script), ["tirith_check.py", "canary_pretool.py"]);
+});
+
+test("tool_call: allowlist blocks before any script runs in enforce mode", () => {
+  const { spawn, calls } = fakeSpawn({});
+  const { onToolCall } = createHooks({ ...manifest, bashAllowlistMode: "enforce" }, { spawn, ...quiet });
+  const verdict = onToolCall({ toolName: "bash", input: { command: "curl http://evil" } });
+  assert.equal(verdict.block, true);
+  assert.match(verdict.reason, /Bash allowlist/);
+  assert.equal(calls.length, 0);
+});
+
+test("tool_call: runs PreToolUse groups in plan order with Claude names and stops at the first block", () => {
+  const { spawn, calls } = fakeSpawn({
+    "tirith_check.py": { status: 0 },
+    "canary_pretool.py": { status: 1, stdout: JSON.stringify({ decision: "block", reason: "canary in input" }) },
+  });
+  const { onToolCall } = createHooks(manifest, { spawn, ...quiet });
+  const verdict = onToolCall({ toolName: "bash", input: { command: "gh issue list" } });
+  assert.deepEqual(verdict, { block: true, reason: "canary in input" });
+  assert.deepEqual(calls.map((c) => c.script), ["tirith_check.py", "canary_pretool.py"]);
+  assert.equal(calls[0].cmd, PINNED_PYTHON, "the pinned interpreter, never a bare python3 looked up on PATH");
+  assert.deepEqual(calls[0].args.slice(0, 3), ["-E", "-s", "-B"], "hook interpreter ignores PYTHON* variables and the user site");
+  assert.deepEqual(calls[0].payload, { tool_name: "Bash", tool_input: { command: "gh issue list" } });
+});
+
+test("tool_call: allowed call returns undefined; non-matching tools skip Bash-only groups", () => {
+  const { spawn, calls } = fakeSpawn({});
+  const { onToolCall } = createHooks(manifest, { spawn, ...quiet });
+  assert.equal(onToolCall({ toolName: "read", input: { path: "/x" } }), undefined);
+  assert.deepEqual(calls.map((c) => c.script), ["canary_pretool.py"], "only the * group applies to read");
+  assert.equal(calls[0].payload.tool_name, "Read");
+  assert.equal(calls[0].payload.tool_input.file_path, "/x");
+});
+
+test("tool_call: a script that cannot be spawned blocks (fail closed)", () => {
+  const { spawn } = fakeSpawn({ "tirith_check.py": { status: null, error: new Error("ENOENT python3") } });
+  const { onToolCall } = createHooks(manifest, { spawn, ...quiet });
+  const verdict = onToolCall({ toolName: "bash", input: { command: "gh x" } });
+  assert.equal(verdict.block, true);
+  assert.match(verdict.reason, /failed to run \(fail closed\): ENOENT/);
+});
+
+test("tool_call: missing manifest blocks everything", () => {
+  const { onToolCall, onToolResult } = createHooks(null, quiet);
+  assert.equal(onToolCall({ toolName: "read", input: {} }).block, true);
+  assert.equal(onToolResult({ toolName: "read", content: [] }), undefined);
+});
+
+test("tool_call: a manifest without a hook plan blocks everything (adapter is only loaded when security is on)", () => {
+  const { spawn, calls } = fakeSpawn({});
+  for (const m of [{ ...manifest, hooks: null }, { ...manifest, hooks: {} }, { ...manifest, hooks: { dir: "/x" } }]) {
+    const { onToolCall, onToolResult } = createHooks(m, { spawn, ...quiet });
+    const verdict = onToolCall({ toolName: "bash", input: { command: "gh x" } });
+    assert.equal(verdict.block, true);
+    assert.match(verdict.reason, /no hook plan/);
+    assert.equal(onToolResult({ toolName: "bash", content: [{ type: "text", text: "x" }] }), undefined);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("tool_result: chains sanitizers, feeding each the previous output (v1 and v2 shapes)", () => {
+  const { spawn, calls } = fakeSpawn({
+    "unicode_posttool.py": (p) => ({ status: 0, stdout: JSON.stringify({ tool_result: p.tool_result.replace("​", "") }) }),
+    "secret_redact_posttool.py": (p) => ({
+      status: 0,
+      stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: p.tool_response.replace("ghp_SECRET", "ghp_...") } }),
+    }),
+    "canary_posttool.py": { status: 0 },
+  });
+  const { onToolResult } = createHooks(manifest, { spawn, ...quiet });
+  const patch = onToolResult({
+    toolName: "bash",
+    input: { command: "gh x" },
+    content: [{ type: "text", text: "token g​hp_SECRET" }, { type: "image", data: "..." }],
+  });
+  assert.deepEqual(patch, { content: [{ type: "text", text: "token ghp_..." }, { type: "image", data: "..." }] });
+  assert.deepEqual(calls.map((c) => c.script), ["unicode_posttool.py", "secret_redact_posttool.py", "canary_posttool.py"]);
+  assert.equal(calls[1].payload.tool_result, "token ghp_SECRET", "second script sees the first one's output");
+  assert.equal(calls[1].payload.tool_response, "token ghp_SECRET");
+  assert.equal(calls[2].payload.tool_result, "token ghp_...");
+});
+
+test("tool_result: every PostToolUse payload carries the process cwd as the checkout", () => {
+  // pi is started with `cd <repo>` and its tools run in child shells, so
+  // process.cwd() is the checkout and cannot be moved by the agent; the
+  // redact stage scopes its bare-JWT skip to paths under it.
+  const { spawn, calls } = fakeSpawn({});
+  const { onToolResult } = createHooks(manifest, { spawn, ...quiet });
+  onToolResult({ toolName: "read", input: { path: "/x" }, content: [{ type: "text", text: "eyJ" }] });
+  const afterFirst = calls.length;
+  assert.ok(afterFirst >= 1, "at least one PostToolUse script ran");
+  // Every event on the same instance, not only the first.
+  onToolResult({ toolName: "read", input: { path: "/y" }, content: [{ type: "text", text: "eyJ" }] });
+  assert.ok(calls.length > afterFirst, "the second event ran PostToolUse scripts too");
+  for (const c of calls) {
+    assert.equal(c.payload.cwd, process.cwd(), `${c.script} must receive cwd`);
+  }
+});
+
+test("tool_result: a PostToolUseFailure group in the plan is ignored (pi's tool_result already covers failed calls)", () => {
+  const { spawn, calls } = fakeSpawn({ "canary_posttool.py": { status: 0 } });
+  const withFailure = {
+    ...manifest,
+    hooks: {
+      ...manifest.hooks,
+      groups: [...manifest.hooks.groups, { phase: "PostToolUseFailure", tools: ["*"], scripts: ["posttool_chain.py"] }],
+    },
+  };
+  const { onToolCall, onToolResult } = createHooks(withFailure, { spawn, ...quiet });
+  assert.equal(onToolCall({ toolName: "bash", input: { command: "gh x" } }), undefined);
+  assert.equal(onToolResult({ toolName: "bash", input: {}, content: [{ type: "text", text: "same" }] }), undefined);
+  assert.ok(!calls.some((c) => c.script === "posttool_chain.py"), "the failure-phase script is never spawned by the adapter");
+});
+
+test("tool_result: unchanged output returns undefined", () => {
+  const { spawn } = fakeSpawn({});
+  const { onToolResult } = createHooks(manifest, { spawn, ...quiet });
+  assert.equal(onToolResult({ toolName: "read", input: {}, content: [{ type: "text", text: "same" }] }), undefined);
+});
+
+test("tool_result: a blocking script withholds the result and marks it an error", () => {
+  const { spawn } = fakeSpawn({
+    "canary_posttool.py": { status: 1, stdout: JSON.stringify({ decision: "block", reason: "canary leaked" }) },
+  });
+  const { onToolResult } = createHooks(manifest, { spawn, ...quiet });
+  const patch = onToolResult({ toolName: "grep", input: { pattern: "x" }, content: [{ type: "text", text: "CANARY-123" }] });
+  assert.equal(patch.isError, true);
+  assert.match(patch.content[0].text, /withheld this tool result: canary leaked/);
+  assert.doesNotMatch(patch.content[0].text, /CANARY-123/);
+});
+
+test("tool_result: v2 canary block with updatedToolOutput keeps the redacted text", () => {
+  const { spawn } = fakeSpawn({
+    "canary_posttool.py": {
+      status: 1,
+      stdout: JSON.stringify({ decision: "block", continue: false, reason: "canary", hookSpecificOutput: { updatedToolOutput: "x [CANARY_REDACTED] y" } }),
+    },
+  });
+  const { onToolResult } = createHooks(manifest, { spawn, ...quiet });
+  const patch = onToolResult({ toolName: "ls", input: {}, content: "x CANARY y" });
+  assert.deepEqual(patch, { content: [{ type: "text", text: "x [CANARY_REDACTED] y" }], isError: true });
+});
+
+// realPython returns the absolute path of the python3 on PATH, or null.
+function realPython() {
+  const probe = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" });
+  if (probe.error || probe.status !== 0) return null;
+  const path = probe.stdout.trim();
+  return path.startsWith("/") ? path : null;
+}
+
+const ECHO_BLOCK_PY =
+  'import json,sys\nd=json.load(sys.stdin)\nif "evil" in d["tool_input"].get("command",""):\n    print(json.dumps({"decision":"block","reason":"evil: "+d["tool_name"]}))\n    sys.exit(1)\nsys.exit(0)\n';
+
+test("runScript with a real python3 script (skipped without python3)", (t) => {
+  const python = realPython();
+  if (python === null) {
+    t.skip("python3 not available");
+    return;
+  }
+  const env = { ...process.env, [HOOK_PYTHON_ENV]: python, [HOOK_PATH_ENV]: TRUSTED_PATH };
+  const dir = mkdtempSync(join(tmpdir(), "fullsend-hooks-"));
+  writeFileSync(join(dir, "echo_block.py"), ECHO_BLOCK_PY);
+  const m = { ...manifest, hooks: { ...manifest.hooks, dir } };
+  assert.deepEqual(runScript(m, "echo_block.py", { tool_name: "Bash", tool_input: { command: "evil" } }, spawnSync, env).block, true);
+  assert.equal(runScript(m, "echo_block.py", { tool_name: "Bash", tool_input: { command: "evil" } }, spawnSync, env).reason, "evil: Bash");
+  assert.equal(runScript(m, "echo_block.py", { tool_name: "Bash", tool_input: { command: "ok" } }, spawnSync, env).block, false);
+  assert.equal(runScript(m, "missing.py", { tool_name: "Bash", tool_input: {} }, spawnSync, env).block, true, "missing script blocks");
+});
+
+// #8577: a python3 stub that exits 0 earlier on PATH (a .env can prepend a
+// directory) must not stand in for the hook interpreter.
+test("runScript: a python3 stub earlier on PATH is never used for hooks (skipped without python3)", (t) => {
+  const python = realPython();
+  if (python === null || !existsSync("/bin/sh")) {
+    t.skip("python3 or /bin/sh not available");
+    return;
+  }
+  const dir = mkdtempSync(join(tmpdir(), "fullsend-hooks-"));
+  const stubDir = join(dir, "bin");
+  mkdirSync(stubDir);
+  const marker = join(dir, "stub-ran");
+  writeFileSync(join(stubDir, "python3"), `#!/bin/sh\n: > '${marker}'\nexit 0\n`);
+  chmodSync(join(stubDir, "python3"), 0o755);
+  writeFileSync(join(dir, "echo_block.py"), ECHO_BLOCK_PY);
+  const m = { ...manifest, hooks: { ...manifest.hooks, dir } };
+  const env = { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, [HOOK_PYTHON_ENV]: python, [HOOK_PATH_ENV]: TRUSTED_PATH };
+
+  const { onToolCall } = createHooks(
+    { ...m, hooks: { ...m.hooks, groups: [{ phase: "PreToolUse", tools: ["Bash"], scripts: ["echo_block.py"] }] } },
+    { env, ...quiet },
+  );
+  assert.deepEqual(onToolCall({ toolName: "bash", input: { command: "evil" } }), { block: true, reason: "evil: Bash" },
+    "the blocking script ran under the pinned interpreter and its verdict is honoured");
+  assert.equal(existsSync(marker), false, "the stub on PATH was never spawned");
+});
+
+test("runScript: spawns the pinned interpreter and fails closed without a usable one", () => {
+  const payload = { tool_name: "Bash", tool_input: { command: "gh x" } };
+  const { spawn, calls } = fakeSpawn({});
+  assert.equal(runScript(manifest, "tirith_check.py", payload, spawn, { [HOOK_PYTHON_ENV]: "/opt/py/bin/python3", [HOOK_PATH_ENV]: TRUSTED_PATH }).block, false);
+  assert.equal(calls[0].cmd, "/opt/py/bin/python3");
+
+  for (const [label, env] of [
+    ["unset", { [HOOK_PATH_ENV]: TRUSTED_PATH }],
+    ["empty", { [HOOK_PYTHON_ENV]: "", [HOOK_PATH_ENV]: TRUSTED_PATH }],
+    ["relative", { [HOOK_PYTHON_ENV]: "python3", [HOOK_PATH_ENV]: TRUSTED_PATH }],
+    ["relative path", { [HOOK_PYTHON_ENV]: "bin/python3", [HOOK_PATH_ENV]: TRUSTED_PATH }],
+  ]) {
+    const before = calls.length;
+    const verdict = runScript(manifest, "tirith_check.py", payload, spawn, env);
+    assert.equal(verdict.block, true, `${label}: blocks`);
+    assert.match(verdict.reason, new RegExp(`fail closed.*${HOOK_PYTHON_ENV}`), `${label}: names the missing pin`);
+    assert.equal(calls.length, before, `${label}: nothing is spawned`);
+  }
+  assert.equal(hookPython(undefined), null);
+});
+
+// The hook scripts run with the trusted PATH, not the PATH .env left behind,
+// and a missing or malformed one blocks without spawning.
+test("runScript: hook scripts get the trusted PATH and fail closed without one", () => {
+  const payload = { tool_name: "Bash", tool_input: { command: "gh x" } };
+  const { spawn, calls } = fakeSpawn({});
+  const env = { PATH: "/sandbox/x/bin:/usr/bin", [HOOK_PYTHON_ENV]: PINNED_PYTHON, [HOOK_PATH_ENV]: TRUSTED_PATH };
+  assert.equal(runScript(manifest, "tirith_check.py", payload, spawn, env).block, false);
+  assert.equal(calls[0].env.PATH, TRUSTED_PATH, "the inherited PATH is replaced");
+  assert.equal(calls[0].env[HOOK_PYTHON_ENV], PINNED_PYTHON, "the rest of the environment is kept");
+
+  for (const [label, value] of [
+    ["unset", undefined],
+    ["empty", ""],
+    ["empty entry", "/usr/bin::/bin"],
+    ["trailing colon", "/usr/bin:"],
+    ["relative entry", "bin:/usr/bin"],
+  ]) {
+    const before = calls.length;
+    const e = { [HOOK_PYTHON_ENV]: PINNED_PYTHON };
+    if (value !== undefined) e[HOOK_PATH_ENV] = value;
+    const verdict = runScript(manifest, "tirith_check.py", payload, spawn, e);
+    assert.equal(verdict.block, true, `${label}: blocks`);
+    assert.match(verdict.reason, new RegExp(`fail closed.*${HOOK_PATH_ENV}`), `${label}: names the missing PATH`);
+    assert.equal(calls.length, before, `${label}: nothing is spawned`);
+    assert.equal(hookPath(e), null, label);
+  }
+});
+
+// A tool stub earlier on the inherited PATH is not what a hook script runs.
+test("runScript: a hook's tools resolve on the trusted PATH, not the inherited one (skipped without python3)", (t) => {
+  const python = realPython();
+  if (python === null || !existsSync("/bin/sh")) {
+    t.skip("python3 or /bin/sh not available");
+    return;
+  }
+  const dir = mkdtempSync(join(tmpdir(), "fullsend-hooks-"));
+  const stubDir = join(dir, "bin");
+  mkdirSync(stubDir);
+  const marker = join(dir, "stub-ran");
+  writeFileSync(join(stubDir, "scanner"), `#!/bin/sh\n: > '${marker}'\nexit 0\n`);
+  chmodSync(join(stubDir, "scanner"), 0o755);
+  writeFileSync(join(dir, "calls_scanner.py"),
+    'import shutil,sys\nsys.exit(0 if shutil.which("scanner") is None else 3)\n');
+  const m = { ...manifest, hooks: { ...manifest.hooks, dir } };
+  const env = { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, [HOOK_PYTHON_ENV]: python, [HOOK_PATH_ENV]: "/usr/bin:/bin" };
+  const verdict = runScript(m, "calls_scanner.py", { tool_name: "Bash", tool_input: { command: "x" } }, spawnSync, env);
+  assert.equal(verdict.block, false, "the script found no scanner on its PATH");
+  assert.equal(existsSync(marker), false);
+});
+
+test("tool_call and tool_result: no pinned interpreter blocks the call and withholds the result", () => {
+  const { spawn, calls } = fakeSpawn({});
+  const { onToolCall, onToolResult } = createHooks(manifest, { spawn, env: {}, ...quiet });
+  const verdict = onToolCall({ toolName: "bash", input: { command: "gh x" } });
+  assert.equal(verdict.block, true);
+  const patch = onToolResult({ toolName: "bash", input: { command: "gh x" }, content: [{ type: "text", text: "out" }] });
+  assert.equal(patch.isError, true);
+  assert.equal(calls.length, 0, "no script is spawned without the pinned interpreter");
+});
+
+// ── Declared extensions (ADR 0094) ───────────────────────────────────────
+
+const allowlistManifest = {
+  ...manifest,
+  hooks: {
+    ...manifest.hooks,
+    groups: [
+      { phase: "PreToolUse", tools: ["*"], scripts: ["canary_pretool.py"] },
+      { phase: "PreToolUse", tools: ["*"], scripts: ["tool_allowlist_pretool.py"] },
+      { phase: "PostToolUse", tools: ["*"], scripts: ["canary_posttool.py"] },
+    ],
+  },
+  extensions: [{ name: "go-diagnostics", path: "/sandbox/pi-config/extensions/go-diagnostics", sha256: "a".repeat(64) }],
+};
+
+test("extension tool: every PreToolUse script runs, the allowlist included; first use is logged", () => {
+  const logs = [];
+  const { spawn, calls } = fakeSpawn({});
+  const m = { ...allowlistManifest, tools: null };
+  const { onToolCall, onToolResult } = createHooks(m, { spawn, log: (l) => logs.push(l) });
+
+  assert.equal(onToolCall({ toolName: "go_diag", input: { path: "pkg/a.go" } }), undefined);
+  assert.deepEqual(calls.map((c) => c.script), ["canary_pretool.py", "tool_allowlist_pretool.py"], "no script is skipped for an extension tool");
+  assert.equal(calls[0].payload.tool_name, "go_diag", "extension tools keep their pi name");
+  assert.deepEqual(logs, ["[fullsend-hooks] extension tool: go_diag"]);
+
+  // Logged once per tool name, not per call.
+  onToolCall({ toolName: "go_diag", input: {} });
+  onToolCall({ toolName: "go_lint", input: {} });
+  assert.deepEqual(logs, ["[fullsend-hooks] extension tool: go_diag", "[fullsend-hooks] extension tool: go_lint"]);
+
+  // PostToolUse * groups still see the extension tool's result.
+  calls.length = 0;
+  assert.equal(onToolResult({ toolName: "go_diag", input: {}, content: "ok" }), undefined);
+  assert.deepEqual(calls.map((c) => c.script), ["canary_posttool.py"]);
+});
+
+test("extension tool: the allowlist script's verdict is honoured (the manifest is agent-writable, so it never grants a bypass)", () => {
+  const { spawn, calls } = fakeSpawn({ "tool_allowlist_pretool.py": { status: 1, stdout: JSON.stringify({ decision: "block", reason: "not allowlisted" }) } });
+  const { onToolCall } = createHooks({ ...allowlistManifest, tools: null }, { spawn, ...quiet });
+  assert.deepEqual(onToolCall({ toolName: "go_diag", input: {} }), { block: true, reason: "not allowlisted" },
+    "an extension tool the org did not put in FULLSEND_TOOL_ALLOWLIST is blocked like any other");
+  assert.deepEqual(calls.map((c) => c.script), ["canary_pretool.py", "tool_allowlist_pretool.py"]);
+});
+
+test("extension tool: powershell is a pi built-in even though the tool map has no Claude name for it", () => {
+  const logs = [];
+  const { spawn } = fakeSpawn({});
+  const { onToolCall } = createHooks({ ...allowlistManifest, tools: null }, { spawn, log: (l) => logs.push(l) });
+  assert.equal(onToolCall({ toolName: "powershell", input: { command: "Get-Item ." } }), undefined);
+  assert.deepEqual(logs.filter((l) => l.includes("extension tool:")), [], "built-ins are never announced as extension tools");
+});
+
+test("extension tool: a built-in or Claude-vocabulary name is never treated as an extension tool", () => {
+  const logs = [];
+  const { spawn, calls } = fakeSpawn({ "tool_allowlist_pretool.py": { status: 1, stdout: JSON.stringify({ decision: "block", reason: "not allowlisted" }) } });
+  const { onToolCall } = createHooks({ ...allowlistManifest, tools: null }, { spawn, log: (l) => logs.push(l) });
+  assert.deepEqual(onToolCall({ toolName: "read", input: { path: "/x" } }), { block: true, reason: "not allowlisted" });
+  assert.deepEqual(calls.map((c) => c.script), ["canary_pretool.py", "tool_allowlist_pretool.py"]);
+  calls.length = 0;
+  assert.deepEqual(onToolCall({ toolName: "Read", input: { path: "/x" } }), { block: true, reason: "not allowlisted" });
+  assert.deepEqual(calls.map((c) => c.script), ["canary_pretool.py", "tool_allowlist_pretool.py"]);
+  assert.deepEqual(logs.filter((l) => l.includes("extension tool:")), [], "built-ins are never announced as extension tools");
+});
+
+test("extension tool: a declared tools: list changes nothing about which scripts run", () => {
+  const { spawn, calls } = fakeSpawn({ "tool_allowlist_pretool.py": { status: 1, stdout: JSON.stringify({ decision: "block", reason: "not allowlisted" }) } });
+  const { onToolCall } = createHooks({ ...allowlistManifest, tools: ["bash"] }, { spawn, ...quiet });
+  assert.deepEqual(onToolCall({ toolName: "go_diag", input: {} }), { block: true, reason: "not allowlisted" });
+  assert.deepEqual(calls.map((c) => c.script), ["canary_pretool.py", "tool_allowlist_pretool.py"]);
+});
+
+test("extension tool: without manifest extensions an unknown tool is not an extension tool", () => {
+  const logs = [];
+  const { spawn, calls } = fakeSpawn({ "tool_allowlist_pretool.py": { status: 1, stdout: JSON.stringify({ decision: "block", reason: "not allowlisted" }) } });
+  const { onToolCall } = createHooks({ ...allowlistManifest, extensions: [], tools: null }, { spawn, log: (l) => logs.push(l) });
+  assert.deepEqual(onToolCall({ toolName: "go_diag", input: {} }), { block: true, reason: "not allowlisted" });
+  assert.deepEqual(calls.map((c) => c.script), ["canary_pretool.py", "tool_allowlist_pretool.py"]);
+  assert.deepEqual(logs.filter((l) => l.includes("extension tool:")), []);
+});
+
+test("session_start roster names the declared extensions", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fullsend-hooks-ext-"));
+  const manifestPath = join(dir, "manifest.json");
+  const lines = [];
+  const origError = console.error;
+  console.error = (l) => lines.push(l);
+  process.env.FULLSEND_PI_MANIFEST = manifestPath;
+  try {
+    writeFileSync(manifestPath, JSON.stringify({ ...allowlistManifest, extensions: [{ name: "go-diagnostics" }, { name: "pi-fff" }] }));
+    const registered = {};
+    defaultExport({ on: (ev, fn) => { registered[ev] = fn; } });
+    registered.session_start({});
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /^\[fullsend-hooks\] agent=triage hooks=.* bash-allowlist=gh,jq extensions=go-diagnostics,pi-fff$/);
+
+    lines.length = 0;
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    const plain = {};
+    defaultExport({ on: (ev, fn) => { plain[ev] = fn; } });
+    plain.session_start({});
+    assert.equal(lines.length, 1);
+    assert.doesNotMatch(lines[0], /extensions=/, "no suffix without extensions");
+  } finally {
+    console.error = origError;
+    delete process.env.FULLSEND_PI_MANIFEST;
+  }
+});
+
+test("manifestDigestError: matches, mismatches, and nothing to check", () => {
+  const bytes = Buffer.from(JSON.stringify(manifest));
+  const sum = createHash("sha256").update(bytes).digest("hex");
+  assert.equal(manifestDigestError(bytes, sum), null, "the bytes the runner hashed");
+  assert.equal(manifestDigestError(bytes, sum.toUpperCase()), null, "hex case does not matter");
+  assert.equal(manifestDigestError(bytes, ` ${sum} `), null, "surrounding whitespace does not matter");
+  // No digest exported: a caller that bootstrapped the sandbox in another
+  // process gets neither the shell guard nor this check (pi_bootstrap.go
+  // piManifestHash), and failing closed here would break it.
+  assert.equal(manifestDigestError(bytes, undefined), null);
+  assert.equal(manifestDigestError(bytes, ""), null);
+  const other = Buffer.from(JSON.stringify({ ...manifest, hooks: { ...manifest.hooks, groups: [] } }));
+  const bad = manifestDigestError(other, sum);
+  assert.match(bad, new RegExp(`is not the ${sum} the runner recorded`), "a manifest whose hook plan was emptied is refused");
+});
+
+test("the extension exits non-zero when the manifest no longer matches the runner's digest", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fullsend-hooks-digest-"));
+  const manifestPath = join(dir, "manifest.json");
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  const sum = createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+  const extension = fileURLToPath(new URL("./fullsend-hooks.js", import.meta.url));
+  // A child of the Agent tool loads this file minutes into the iteration,
+  // so the manifest is re-checked there; the exit is what makes the tool
+  // report the dispatch as an error rather than returning a result no hook
+  // ever saw. Run out of process: the check calls process.exit.
+  const load = (env) =>
+    spawnSync(process.execPath, ["-e", `import(${JSON.stringify(extension)}).then((m) => m.default({ on: () => {} }))`], {
+      encoding: "utf8",
+      env: { ...process.env, FULLSEND_PI_MANIFEST: manifestPath, ...env },
+    });
+
+  const clean = load({ [MANIFEST_SHA256_ENV]: sum });
+  assert.equal(clean.status, 0, clean.stderr);
+
+  writeFileSync(manifestPath, JSON.stringify({ ...manifest, hooks: { ...manifest.hooks, groups: [] } }));
+  const tampered = load({ [MANIFEST_SHA256_ENV]: sum });
+  assert.notEqual(tampered.status, 0, "a rewritten manifest must not produce a hookless process");
+  assert.match(tampered.stderr, /refusing to run/);
+
+  const unchecked = load({});
+  assert.equal(unchecked.status, 0, "without an exported digest there is nothing to check");
+});

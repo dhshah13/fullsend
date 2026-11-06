@@ -1,31 +1,58 @@
 ---
-order: 3
+sidebar_position: 3
 ---
 
 # Configuring GitHub For Fullsend
 
-The goal of this document is that you configure Fullsend for your GitHub repository.
+> Background: [How fullsend authenticates](../user/how-fullsend-authenticates.md).
+
+The goal of this document is that you configure fullsend for your GitHub repository.
+GitLab repositories use a different command (`fullsend repos install`, driven by a
+`repos.yaml` manifest). See [Configuring GitLab](configuring-gitlab.md) for that flow.
+To manage GitHub repositories from `repos.yaml` instead of `github setup`, see
+[Repo Management](repo-management.md) and
+[Migrating to manifest-driven `repos install`](migrating-from-github-setup.md).
 
 ## Prerequisites
 
-* Your org or repo is enrolled in a fullsend token mint service (see [Getting Started](README.md) step 1).
-* You have your WIF provider URL from [Getting Inference](getting-inference.md).
+* For Vertex agents, you have your WIF provider URL from [Getting Inference](getting-inference.md). OpenAI-only setup does not need it.
 * Download the latest [fullsend](https://github.com/fullsend-ai/fullsend/releases) CLI.
 * Download the latest [gh](https://cli.github.com/) CLI and authenticate with it.
 
+> **Note:** If your organization restricts classic personal access tokens,
+> `gh auth login` may produce a token that GitHub rejects with a 403. Create a
+> [fine-grained PAT](https://github.com/settings/personal-access-tokens/new)
+> scoped to the target repository with **Contents**, **Workflows**, **Secrets**,
+> **Variables** (read/write), **Pull requests** (read/write — not needed with
+> `--direct`), and **Metadata** (read-only), then `export GH_TOKEN=github_pat_...`
+> before running setup. The CLI checks `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token`,
+> in that order.
+>
+> **Fork limitation:** Fine-grained PATs are scoped to a single GitHub
+> organization and cannot create forks across org boundaries. When the CLI
+> detects a fine-grained token, the fork delivery option (`[f]`) is
+> unavailable. The CLI will offer the upstream option (`[u]`), which pushes
+> a branch to the target repository and creates a PR containing the fullsend
+> scaffolding files. No changes are made to the default branch until the PR
+> is merged. This limitation only applies to the initial setup — after setup,
+> fullsend agents use their own GitHub App tokens and do not require a fork.
+
 ## Installing GitHub Applications
 
-In order to use Fullsend install the following applications to your organization
-and provide them permissions to the repository you want to install Fullsend to.
+Install the following agent applications to your organization
+and provide them permissions to the repository you want to install fullsend to.
 
 | Role | Installation URL |
 |------|-----------------|
-| fullsend | <https://github.com/apps/fullsend-ai-fullsend/installations/new> |
 | triage | <https://github.com/apps/fullsend-ai-triage/installations/new> |
 | coder | <https://github.com/apps/fullsend-ai-coder/installations/new> |
 | review | <https://github.com/apps/fullsend-ai-review/installations/new> |
 | retro | <https://github.com/apps/fullsend-ai-retro/installations/new> |
 | prioritize | <https://github.com/apps/fullsend-ai-prioritize/installations/new> |
+
+> **Note:** You do not need the `fullsend` dispatch app
+> (`fullsend-ai-fullsend`). Each repository dispatches through its own shim
+> workflow.
 
 > **Note:** Installing a subset of GitHub Apps does **not** automatically
 > limit which agents are active. You must also pass the `--agents` flag
@@ -47,7 +74,16 @@ Where `<org>/<repo>` refers to the GitHub organization and repository you want t
 for, `<gcp-project>` is your GCP project name, and `<wif-provider-url>` is the WIF Provider URL
 created at [Getting Inference](getting-inference.md).
 
-The command creates files, secrets and variables in your repository.
+The command creates files, secrets and variables in your repository. If you
+will use only OpenAI agents, omit both `--inference-project` and
+`--inference-wif-provider`. Setup then writes no GCP inference secrets;
+a later Vertex run requires both credentials.
+Configure each enabled agent's runtime and model for OpenAI before it runs.
+For OpenAI credentials, see [OpenAI Workload Identity](../infrastructure/openai-workload-identity.md).
+For repositories managed with `fullsend repos install`, select OpenAI Workload Identity with
+`inference.auth: openai-wif` in `repos.yaml` (for example
+`fullsend repos set 'github.repos["<org>/<repo>"].inference.auth' openai-wif`); see
+[Manifest-managed repositories](../infrastructure/openai-workload-identity.md#manifest-managed-repositories-repos-install).
 
 ### Enabling a subset of agents
 
@@ -66,18 +102,49 @@ Only the listed agents will be configured. Make sure you have installed the
 corresponding GitHub Apps for each agent you enable (see the table above).
 
 For the full list of setup flags, see the
-[GitHub setup reference](../../reference/github-setup.md#setup-flags).
+[CLI reference](../../cli/github.md#flags).
+
+### Using a vendor preset
+
+If your platform operator provides a curated preset configuration, you can
+install it directly instead of relying on per-flag generation:
+
+```bash
+fullsend github setup <org>/<repo> \
+  --inference-project "<gcp-project>" \
+  --inference-wif-provider "<wif-provider-url>" \
+  --config "<path-or-url>" \
+  --config-hash "<sha256-hex>"
+```
+
+When `--config` is provided, the preset content is committed unchanged as
+`.fullsend/config.base.yaml`. Explicit persistent setup flags (`--runtime`,
+`--agents`, `--mint-url`, `--inference-*`) are written to the
+`.fullsend/config.yaml` overlay and override the same values from the
+preset. Omitted flags inherit from the preset, then from compiled-in
+defaults. If you pass a persistent flag whose value already matches the
+preset or compiled default, setup still writes it into the overlay and
+warns that the field is now pinned locally — later updates to the base
+layer or default will not apply until you remove that key from
+`.fullsend/config.yaml`. Per-run flags such as `--dry-run` never pin.
+The `--config-hash` flag is optional but recommended for remote
+URLs — it verifies the SHA-256 digest of the fetched content before
+committing. `--config` is only valid for per-repo mode.
+
+This is where the agent runtime is selected: on a terminal, `fullsend github setup` asks once (press Enter to keep `claude`, the stable default); `--runtime` sets it explicitly. `pi`, `codex`, and `opencode` are experimental and meant for opt-in pilots — see [Choose a Runtime](choosing-a-runtime.md) for what the runtimes are and how to change the selection after setup.
+
+To apply the same preset across many repositories, declare `defaults.config_base` (and optionally `defaults.config_base.sha256`) in `repos.yaml` and run `fullsend repos install`. See [Repo Management — Configuration presets](repo-management.md#configuration-presets). `repos install` takes the settings these setup flags carry from `repos.yaml` rather than from flags; [Migrating to manifest-driven `repos install`](migrating-from-github-setup.md#mapping-github-setup-flags) maps each setup flag to its manifest key.
 
 ## Testing Fullsend
 
 After installing open a new issue or comment `/fs-triage` in an open issue. Then visit the
-Actions tab to see the Fullsend workflow in action. In some minutes the
+Actions tab to see the fullsend workflow in action. In some minutes the
 `fullsend-ai-triage` bot should post a comment in the issue.
 
 ## Next steps
 
-* Read [Organization installation mode](org-mode.md) to learn how to share GCP project with other repositories
-within your GitHub organization.
-* Read the [Default Agents](../../agents/README.md) section to learn about the default agents Fullsend
+* Read [Repo Management](repo-management.md) to learn how to install and manage fullsend across
+many repositories, including sharing configuration presets between them.
+* Read the [Agents](../../agents/README.md) section to learn about the default agents fullsend
 ships with.
 * Explore other sections of this documentation for more information.

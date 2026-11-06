@@ -1,12 +1,19 @@
 # Testing the Agents
 
-We have CI for code, but no CI for prompts. If someone tweaks the Intent & Coherence sub-agent's instructions, how do we prove it didn't forget how to detect Tier Escalation?
+We have CI for code, but no CI for prompts. If someone tweaks the Intent & Coherence sub-agent's instructions, how do we prove it didn't forget how to detect intent authorization tier escalation?
 
 ## Why this is a distinct problem
 
-Testing application code is a solved problem with mature tooling: unit tests, integration tests, CI pipelines, coverage reports. But agent instructions — system prompts, CLAUDE.md files, review criteria, escalation rules — are a fundamentally different artifact. They're natural language, not code. Their behavior is probabilistic, not deterministic. And the consequences of a regression can be severe: an agent that silently stops catching tier escalation, or starts rubber-stamping security-sensitive changes, or loses its ability to detect prompt injection.
+Testing application code is a solved problem with mature tooling: unit tests, integration tests, CI pipelines, coverage reports. But agent instructions — system prompts, CLAUDE.md files, review criteria, escalation rules — are a fundamentally different artifact. They're natural language, not code. Their behavior is probabilistic, not deterministic. And the consequences of a regression can be severe: an agent that silently stops catching intent authorization tier escalation, or starts rubber-stamping security-sensitive changes, or loses its ability to detect prompt injection.
 
 Today, if someone modifies a review agent's instructions, the only verification is human review of the prose change. There is no automated way to confirm the agent still behaves correctly after the modification. This is the equivalent of shipping code changes with no test suite — something we would never accept for application code.
+
+**Behaviour tests are orthogonal.** [ADR 0066](../ADRs/0066-behaviour-tests-with-gherkin-and-drivers.md) describes Gherkin end-to-end tests (framework in `pkg/behaviourtest/`, runner under `e2e/behaviour/`) that validate deterministic platform code (workflows, harness, sandbox policy, post-scripts) with inference explicitly removed via the dummy and dummy-playback ([ADR 0116](../ADRs/0116-dummy-playback-runtime.md)) runtimes. They do not evaluate instructions, prompts, or models, and they do not replace golden-set or statistical LLM evals described below.
+
+[ADR 0154](../ADRs/0154-correlate-work-item-and-behaviour-scenario-traces.md)
+calls for grouping a behaviour test's fullsend and test-driver operations,
+including work items it creates, under one scenario trace for end-to-end
+diagnosis.
 
 ## What makes agent testing hard
 
@@ -14,13 +21,15 @@ Today, if someone modifies a review agent's instructions, the only verification 
 
 The same prompt with the same input can produce different outputs across runs. Traditional assertions ("output must equal X") don't work. Testing must be statistical — "the agent produces the correct classification in at least 95 of 100 runs" — which is slower, more expensive, and harder to interpret than binary pass/fail.
 
+The cost of that statistical framing is easy to underestimate: reliable significance requires a large number of trials, and the count grows as the claim gets bolder relative to the agent's true performance. A run that scores 19/20 does not certify a 90% floor — that sample is consistent with a true rate as low as ~76%. Distinguishing a real ten-point regression from run-to-run noise takes on the order of a hundred-plus trials per variant, and small differences in a graded (1–5) judge score can take thousands. Two practical consequences: gate against the *lower bound* of a confidence interval rather than the point estimate, and size the suite to the smallest regression worth catching. [Experiment 0026](https://github.com/fullsend-ai/experiments/tree/main/0026-eval-statistical-significance) works through the sizing math and the numbers.
+
 ### Behavioral surface area
 
 An agent's behavior is the product of its instructions, the model it runs on, the context it receives, and the specific input. A change to any of these can alter behavior. Testing agent instructions in isolation doesn't capture how they interact with real-world inputs. Testing them with the actual model is expensive and slow. Testing them with a different model may not be representative.
 
 ### Absence detection
 
-The hardest bugs to catch are capabilities that silently disappear. If someone simplifies the Intent & Coherence sub-agent's instructions and removes the paragraph about tier escalation detection, the agent won't error — it will simply stop checking for tier escalation. There's no compile error, no stack trace, no failing import. The capability quietly vanishes, and you only discover it when a tier-gaming attack succeeds.
+The hardest bugs to catch are capabilities that silently disappear. If someone simplifies the Intent & Coherence sub-agent's instructions and removes the paragraph about intent authorization tier escalation detection, the agent won't error — it will simply stop checking for intent authorization tier escalation. There's no compile error, no stack trace, no failing import. The capability quietly vanishes, and you only discover it when an intent-authorization-tier-gaming attack succeeds.
 
 ### Interaction effects
 
@@ -43,7 +52,7 @@ When someone modifies an agent's system prompt, CLAUDE.md, or configuration:
 
 ### Capability coverage
 
-For each agent role described in [agent-architecture.md](agent-architecture.md) and [code-review.md](code-review.md), there's an implicit set of capabilities. The Intent & Coherence sub-agent should detect tier escalation. The Security sub-agent should catch known injection patterns and flag RBAC changes. These capabilities need explicit test coverage.
+For each agent role described in [agent-architecture.md](agent-architecture.md) and [code-review.md](code-review.md), there's an implicit set of capabilities. The Intent & Coherence sub-agent should detect intent authorization tier escalation. The Security sub-agent should catch known injection patterns and flag RBAC changes. These capabilities need explicit test coverage.
 
 ### Cross-agent composition
 
@@ -63,7 +72,7 @@ Maintain a curated set of test cases — inputs with known-correct outputs — f
 agent-tests/
   intent-coherence/
     golden-set/
-      tier-escalation-detection.yaml
+      intent-tier-escalation-detection.yaml
       scope-mismatch.yaml
       cross-repo-intent.yaml
     ...
@@ -81,7 +90,7 @@ Each test case specifies an input (a synthetic PR, issue, or diff) and the expec
 
 **Pros:**
 - Concrete, auditable, version-controlled
-- Directly tests for known capabilities — if tier escalation detection breaks, the golden-set test for it fails
+- Directly tests for known capabilities — if intent authorization tier escalation detection breaks, the golden-set test for it fails
 - Fast feedback loop compared to production monitoring
 - Can be run in CI on every instruction change
 
@@ -103,7 +112,7 @@ Define contracts for each agent — formal statements about what the agent must 
 
 - MUST flag any PR where the linked issue describes a bug fix but the diff adds new API surface
 - MUST flag any PR that modifies files in more than 3 directories when the linked issue is labeled "bug"
-- MUST NOT approve a PR with no linked issue unless the change is classified as Tier 0
+- MUST NOT approve a PR with no linked issue unless the change is classified as intent authorization tier 0
 - MUST escalate when the diff scope exceeds what the linked intent file authorizes
 
 ### Trade-offs
@@ -198,7 +207,7 @@ Under the hood, promptfoo makes direct HTTP calls to model provider APIs. Each t
 - The pytest integration means eval suites look like normal test suites, which lowers the adoption barrier for teams already testing in Python
 - Has explicit "Agentic Metrics" (Task Completion, Tool Correctness, Goal Accuracy, Step Efficiency, Plan Adherence) — but these score agent *traces*, they don't run agents
 
-The main gap: deepeval's built-in metrics are oriented toward conversational AI (relevancy, faithfulness to a source document). Evaluating whether a review agent correctly detected tier escalation requires custom metrics — the framework supports this, but the useful metrics would need to be written.
+The main gap: deepeval's built-in metrics are oriented toward conversational AI (relevancy, faithfulness to a source document). Evaluating whether a review agent correctly detected intent authorization tier escalation requires custom metrics — the framework supports this, but the useful metrics would need to be written.
 
 #### lightspeed-evaluation
 
@@ -356,6 +365,14 @@ Beyond testing individual instruction changes, there's a need for ongoing monito
 - **Production outcome tracking** — when a human overrides an agent's decision, log it as a potential test case. If the agent approved something a human rejected, that's a signal.
 - **Capability dashboards** — for each agent, track which capabilities are covered by tests and what their recent pass rates look like. Similar in spirit to the coverage dashboard referenced in [repo-readiness.md](repo-readiness.md).
 
+External judge results can become policy inputs: a
+[Gemara lab](../spikes/2026-10-24-gemara-auto-merge.md) assessed an aggregate
+judge pass rate against an owner-set threshold before allowing a merge. Its
+aggregate mixed experiment-wide scored approvals rather than a reliably
+isolated current-agent-version cohort, so it could not separate drift in the
+agent from drift in the population. Selection bias, skipped or unscored cases,
+judge and rubric drift, and the lack of human labels remain unresolved.
+
 ## Relationship to other problem areas
 
 - **[Governance](governance.md)** — Who is authorized to change agent instructions? Testing is the verification layer, but governance determines who can make changes and who reviews them.
@@ -366,9 +383,9 @@ Beyond testing individual instruction changes, there's a need for ongoing monito
 
 ## Open questions
 
-- What's the right statistical threshold for non-deterministic tests? How many runs constitute a reliable signal, and what pass rate is acceptable?
+- What's the right statistical threshold for non-deterministic tests? How many runs constitute a reliable signal, and what pass rate is acceptable? *(Partially explored in [experiment 0026](https://github.com/fullsend-ai/experiments/tree/main/0026-eval-statistical-significance): the required run count scales with the effect size you need to detect, and gating on the lower confidence bound beats the point estimate. The policy half — what pass rate is acceptable — remains open.)*
 - Can we use one LLM to test another's behavior reliably, or does LLM-as-judge just move the trust problem?
-- ~~How do we bootstrap the golden set? Do we start with synthetic examples, or do we capture real-world cases from early human-supervised agent operation?~~ Functional tests bootstrap with hand-crafted cases under `eval/`; see [ADR 0052](../ADRs/0052-functional-tests-for-agent-pipelines.md). Prompt-level evals and synthetic expansion remain open.
+- ~~How do we bootstrap the golden set? Do we start with synthetic examples, or do we capture real-world cases from early human-supervised agent operation?~~ Functional tests bootstrap with hand-crafted cases, now kept in the agents repository's functional-test suite; see [ADR 0052](../ADRs/0052-functional-tests-for-agent-pipelines.md) and [ADR 0139](../ADRs/0139-agent-functional-test-suite-lives-in-agents-repo.md). Prompt-level evals and synthetic expansion remain open.
 - Who maintains the test suite for each agent? Is it the agent's instruction author, a separate testing team, or the agent itself (self-testing)?
 - How do we handle model provider updates that change behavior without any instruction changes? Is periodic re-evaluation sufficient, or do we need real-time drift detection?
 - What's the cost budget for agent testing? Running hundreds of LLM evaluations per instruction change could be expensive — both in LLM API costs and in compute resources for running the evaluations in CI.

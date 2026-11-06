@@ -77,6 +77,12 @@ ssh-config`, use standard `ssh`/`scp`/`rsync`. Supports stdout streaming.
 file transfer. No SSH binary or config needed — all communication goes through
 the gateway's gRPC API.
 
+> **Note (2026-09, [#7229](https://github.com/fullsend-ai/fullsend/issues/7229)):**
+> `sandbox exec` cannot deliver a signal to the process it started, and
+> `sandbox stop` never sends SIGINT — but a *second* `sandbox exec`
+> that runs `kill -INT <pid>` against a known guest PID does work. See
+> [Signal and lifecycle semantics](#signal-and-lifecycle-semantics).
+
 ### Credential delivery
 
 **A. OpenShell providers with bare-key form.** Register providers on the gateway
@@ -118,9 +124,9 @@ loader that sources `.env.d/*.env`. Application configuration is delivered via
 are available only to pre/post scripts and never enter the sandbox.
 
 **Credentials: providers reconciled on the gateway.** Credential delivery follows
-the four-tier model in
+the four-tier credential delivery model in
 [ADR 0025](0025-provider-credential-delivery-for-sandboxed-agents.md). For
-tiers that use OpenShell providers, the runner reconciles them before sandbox
+credential delivery tiers that use OpenShell providers, the runner reconciles them before sandbox
 creation: it loads provider definitions from the harness's `providers/`
 directory and calls `openshell provider create --name <n> --type <t>
 --credential <KEY>` for each one. Credentials use the bare-key form — secret
@@ -131,7 +137,7 @@ Providers are then attached to the sandbox via `--provider <name>` flags on
 real credentials at the HTTP proxy layer, so credentials never enter the
 sandbox. For auth flows incompatible with the provider placeholder model
 (e.g. GCP Vertex AI file-based auth), host files deliver credential files
-directly (tier 4).
+directly (credential delivery tier 4).
 
 **Files and binaries: SCP + images (Options A + B).** Agent definitions, skills,
 host files, and security hooks are SCP'd during bootstrap. Tool binaries and
@@ -144,7 +150,7 @@ HTTP CONNECT endpoint — no direct TCP listener on the sandbox. Rsync over SSH
 extracts the modified target repo with `--no-links` (prevent symlink-based
 sandbox escape) and `--exclude .git/hooks/` (prevent injected executables).
 
-**Gateway: start once, reuse (Option A).** `EnsureGateway()` is idempotent. The
+**Gateway: start once, reuse (Option A).** `EnsureGateway()` (since renamed to `CheckGateway()`) is idempotent. The
 gateway persists across sandbox invocations within the same runner job.
 
 **Sandbox lifecycle** follows a fixed sequence: create (`openshell sandbox create
@@ -154,6 +160,59 @@ create directories) → execute agent (SSH with streaming) → extract results (
 for transcripts and output, rsync for repo) → delete
 (`openshell sandbox delete`). The `--keep` flag prevents self-deletion after the
 entry command (`true`) exits; fullsend explicitly deletes after extraction.
+
+> **Note (see #6691):** OpenShell 0.0.111 made an exited main process leave the
+> sandbox terminal rather than Ready, so the entry command recorded above is now
+> `--detach -- sleep infinity` instead of `-- true`. The rest of the sequence,
+> and the reason `--keep` is passed, are unchanged.
+
+### Signal and lifecycle semantics
+
+> **Note (2026-09, [#7229](https://github.com/fullsend-ai/fullsend/issues/7229)):**
+> Annotation of a constraint discovered after this ADR was accepted; the
+> Commands decision above is unchanged.
+>
+> `openshell sandbox exec` is fire-and-forget with respect to the process it
+> started: it does not return an exec id, does not propagate host-side
+> signals into that invoked process tree, and closing the client does not
+> stop the in-sandbox command. Upstream declined to add a per-exec kill
+> ([NVIDIA/OpenShell#3159](https://github.com/NVIDIA/OpenShell/issues/3159),
+> closed as not planned) — its stated position is that callers should not
+> expect exec'd processes to exit when the caller does, the same contract as
+> `podman exec` / `kubectl exec`.
+>
+> This does not make signal delivery impossible: a *second*, independent
+> `sandbox exec` that runs `kill -INT <pid>` against a known guest PID does
+> deliver the signal, because it targets the guest PID directly rather than
+> relying on the original exec channel to propagate anything. [PR
+> #7208](https://github.com/fullsend-ai/fullsend/pull/7208) E2E-verified this
+> path (`total_cost_usd: 0.7879`, was `0`), and production already relies on
+> the same second-exec-plus-in-guest-kill pattern in
+> `killStrayProcessesTemplate` (`internal/runtime/stray_processes.go`) to
+> send TERM/KILL to known guest PIDs.
+>
+> `openshell sandbox stop` is not a graceful alternative to either exec path:
+> it never sends SIGINT. On OpenShell 0.0.x it waited ~45s for a SIGTERM
+> that never arrived (`CAP_KILL` dropped,
+> [NVIDIA/OpenShell#2855](https://github.com/NVIDIA/OpenShell/issues/2855))
+> and then SIGKILLed the container. From 0.1.0
+> ([NVIDIA/OpenShell#3036](https://github.com/NVIDIA/OpenShell/pull/3036))
+> it SIGTERMs the canonical process group and returns in under a second
+> (0.15–0.28s measured on 0.1.1 with podman). Each exec'd process tree now
+> runs in its own process group rather than the supervisor's; whether stop
+> signals those trees gracefully has not been measured.
+>
+> Token-count persistence is the accepted partial fix for cancelled-run
+> telemetry ([#6936](https://github.com/fullsend-ai/fullsend/issues/6936) /
+> [PR #6938](https://github.com/fullsend-ai/fullsend/pull/6938)).
+> [PR #7208](https://github.com/fullsend-ai/fullsend/pull/7208) added a
+> second-exec SIGINT side-channel to also capture `total_cost_usd` on
+> cancellation, and signal delivery itself worked. It was closed unmerged
+> anyway: the side-channel bypasses OpenShell's supported stop lifecycle, the
+> PID-file mechanism it depends on only reliably targets the runtime process
+> for callers that `exec` into it (Claude) and not the others (Codex, Pi),
+> and `total_cost_usd` is a list-price estimate rather than an authoritative
+> billing figure — not worth the added complexity and risk.
 
 ## Consequences
 

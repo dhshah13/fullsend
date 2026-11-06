@@ -1,0 +1,233 @@
+package dispatch
+
+import (
+	"slices"
+	"strings"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
+)
+
+// changesRequestedMarker is the HTML comment that the review bot
+// embeds in MR notes to signal the fix stage. Aliased from forge so
+// GitLab note posting, poller retention, and routing stay in lockstep.
+const changesRequestedMarker = forge.ChangesRequestedMarker
+
+// noFixLabel suppresses bot-triggered fix dispatch, matching GitHub's
+// check-fix-eligibility.sh. Applied by /fs-fix-stop; see docs/agents/fix.md.
+const noFixLabel = "fullsend-no-fix"
+
+// HarnessRouter implements EventRouter by applying the default routing
+// rules from ADR 0067's event routing table. Slash commands (/fs-X)
+// dispatch to any agent in the valid set; label, merge, MR-open, and
+// MR-push (synchronized) events use hardcoded stage mappings.
+//
+// This is an interim implementation using Go routing rules. ADR 0067
+// prescribes CEL trigger expressions (ADR 0061) for routing; this
+// hard-coded router will be replaced once the CEL evaluation engine
+// is available in the dispatch core.
+type HarnessRouter struct {
+	validAgents map[string]bool
+}
+
+// NewHarnessRouter creates a router that accepts the given agent names
+// as valid dispatch targets. Names are stored lowercase for
+// case-insensitive matching.
+func NewHarnessRouter(agentNames []string) *HarnessRouter {
+	m := make(map[string]bool, len(agentNames))
+	for _, name := range agentNames {
+		m[strings.ToLower(name)] = true
+	}
+	return &HarnessRouter{validAgents: m}
+}
+
+// Route determines which stages (if any) should handle the event.
+func (r *HarnessRouter) Route(event *NormalizedEvent) ([]string, error) {
+	if event == nil {
+		return nil, nil
+	}
+
+	switch event.Transition.Kind {
+	case "comment_added":
+		return r.routeComment(event)
+	case "label_changed":
+		return r.routeLabel(event)
+	case "merged", "closed":
+		return r.routeMerge(event)
+	case "opened":
+		return r.routeOpened(event)
+	case "synchronized":
+		return r.routeSynchronized(event)
+	default:
+		return nil, nil
+	}
+}
+
+func (r *HarnessRouter) routeComment(event *NormalizedEvent) ([]string, error) {
+	if event.Transition.Comment == nil {
+		return nil, nil
+	}
+
+	// Slash command: /fs-{agent}
+	if cmd := event.Transition.Comment.Command; cmd != "" {
+		return r.routeSlashCommand(event, cmd)
+	}
+
+	// Changes-requested marker on MR notes → fix stage.
+	// Only trusted (bot-authored) markers trigger fix; human comments
+	// containing the marker string are ignored to prevent spoofing.
+	if event.Entity.Kind == "change_proposal" &&
+		event.Actor.Kind == "bot" &&
+		strings.Contains(event.Transition.Comment.Body, changesRequestedMarker) {
+		if isForkOrUnknown(event.State) {
+			return nil, nil
+		}
+		if !r.validAgents["fix"] {
+			return nil, nil
+		}
+		// fullsend-no-fix suppresses bot-triggered fix runs, matching
+		// GitHub's check-fix-eligibility.sh gate. GitHub also requires
+		// a fullsend-fix opt-in label for non-coder-bot/human-authored
+		// PRs; State does not yet carry enough MR-author identity to
+		// replicate that half of the gate for GitLab, so it is deferred
+		// (see docs/agents/fix.md Control labels section).
+		if slices.Contains(event.State.Labels, noFixLabel) {
+			return nil, nil
+		}
+		return []string{"fix"}, nil
+	}
+
+	return nil, nil
+}
+
+func (r *HarnessRouter) routeSlashCommand(event *NormalizedEvent, cmd string) ([]string, error) {
+	if !strings.HasPrefix(cmd, "/fs-") {
+		return nil, nil
+	}
+
+	if event.Entity.Kind == "change_proposal" && isForkOrUnknown(event.State) {
+		return nil, nil
+	}
+
+	stage := strings.ToLower(strings.TrimPrefix(cmd, "/fs-"))
+	if stage == "" {
+		return nil, nil
+	}
+
+	if !r.validAgents[stage] {
+		return nil, nil
+	}
+
+	// Observation stages (triage, review) accept the triage role;
+	// mutation stages (code, fix, etc.) require write per ADR 0054.
+	minRole := "write"
+	if isObservationStage(stage) {
+		minRole = "triage"
+	}
+
+	if !HasRole(event.Actor.Role, minRole) {
+		// Entity-author bypass: issue reporters can trigger observation
+		// stages on their own work_item entities even with read-only
+		// access. Does not apply to change_proposal entities.
+		if !(isObservationStage(stage) && event.Entity.Kind == "work_item" && event.Actor.IsEntityAuthor) {
+			return nil, nil
+		}
+	}
+
+	return []string{stage}, nil
+}
+
+// isObservationStage reports whether stage is a read-only observation
+// stage that accepts the triage role per ADR 0054.
+func isObservationStage(stage string) bool {
+	return stage == "triage" || stage == "review"
+}
+
+func (r *HarnessRouter) routeLabel(event *NormalizedEvent) ([]string, error) {
+	if event.Transition.Label == nil || event.Transition.Label.Action != "added" {
+		return nil, nil
+	}
+
+	var stage string
+	switch event.Transition.Label.Name {
+	case "ready-to-code":
+		stage = "code"
+	case "ready-for-review":
+		stage = "review"
+	default:
+		return nil, nil
+	}
+
+	if event.Entity.Kind == "change_proposal" && isForkOrUnknown(event.State) {
+		return nil, nil
+	}
+
+	if !HasRole(event.Actor.Role, "write") {
+		return nil, nil
+	}
+
+	if !r.validAgents[stage] {
+		return nil, nil
+	}
+
+	return []string{stage}, nil
+}
+
+// routeMerge does not verify the merge/close actor's role — retro is a
+// read-only analysis stage, so dispatching it carries no mutation risk.
+// Both merged and closed-unmerged transitions dispatch retro. Only
+// change proposals reach retro: a closed work item (issue close, which
+// the GitLab webhook builder can emit) is not a retro trigger.
+func (r *HarnessRouter) routeMerge(event *NormalizedEvent) ([]string, error) {
+	if event.Entity.Kind != "change_proposal" {
+		return nil, nil
+	}
+	if !r.validAgents["retro"] {
+		return nil, nil
+	}
+	return []string{"retro"}, nil
+}
+
+// routeOpened dispatches triage for a new GitLab work item and review for a
+// new change proposal. Jira issue opening retains its existing routing.
+// Authorization is enforced in the GitLab agent template (Developer+),
+// matching the previous native merge_request_event path. Review is
+// read-only, so fork MRs are allowed; the agent template skips write
+// stages on forks.
+func (r *HarnessRouter) routeOpened(event *NormalizedEvent) ([]string, error) {
+	switch event.Entity.Kind {
+	case "work_item":
+		if event.Source.System == "gitlab" && r.validAgents["triage"] {
+			return []string{"triage"}, nil
+		}
+	case "change_proposal":
+		if r.validAgents["review"] {
+			return []string{"review"}, nil
+		}
+	}
+	return nil, nil
+}
+
+// routeSynchronized dispatches review for a same-project change proposal
+// whose head received new commits. The poller cannot tell who pushed (the
+// event actor is the MR author), so the pusher is never authorized here.
+// Fork and unknown-origin MRs are denied: a non-member with push access to
+// the fork could otherwise trigger repeated reviews under the author's
+// identity. Fork MR re-review is currently unsupported, since
+// routeSlashCommand also denies fork MRs. For a same-project MR any pusher
+// already holds project push access.
+func (r *HarnessRouter) routeSynchronized(event *NormalizedEvent) ([]string, error) {
+	if event.Entity.Kind != "change_proposal" || isForkOrUnknown(event.State) {
+		return nil, nil
+	}
+	if r.validAgents["review"] {
+		return []string{"review"}, nil
+	}
+	return nil, nil
+}
+
+// isForkOrUnknown reports whether the event's change proposal state
+// indicates a fork MR or is absent (nil == unknown, deny by default
+// per the State doc comment in event.go).
+func isForkOrUnknown(s State) bool {
+	return s.ChangeProposal == nil || s.ChangeProposal.IsFork
+}

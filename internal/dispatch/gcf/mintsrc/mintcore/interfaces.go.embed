@@ -2,13 +2,7 @@ package mintcore
 
 import (
 	"context"
-	"net/http"
 )
-
-// HTTPDoer abstracts http.Client for testability.
-type HTTPDoer interface {
-	Do(req *http.Request) (*http.Response, error)
-}
 
 // OIDCVerifier validates OIDC tokens and returns parsed claims.
 // Implementations include JWKSVerifier (direct JWKS validation) and

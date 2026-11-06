@@ -1,3 +1,10 @@
 # Web
 
-Browser-delivered assets for the public site: static files under `public/` today (document graph as `index.html`), plus the **admin installation SPA** under [`admin/`](admin/) (Svelte + Vite; **`vite.config.ts`** at the repository root). Local admin OAuth expects **`GITHUB_APP_*` in the environment** (see [`admin/README.md`](admin/README.md)); **mise** can load repo-root **`.env.local`** for you if you use it. Build output is `web/admin/dist/` and CI stages `_bundle/public/admin/`. **`package.json` / `npm run dev` stay at the repository root** (see [ADR 0019](../docs/ADRs/0019-web-source-and-cloudflare-site-layout.md)). Wrangler configuration and the Worker live only under [`../cloudflare_site/`](../cloudflare_site/).
+Browser-delivered static assets for the public site: the landing page and the
+custom 404 page under [`public/`](public/) (`index.html` and `404.html`).
+
+There is no Vite build in this directory.
+
+The documentation site is built separately by VitePress from [`../docs/`](../docs/)
+(`npm run docs:build`). Wrangler configuration and the site Worker live only under
+[`../cloudflare_site/`](../cloudflare_site/); that Worker is now a static-asset passthrough.

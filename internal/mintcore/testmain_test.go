@@ -7,11 +7,12 @@ import (
 
 func TestMain(m *testing.M) {
 	defaults := map[string]string{
-		"ALLOWED_ORGS":           "test-org",
 		"GCP_PROJECT_NUMBER":     "123456",
-		"OIDC_AUDIENCE":          "fullsend-mint",
-		"ROLE_APP_IDS":           `{"triage":"100","coder":"200","review":"300","fullsend":"500"}`,
+		"ROLE_APP_IDS":           `{"triage":"100","coder":"200","review":"300","fullsend":"500","retro":"600","prioritize":"700"}`,
 		"ALLOWED_WORKFLOW_FILES": "*",
+		// The default test token's repository is enrolled per-repo so
+		// callers are authorized unless a test overrides enrollment.
+		"PER_REPO_WIF_REPOS": "test-org/test-repo",
 	}
 	for k, v := range defaults {
 		if os.Getenv(k) == "" {

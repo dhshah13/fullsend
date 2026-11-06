@@ -59,14 +59,23 @@ func TestYAMLSemantics_Slices(t *testing.T) {
 			absent:    `agent: test.md`,
 			empty:     "agent: test.md\nskills: []",
 			populated: "agent: test.md\nskills:\n  - a\n  - b",
-			getSlice:  func(h Harness) []string { return h.Skills },
+			getSlice:  func(h Harness) []string { return SkillSources(h.Skills) },
 		},
 		{
 			fieldName: "plugins",
 			absent:    `agent: test.md`,
 			empty:     "agent: test.md\nplugins: []",
 			populated: "agent: test.md\nplugins:\n  - a\n  - b",
-			getSlice:  func(h Harness) []string { return h.Plugins },
+			getSlice: func(h Harness) []string {
+				if h.Plugins == nil {
+					return nil
+				}
+				out := make([]string, 0, len(h.Plugins))
+				for _, p := range h.Plugins {
+					out = append(out, p.Path)
+				}
+				return out
+			},
 		},
 		{
 			fieldName: "providers",
@@ -491,5 +500,26 @@ func TestYAMLSemantics_PointerBools(t *testing.T) {
 		h := unmarshalHarness(t, "agent: test.md\nsecurity:\n  sandbox_hooks:\n    tool_allowlist_pretool:\n      enabled: true")
 		require.NotNil(t, h.Security.SandboxHooks.ToolAllowlistPreTool.Enabled)
 		assert.True(t, *h.Security.SandboxHooks.ToolAllowlistPreTool.Enabled)
+	})
+}
+
+func TestYAMLSemantics_SchemaVersion(t *testing.T) {
+	t.Run("schema_version/absent_is_nil", func(t *testing.T) {
+		h := unmarshalHarness(t, `agent: test.md`)
+		assert.Nil(t, h.SchemaVersion)
+	})
+	t.Run("schema_version/null_is_nil", func(t *testing.T) {
+		h := unmarshalHarness(t, "agent: test.md\nschema_version: null")
+		assert.Nil(t, h.SchemaVersion)
+	})
+	t.Run("schema_version/tilde_is_nil", func(t *testing.T) {
+		h := unmarshalHarness(t, "agent: test.md\nschema_version: ~")
+		assert.Nil(t, h.SchemaVersion)
+	})
+	t.Run("schema_version/explicit_one", func(t *testing.T) {
+		h := unmarshalHarness(t, "agent: test.md\nschema_version: 1")
+		require.NotNil(t, h.SchemaVersion)
+		// EqualValues: the field is a named schemaVersionValue, not a bare int.
+		assert.EqualValues(t, 1, *h.SchemaVersion)
 	})
 }

@@ -1,0 +1,1210 @@
+package gitlab
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/fullsend-ai/fullsend/internal/forge"
+	"github.com/fullsend-ai/fullsend/internal/poll"
+)
+
+// Compile-time check that PollClient satisfies poll.GitLabClient.
+var _ poll.GitLabClient = (*PollClient)(nil)
+
+func setupPollTest(t *testing.T) (*PollClient, *http.ServeMux) {
+	t.Helper()
+	client, mux := setupTest(t)
+	return NewPollClient(client), mux
+}
+
+func TestGetUserBot(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    map[string]any
+		status  int
+		userID  int
+		wantBot bool
+		wantErr bool
+	}{
+		{"service account", map[string]any{"id": 57, "bot": true}, http.StatusOK, 57, true, false},
+		{"human", map[string]any{"id": 57, "bot": false}, http.StatusOK, 57, false, false},
+		{"missing bot flag", map[string]any{"id": 57}, http.StatusOK, 57, false, true},
+		{"mismatched user", map[string]any{"id": 58, "bot": false}, http.StatusOK, 57, false, true},
+		{"API failure", nil, http.StatusServiceUnavailable, 57, false, true},
+		{"invalid ID", nil, http.StatusOK, 0, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pc, mux := setupPollTest(t)
+			handlerCalled := false
+			mux.HandleFunc("/api/v4/users/57", func(w http.ResponseWriter, r *http.Request) {
+				handlerCalled = true
+				assert.Equal(t, http.MethodGet, r.Method)
+				writeJSON(t, w, tt.status, tt.body)
+			})
+			bot, err := pc.GetUserBot(context.Background(), tt.userID)
+			// An invalid ID must be rejected before any HTTP request.
+			assert.Equal(t, tt.userID != 0, handlerCalled)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantBot, bot)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ListIssuesUpdatedSince
+// ---------------------------------------------------------------------------
+
+func TestListIssuesUpdatedSince(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "100", r.URL.Query().Get("per_page"))
+		assert.NotEmpty(t, r.URL.Query().Get("updated_after"))
+
+		writeJSON(t, w, http.StatusOK, []map[string]any{
+			{
+				"iid":        1,
+				"title":      "Bug report",
+				"state":      "opened",
+				"labels":     []string{"bug"},
+				"author":     map[string]any{"id": 10, "username": "alice", "bot": false},
+				"updated_at": "2024-06-01T12:00:00Z",
+			},
+			{
+				"iid":        2,
+				"title":      "Feature req",
+				"state":      "closed",
+				"labels":     []string{"feature"},
+				"author":     map[string]any{"id": 20, "username": "bob", "bot": false},
+				"updated_at": "2024-06-02T12:00:00Z",
+			},
+		})
+	})
+
+	since := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	issues, err := pc.ListIssuesUpdatedSince(ctx, "myorg", "myrepo", since)
+	require.NoError(t, err)
+	require.Len(t, issues, 2)
+	assert.Equal(t, 1, issues[0].IID)
+	assert.Equal(t, "Bug report", issues[0].Title)
+	assert.Equal(t, "opened", issues[0].State)
+	assert.Equal(t, []string{"bug"}, issues[0].Labels)
+	assert.Equal(t, "alice", issues[0].Author.Username)
+	assert.Equal(t, 2, issues[1].IID)
+}
+
+func TestListIssuesUpdatedSince_Pagination(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues", func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		switch page {
+		case "1", "":
+			items := make([]map[string]any, 100)
+			for i := range items {
+				items[i] = map[string]any{
+					"iid":        i + 1,
+					"title":      "Issue",
+					"state":      "opened",
+					"labels":     []string{},
+					"author":     map[string]any{"id": 1, "username": "u"},
+					"updated_at": "2024-06-01T12:00:00Z",
+				}
+			}
+			writeJSON(t, w, http.StatusOK, items)
+		case "2":
+			writeJSON(t, w, http.StatusOK, []map[string]any{
+				{
+					"iid":        101,
+					"title":      "Last",
+					"state":      "opened",
+					"labels":     []string{},
+					"author":     map[string]any{"id": 1, "username": "u"},
+					"updated_at": "2024-06-01T12:00:00Z",
+				},
+			})
+		}
+	})
+
+	since := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	issues, err := pc.ListIssuesUpdatedSince(ctx, "myorg", "myrepo", since)
+	require.NoError(t, err)
+	assert.Len(t, issues, 101)
+}
+
+// ---------------------------------------------------------------------------
+// ListMergeRequestsUpdatedSince
+// ---------------------------------------------------------------------------
+
+func TestListMergeRequestsUpdatedSince(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.NotEmpty(t, r.URL.Query().Get("updated_after"))
+
+		writeJSON(t, w, http.StatusOK, []map[string]any{
+			{
+				"iid":               10,
+				"title":             "Add feature",
+				"state":             "merged",
+				"labels":            []string{"enhancement"},
+				"source_project_id": 100,
+				"target_project_id": 100,
+				"source_branch":     "feature",
+				"target_branch":     "main",
+				"author":            map[string]any{"id": 5, "username": "dev"},
+				"merge_user":        map[string]any{"id": 6, "username": "merger"},
+				"merged_by":         map[string]any{"id": 6, "username": "merger"},
+				"merged_at":         "2024-06-01T14:00:00Z",
+				"created_at":        "2024-06-01T10:00:00Z",
+				"updated_at":        "2024-06-01T14:00:00Z",
+			},
+		})
+	})
+
+	since := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	mrs, err := pc.ListMergeRequestsUpdatedSince(ctx, "myorg", "myrepo", since)
+	require.NoError(t, err)
+	require.Len(t, mrs, 1)
+	assert.Equal(t, 10, mrs[0].IID)
+	assert.Equal(t, "Add feature", mrs[0].Title)
+	assert.Equal(t, "merged", mrs[0].State)
+	assert.Equal(t, "dev", mrs[0].Author.Username)
+	assert.Equal(t, "merger", mrs[0].MergeUser.Username)
+	assert.Equal(t, "feature", mrs[0].SourceBranch)
+	assert.Equal(t, "main", mrs[0].TargetBranch)
+	assert.Equal(t, time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC), mrs[0].CreatedAt)
+}
+
+func TestListMergeRequestsUpdatedSince_ClosedFields(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusOK, []map[string]any{
+			{
+				"iid":               11,
+				"title":             "Abandoned",
+				"state":             "closed",
+				"source_project_id": 100,
+				"target_project_id": 100,
+				"author":            map[string]any{"id": 5, "username": "dev"},
+				"closed_by":         map[string]any{"id": 7, "username": "closer"},
+				"closed_at":         "2024-06-01T15:00:00Z",
+				"created_at":        "2024-06-01T10:00:00Z",
+				"updated_at":        "2024-06-01T15:00:00Z",
+			},
+		})
+	})
+
+	since := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	mrs, err := pc.ListMergeRequestsUpdatedSince(ctx, "myorg", "myrepo", since)
+	require.NoError(t, err)
+	require.Len(t, mrs, 1)
+	assert.Equal(t, 11, mrs[0].IID)
+	assert.Equal(t, "closed", mrs[0].State)
+	assert.Equal(t, "closer", mrs[0].ClosedBy.Username)
+	assert.Equal(t, 7, mrs[0].ClosedBy.ID)
+	assert.Equal(t, time.Date(2024, 6, 1, 15, 0, 0, 0, time.UTC), mrs[0].ClosedAt)
+	assert.True(t, mrs[0].MergedAt.IsZero())
+}
+
+// ---------------------------------------------------------------------------
+// ListProjectEvents
+// ---------------------------------------------------------------------------
+
+func TestListProjectEvents(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/events", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "note", r.URL.Query().Get("target_type"))
+
+		// Verify the date parameter was widened by one day:
+		// since = 2024-06-15, so after should be 2024-06-14
+		assert.Equal(t, "2024-06-14", r.URL.Query().Get("after"))
+
+		writeJSON(t, w, http.StatusOK, []map[string]any{
+			{
+				"id":         1,
+				"author":     map[string]any{"id": 10, "username": "commenter"},
+				"created_at": "2024-06-15T10:00:00Z",
+				"note": map[string]any{
+					"id":            100,
+					"noteable_type": "Issue",
+					"noteable_iid":  5,
+					"body":          "LGTM",
+				},
+			},
+			{
+				"id":         2,
+				"author":     map[string]any{"id": 20, "username": "old"},
+				"created_at": "2024-06-14T08:00:00Z",
+				"note": map[string]any{
+					"id":            99,
+					"noteable_type": "MergeRequest",
+					"noteable_iid":  3,
+					"body":          "old comment",
+				},
+			},
+		})
+	})
+
+	since := time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC)
+	events, err := pc.ListProjectEvents(ctx, "myorg", "myrepo", "note", since)
+	require.NoError(t, err)
+
+	// Only the event at 2024-06-15T10:00:00Z should pass the
+	// client-side filter (>= since). The old event from 2024-06-14
+	// should be excluded.
+	require.Len(t, events, 1)
+	assert.Equal(t, 1, events[0].ID)
+	assert.Equal(t, "commenter", events[0].Author.Username)
+	assert.Equal(t, "Issue", events[0].Note.NoteableType)
+	assert.Equal(t, 5, events[0].Note.NoteableIID)
+	assert.Equal(t, "LGTM", events[0].Note.Body)
+}
+
+// ---------------------------------------------------------------------------
+// ListIssueNotes
+// ---------------------------------------------------------------------------
+
+func TestListIssueNotes(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/5/notes", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "asc", r.URL.Query().Get("sort"))
+
+		writeJSON(t, w, http.StatusOK, []map[string]any{
+			{
+				"id":         100,
+				"body":       "First note",
+				"author":     map[string]any{"id": 10, "username": "alice", "bot": false},
+				"created_at": "2024-06-01T12:00:00Z",
+			},
+			{
+				"id":         101,
+				"body":       "Bot note",
+				"author":     map[string]any{"id": 20, "username": "bot-user", "bot": true},
+				"created_at": "2024-06-01T12:05:00Z",
+			},
+		})
+	})
+
+	notes, err := pc.ListIssueNotes(ctx, "myorg", "myrepo", 5)
+	require.NoError(t, err)
+	require.Len(t, notes, 2)
+	assert.Equal(t, 100, notes[0].ID)
+	assert.Equal(t, "First note", notes[0].Body)
+	assert.Equal(t, "alice", notes[0].Author.Username)
+	assert.False(t, notes[0].Author.Bot)
+	assert.Equal(t, 101, notes[1].ID)
+	assert.True(t, notes[1].Author.Bot)
+}
+
+// ---------------------------------------------------------------------------
+// ListMergeRequestNotes
+// ---------------------------------------------------------------------------
+
+func TestListMergeRequestNotes(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/10/notes", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "asc", r.URL.Query().Get("sort"))
+
+		writeJSON(t, w, http.StatusOK, []map[string]any{
+			{
+				"id":         200,
+				"body":       "Review comment",
+				"author":     map[string]any{"id": 30, "username": "reviewer"},
+				"created_at": "2024-06-01T15:00:00Z",
+			},
+		})
+	})
+
+	notes, err := pc.ListMergeRequestNotes(ctx, "myorg", "myrepo", 10)
+	require.NoError(t, err)
+	require.Len(t, notes, 1)
+	assert.Equal(t, 200, notes[0].ID)
+	assert.Equal(t, "Review comment", notes[0].Body)
+	assert.Equal(t, "reviewer", notes[0].Author.Username)
+}
+
+// ---------------------------------------------------------------------------
+// ListMergeRequestDiffVersions
+// ---------------------------------------------------------------------------
+
+func TestListMergeRequestDiffVersions(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/10/versions", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "100", r.URL.Query().Get("per_page"))
+
+		writeJSON(t, w, http.StatusOK, []map[string]any{
+			{"id": 2, "head_commit_sha": "bbb", "created_at": "2024-06-01T16:00:00Z"},
+			{"id": 1, "head_commit_sha": "aaa", "created_at": "2024-06-01T15:00:00Z"},
+		})
+	})
+
+	versions, err := pc.ListMergeRequestDiffVersions(ctx, "myorg", "myrepo", 10)
+	require.NoError(t, err)
+	require.Len(t, versions, 2)
+	assert.Equal(t, 2, versions[0].ID)
+	assert.Equal(t, "bbb", versions[0].HeadCommitSHA)
+	assert.Equal(t, time.Date(2024, 6, 1, 16, 0, 0, 0, time.UTC), versions[0].CreatedAt)
+}
+
+func TestListMergeRequestDiffVersions_Error(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	handlerCalled := false
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/10/versions", func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled = true
+		writeJSON(t, w, http.StatusNotFound, map[string]any{"message": "404 Not Found"})
+	})
+
+	_, err := pc.ListMergeRequestDiffVersions(ctx, "myorg", "myrepo", 10)
+	require.Error(t, err)
+	assert.True(t, handlerCalled)
+}
+
+// ---------------------------------------------------------------------------
+// ListResourceLabelEvents
+// ---------------------------------------------------------------------------
+
+func TestListResourceLabelEvents(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/5/resource_label_events", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "100", r.URL.Query().Get("per_page"))
+
+		writeJSON(t, w, http.StatusOK, []map[string]any{
+			{
+				"id":     1,
+				"action": "add",
+				"label":  map[string]any{"name": "ready-to-code"},
+				"user":   map[string]any{"id": 10, "username": "alice"},
+			},
+			{
+				"id":     2,
+				"action": "remove",
+				"label":  map[string]any{"name": "wip"},
+				"user":   map[string]any{"id": 10, "username": "alice"},
+			},
+		})
+	})
+
+	events, err := pc.ListResourceLabelEvents(ctx, "myorg", "myrepo", 5)
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	assert.Equal(t, 1, events[0].ID)
+	assert.Equal(t, "add", events[0].Action)
+	assert.Equal(t, "ready-to-code", events[0].Label.Name)
+	assert.Equal(t, 2, events[1].ID)
+	assert.Equal(t, "remove", events[1].Action)
+}
+
+// ---------------------------------------------------------------------------
+// GetCIVariable
+// ---------------------------------------------------------------------------
+
+func TestPollGetCIVariable(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/variables/MY_VAR", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		writeJSON(t, w, http.StatusOK, map[string]string{
+			"key":   "MY_VAR",
+			"value": "cursor-value",
+		})
+	})
+
+	val, err := pc.GetCIVariable(ctx, "myorg", "myrepo", "MY_VAR")
+	require.NoError(t, err)
+	assert.Equal(t, "cursor-value", val)
+}
+
+func TestPollGetCIVariable_NotFound(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/variables/MISSING", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusNotFound, map[string]string{"message": "404 Not Found"})
+	})
+
+	_, err := pc.GetCIVariable(ctx, "myorg", "myrepo", "MISSING")
+	require.Error(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// CreateNoteAwardEmoji
+// ---------------------------------------------------------------------------
+
+func TestCreateNoteAwardEmoji_Issue(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/5/notes/100/award_emoji", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		var body map[string]string
+		readJSONBody(t, r, &body)
+		assert.Equal(t, "eyes", body["name"])
+		writeJSON(t, w, http.StatusCreated, map[string]any{"id": 1, "name": "eyes"})
+	})
+
+	err := pc.CreateNoteAwardEmoji(ctx, "myorg", "myrepo", "Issue", 5, 100, "eyes")
+	require.NoError(t, err)
+}
+
+func TestCreateNoteAwardEmoji_MergeRequest(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/10/notes/200/award_emoji", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		var body map[string]string
+		readJSONBody(t, r, &body)
+		assert.Equal(t, "thumbsup", body["name"])
+		writeJSON(t, w, http.StatusCreated, map[string]any{"id": 2, "name": "thumbsup"})
+	})
+
+	err := pc.CreateNoteAwardEmoji(ctx, "myorg", "myrepo", "MergeRequest", 10, 200, "thumbsup")
+	require.NoError(t, err)
+}
+
+func TestCreateNoteAwardEmoji_InvalidType(t *testing.T) {
+	pc, _ := setupPollTest(t)
+	ctx := context.Background()
+
+	err := pc.CreateNoteAwardEmoji(ctx, "myorg", "myrepo", "Unknown", 1, 1, "eyes")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported noteable type")
+}
+
+// ---------------------------------------------------------------------------
+// GetIssue (poll version)
+// ---------------------------------------------------------------------------
+
+func TestPollGetIssue(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/42", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		writeJSON(t, w, http.StatusOK, map[string]any{
+			"iid":        42,
+			"title":      "Poll issue",
+			"state":      "opened",
+			"labels":     []string{"bug", "critical"},
+			"author":     map[string]any{"id": 10, "username": "alice", "bot": false},
+			"updated_at": "2024-06-01T12:00:00Z",
+		})
+	})
+
+	issue, err := pc.GetIssue(ctx, "myorg", "myrepo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, 42, issue.IID)
+	assert.Equal(t, "Poll issue", issue.Title)
+	assert.Equal(t, "opened", issue.State)
+	assert.Equal(t, []string{"bug", "critical"}, issue.Labels)
+	assert.Equal(t, "alice", issue.Author.Username)
+	assert.Equal(t, 10, issue.Author.ID)
+}
+
+func TestPollGetIssue_NotFound(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/999", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusNotFound, map[string]string{"message": "404 Not Found"})
+	})
+
+	_, err := pc.GetIssue(ctx, "myorg", "myrepo", 999)
+	require.Error(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// GetMergeRequest
+// ---------------------------------------------------------------------------
+
+func TestPollGetMergeRequest(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/10", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		writeJSON(t, w, http.StatusOK, map[string]any{
+			"iid":               10,
+			"title":             "Add feature",
+			"state":             "opened",
+			"labels":            []string{"review"},
+			"source_project_id": 100,
+			"target_project_id": 100,
+			"source_branch":     "feature",
+			"target_branch":     "main",
+			"author":            map[string]any{"id": 55, "username": "bob", "bot": false},
+			"updated_at":        "2024-06-01T12:00:00Z",
+		})
+	})
+
+	mr, err := pc.GetMergeRequest(ctx, "myorg", "myrepo", 10)
+	require.NoError(t, err)
+	assert.Equal(t, 10, mr.IID)
+	assert.Equal(t, "Add feature", mr.Title)
+	assert.Equal(t, 100, mr.SourceProjectID)
+	assert.Equal(t, 100, mr.TargetProjectID)
+	assert.Equal(t, "feature", mr.SourceBranch)
+	assert.Equal(t, "main", mr.TargetBranch)
+	assert.Equal(t, "bob", mr.Author.Username)
+}
+
+func TestPollGetMergeRequest_NotFound(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/999", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusNotFound, map[string]string{"message": "404 Not Found"})
+	})
+
+	_, err := pc.GetMergeRequest(ctx, "myorg", "myrepo", 999)
+	require.Error(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// GetMemberAccessLevel
+// ---------------------------------------------------------------------------
+
+func TestGetMemberAccessLevel(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/members/all/42", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		writeJSON(t, w, http.StatusOK, map[string]any{
+			"id":           42,
+			"username":     "alice",
+			"access_level": 30,
+		})
+	})
+
+	level, err := pc.GetMemberAccessLevel(ctx, "myorg", "myrepo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, 30, level)
+}
+
+func TestGetMemberAccessLevel_NotFound(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/members/all/999", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusNotFound, map[string]string{"message": "404 Not Found"})
+	})
+
+	_, err := pc.GetMemberAccessLevel(ctx, "myorg", "myrepo", 999)
+	require.Error(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// GetProjectPath
+// ---------------------------------------------------------------------------
+
+func TestGetProjectPath(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/12345", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		writeJSON(t, w, http.StatusOK, map[string]any{
+			"id":                  12345,
+			"path_with_namespace": "mygroup/myrepo",
+		})
+	})
+
+	path, err := pc.GetProjectPath(ctx, 12345)
+	require.NoError(t, err)
+	assert.Equal(t, "mygroup/myrepo", path)
+}
+
+func TestGetProjectPath_NotFound(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/99999", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusNotFound, map[string]string{"message": "404 Not Found"})
+	})
+
+	_, err := pc.GetProjectPath(ctx, 99999)
+	require.Error(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// Error paths — API failures
+// ---------------------------------------------------------------------------
+
+func TestListIssuesUpdatedSince_APIError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusInternalServerError, map[string]string{"message": "internal error"})
+	})
+
+	_, err := pc.ListIssuesUpdatedSince(ctx, "myorg", "myrepo", time.Now())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list issues updated since page 1")
+}
+
+func TestListMergeRequestsUpdatedSince_APIError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusInternalServerError, map[string]string{"message": "internal error"})
+	})
+
+	_, err := pc.ListMergeRequestsUpdatedSince(ctx, "myorg", "myrepo", time.Now())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list merge requests updated since page 1")
+}
+
+func TestListMergeRequestsUpdatedSince_Pagination(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		switch page {
+		case "1", "":
+			items := make([]map[string]any, 100)
+			for i := range items {
+				items[i] = map[string]any{
+					"iid":               i + 1,
+					"title":             "MR",
+					"state":             "opened",
+					"labels":            []string{},
+					"source_project_id": 1,
+					"target_project_id": 1,
+					"source_branch":     "feature",
+					"target_branch":     "main",
+					"author":            map[string]any{"id": 1, "username": "u"},
+					"updated_at":        "2024-06-01T12:00:00Z",
+				}
+			}
+			writeJSON(t, w, http.StatusOK, items)
+		case "2":
+			writeJSON(t, w, http.StatusOK, []map[string]any{
+				{
+					"iid":               101,
+					"title":             "Last MR",
+					"state":             "opened",
+					"labels":            []string{},
+					"source_project_id": 1,
+					"target_project_id": 1,
+					"source_branch":     "feature",
+					"target_branch":     "main",
+					"author":            map[string]any{"id": 1, "username": "u"},
+					"updated_at":        "2024-06-01T12:00:00Z",
+				},
+			})
+		}
+	})
+
+	since := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	mrs, err := pc.ListMergeRequestsUpdatedSince(ctx, "myorg", "myrepo", since)
+	require.NoError(t, err)
+	assert.Len(t, mrs, 101)
+}
+
+func TestListProjectEvents_APIError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/events", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusInternalServerError, map[string]string{"message": "internal error"})
+	})
+
+	_, err := pc.ListProjectEvents(ctx, "myorg", "myrepo", "note", time.Now())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list project events page 1")
+}
+
+func TestListProjectEvents_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.ListProjectEvents(ctx, "myorg", "myrepo", "note", time.Now())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode project events page 1")
+}
+
+func TestListIssueNotes_APIError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/5/notes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusInternalServerError, map[string]string{"message": "internal error"})
+	})
+
+	_, err := pc.ListIssueNotes(ctx, "myorg", "myrepo", 5)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list issue notes page 1")
+}
+
+func TestListMergeRequestNotes_APIError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/10/notes", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusInternalServerError, map[string]string{"message": "internal error"})
+	})
+
+	_, err := pc.ListMergeRequestNotes(ctx, "myorg", "myrepo", 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list merge request notes page 1")
+}
+
+func TestListResourceLabelEvents_APIError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/5/resource_label_events", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusInternalServerError, map[string]string{"message": "internal error"})
+	})
+
+	_, err := pc.ListResourceLabelEvents(ctx, "myorg", "myrepo", 5)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list resource label events page 1")
+}
+
+func TestCreateNoteAwardEmoji_APIError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/5/notes/100/award_emoji", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusInternalServerError, map[string]string{"message": "internal error"})
+	})
+
+	err := pc.CreateNoteAwardEmoji(ctx, "myorg", "myrepo", "Issue", 5, 100, "eyes")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "create award emoji on Issue #5 note 100")
+}
+
+func TestCreateNoteAwardEmoji_MRError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/10/notes/200/award_emoji", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusInternalServerError, map[string]string{"message": "internal error"})
+	})
+
+	err := pc.CreateNoteAwardEmoji(ctx, "myorg", "myrepo", "MergeRequest", 10, 200, "eyes")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "create award emoji on MergeRequest !10 note 200")
+}
+
+func TestGetCIVariable_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/variables/BAD", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.GetCIVariable(ctx, "myorg", "myrepo", "BAD")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode CI variable BAD")
+}
+
+func TestPollGetIssue_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/42", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.GetIssue(ctx, "myorg", "myrepo", 42)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode issue #42")
+}
+
+func TestGetMemberAccessLevel_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/members/all/42", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.GetMemberAccessLevel(ctx, "myorg", "myrepo", 42)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode member access level for user 42")
+}
+
+func TestGetProjectPath_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/12345", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.GetProjectPath(ctx, 12345)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode project path for ID 12345")
+}
+
+func TestListIssuesUpdatedSince_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.ListIssuesUpdatedSince(ctx, "myorg", "myrepo", time.Now())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode issues page 1")
+}
+
+func TestListMergeRequestsUpdatedSince_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.ListMergeRequestsUpdatedSince(ctx, "myorg", "myrepo", time.Now())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode merge requests page 1")
+}
+
+func TestListIssueNotes_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/5/notes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.ListIssueNotes(ctx, "myorg", "myrepo", 5)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode issue notes page 1")
+}
+
+func TestListMergeRequestNotes_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/10/notes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.ListMergeRequestNotes(ctx, "myorg", "myrepo", 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode merge request notes page 1")
+}
+
+func TestListResourceLabelEvents_DecodeError(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/issues/5/resource_label_events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`not valid json`))
+	})
+
+	_, err := pc.ListResourceLabelEvents(ctx, "myorg", "myrepo", 5)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode resource label events page 1")
+}
+
+// ---------------------------------------------------------------------------
+// NewPollClient
+// ---------------------------------------------------------------------------
+
+func TestNewPollClient(t *testing.T) {
+	client, err := New("test-token")
+	require.NoError(t, err)
+
+	pc := NewPollClient(client)
+	assert.NotNil(t, pc)
+	assert.Equal(t, client, pc.LiveClient)
+}
+
+// ---------------------------------------------------------------------------
+// Inherited methods from LiveClient
+// ---------------------------------------------------------------------------
+
+func TestPollClient_UpdateCIVariable(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/variables/CURSOR", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPut, r.Method)
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		assert.Equal(t, "new-cursor", body["value"])
+		writeJSON(t, w, http.StatusOK, map[string]any{"key": "CURSOR"})
+	})
+
+	err := pc.UpdateCIVariable(ctx, "myorg", "myrepo", "CURSOR", "new-cursor", false)
+	require.NoError(t, err)
+}
+
+func TestPollClient_GetAuthenticatedUser(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusOK, map[string]string{"username": "pollbot"})
+	})
+
+	username, err := pc.GetAuthenticatedUser(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, "pollbot", username)
+}
+
+func TestPollClient_CreatePipelineWithInputs(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	handlerCalled := false
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/pipeline", func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled = true
+		assert.Equal(t, http.MethodPost, r.Method)
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		assert.Equal(t, "main", body["ref"])
+		// Unlike CreatePipeline, this must never send a "variables" key —
+		// that's the user-defined-pipeline-variable transport GitLab's
+		// ci_pipeline_variables_minimum_override_role gates and #7850
+		// moves dispatch away from.
+		_, hasVariables := body["variables"]
+		assert.False(t, hasVariables, "CreatePipelineWithInputs must not send a variables field")
+		inputs, _ := body["inputs"].(map[string]any)
+		assert.Equal(t, "triage", inputs["stage"])
+		assert.Equal(t, true, inputs["is_fork"])
+		writeJSON(t, w, http.StatusCreated, map[string]any{
+			"id":      43,
+			"web_url": "https://gitlab.com/myorg/myrepo/-/pipelines/43",
+		})
+	})
+
+	id, webURL, err := pc.CreatePipelineWithInputs(ctx, "myorg", "myrepo", "main", map[string]forge.PipelineInputValue{
+		"stage":   forge.StringInput("triage"),
+		"is_fork": forge.BoolInput(true),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(43), id)
+	assert.Equal(t, "https://gitlab.com/myorg/myrepo/-/pipelines/43", webURL)
+	assert.True(t, handlerCalled, "pipeline handler must be called")
+}
+
+func TestPollClient_CreatePipelineWithInputs_Error(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	handlerCalled := false
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/pipeline", func(w http.ResponseWriter, r *http.Request) {
+		handlerCalled = true
+		writeJSON(t, w, http.StatusForbidden, map[string]string{"message": "403 Forbidden"})
+	})
+
+	_, _, err := pc.CreatePipelineWithInputs(ctx, "myorg", "myrepo", "main", nil)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "403")
+	assert.True(t, handlerCalled, "pipeline handler must be called")
+}
+
+func TestPollClient_CreateChildPipelineWithInputs(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	calls := 0
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/trigger/pipeline", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.Equal(t, http.MethodPost, r.Method)
+		// The job token alone authenticates the request: the client's PAT
+		// must not be sent, and the token must not travel in the URL.
+		assert.Empty(t, r.Header.Get("PRIVATE-TOKEN"), "the Poller PAT must not be sent with a job-token trigger")
+		assert.Empty(t, r.URL.RawQuery, "the job token must not travel in the URL")
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		assert.Equal(t, "job-token-value", body["token"])
+		assert.Equal(t, "main", body["ref"])
+		_, hasVariables := body["variables"]
+		assert.False(t, hasVariables, "the child route must not send pipeline variables")
+		inputs, _ := body["inputs"].(map[string]any)
+		assert.Equal(t, "triage", inputs["stage"])
+		writeJSON(t, w, http.StatusCreated, map[string]any{
+			"id":      44,
+			"web_url": "https://gitlab.com/myorg/myrepo/-/pipelines/44",
+		})
+	})
+
+	id, webURL, err := pc.CreateChildPipelineWithInputs(ctx, "myorg", "myrepo", "main", "job-token-value", map[string]forge.PipelineInputValue{
+		"stage": forge.StringInput("triage"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(44), id)
+	assert.Equal(t, "https://gitlab.com/myorg/myrepo/-/pipelines/44", webURL)
+	assert.Equal(t, 1, calls)
+}
+
+func TestPollClient_CreateChildPipelineWithInputs_NilInputsSendsEmptyObject(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	calls := 0
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/trigger/pipeline", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		assert.Equal(t, map[string]any{}, body["inputs"])
+		writeJSON(t, w, http.StatusOK, map[string]any{"id": 45, "web_url": "u"})
+	})
+
+	id, _, err := pc.CreateChildPipelineWithInputs(ctx, "myorg", "myrepo", "main", "job-token-value", nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(45), id)
+	assert.Equal(t, 1, calls, "the trigger handler must be called")
+}
+
+func TestPollClient_CreateChildPipelineWithInputs_Errors(t *testing.T) {
+	t.Run("empty job token is refused without a request", func(t *testing.T) {
+		pc, mux := setupPollTest(t)
+		mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/trigger/pipeline", func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("no request may be sent without a job token")
+		})
+		_, _, err := pc.CreateChildPipelineWithInputs(context.Background(), "myorg", "myrepo", "main", "", nil)
+		require.ErrorContains(t, err, "CI job token is empty")
+	})
+
+	t.Run("API rejection is sent once and reported", func(t *testing.T) {
+		pc, mux := setupPollTest(t)
+		calls := 0
+		mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/trigger/pipeline", func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			writeJSON(t, w, http.StatusBadGateway, map[string]string{"message": "502 Bad Gateway"})
+		})
+		_, _, err := pc.CreateChildPipelineWithInputs(context.Background(), "myorg", "myrepo", "main", "job-token-value", nil)
+		require.ErrorContains(t, err, "502")
+		assert.NotContains(t, err.Error(), "job-token-value")
+		assert.Equal(t, 1, calls, "a job-token trigger must never be retried")
+	})
+
+	// A 307/308 would make net/http replay the body, which carries the job
+	// token, so a redirect (cross-origin or same-origin) is an error and the
+	// target is never contacted.
+	for _, code := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(fmt.Sprintf("%d redirect is not followed", code), func(t *testing.T) {
+			targetHits := 0
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetHits++
+				writeJSON(t, w, http.StatusCreated, map[string]any{"id": 1, "web_url": "u"})
+			}))
+			defer target.Close()
+			pc, mux := setupPollTest(t)
+			calls := 0
+			mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/trigger/pipeline", func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				http.Redirect(w, r, target.URL+"/capture", code)
+			})
+			_, _, err := pc.CreateChildPipelineWithInputs(context.Background(), "myorg", "myrepo", "main", "job-token-value", nil)
+			require.ErrorContains(t, err, strconv.Itoa(code))
+			assert.NotContains(t, err.Error(), "job-token-value")
+			assert.Equal(t, 1, calls)
+			assert.Zero(t, targetHits, "the redirect target must never receive the job token")
+		})
+	}
+
+	t.Run("undecodable response is reported", func(t *testing.T) {
+		pc, mux := setupPollTest(t)
+		calls := 0
+		mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/trigger/pipeline", func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("not json"))
+		})
+		_, _, err := pc.CreateChildPipelineWithInputs(context.Background(), "myorg", "myrepo", "main", "job-token-value", nil)
+		require.ErrorContains(t, err, "decode triggered pipeline response")
+		assert.Equal(t, 1, calls, "the trigger handler must be called")
+	})
+
+	t.Run("transport failure is reported", func(t *testing.T) {
+		pc, _ := setupPollTest(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, _, err := pc.CreateChildPipelineWithInputs(ctx, "myorg", "myrepo", "main", "job-token-value", nil)
+		require.ErrorContains(t, err, "trigger pipeline with job token")
+	})
+}
+
+func TestPollClient_GetAuthenticatedUserID(t *testing.T) {
+	pc, mux := setupPollTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusOK, map[string]int{"id": 42})
+	})
+
+	id, err := pc.GetAuthenticatedUserID(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 42, id)
+}

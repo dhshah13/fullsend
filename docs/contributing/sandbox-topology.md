@@ -1,0 +1,29 @@
+# Sandbox Image Topology
+
+Fullsend agents run inside sandboxed containers. Two images exist in a
+parent-child hierarchy; which image an agent uses depends on whether it
+needs a compiled-language toolchain.
+
+```
+ghcr.io/nvidia/openshell-community/sandboxes/base   (upstream)
+  +-- fullsend-sandbox                                (base sandbox)
+        +-- fullsend-code                             (extends base with Go)
+```
+
+| Image | Agents | Run frequency | Key additions over parent |
+|-------|--------|---------------|--------------------------|
+| `fullsend-sandbox` | triage, prioritize, retro | High (most agent runs) | Claude Code, pi (pinned; opt-in runtime, #6464), Codex (pinned; opt-in runtime, #6920), ripgrep + fd (pi grep/find backends), jq, gitleaks, acli, pre-commit, gitlint, tirith |
+| `fullsend-code` | code, fix, review | Lower (code/fix are the least-run agents; review runs per-PR) | Go toolchain, scan-secrets, gopls, lychee |
+
+Harness definitions that map agents to images live in
+the [`fullsend-ai/agents`](https://github.com/fullsend-ai/agents) repo (the `image:` field in each harness YAML).
+The GitLab scaffold (`internal/scaffold/fullsend-repo-gitlab/`) uses the same execution model: a single generic agent template (`fullsend-agent.yml`) calls `fullsend run "${STAGE}"`, parameterized by the `stage` pipeline input set by API-triggered pipelines dispatched by the cron poller (#7850), or by `source=pipeline` child pipelines the trigger-only account's poll or dispatcher job starts with its `CI_JOB_TOKEN` (#8438) — the template bridges that input into the `STAGE` job environment variable `fullsend run` reads. `fullsend run` resolves the harness and creates the sandbox container from the harness `image:` field.
+Image Containerfiles live in `images/sandbox/` and `images/code/`.
+The CI build pipeline is `.github/workflows/sandbox-images.yml`.
+
+**When reviewing CI changes:** If a PR modifies image pulling, caching,
+or pre-warming logic in `action.yml`, consider which agent types are
+affected. Changes that only benefit `fullsend-code` have a smaller blast
+radius (fewer agent runs) than changes to `fullsend-sandbox`. A cache or
+pull optimization may not be worth the complexity if it only helps the
+least-frequently-run agents.

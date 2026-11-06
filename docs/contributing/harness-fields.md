@@ -1,0 +1,293 @@
+# Harness Field Reference
+
+> **This is a living document.** It is the authoritative reference for harness
+> field classifications, merge rules, and the `ForgeConfig` struct. Update
+> this document whenever you add a new field to `Harness` or `ForgeConfig`,
+> move a field between classification tiers, or change merge semantics.
+>
+> The architectural decisions behind these rules are recorded in
+> [ADR-0045](../ADRs/0045-forge-portable-harness-schema.md) (forge-portable
+> schema) and [ADR-0088](../ADRs/0088-cel-guarded-overlays.md) (CEL-guarded
+> overlays). Those ADRs are point-in-time records; this document reflects the
+> current state.
+>
+> **Decided, not yet implemented (2026-10-01; ADR 0158 2026-10-27):**
+> [ADR 0112](../ADRs/0112-overlays-may-set-any-harness-field.md) will let
+> overlays set any field except `base`, `trigger`, `overlays`, `slug`, `role`
+> and `forge`, with guarded fields limited to trusted inputs, and
+> [ADR 0158](../ADRs/0158-overlays-may-grant-runtime-fetch-within-the-config-allowlist.md)
+> will let a matching overlay grant runtime fetch within the config-level
+> allowlist. The tables below change when they are implemented.
+> [ADR 0151](../ADRs/0151-harness-human-role-minimums.md) adds the target
+> `human_min_role` field at the top level and in guarded overlays, with its
+> overlay selected before actor admission and pinned through the run. Legacy
+> `forge:` blocks cannot set it; the tables below remain current behavior.
+
+## Field classification
+
+Harness fields are classified into two tiers based on whether they can be
+overridden inside `forge.<platform>` blocks or `overlays:` entries.
+
+### Fields that can appear at both levels
+
+These fields can appear at the harness top level (as defaults) and inside
+`ForgeConfig` (forge blocks or overlay entries):
+
+| Field              | Rationale                                          |
+|--------------------|----------------------------------------------------|
+| `pre_script`       | Scripts often call forge-specific CLIs (gh, glab)  |
+| `post_script`      | Push, PR/MR creation is forge-specific             |
+| `skills`           | Some skills wrap forge-specific APIs               |
+| `runner_env`       | Token names and event URLs differ per forge        |
+| `validation_loop`  | Validation scripts may call forge-specific tools   |
+| `policy`           | Sandbox policies may need forge-specific filesystem or process rules; network access is managed via providers (ADR-0065) but non-network policy sections can still differ per forge |
+| `providers`        | Providers may need forge-specific entries (e.g., different API endpoints per platform); concatenated (top-level + forge) |
+| `openshell`        | OpenShell profiles may need forge-specific configuration; `profiles` concatenated (top-level + forge) |
+| `host_files`       | Host files may need forge-specific entries (e.g., different credential files per platform); deduplicated by `dest` path (child wins) |
+| `env`              | Env config (`runner` and `sandbox` sub-maps) may need forge-specific entries (e.g., different token names per forge); sub-maps merged independently, forge/child keys win (ADR-0055) |
+
+### Fields that stay at top level only
+
+These fields cannot be overridden per-forge or per-overlay. A key for one of
+them under `forge:` or `overlays:` is ignored, not an error:
+
+| Field              | Rationale                                          |
+|--------------------|----------------------------------------------------|
+| `agent`            | Agent definition                                   |
+| `model`            | Model selection                                    |
+| `image`            | Container image                                    |
+| `api_servers`      | REST proxies abstract forge details                |
+| `plugins`          | Plugin directories; each entry is a local path or a pinned URL and keeps its own `env`/`pi` options (ADR-0038, ADR-0094) |
+| `agent_input`      | Agent prompt input                                 |
+| `timeout_minutes`  | Run timeout                                        |
+| `sandbox_timeout_seconds` | Sandbox-level timeout                       |
+| `security`         | Security scanning                                  |
+| `allowed_remote_resources` | URL allowlist for resource fetching (ADR 0038) |
+| `description`      | Documentation, no runtime effect                   |
+| `role`             | Agent identity                                     |
+| `slug`             | Kept top-level; per-forge slug differences handled via `base` composition |
+| `base`             | Composition is a structural concern                |
+| `doc`              | Documentation path, no runtime effect              |
+| `effort`           | Effort level                                       |
+| `readonly_repo`    | Repo access mode                                   |
+| `allow_runtime_fetch` | Runtime fetch opt-in                            |
+| `max_runtime_fetches` | Fetch cap                                       |
+| `trigger`          | CEL trigger expression, evaluated against normalized events (ADR-0061) |
+| `privilege_levels` | Mint privilege per run-stage (ADR-0073)            |
+| `schema_version`   | Schema contract version (ADR-0127); absent = `1`; malformed, zero, negative or unsupported values fail load |
+| `preflight_check`  | Single host-dependency gate run once before sandbox creation for `pre_script`/`post_script`/`validation_loop`; a literal `sh -c` command, not a script path (ADR-0128, ADR-0129). **Planned, not yet implemented** ([#8722](https://github.com/fullsend-ai/fullsend/issues/8722)) |
+
+## Semantic types (ADR 0127)
+
+Each harness field has a semantic type that governs how fullsend interprets
+its value ([ADR 0127](../ADRs/0127-harness-schema-versioning-and-field-types.md)).
+The following groups cover the top-level fields and their nested values;
+`forge.<platform>` and `overlays[]` inherit the types of their shared
+`ForgeConfig` fields. A map or list container is structural; its keys and
+elements use the types listed below. Ordinary strings, numbers, booleans,
+and map values not explicitly identified as paths, commands, or resource
+references are scalar values, not shell commands.
+
+| Semantic type | Meaning | Fields |
+|---|---|---|
+| inline command | Executed via `sh -c` on the host against the allowlisted preflight environment (credential-safe), not resource-resolved | `validation_loop.preflight_check`; top-level `preflight_check` (planned) |
+| runtime local path | Path to a file or directory in the local configuration, not a command | `pre_script`, `post_script`, `validation_loop.script`, `validation_loop.schema`, `agent_input` (directory), `host_files[].src` (host path, optional `${VAR}` expansion), `api_servers[].script` (path resolved, server startup planned) |
+| resource reference | Local path or pinned URL resolved/fetched as applicable | `agent`, `base`, `policy`, `skills[].source`, `plugins[].path`, `openshell.profiles[]`; `providers[]` has additional identifier semantics below |
+| skill override | Key is a path within the skill; value is a local file, pinned URL, or `null` to remove the file | `skills[].overrides[<path>]` |
+| source metadata path | Describes a path in the source repository; not runtime-resolved or delivered | `doc` |
+| destination path | Names a location inside the sandbox, not a host file to resolve | `host_files[].dest` |
+| structural | Contains nested fields, lists, maps, or conditions | `forge`, `overlays[]`, `validation_loop`, `host_files[]`, `api_servers[]`, `skills[]`, `plugins[]`, `plugins[].pi`, `openshell`, `security` and its nested scanner/hook/escalation/trace blocks, `runner_env`, `env`, `env.runner`, `env.sandbox`, `privilege_levels`, `api_servers[].env`, `plugins[].env`, `allowed_remote_resources`, `providers` |
+| scalar | Interpreted as a configuration value, never as a path solely because it resembles one | `role`, `slug`, `description`, `image`, `model`, `effort`, `timeout_minutes`, `readonly_repo`, `sandbox_timeout_seconds`, `allow_runtime_fetch`, `max_runtime_fetches`, `trigger` (CEL expression), `schema_version`; `validation_loop.max_iterations`, `validation_loop.feedback_mode`, `host_files[].expand`, `host_files[].optional`, `api_servers[].name`, `api_servers[].port`, `api_servers[].env[<key>]`, `plugins[].env[<key>]`, `plugins[].pi.args[]`, `runner_env[<key>]`, `env.runner[<key>]`, `env.sandbox[<key>]`, `privilege_levels[<stage>]`, `allowed_remote_resources[]`, `overlays[].when` (CEL expression); all leaf values under `security` |
+
+For local harnesses, relative runtime paths resolve from the `.fullsend`
+configuration root (the parent of `harness/`), **not** from the YAML file's
+directory. The same rule applies to local resource references except a local
+`base:`, which resolves relative to the child harness YAML's directory. Direct
+resource URLs use the allowlisted, hash-verified fetch pipeline; a URL `base:`
+hash verifies the harness YAML, not the relative files fetched alongside it.
+Use an immutable commit ref for a URL base whose relative resources will run on
+the host. For URL `base:` layers,
+relative `pre_script`, `post_script`, `validation_loop.script`/`schema`,
+`host_files[].src` (except `${VAR}` sources), `agent`, `policy`, skills
+(including overrides), `plugins[].path`, `openshell.profiles[]`, and path-form
+`providers[]` are fetched from the base repository and rewritten to cache
+paths. An inherited URL-base `agent_input` is **cleared**, because it is a
+directory and is not fetched. `doc` is source metadata, not a runtime dependency;
+`api_servers[].script` resolves as a local
+path, not a URL-base fetch, and server startup is planned. See
+[ADR 0038](../ADRs/0038-universal-harness-access.md)
+for remote delivery and the [current-field reference](../reference/harness-reference.md)
+for implementation status.
+
+`providers[]` is a union: each entry is either a bare identifier (matching
+`^[a-zA-Z0-9_-]+$`, looked up under `providers/`) or a fetched resource (a
+local path or a `#sha256=` URL). A `skills[]` entry can be a source string or
+a single-key map of that source to file overrides; a `plugins[]` entry can be
+a path string or a `{path, env, pi}` map. Scalar security leaf values retain
+their own validation and defaults; this type table does not override them.
+
+The `schema_version` field (absent = `1`) declares this contract; an
+incompatible field-type change requires a version bump and an update to this
+table in the same change. Backward-compatible field additions do not require a
+bump; [ADR 0127](../ADRs/0127-harness-schema-versioning-and-field-types.md)
+leaves other breaking schema changes for a separate versioning policy. Loaders
+reject malformed, zero, negative, and unsupported versions in each raw
+composition layer at parse time — a load failure, not a `Harness.Lint()`
+finding — and mixed-version `base:` composition is rejected before any merge
+runs. Older pinned consumers must be upgraded before harness content using a
+new version is published to them.
+
+## Merge and inheritance rules
+
+When a forge block or overlay is merged into the harness top level, each
+field type follows specific merge semantics. The same rules apply during
+`base:` composition (base → child merging). All `base:` layers in a
+composition chain must share a single effective schema version; mixed-version
+composition is rejected at load time (ADR-0127).
+
+Two independent precedence axes govern field resolution
+(see [#6798](https://github.com/fullsend-ai/fullsend/issues/6798)):
+
+- **Specificity (within a layer):** Conditional forge/overlay values
+  override same-layer top-level values.
+- **Derivation (across layers):** Child-layer values override inherited
+  base-layer values. Each base layer's forge and overlay blocks are
+  resolved into top-level fields before merging into the child, so
+  inherited conditional values cannot override the child's explicit
+  settings.
+
+| Field type       | Merge behavior                                       | Nil vs empty                                          |
+|------------------|------------------------------------------------------|-------------------------------------------------------|
+| Scalar fields    | Forge/child value overrides top-level/base value     | Absent = inherit from top level / base                |
+| `schema_version` | Not inherited, and an exception to the Scalar row: the merged harness keeps the child's own declaration. Every composed `base:` layer must share one effective version, or the load fails naming both versions and the layer (ADR-0127). Top level only (not in `ForgeConfig`, so no forge/overlay override) | Absent = version `1`; an absent child stays absent after the merge rather than inheriting the base's value |
+| `skills`         | Merged with deduplication by skill identity (declared `SKILL.md` name, otherwise directory basename; `skill.SandboxName`). Relative entries are resolved against the fullsend directory before the merge, so a local override matches by declared name too. Two entries with one identity in a single list are both kept and fail at bootstrap. A relative entry reached through a symlink that leaves the fullsend directory, or that has an absolute target, at any component including the marker file, keeps its directory basename as its merge identity. Forge/child overrides a matching top-level/base entry, and the two entries' per-file override maps merge (`mergeOverrides`; forge/child keys win). A map-form forge/child entry whose path has no `SKILL.md` keeps the matched entry's source and adds only its overrides (#6158); If such an entry matches no key, it can match the one pinned-URL entry of its name (ignoring `#fragment` and `?query`); two or more candidates are an error that names them and asks for the full base URL as the map key (#8973). Sibling nested dirs that share a leaf name are kept. | Absent (nil) = inherit; `skills: []` = empty list merged with base (base entries are returned) |
+| `runner_env`     | Top-level/base map merged with forge/child map; forge/child keys win  | Absent (nil) = inherit; `runner_env: {}` = no forge-specific keys (top-level env still inherited) |
+| `privilege_levels` | Top-level/base map merged with child map; child keys win (not in `ForgeConfig`, so no forge/overlay override) | Absent (nil) = inherit from base; omitted entirely at every layer defaults every run-stage to `write` |
+| `validation_loop`| Field-level merge; forge/child non-zero values win, base/top-level fills gaps | Absent (nil) = inherit from top level / base; `validation_loop: {}` inherits all fields (zero-value-as-unset). Post-merge `Validate()` still requires `script`. There is no way to disable an inherited validation loop. |
+| `providers`      | Concatenated (top-level/base + forge/child)           | Absent (nil) = inherit; `providers: []` = no forge-specific additions (top-level providers still apply) |
+| `openshell`      | `profiles` concatenated (top-level/base + forge/child) | Absent (nil) = inherit; empty `profiles: []` = no forge-specific additions |
+| `host_files`     | Concatenated (base + child); deduplicated by `dest` path (child wins) | Absent (nil) = inherit |
+| `plugins`        | Concatenated (base + child)                          | Absent (nil) = inherit |
+| `api_servers`    | Concatenated (base + child)                          | Absent (nil) = inherit |
+| `env`            | Sub-maps (`runner`, `sandbox`) merged independently; forge/child keys win (ADR-0055) | Absent (nil) = inherit |
+| `security`       | Child replaces base entirely (if non-nil)            | Absent (nil) = inherit |
+| `overlays`       | Concatenated (base + child); all matching entries merged at resolution with later precedence (ADR-0088) | Absent (nil) = inherit |
+
+## `ForgeConfig` struct
+
+`ForgeConfig` is the shared field payload used by both legacy `forge:`
+platform blocks and current `overlays:` entries (via `OverlayEntry`'s
+`yaml:",inline"` embedding). The type name is a legacy artifact from the
+original forge feature (ADR-0045); it was retained when ADR-0088
+introduced overlays to avoid a rename-heavy migration. Both mechanisms
+use `mergeForgeConfig` to apply their fields onto harness top-level values.
+
+```go
+// ForgeConfig holds platform-specific harness configuration.
+// This is purely declarative YAML config — it selects which
+// scripts, skills, host files, and env vars to use per platform. It is
+// distinct from the forge.Client interface (internal/forge/),
+// which is the runtime abstraction for forge API operations.
+type ForgeConfig struct {
+    PreScript      string            `yaml:"pre_script,omitempty"`
+    PostScript     string            `yaml:"post_script,omitempty"`
+    Policy         string            `yaml:"policy,omitempty"`
+    Skills         []SkillEntry      `yaml:"skills,omitempty"`
+    Providers      []string          `yaml:"providers,omitempty"`
+    OpenShell      *OpenShellConfig  `yaml:"openshell,omitempty"`
+    HostFiles      []HostFile        `yaml:"host_files,omitempty"`
+    ValidationLoop *ValidationLoop   `yaml:"validation_loop,omitempty"`
+    RunnerEnv      map[string]string `yaml:"runner_env,omitempty"`
+    Env            *EnvConfig        `yaml:"env,omitempty"`
+}
+```
+
+## Current resolution pipeline
+
+The current forge resolution pipeline is:
+
+```
+Unmarshal → validateForge → ResolveForge(platform) → Validate
+```
+
+## Overlay resolution (ADR-0088)
+
+`overlays:` is the successor to deprecated `forge:` blocks. Each overlay
+entry has a `when:` CEL expression and the same override fields as
+`ForgeConfig`. All entries whose `when` evaluates to true are merged
+in order, with later matches taking precedence over earlier matches.
+
+### Resolution pipeline
+
+```
+Unmarshal → validateForge → validateOverlays →
+ResolveForge(platform) → ResolveOverlays(event, forgePlatform, config) → Validate
+```
+
+When `event` is nil (CLI flows without event context, such as
+`fullsend lock` or `fullsend run` when no event can be recovered),
+`ResolveOverlays` substitutes an empty map so
+overlays conditioned on `runtime.forge` or `config` can still evaluate
+and match. Overlays that reference `event` fields should use `has()` to
+guard field access (e.g., `has(event.source) && event.source.system == "jira"`).
+
+### CEL environment
+
+Overlay `when` expressions are evaluated with:
+
+| Variable | Type | Source |
+|---|---|---|
+| `event` | `normevent.Event` | The triggering event — fields like `source.system`, `entity.kind`, `transition.kind`. The ADR 0107 fields `actor.bot_role` and `actor.role_verified` are present only when an adapter performed a bot-role lookup; guard them with `has()` |
+| `runtime.forge` | `string` | Effective forge platform (precedence: CLI flag > config.forge > CI env vars) |
+| `config` | `map[string]any` | Full per-repo config from `config.yaml` |
+
+### Mutual exclusion
+
+`forge:` and `overlays:` must not coexist in the same harness (post-merge).
+`forge:` is deprecated; new harnesses should use `overlays:` instead.
+
+## Event payload and normalized-event resolution
+
+During dispatch, fullsend projects normalized events (`internal/normevent/`) into
+`event_payload` via `buildEventPayload` in `internal/harnessdispatch/project.go`.
+This payload provides backwards-compatible legacy forge fields (`issue`,
+`pull_request`, `comment`) alongside `_normalized_event` (the serialized
+`normevent.Event` map).
+
+GitLab has a second, separate builder: `buildEventPayload` in
+`internal/poll/dispatch.go`, shared by the poller and the webhook dispatcher.
+It emits a minimal payload. Its `_normalized_event` is the complete event when
+that validates and fits the transport budget, and otherwise a partial map that
+carries only `transition.comment.body` (see
+`docs/normative/normalized-event/v1/README.md`). Its unit tests are in
+`internal/poll/dispatch_test.go`, `internal/poll/dispatch_normalized_test.go`
+and `internal/poll/webhook_dispatch_test.go`;
+`run-agent-job.sh` reads the body in
+`internal/scaffold/fullsend-repo-gitlab/.gitlab/ci/scripts/`, and
+`internal/scaffold/gitlab_fix_instruction_test.go` covers that script.
+
+When resolving CEL-guarded overlays via `ResolveOverlays(event, forgePlatform,
+config)`, the runtime passes the deserialized `normevent.Event` directly as
+the `event` variable in the CEL environment (see [CEL environment](#cel-environment)
+above). When adding, modifying, or removing fields in normalized event structures
+or `event_payload`:
+
+1. Update `buildEventPayload` in `internal/harnessdispatch/project.go` and its
+   unit tests in `internal/harnessdispatch/project_test.go`. If the change
+   affects GitLab dispatch, also update `buildEventPayload` in
+   `internal/poll/dispatch.go` and its tests.
+2. Update the projection table in `docs/normative/normalized-event/v1/README.md`.
+3. If new event fields or properties are exposed to overlay CEL evaluation,
+   document them in the [CEL environment](#cel-environment) table above.
+
+## Related
+
+- [ADR-0045](../ADRs/0045-forge-portable-harness-schema.md): Forge-portable
+  harness schema — original architectural decision (Superseded by ADR-0088)
+- [ADR-0088](../ADRs/0088-cel-guarded-overlays.md): CEL-guarded overlays —
+  current overlay mechanism
+- [ADR-0127](../ADRs/0127-harness-schema-versioning-and-field-types.md): Harness
+  schema versioning and field semantic types
+- [Harness Composition](harness-composition.md): Merge function checklist
+  (step 6 references this document)
+- Issue #5579: Harness field integration pipeline (complementary checklist)

@@ -1,0 +1,203 @@
+# How To Emit Traces
+
+## Overview
+
+Fullsend emits OpenTelemetry traces for every agent run. By default, traces
+are written to the `run-telemetry.jsonl` file that gets uploaded into an artifact
+in the workflow. Fullsend is able to send traces to a remote OpenTelemetry-compatible
+endpoint.
+
+When the same `OTEL_EXPORTER_OTLP_*` configuration is set,
+`fullsend eval-measure` also exports newly written scores as
+`gen_ai.evaluation.result` span events on that endpoint (fail-open; local
+`eval-measurements.jsonl` always wins). See
+[Eval Measurements](../infrastructure/eval-measurements.md) for the score
+contract and carrier details.
+
+Follow this guide to configure a GitHub repository or organization to send traces
+to a backend like MLflow, Jaeger, Grafana Tempo, etc.
+
+## Before you begin
+
+- An **OTLP/HTTP-compatible endpoint** and its URL (e.g.
+  `https://mlflow.example.com:4318/v1/traces`).
+- **Authentication credentials** for the endpoint (bearer token, basic
+  auth, or API key) if required.
+- **Network reachability** from where runs execute (your machine or CI
+  runners) to the backend endpoint.
+- The **`gh` CLI** installed and authenticated, or access to the GitHub UI
+  for setting variables and secrets.
+
+## Send traces from a repository
+
+1. Determine the endpoint URL where your backend receives traces.
+
+   For most systems this is `<host>:4318/v1/traces`.
+
+2. Set the endpoint as a GitHub Actions variable on the repository.
+
+   ```bash
+   gh variable set OTEL_EXPORTER_OTLP_ENDPOINT --body "https://example.com:4318" --repo <owner/repo>
+   ```
+
+   `OTEL_EXPORTER_OTLP_ENDPOINT` gets `/v1/traces` appended automatically
+   by the SDK. If your backend uses a different path, use
+   `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and specify the full URL instead.
+
+3. Build the authentication header for your endpoint.
+
+   The header format depends on your backend. Common patterns include:
+
+   - Bearer token: `Authorization=Bearer%20<token>`
+   - Basic auth: `Authorization=Basic%20<base64 of user:password>`
+
+   `%20` is the encoding for space, don't use spaces directly.
+
+   ::: warning Use `=` not `:`
+   OpenTelemetry headers must be written in `key=value` format, **not** standard HTTP header syntax (`key: value`). Entries with `:` instead of `=` (e.g. `Authorization: Bearer <token>`) will fail fullsend's header validation and prevent traces from exporting to the remote endpoint.
+   :::
+
+4. Set the authentication header as a GitHub Actions secret on the repository.
+
+   ```bash
+   gh secret set OTEL_EXPORTER_OTLP_TRACES_HEADERS --body "<authentication-header>" --repo <owner/repo>
+   ```
+
+5. *(Optional)* Add backend-specific routing headers to the same secret.
+
+   Some backends require additional headers. For MLflow, append the
+   experiment ID:
+
+   ```bash
+   gh secret set OTEL_EXPORTER_OTLP_TRACES_HEADERS \
+     --body "<authentication-header>,x-mlflow-experiment-id=<id>" \
+     --repo <owner/repo>
+   ```
+
+6. *(Optional)* Set resource attributes to tag traces with metadata.
+
+   ```bash
+   gh variable set OTEL_RESOURCE_ATTRIBUTES \
+     --body "deployment.env=prod,category=a" \
+     --repo <owner/repo>
+   ```
+
+   Resource attributes may become filterable trace tags depending on your backend.
+
+## Send traces to an endpoint from a GitHub organization
+
+1. Set the endpoint as an organization-level variable.
+
+   To make it visible to all repositories:
+
+   ```bash
+   gh variable set OTEL_EXPORTER_OTLP_ENDPOINT \
+     --body "https://example.com:4318" \
+     --org <org> --visibility all
+   ```
+
+   To restrict visibility to specific repositories:
+
+   ```bash
+   gh variable set OTEL_EXPORTER_OTLP_ENDPOINT \
+     --body "https://example.com:4318" \
+     --org <org> --repos repo1,repo2,repo3
+   ```
+
+2. Set the authentication header as an organization-level secret with the
+   same visibility.
+
+   ```bash
+   gh secret set OTEL_EXPORTER_OTLP_TRACES_HEADERS \
+     --body "<authentication-header>" \
+     --org <org> --visibility all
+   ```
+
+   To restrict visibility to specific repositories:
+
+   ```bash
+   gh secret set OTEL_EXPORTER_OTLP_TRACES_HEADERS \
+     --body "<authentication-header>" \
+     --org <org> --repos repo1,repo2,repo3
+   ```
+
+## Capture conversation content
+
+By default, traces carry metadata only: timing, token counts, tool names, and
+errors. Set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to also record
+the agent's conversation content (Level 3) on each `agent` span: its text,
+reasoning, tool calls, and tool results. On a retry that carries validation
+feedback, the prompt the runner composed is recorded too. Content goes to the
+local `run-telemetry.jsonl` file and, when configured, to the endpoint.
+
+To enable it on a repository:
+
+```bash
+gh variable set OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT --body "true" --repo <owner/repo>
+```
+
+To enable it for all repositories in an organization:
+
+```bash
+gh variable set OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT \
+  --body "true" \
+  --org <org> --visibility all
+```
+
+::: warning Check your backend's access controls first
+Content is redacted for secrets and bounded in size, but it can still contain
+proprietary code or PII, such as the commands an agent ran and the file paths
+it read. Make sure your backend's access controls are appropriate before
+enabling capture.
+:::
+
+What gets recorded depends on the agent runtime. Claude runs include tool
+arguments and results; the pi and codex runtimes do not yet (see
+[Runtimes](../../runtimes.md)). With the `claude` runtime, tool calls also
+appear as `execute_tool` child spans at every level. Those spans are metadata,
+and this variable does not affect them.
+
+For accepted values, redaction rules, size limits, and the attributes that
+hold content, see
+[Content capture (Level 3)](../infrastructure/distributed-tracing.md#content-capture-level-3)
+in the Tracing Reference.
+
+## Disable trace export
+
+Remove the endpoint variable and header secret from the repository or
+organization to stop sending traces to the endpoint. The local
+`run-telemetry.jsonl` file continues to be produced.
+
+```bash
+gh variable delete OTEL_EXPORTER_OTLP_ENDPOINT --repo <owner/repo>
+gh secret delete OTEL_EXPORTER_OTLP_TRACES_HEADERS --repo <owner/repo>
+```
+
+## Disable the local trace file
+
+Set `OTEL_SDK_DISABLED` to suppress all telemetry output, including the
+local file and any configured endpoint export.
+
+```bash
+gh variable set OTEL_SDK_DISABLED --body "true" --repo <owner/repo>
+```
+
+To disable at the organization level and then re-enable individual
+repositories:
+
+```bash
+gh variable set OTEL_SDK_DISABLED --body "true" --org <org> --visibility all
+gh variable set OTEL_SDK_DISABLED --body "false" --repo <owner/repo>
+```
+
+## See also
+
+- [Eval Measurements](../infrastructure/eval-measurements.md): local score
+  JSONL and optional OTLP `gen_ai.evaluation.result` export on the same
+  `OTEL_EXPORTER_OTLP_*` path as agent traces
+- [Tracing with MLflow](tracing-with-mlflow.md): experiment routing, Basic
+  auth encoding, org-level organization, and cost column caveats
+- [Tracing Reference](../infrastructure/distributed-tracing.md): span
+  schemas, attribute tables, and environment variable reference
+- [Tracing Development Guide](../dev/tracing.md): implementation details
+  for contributors

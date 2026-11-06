@@ -1,0 +1,2474 @@
+package cf
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// --- FakeWranglerRunner ---
+
+type fakeWranglerRunner struct {
+	deployErr    error
+	deployURL    string
+	deployCalls  []deployCall
+	secretCalls  []secretCall
+	deleteCalls  []string
+	deleteErr    error
+	secretPutErr error
+	// captureFiles lists relative paths to read from sourceDir during
+	// Deploy and store in deployCall.fileContents (for asserting
+	// generated file content after the temp dir is cleaned up).
+	captureFiles []string
+	// workerExists controls the return value of WorkerExists.
+	// Defaults to true (Worker exists).
+	workerExists *bool
+	// workerExistsErr, if non-nil, is returned by WorkerExists.
+	workerExistsErr error
+}
+
+type deployCall struct {
+	sourceDir    string
+	workerName   string
+	previewAlias string
+	envVars      map[string]string
+	secrets      map[string][]byte
+	// fileContents captures file contents at deploy time. Populated
+	// when captureFiles is set on the fakeWranglerRunner.
+	fileContents map[string]string
+}
+
+type secretCall struct {
+	workerName string
+	secretName string
+	value      []byte
+}
+
+func (f *fakeWranglerRunner) Deploy(_ context.Context, sourceDir, workerName string, previewAlias string, envVars map[string]string, secrets map[string][]byte) (string, error) {
+	call := deployCall{
+		sourceDir:    sourceDir,
+		workerName:   workerName,
+		previewAlias: previewAlias,
+		envVars:      envVars,
+		secrets:      secrets,
+	}
+	// Capture file contents from the source dir before it's cleaned up.
+	if len(f.captureFiles) > 0 {
+		call.fileContents = make(map[string]string)
+		for _, rel := range f.captureFiles {
+			data, err := os.ReadFile(filepath.Join(sourceDir, rel))
+			if err == nil {
+				call.fileContents[rel] = string(data)
+			}
+		}
+	}
+	f.deployCalls = append(f.deployCalls, call)
+	if f.deployErr != nil {
+		return "", f.deployErr
+	}
+	url := f.deployURL
+	if url == "" {
+		if previewAlias != "" {
+			url = fmt.Sprintf("https://%s-%s.test-sub.workers.dev", previewAlias, workerName)
+		} else {
+			url = fmt.Sprintf("https://%s.test-sub.workers.dev", workerName)
+		}
+	}
+	return url, nil
+}
+
+func (f *fakeWranglerRunner) PutSecret(_ context.Context, workerName, secretName string, value []byte) error {
+	f.secretCalls = append(f.secretCalls, secretCall{
+		workerName: workerName,
+		secretName: secretName,
+		value:      value,
+	})
+	return f.secretPutErr
+}
+
+func (f *fakeWranglerRunner) Delete(_ context.Context, workerName string) error {
+	f.deleteCalls = append(f.deleteCalls, workerName)
+	return f.deleteErr
+}
+
+func (f *fakeWranglerRunner) WorkerExists(_ context.Context, _ string) (bool, error) {
+	if f.workerExistsErr != nil {
+		return false, f.workerExistsErr
+	}
+	if f.workerExists != nil {
+		return *f.workerExists, nil
+	}
+	return true, nil // default: Worker exists
+}
+
+// --- Provisioner tests ---
+
+func TestProvisioner_Name(t *testing.T) {
+	p := NewProvisioner(Config{}, &fakeWranglerRunner{})
+	assert.Equal(t, "cf", p.Name())
+}
+
+func TestProvisioner_OrgVariableNames(t *testing.T) {
+	p := NewProvisioner(Config{}, &fakeWranglerRunner{})
+	assert.Equal(t, []string{"FULLSEND_MINT_URL"}, p.OrgVariableNames())
+}
+
+func TestProvisioner_OrgSecretNames(t *testing.T) {
+	p := NewProvisioner(Config{}, &fakeWranglerRunner{})
+	assert.Nil(t, p.OrgSecretNames())
+}
+
+func TestProvisioner_Provision_MissingAccountID(t *testing.T) {
+	p := NewProvisioner(Config{
+		WorkerName: "test-mint",
+	}, &fakeWranglerRunner{})
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CLOUDFLARE_ACCOUNT_ID")
+}
+
+func TestProvisioner_Provision_InvalidWorkerName(t *testing.T) {
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "INVALID_NAME",
+	}, &fakeWranglerRunner{})
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid Worker name")
+}
+
+func TestProvisioner_Provision_WithSourceDir(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		deployURL: "https://test-mint.workers.dev",
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		SourceDir:  sourceDir,
+	}, fake)
+
+	result, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "https://test-mint.workers.dev", result["FULLSEND_MINT_URL"])
+	require.Len(t, fake.deployCalls, 1)
+	// Deploy receives a temp copy of sourceDir (to keep checkout clean).
+	assert.NotEqual(t, sourceDir, fake.deployCalls[0].sourceDir,
+		"should deploy from a temp copy, not the original source dir")
+	assert.Equal(t, "test-mint", fake.deployCalls[0].workerName)
+	assert.Empty(t, fake.deployCalls[0].previewAlias)
+}
+
+func TestProvisioner_Provision_Preview(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deployCalls, 1)
+	assert.Equal(t, "bt-run-42", fake.deployCalls[0].previewAlias)
+}
+
+func TestProvisioner_Provision_EnvVars(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{}
+
+	envVars := map[string]string{
+		"ROLE_APP_IDS":       `{"coder":"12345"}`,
+		"PER_REPO_WIF_REPOS": "acme/widget",
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		SourceDir:  sourceDir,
+		EnvVars:    envVars,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deployCalls, 1)
+	assert.Equal(t, `{"coder":"12345"}`, fake.deployCalls[0].envVars["ROLE_APP_IDS"])
+	assert.Equal(t, "acme/widget", fake.deployCalls[0].envVars["PER_REPO_WIF_REPOS"])
+	// OIDC_AUDIENCE is no longer set as an env var — it is a compile-time constant.
+	assert.Empty(t, fake.deployCalls[0].envVars["OIDC_AUDIENCE"])
+}
+
+func TestProvisioner_Provision_StampsVersion(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		SourceDir:  sourceDir,
+		Version:    "1.2.3",
+		Commit:     "deadbeef",
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deployCalls, 1)
+
+	// Version is now stamped via -ldflags in BuildWASMFn.
+	// Env vars should NOT contain version fields.
+	_, hasVersion := fake.deployCalls[0].envVars["FULLSEND_VERSION"]
+	_, hasCommit := fake.deployCalls[0].envVars["FULLSEND_COMMIT"]
+	assert.False(t, hasVersion, "FULLSEND_VERSION should not be in env vars")
+	assert.False(t, hasCommit, "FULLSEND_COMMIT should not be in env vars")
+}
+
+func TestProvisioner_Provision_OmitsEmptyVersion(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		SourceDir:  sourceDir,
+		// No Version or Commit set.
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deployCalls, 1)
+
+	// Env vars should NOT contain version fields.
+	_, hasVersion := fake.deployCalls[0].envVars["FULLSEND_VERSION"]
+	_, hasCommit := fake.deployCalls[0].envVars["FULLSEND_COMMIT"]
+	assert.False(t, hasVersion, "FULLSEND_VERSION should not be set when empty")
+	assert.False(t, hasCommit, "FULLSEND_COMMIT should not be set when empty")
+}
+
+func TestProvisioner_Provision_DeployModePassing(t *testing.T) {
+	stubWASMBuild(t)
+	// Verify that Deploy is called for both durable and preview modes
+	// with the correct preview alias. --keep-vars behavior differs:
+	// durable uses --keep-vars (to preserve secrets from StoreAgentPEM),
+	// preview does NOT (each preview version is self-contained to
+	// prevent cross-preview env var inheritance).
+	sourceDir := createFakeWorkerSourceDir(t)
+
+	tests := []struct {
+		name         string
+		mode         DeployMode
+		previewAlias string
+	}{
+		{"durable", DeployDurable, ""},
+		{"preview", DeployPreview, "bt-test"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeWranglerRunner{}
+			p := NewProvisioner(Config{
+				AccountID:    "abc123",
+				WorkerName:   "test-mint",
+				SourceDir:    sourceDir,
+				DeployMode:   tc.mode,
+				PreviewAlias: tc.previewAlias,
+			}, fake)
+
+			_, err := p.Provision(context.Background())
+			require.NoError(t, err)
+			require.Len(t, fake.deployCalls, 1)
+			assert.Equal(t, tc.previewAlias, fake.deployCalls[0].previewAlias)
+		})
+	}
+}
+
+func TestProvisioner_Provision_DeployError(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		deployErr: fmt.Errorf("network error"),
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		SourceDir:  sourceDir,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "deploying worker")
+}
+
+func TestProvisioner_Provision_EmbeddedSource(t *testing.T) {
+	stubWASMBuild(t)
+	fake := &fakeWranglerRunner{
+		deployURL: "https://test-mint.workers.dev",
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		// No SourceDir — uses embedded source.
+	}, fake)
+
+	result, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "https://test-mint.workers.dev", result["FULLSEND_MINT_URL"])
+	require.Len(t, fake.deployCalls, 1)
+	// Should have extracted to a temp dir.
+	assert.NotEmpty(t, fake.deployCalls[0].sourceDir)
+	// Temp dir should be cleaned up.
+	_, statErr := os.Stat(fake.deployCalls[0].sourceDir)
+	assert.True(t, os.IsNotExist(statErr), "temp dir should be cleaned up")
+}
+
+func TestProvisioner_Provision_BadSourceDir(t *testing.T) {
+	fake := &fakeWranglerRunner{}
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		SourceDir:  "/nonexistent",
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "source-dir")
+}
+
+func TestProvisioner_Provision_DefaultWorkerName(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{}
+
+	p := NewProvisioner(Config{
+		AccountID: "abc123",
+		SourceDir: sourceDir,
+		// No WorkerName — should default.
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deployCalls, 1)
+	assert.Equal(t, "fullsend-mint", fake.deployCalls[0].workerName)
+}
+
+// --- StoreAgentPEM tests ---
+
+func TestProvisioner_StoreAgentPEM(t *testing.T) {
+	fake := &fakeWranglerRunner{}
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+	}, fake)
+
+	err := p.StoreAgentPEM(context.Background(), "coder", []byte("pem-data"))
+	require.NoError(t, err)
+	require.Len(t, fake.secretCalls, 1)
+	assert.Equal(t, "test-mint", fake.secretCalls[0].workerName)
+	assert.Equal(t, "CODER_APP_PEM", fake.secretCalls[0].secretName)
+	assert.Equal(t, []byte("pem-data"), fake.secretCalls[0].value)
+}
+
+func TestProvisioner_StoreAgentPEM_InvalidRole(t *testing.T) {
+	fake := &fakeWranglerRunner{}
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+	}, fake)
+
+	err := p.StoreAgentPEM(context.Background(), "INVALID", []byte("pem"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid role name")
+}
+
+func TestProvisioner_StoreAgentPEM_Error(t *testing.T) {
+	fake := &fakeWranglerRunner{
+		secretPutErr: fmt.Errorf("api error"),
+	}
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+	}, fake)
+
+	err := p.StoreAgentPEM(context.Background(), "coder", []byte("pem"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "storing PEM secret")
+}
+
+func TestProvisioner_Provision_PreviewWithSecrets(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{}
+	secrets := map[string][]byte{
+		"CODER_APP_PEM": []byte("pem-data"),
+	}
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-test-42",
+		SourceDir:    sourceDir,
+		Secrets:      secrets,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deployCalls, 1)
+	assert.Equal(t, "bt-test-42", fake.deployCalls[0].previewAlias)
+	require.NotNil(t, fake.deployCalls[0].secrets,
+		"secrets should be passed to Deploy for preview deploys")
+	assert.Equal(t, []byte("pem-data"), fake.deployCalls[0].secrets["CODER_APP_PEM"],
+		"PEM secrets should be passed through Deploy for preview deploys")
+	assert.Empty(t, fake.secretCalls,
+		"PutSecret should not be called when secrets are in Deploy")
+}
+
+// --- Tracing tests ---
+
+func TestProvisioner_StoreTraceHeaders(t *testing.T) {
+	fake := &fakeWranglerRunner{}
+	p := NewProvisioner(Config{AccountID: "abc123", WorkerName: "test-mint"}, fake)
+
+	require.NoError(t, p.StoreTraceHeaders(context.Background(), []byte("Authorization=Bearer%20x")))
+	require.Len(t, fake.secretCalls, 1)
+	assert.Equal(t, "test-mint", fake.secretCalls[0].workerName)
+	assert.Equal(t, TraceHeadersSecretName, fake.secretCalls[0].secretName)
+	assert.Equal(t, []byte("Authorization=Bearer%20x"), fake.secretCalls[0].value)
+
+	fake.secretPutErr = fmt.Errorf("api error")
+	err := p.StoreTraceHeaders(context.Background(), []byte("v"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "storing secret "+TraceHeadersSecretName)
+}
+
+// A durable build stores its headers under the secret name stamped into
+// that build, not the shared default.
+func TestProvisioner_StoreTraceHeaders_StampedSecretName(t *testing.T) {
+	fake := &fakeWranglerRunner{}
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		Tracing:    TracingStamp{Endpoint: "https://collector.example/v1/traces", HeadersSecret: "MINT_OTLP_HEADERS_TEST"},
+	}, fake)
+
+	require.NoError(t, p.StoreTraceHeaders(context.Background(), []byte("k=v")))
+	require.Len(t, fake.secretCalls, 1)
+	assert.Equal(t, "MINT_OTLP_HEADERS_TEST", fake.secretCalls[0].secretName)
+}
+
+func TestNewTraceHeadersSecretName(t *testing.T) {
+	a, err := NewTraceHeadersSecretName()
+	require.NoError(t, err)
+	b, err := NewTraceHeadersSecretName()
+	require.NoError(t, err)
+	assert.NotEqual(t, a, b, "each deploy needs its own secret name")
+	for _, n := range []string{a, b} {
+		assert.True(t, strings.HasPrefix(n, TraceHeadersSecretName+"_"), n)
+		assert.NotEqual(t, TraceHeadersSecretName, n)
+		assert.Regexp(t, traceHeadersSecretNamePattern, n)
+	}
+}
+
+func TestProvisioner_Validate_RejectsBadTraceHeadersSecretName(t *testing.T) {
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		Tracing:    TracingStamp{Endpoint: "https://collector.example/v1/traces", HeadersSecret: "bad name"},
+	}, &fakeWranglerRunner{})
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid trace headers secret name")
+}
+
+func TestProvisioner_Provision_PreviewWithTracing(t *testing.T) {
+	const headerValue = "Authorization=Bearer%20collector-header-value"
+	var builtWith TracingStamp
+	origBuild, origCopy := BuildWASMFn, CopyWASMExecFn
+	BuildWASMFn = func(outPath, _, _ string, _ StatusGitHubAuth, tracing TracingStamp) error {
+		builtWith = tracing
+		return os.WriteFile(outPath, []byte("fake-wasm"), 0o644)
+	}
+	CopyWASMExecFn = func(destPath string) error { return os.WriteFile(destPath, []byte("x"), 0o644) }
+	t.Cleanup(func() { BuildWASMFn, CopyWASMExecFn = origBuild, origCopy })
+
+	fake := &fakeWranglerRunner{}
+	stamp := TracingStamp{Endpoint: "https://collector.example/v1/traces", Deployment: "test-mint@bt-1"}
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-1",
+		SourceDir:    createFakeWorkerSourceDir(t),
+		Secrets:      map[string][]byte{TraceHeadersSecretName: []byte(headerValue)},
+		Tracing:      stamp,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, stamp, builtWith, "tracing settings must be stamped into the WASM build")
+	assert.NotContains(t, traceLDFlags(builtWith), "collector-header-value", "header values must never reach the build")
+	require.Len(t, fake.deployCalls, 1)
+	assert.Equal(t, []byte(headerValue), fake.deployCalls[0].secrets[TraceHeadersSecretName],
+		"preview header secret must be version-scoped via Deploy secrets")
+	assert.Empty(t, fake.secretCalls)
+}
+
+func TestProvisioner_Provision_RejectsInvalidTracing(t *testing.T) {
+	stubWASMBuild(t)
+	for name, stamp := range map[string]TracingStamp{
+		"bad endpoint":   {Endpoint: "not a url"},
+		"bad deployment": {Endpoint: "https://collector.example/v1/traces", Deployment: "a b"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := &fakeWranglerRunner{}
+			p := NewProvisioner(Config{
+				AccountID:  "abc123",
+				WorkerName: "test-mint",
+				SourceDir:  createFakeWorkerSourceDir(t),
+				Tracing:    stamp,
+			}, fake)
+			_, err := p.Provision(context.Background())
+			require.Error(t, err)
+			assert.Empty(t, fake.deployCalls)
+		})
+	}
+}
+
+// --- Teardown tests ---
+
+func TestProvisioner_Teardown_PreviewWithAlias(t *testing.T) {
+	fake := &fakeWranglerRunner{}
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+	}, fake)
+
+	err := p.Teardown(context.Background())
+	require.NoError(t, err)
+	// Preview-alias teardown should NOT delete the Worker script.
+	assert.Empty(t, fake.deleteCalls, "preview-alias teardown must not call Delete")
+}
+
+func TestProvisioner_Provision_DurableWithPreviewAliasRejected(t *testing.T) {
+	sourceDir := createFakeWorkerSourceDir(t)
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployDurable,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+	}, &fakeWranglerRunner{})
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires DeployMode=DeployPreview")
+}
+
+func TestProvisioner_Provision_DurableWithSecretsRejected(t *testing.T) {
+	sourceDir := createFakeWorkerSourceDir(t)
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		DeployMode: DeployDurable,
+		SourceDir:  sourceDir,
+		Secrets:    map[string][]byte{"CODER_APP_PEM": []byte("pem-data")},
+	}, &fakeWranglerRunner{})
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Config.Secrets must be empty for durable deploys")
+}
+
+func TestProvisioner_Teardown_DurableDeletesWorker(t *testing.T) {
+	fake := &fakeWranglerRunner{}
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		DeployMode: DeployDurable,
+	}, fake)
+
+	err := p.Teardown(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deleteCalls, 1, "durable teardown must call Delete")
+	assert.Equal(t, "test-mint", fake.deleteCalls[0])
+}
+
+// --- WASM auto-staging tests ---
+
+func TestWasmLDFlags(t *testing.T) {
+	t.Run("includes strip flags and version stamps", func(t *testing.T) {
+		flags := wasmLDFlags("1.2.3", "abc123", StatusGitHubAuth{})
+		assert.Contains(t, flags, "-s -w")
+		assert.Contains(t, flags, "-X github.com/fullsend-ai/fullsend/internal/mintcore.Version=1.2.3")
+		assert.Contains(t, flags, "-X github.com/fullsend-ai/fullsend/internal/mintcore.Commit=abc123")
+	})
+
+	t.Run("empty version and commit", func(t *testing.T) {
+		flags := wasmLDFlags("", "", StatusGitHubAuth{})
+		assert.Contains(t, flags, "-s -w")
+		assert.Contains(t, flags, "Version=")
+		assert.Contains(t, flags, "Commit=")
+	})
+
+	t.Run("non-empty status GitHub group", func(t *testing.T) {
+		flags := wasmLDFlags("1.0.0", "def456", StatusGitHubAuth{Group: "my-org/my-team"})
+		assert.Contains(t, flags, "-X github.com/fullsend-ai/fullsend/internal/mintcore.StatusGitHubGroup=my-org/my-team")
+	})
+}
+
+func TestEnsureWASMArtifacts_ForwardsVersionCommit(t *testing.T) {
+	dir := t.TempDir()
+	// Pre-stage wasm_exec.js so only the build function is called.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "wasm_exec.js"), []byte("exec"), 0o644))
+
+	var capturedVersion, capturedCommit string
+	origBuild := BuildWASMFn
+	BuildWASMFn = func(outPath, version, commit string, _ StatusGitHubAuth, _ TracingStamp) error {
+		capturedVersion = version
+		capturedCommit = commit
+		return os.WriteFile(outPath, []byte("fake-wasm"), 0o644)
+	}
+	t.Cleanup(func() { BuildWASMFn = origBuild })
+
+	err := ensureWASMArtifacts(dir, "2.0.0", "deadbeef", StatusGitHubAuth{}, TracingStamp{})
+	require.NoError(t, err)
+	assert.Equal(t, "2.0.0", capturedVersion, "version should be forwarded to BuildWASMFn")
+	assert.Equal(t, "deadbeef", capturedCommit, "commit should be forwarded to BuildWASMFn")
+}
+
+func TestEnsureWASMArtifacts_ForwardsStatusParams(t *testing.T) {
+	dir := t.TempDir()
+	// Pre-stage wasm_exec.js so only the build function is exercised.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "wasm_exec.js"), []byte("exec"), 0o644))
+
+	var capturedStatusGitHub StatusGitHubAuth
+	origBuild := BuildWASMFn
+	BuildWASMFn = func(outPath, _, _ string, statusGitHub StatusGitHubAuth, _ TracingStamp) error {
+		capturedStatusGitHub = statusGitHub
+		return os.WriteFile(outPath, []byte("fake-wasm"), 0o644)
+	}
+	t.Cleanup(func() { BuildWASMFn = origBuild })
+
+	err := ensureWASMArtifacts(dir, "", "", StatusGitHubAuth{Group: "acme/team"}, TracingStamp{})
+	require.NoError(t, err)
+	assert.Equal(t, "acme/team", capturedStatusGitHub.Group, "StatusGitHub.Group should be forwarded to BuildWASMFn")
+}
+
+func TestEnsureWASMArtifacts_TracingForcesRebuild(t *testing.T) {
+	dir := t.TempDir()
+	// Pre-stage both files: without tracing this would be a no-op.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "mintcore.wasm"), []byte("stale"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "wasm_exec.js"), []byte("exec"), 0o644))
+
+	var captured TracingStamp
+	origBuild := BuildWASMFn
+	BuildWASMFn = func(outPath, _, _ string, _ StatusGitHubAuth, tracing TracingStamp) error {
+		captured = tracing
+		return os.WriteFile(outPath, []byte("fresh"), 0o644)
+	}
+	t.Cleanup(func() { BuildWASMFn = origBuild })
+
+	stamp := TracingStamp{Endpoint: "https://collector.example/v1/traces", Deployment: "bt-mint@bt-1"}
+	require.NoError(t, ensureWASMArtifacts(dir, "", "", StatusGitHubAuth{}, stamp))
+	assert.Equal(t, stamp, captured, "a stale pre-staged binary lacks the tracing stamp and must be rebuilt")
+	data, err := os.ReadFile(filepath.Join(dir, "mintcore.wasm"))
+	require.NoError(t, err)
+	assert.Equal(t, "fresh", string(data))
+}
+
+func TestTraceLDFlags(t *testing.T) {
+	assert.Empty(t, traceLDFlags(TracingStamp{}), "no stamp when tracing is disabled")
+	assert.Empty(t, traceLDFlags(TracingStamp{Deployment: "w"}), "deployment alone does not enable tracing")
+	flags := traceLDFlags(TracingStamp{Endpoint: "https://collector.example/v1/traces", Deployment: "bt-mint@bt-1"})
+	assert.Equal(t, " -X main.otlpTracesEndpoint=https://collector.example/v1/traces -X main.traceDeployment=bt-mint@bt-1", flags)
+	flags = traceLDFlags(TracingStamp{Endpoint: "https://collector.example/v1/traces", Deployment: "stage-mint", HeadersSecret: "MINT_OTLP_HEADERS_TEST"})
+	assert.Equal(t, " -X main.otlpTracesEndpoint=https://collector.example/v1/traces -X main.traceDeployment=stage-mint -X main.otlpHeadersSecret=MINT_OTLP_HEADERS_TEST", flags)
+}
+
+func TestValidateTraceEndpoint(t *testing.T) {
+	assert.NoError(t, ValidateTraceEndpoint("https://collector.example/v1/traces"))
+	for _, bad := range []string{
+		"http://collector.example/v1/traces",
+		"http://127.0.0.1:4318/v1/traces",
+		"collector.example/v1/traces",
+		"ftp://collector.example/v1/traces",
+		"https://user:pass@collector.example/v1/traces",
+		"https://collector.example/v1/traces -X main.x=y",
+		"https://collector.example/\"q",
+		"https://collector.example/a\\b",
+	} {
+		assert.Error(t, ValidateTraceEndpoint(bad), bad)
+	}
+}
+
+func TestTraceDeploymentName(t *testing.T) {
+	assert.Equal(t, "fullsend-mint", TraceDeploymentName("", ""))
+	assert.Equal(t, "stage-mint", TraceDeploymentName("stage-mint", ""))
+	assert.Equal(t, "bt-mint@bt-1234", TraceDeploymentName("bt-mint", "bt-1234"))
+}
+
+func TestBuildWASM(t *testing.T) {
+	t.Run("constructs correct command", func(t *testing.T) {
+		origExec := execCombinedOutputFn
+		var capturedCmd *exec.Cmd
+		execCombinedOutputFn = func(cmd *exec.Cmd) ([]byte, error) {
+			capturedCmd = cmd
+			return nil, nil
+		}
+		t.Cleanup(func() { execCombinedOutputFn = origExec })
+
+		outPath := filepath.Join(t.TempDir(), "mintcore.wasm")
+		err := buildWASM(outPath, "1.2.3", "abc123", StatusGitHubAuth{}, TracingStamp{})
+		require.NoError(t, err)
+		require.NotNil(t, capturedCmd)
+
+		// argv includes go, build, -ldflags, output path.
+		args := strings.Join(capturedCmd.Args, " ")
+		assert.Contains(t, args, "go build")
+		assert.Contains(t, args, "-ldflags")
+		assert.Contains(t, args, "-o "+outPath)
+
+		// -ldflags value matches wasmLDFlags.
+		assert.Contains(t, args, wasmLDFlags("1.2.3", "abc123", StatusGitHubAuth{}))
+
+		// cmd.Dir ends with cmd/mint-wasm.
+		assert.True(t, strings.HasSuffix(capturedCmd.Dir, filepath.Join("cmd", "mint-wasm")),
+			"Dir should end with cmd/mint-wasm, got %s", capturedCmd.Dir)
+
+		// cmd.Env includes GOOS=js and GOARCH=wasm.
+		envMap := make(map[string]string)
+		for _, e := range capturedCmd.Env {
+			if k, v, ok := strings.Cut(e, "="); ok {
+				envMap[k] = v
+			}
+		}
+		assert.Equal(t, "js", envMap["GOOS"])
+		assert.Equal(t, "wasm", envMap["GOARCH"])
+	})
+
+	t.Run("includes github build tag when status group is set", func(t *testing.T) {
+		origExec := execCombinedOutputFn
+		var capturedCmd *exec.Cmd
+		execCombinedOutputFn = func(cmd *exec.Cmd) ([]byte, error) {
+			capturedCmd = cmd
+			return nil, nil
+		}
+		t.Cleanup(func() { execCombinedOutputFn = origExec })
+
+		outPath := filepath.Join(t.TempDir(), "mintcore.wasm")
+		err := buildWASM(outPath, "1.0.0", "abc", StatusGitHubAuth{Group: "acme/team"}, TracingStamp{})
+		require.NoError(t, err)
+		require.NotNil(t, capturedCmd)
+
+		args := strings.Join(capturedCmd.Args, " ")
+		assert.Contains(t, args, "-tags github")
+		assert.Contains(t, args, wasmLDFlags("1.0.0", "abc", StatusGitHubAuth{Group: "acme/team"}))
+	})
+
+	t.Run("omits github build tag when status group is empty", func(t *testing.T) {
+		origExec := execCombinedOutputFn
+		var capturedCmd *exec.Cmd
+		execCombinedOutputFn = func(cmd *exec.Cmd) ([]byte, error) {
+			capturedCmd = cmd
+			return nil, nil
+		}
+		t.Cleanup(func() { execCombinedOutputFn = origExec })
+
+		outPath := filepath.Join(t.TempDir(), "mintcore.wasm")
+		err := buildWASM(outPath, "1.0.0", "abc", StatusGitHubAuth{}, TracingStamp{})
+		require.NoError(t, err)
+		require.NotNil(t, capturedCmd)
+
+		args := strings.Join(capturedCmd.Args, " ")
+		assert.NotContains(t, args, "-tags")
+		assert.NotContains(t, args, "otlpTracesEndpoint", "no tracing stamp when disabled")
+	})
+
+	t.Run("stamps tracing settings when an endpoint is set", func(t *testing.T) {
+		origExec := execCombinedOutputFn
+		var capturedCmd *exec.Cmd
+		execCombinedOutputFn = func(cmd *exec.Cmd) ([]byte, error) {
+			capturedCmd = cmd
+			return nil, nil
+		}
+		t.Cleanup(func() { execCombinedOutputFn = origExec })
+
+		outPath := filepath.Join(t.TempDir(), "mintcore.wasm")
+		stamp := TracingStamp{Endpoint: "https://collector.example/v1/traces", Deployment: "w@a"}
+		require.NoError(t, buildWASM(outPath, "1.0.0", "abc", StatusGitHubAuth{}, stamp))
+		require.NotNil(t, capturedCmd)
+		args := strings.Join(capturedCmd.Args, " ")
+		assert.Contains(t, args, wasmLDFlags("1.0.0", "abc", StatusGitHubAuth{})+traceLDFlags(stamp))
+	})
+
+	t.Run("wraps exec error", func(t *testing.T) {
+		origExec := execCombinedOutputFn
+		execCombinedOutputFn = func(cmd *exec.Cmd) ([]byte, error) {
+			return []byte("some build output"), fmt.Errorf("exit status 1")
+		}
+		t.Cleanup(func() { execCombinedOutputFn = origExec })
+
+		err := buildWASM("/tmp/out.wasm", "1.0.0", "def456", StatusGitHubAuth{}, TracingStamp{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "go build cmd/mint-wasm")
+		assert.Contains(t, err.Error(), "some build output")
+	})
+}
+
+func TestCopyWASMExec(t *testing.T) {
+	t.Run("copies from GOROOT", func(t *testing.T) {
+		fakeGOROOT := t.TempDir()
+		wasmDir := filepath.Join(fakeGOROOT, "lib", "wasm")
+		require.NoError(t, os.MkdirAll(wasmDir, 0o755))
+		content := "// fake wasm_exec.js for testing"
+		require.NoError(t, os.WriteFile(filepath.Join(wasmDir, "wasm_exec.js"), []byte(content), 0o644))
+
+		t.Setenv("GOROOT", fakeGOROOT)
+
+		destPath := filepath.Join(t.TempDir(), "wasm_exec.js")
+		err := copyWASMExec(destPath)
+		require.NoError(t, err)
+
+		data, err := os.ReadFile(destPath)
+		require.NoError(t, err)
+		assert.Equal(t, content, string(data))
+	})
+
+	t.Run("returns error for missing wasm_exec.js", func(t *testing.T) {
+		fakeGOROOT := t.TempDir()
+		// Create GOROOT structure but omit wasm_exec.js.
+		require.NoError(t, os.MkdirAll(filepath.Join(fakeGOROOT, "lib", "wasm"), 0o755))
+
+		t.Setenv("GOROOT", fakeGOROOT)
+
+		destPath := filepath.Join(t.TempDir(), "wasm_exec.js")
+		err := copyWASMExec(destPath)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "reading")
+	})
+}
+
+func TestEnsureWASMArtifacts_AlreadyPresent(t *testing.T) {
+	dir := t.TempDir()
+	// Pre-stage both files.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "mintcore.wasm"), []byte("wasm"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "wasm_exec.js"), []byte("exec"), 0o644))
+
+	// Should be a no-op — no build functions called.
+	buildCalled := false
+	origBuild := BuildWASMFn
+	BuildWASMFn = func(outPath, _, _ string, _ StatusGitHubAuth, _ TracingStamp) error {
+		buildCalled = true
+		return nil
+	}
+	t.Cleanup(func() { BuildWASMFn = origBuild })
+
+	err := ensureWASMArtifacts(dir, "", "", StatusGitHubAuth{}, TracingStamp{})
+	require.NoError(t, err)
+	assert.False(t, buildCalled, "should not build when WASM is already present")
+}
+
+func TestEnsureWASMArtifacts_MissingBoth(t *testing.T) {
+	stubWASMBuild(t)
+	dir := t.TempDir()
+
+	err := ensureWASMArtifacts(dir, "", "", StatusGitHubAuth{}, TracingStamp{})
+	require.NoError(t, err)
+
+	// Both files should now exist.
+	assert.True(t, fileExistsAndNonEmpty(filepath.Join(dir, "mintcore.wasm")),
+		"mintcore.wasm should be created")
+	assert.True(t, fileExistsAndNonEmpty(filepath.Join(dir, "wasm_exec.js")),
+		"wasm_exec.js should be created")
+}
+
+func TestEnsureWASMArtifacts_MissingWASMOnly(t *testing.T) {
+	stubWASMBuild(t)
+	dir := t.TempDir()
+	// Pre-stage wasm_exec.js but not mintcore.wasm.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "wasm_exec.js"), []byte("exec"), 0o644))
+
+	err := ensureWASMArtifacts(dir, "", "", StatusGitHubAuth{}, TracingStamp{})
+	require.NoError(t, err)
+	assert.True(t, fileExistsAndNonEmpty(filepath.Join(dir, "mintcore.wasm")))
+}
+
+func TestEnsureWASMArtifacts_BuildError(t *testing.T) {
+	origBuild := BuildWASMFn
+	origCopy := CopyWASMExecFn
+	BuildWASMFn = func(outPath, _, _ string, _ StatusGitHubAuth, _ TracingStamp) error {
+		return fmt.Errorf("go build failed")
+	}
+	CopyWASMExecFn = func(destPath string) error {
+		return os.WriteFile(destPath, []byte("exec"), 0o644)
+	}
+	t.Cleanup(func() {
+		BuildWASMFn = origBuild
+		CopyWASMExecFn = origCopy
+	})
+
+	dir := t.TempDir()
+	err := ensureWASMArtifacts(dir, "", "", StatusGitHubAuth{}, TracingStamp{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "auto-building mintcore.wasm")
+}
+
+func TestProvisioner_Provision_SourceDirNotModified(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		captureFiles: []string{"mintcore.wasm"},
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		SourceDir:  sourceDir,
+		Version:    "1.0.0",
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+
+	// Original source dir should NOT contain WASM artifacts or
+	// generated files — deploy operates on a temp copy.
+	_, err = os.Stat(filepath.Join(sourceDir, "mintcore.wasm"))
+	assert.True(t, os.IsNotExist(err), "original source dir should not have mintcore.wasm")
+	// Version is now stamped via -ldflags, no generated files needed.
+
+	// But the temp copy (deploy dir) should have WASM artifacts.
+	require.Len(t, fake.deployCalls, 1)
+	assert.NotEmpty(t, fake.deployCalls[0].fileContents["mintcore.wasm"],
+		"deploy dir should have auto-staged mintcore.wasm")
+}
+
+func TestProvisioner_Provision_EmbeddedAutoStagesWASM(t *testing.T) {
+	stubWASMBuild(t)
+	fake := &fakeWranglerRunner{
+		deployURL:    "https://test-mint.workers.dev",
+		captureFiles: []string{"mintcore.wasm", "wasm_exec.js"},
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		// No SourceDir — uses embedded source with auto WASM staging.
+	}, fake)
+
+	result, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "https://test-mint.workers.dev", result["FULLSEND_MINT_URL"])
+	require.Len(t, fake.deployCalls, 1)
+
+	// WASM artifacts should have been auto-staged (captured during Deploy
+	// before the temp dir was cleaned up).
+	assert.NotEmpty(t, fake.deployCalls[0].fileContents["mintcore.wasm"],
+		"embedded deploy should auto-stage mintcore.wasm")
+	assert.NotEmpty(t, fake.deployCalls[0].fileContents["wasm_exec.js"],
+		"embedded deploy should auto-stage wasm_exec.js")
+}
+
+func TestCopyDir(t *testing.T) {
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src, "file.txt"), []byte("content"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "nested.txt"), []byte("nested"), 0o644)
+
+	dst := t.TempDir()
+	err := copyDir(src, dst)
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(filepath.Join(dst, "file.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "content", string(data))
+
+	data, err = os.ReadFile(filepath.Join(dst, "sub", "nested.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "nested", string(data))
+}
+
+// --- PEMSecretsFromRoles tests ---
+
+func TestPEMSecretsFromRoles(t *testing.T) {
+	agentPEMs := map[string][]byte{
+		"coder":  []byte("coder-pem"),
+		"triage": []byte("triage-pem"),
+	}
+	secrets := PEMSecretsFromRoles(agentPEMs)
+	assert.Len(t, secrets, 2)
+	assert.Equal(t, []byte("coder-pem"), secrets["CODER_APP_PEM"])
+	assert.Equal(t, []byte("triage-pem"), secrets["TRIAGE_APP_PEM"])
+}
+
+func TestPEMSecretsFromRoles_Empty(t *testing.T) {
+	secrets := PEMSecretsFromRoles(nil)
+	assert.Empty(t, secrets)
+}
+
+// --- writeSecretsFile tests ---
+
+func TestWriteSecretsFile(t *testing.T) {
+	secrets := map[string][]byte{
+		"MY_SECRET": []byte("secret-value"),
+	}
+	path, cleanup, err := writeSecretsFile(secrets)
+	require.NoError(t, err)
+	defer cleanup()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"MY_SECRET"`)
+	assert.Contains(t, string(data), `"secret-value"`)
+
+	// Verify file permissions are 0600.
+	info, statErr := os.Stat(path)
+	require.NoError(t, statErr)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(),
+		"secrets file should have 0600 permissions")
+
+	// Verify cleanup removes the file.
+	cleanup()
+	_, err = os.Stat(path)
+	assert.True(t, os.IsNotExist(err))
+}
+
+// --- pemSecretName tests ---
+
+func TestPemSecretName(t *testing.T) {
+	tests := []struct {
+		role   string
+		expect string
+	}{
+		{"coder", "CODER_APP_PEM"},
+		{"triage", "TRIAGE_APP_PEM"},
+		{"review", "REVIEW_APP_PEM"},
+		{"ci-check", "CI_CHECK_APP_PEM"},
+		{"fix", "CODER_APP_PEM"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.role, func(t *testing.T) {
+			assert.Equal(t, tc.expect, pemSecretName(tc.role))
+		})
+	}
+}
+
+// --- ValidateWorkerName tests ---
+
+func TestValidateWorkerName(t *testing.T) {
+	tests := []struct {
+		name  string
+		valid bool
+	}{
+		{"fullsend-mint", true},
+		{"my-worker-123", true},
+		{"ab", true},
+		{"a", false},                   // too short
+		{"UPPER", false},               // uppercase
+		{"has_underscore", false},      // underscore
+		{"-starts-with-hyphen", false}, // starts with hyphen
+		{"ends-with-hyphen-", false},   // ends with hyphen
+		{"", false},                    // empty
+		{"a-very-long-worker-name-that-exceeds-the-maximum-allowed-length-of-63-chars", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.valid, ValidateWorkerName(tc.name))
+		})
+	}
+}
+
+// --- ValidatePreviewAlias tests ---
+
+func TestValidatePreviewAlias(t *testing.T) {
+	tests := []struct {
+		alias string
+		valid bool
+	}{
+		{"bt-run-42", true},
+		{"my-preview", true},
+		{"ab", true},
+		{"a", false},                   // too short
+		{"UPPER", false},               // uppercase
+		{"has_underscore", false},      // underscore
+		{"-starts-with-hyphen", false}, // starts with hyphen
+		{"", false},                    // empty
+	}
+	for _, tc := range tests {
+		t.Run(tc.alias, func(t *testing.T) {
+			assert.Equal(t, tc.valid, ValidatePreviewAlias(tc.alias))
+		})
+	}
+}
+
+// --- ValidateCloudflareEnv tests ---
+
+func TestValidateCloudflareEnv_Missing(t *testing.T) {
+	// Save and restore env vars.
+	origAccount := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	origToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+	defer func() {
+		os.Setenv("CLOUDFLARE_ACCOUNT_ID", origAccount)
+		os.Setenv("CLOUDFLARE_API_TOKEN", origToken)
+	}()
+
+	os.Unsetenv("CLOUDFLARE_ACCOUNT_ID")
+	os.Unsetenv("CLOUDFLARE_API_TOKEN")
+
+	err := ValidateCloudflareEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CLOUDFLARE_ACCOUNT_ID")
+	assert.Contains(t, err.Error(), "CLOUDFLARE_API_TOKEN")
+}
+
+func TestValidateCloudflareEnv_Present(t *testing.T) {
+	origAccount := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	origToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+	defer func() {
+		os.Setenv("CLOUDFLARE_ACCOUNT_ID", origAccount)
+		os.Setenv("CLOUDFLARE_API_TOKEN", origToken)
+	}()
+
+	os.Setenv("CLOUDFLARE_ACCOUNT_ID", "test-account")
+	os.Setenv("CLOUDFLARE_API_TOKEN", "test-token")
+
+	err := ValidateCloudflareEnv()
+	require.NoError(t, err)
+}
+
+// --- ResolveCloudflareAuth tests ---
+
+func withCFEnvCleared(t *testing.T) {
+	t.Helper()
+	origAccount := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+	origToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+	os.Unsetenv("CLOUDFLARE_ACCOUNT_ID")
+	os.Unsetenv("CLOUDFLARE_API_TOKEN")
+	t.Cleanup(func() {
+		os.Setenv("CLOUDFLARE_ACCOUNT_ID", origAccount)
+		os.Setenv("CLOUDFLARE_API_TOKEN", origToken)
+	})
+}
+
+func TestResolveCloudflareAuth_TokenAndAccountID(t *testing.T) {
+	withCFEnvCleared(t)
+	os.Setenv("CLOUDFLARE_API_TOKEN", "my-token")
+	os.Setenv("CLOUDFLARE_ACCOUNT_ID", "my-account-id")
+
+	accountID, err := ResolveCloudflareAuth(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "my-account-id", accountID)
+}
+
+func TestResolveCloudflareAuth_TokenWithoutAccountID(t *testing.T) {
+	withCFEnvCleared(t)
+	os.Setenv("CLOUDFLARE_API_TOKEN", "my-token")
+
+	_, err := ResolveCloudflareAuth(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CLOUDFLARE_ACCOUNT_ID is missing")
+}
+
+func TestResolveCloudflareAuth_WranglerSession_WithAccountEnv(t *testing.T) {
+	withCFEnvCleared(t)
+	os.Setenv("CLOUDFLARE_ACCOUNT_ID", "env-account-id")
+
+	// Mock wrangler whoami to succeed.
+	old := WranglerWhoamiFn
+	WranglerWhoamiFn = func(ctx context.Context) (string, error) {
+		return "ℹ️  Logged in as user@example.com\n", nil
+	}
+	t.Cleanup(func() { WranglerWhoamiFn = old })
+
+	accountID, err := ResolveCloudflareAuth(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "env-account-id", accountID)
+}
+
+func TestResolveCloudflareAuth_WranglerSession_DiscoverAccountID(t *testing.T) {
+	withCFEnvCleared(t)
+
+	old := WranglerWhoamiFn
+	WranglerWhoamiFn = func(ctx context.Context) (string, error) {
+		return "┌──────────────┬──────────────────────────────────┐\n" +
+			"│ Account Name │ Account ID                       │\n" +
+			"├──────────────┼──────────────────────────────────┤\n" +
+			"│ My Account   │ abcdef1234567890abcdef1234567890 │\n" +
+			"└──────────────┴──────────────────────────────────┘\n", nil
+	}
+	t.Cleanup(func() { WranglerWhoamiFn = old })
+
+	accountID, err := ResolveCloudflareAuth(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "abcdef1234567890abcdef1234567890", accountID)
+}
+
+func TestResolveCloudflareAuth_WranglerSession_MultipleAccounts(t *testing.T) {
+	withCFEnvCleared(t)
+
+	old := WranglerWhoamiFn
+	WranglerWhoamiFn = func(ctx context.Context) (string, error) {
+		return "┌──────────────┬──────────────────────────────────┐\n" +
+			"│ Account Name │ Account ID                       │\n" +
+			"├──────────────┼──────────────────────────────────┤\n" +
+			"│ Account One  │ aaaabbbbccccddddeeeeffffaaaabbbb │\n" +
+			"│ Account Two  │ 11112222333344445555666677778888 │\n" +
+			"└──────────────┴──────────────────────────────────┘\n", nil
+	}
+	t.Cleanup(func() { WranglerWhoamiFn = old })
+
+	_, err := ResolveCloudflareAuth(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "could not be auto-detected")
+}
+
+func TestResolveCloudflareAuth_NoCredentials(t *testing.T) {
+	withCFEnvCleared(t)
+
+	old := WranglerWhoamiFn
+	WranglerWhoamiFn = func(ctx context.Context) (string, error) {
+		return "", fmt.Errorf("not logged in")
+	}
+	t.Cleanup(func() { WranglerWhoamiFn = old })
+
+	_, err := ResolveCloudflareAuth(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no Cloudflare credentials")
+	assert.Contains(t, err.Error(), "wrangler login")
+}
+
+// --- parseWranglerWhoamiAccountID tests ---
+
+func TestParseWranglerWhoamiAccountID_SingleAccount(t *testing.T) {
+	output := "┌──────────────┬──────────────────────────────────┐\n" +
+		"│ Account Name │ Account ID                       │\n" +
+		"├──────────────┼──────────────────────────────────┤\n" +
+		"│ My Account   │ abcdef1234567890abcdef1234567890 │\n" +
+		"└──────────────┴──────────────────────────────────┘\n"
+	assert.Equal(t, "abcdef1234567890abcdef1234567890", parseWranglerWhoamiAccountID(output))
+}
+
+func TestParseWranglerWhoamiAccountID_NoAccount(t *testing.T) {
+	output := "ℹ️  Logged in as user@example.com\n"
+	assert.Equal(t, "", parseWranglerWhoamiAccountID(output))
+}
+
+func TestParseWranglerWhoamiAccountID_MultipleAccounts(t *testing.T) {
+	output := "│ Account One  │ aaaabbbbccccddddeeeeffffaaaabbbb │\n" +
+		"│ Account Two  │ 11112222333344445555666677778888 │\n"
+	assert.Equal(t, "", parseWranglerWhoamiAccountID(output))
+}
+
+// --- Embed integrity tests ---
+
+func TestEmbeddedWorkerSource_ContainsRequiredFiles(t *testing.T) {
+	for _, path := range embeddedWorkerFiles {
+		t.Run(path, func(t *testing.T) {
+			data, err := embeddedWorkerSource.ReadFile(path)
+			require.NoError(t, err, "embedded file %s should be readable", path)
+			assert.NotEmpty(t, data, "embedded file %s should not be empty", path)
+		})
+	}
+}
+
+func TestExtractEmbeddedSource(t *testing.T) {
+	dir := t.TempDir()
+	err := extractEmbeddedSource(dir)
+	require.NoError(t, err)
+
+	// Verify key files were extracted.
+	for _, name := range []string{"src/index.ts", "wrangler.toml", "package.json"} {
+		path := filepath.Join(dir, name)
+		info, err := os.Stat(path)
+		require.NoError(t, err, "expected %s to exist", name)
+		assert.True(t, info.Size() > 0, "expected %s to be non-empty", name)
+	}
+}
+
+// --- validateSourceDir tests ---
+
+func TestValidateSourceDir_Valid(t *testing.T) {
+	dir := createFakeWorkerSourceDir(t)
+	err := validateSourceDir(dir)
+	require.NoError(t, err)
+}
+
+func TestValidateSourceDir_MissingDir(t *testing.T) {
+	err := validateSourceDir("/nonexistent")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "source-dir")
+}
+
+func TestValidateSourceDir_MissingFile(t *testing.T) {
+	dir := t.TempDir()
+	// Create only some required files.
+	os.MkdirAll(filepath.Join(dir, "src"), 0o755)
+	os.WriteFile(filepath.Join(dir, "src/index.ts"), []byte("//ts"), 0o644)
+	os.WriteFile(filepath.Join(dir, "wrangler.toml"), []byte("name = \"test\""), 0o644)
+	// Missing package.json.
+
+	err := validateSourceDir(dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "package.json")
+}
+
+// --- parseWorkerURL tests ---
+
+func TestParseWorkerURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		expect string
+	}{
+		{
+			"standard output",
+			"Published test-mint (0.5s)\nhttps://test-mint.workers.dev",
+			"https://test-mint.workers.dev",
+		},
+		{
+			"with trailing punctuation",
+			"Deployed to https://my-worker.workers.dev.",
+			"https://my-worker.workers.dev",
+		},
+		{
+			"no url in output",
+			"Some other output\nwithout a URL",
+			"",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := parseWorkerURL(tc.output, "test-mint")
+			assert.Equal(t, tc.expect, result)
+		})
+	}
+}
+
+// --- parsePreviewURL tests ---
+
+func TestParsePreviewURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		alias  string
+		expect string
+	}{
+		{
+			"standard preview output",
+			"Uploading...\nhttps://bt-run-42-test-mint.fullsend-ai.workers.dev\nDone",
+			"bt-run-42",
+			"https://bt-run-42-test-mint.fullsend-ai.workers.dev",
+		},
+		{
+			"ignores production URL",
+			"Published test-mint (0.5s)\nhttps://test-mint.fullsend-ai.workers.dev\n",
+			"bt-run-42",
+			"",
+		},
+		{
+			"preview URL with trailing punctuation",
+			"Preview: https://bt-abc-my-worker.sub.workers.dev.",
+			"bt-abc",
+			"https://bt-abc-my-worker.sub.workers.dev",
+		},
+		{
+			"no url in output",
+			"Upload completed without URL",
+			"bt-alias",
+			"",
+		},
+		{
+			"prefers preview URL over production URL",
+			"Production: https://test-mint.fullsend-ai.workers.dev\nPreview: https://bt-42-test-mint.fullsend-ai.workers.dev",
+			"bt-42",
+			"https://bt-42-test-mint.fullsend-ai.workers.dev",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := parsePreviewURL(tc.output, tc.alias)
+			assert.Equal(t, tc.expect, result)
+		})
+	}
+}
+
+// --- parseWranglerSubdomainOutput tests ---
+
+func TestParseWranglerSubdomainOutput(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		expect string
+	}{
+		{
+			"simple output",
+			"fullsend-ai.workers.dev\n",
+			"fullsend-ai",
+		},
+		{
+			"with prefix noise",
+			"Fetching subdomain...\nfullsend-ai.workers.dev\n",
+			"fullsend-ai",
+		},
+		{
+			"no subdomain",
+			"No subdomain configured",
+			"",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := parseWranglerSubdomainOutput(tc.output)
+			assert.Equal(t, tc.expect, result)
+		})
+	}
+}
+
+// --- ResolveWorkersSubdomain tests ---
+
+func TestResolveWorkersSubdomain_UsesOverride(t *testing.T) {
+	old := ResolveWorkersSubdomainFn
+	ResolveWorkersSubdomainFn = func(_ context.Context, accountID string) (string, error) {
+		return "test-sub", nil
+	}
+	t.Cleanup(func() { ResolveWorkersSubdomainFn = old })
+
+	sub, err := ResolveWorkersSubdomainFn(context.Background(), "acc-123")
+	require.NoError(t, err)
+	assert.Equal(t, "test-sub", sub)
+}
+
+// writeVersionTS tests removed — version is now stamped via -ldflags
+// in BuildWASMFn, matching the GCF approach of compiling version data
+// into the source.
+
+// --- DefaultWorkerSourceDir tests ---
+
+func TestDefaultWorkerSourceDir(t *testing.T) {
+	dir := DefaultWorkerSourceDir()
+	assert.Equal(t, filepath.Join("internal", "dispatch", "cf", "workersrc"), dir)
+}
+
+// --- EmbeddedWorkerSource tests ---
+
+func TestEmbeddedWorkerSource_ReturnsFS(t *testing.T) {
+	fsys := EmbeddedWorkerSource()
+	require.NotNil(t, fsys)
+	// Verify we can read a known file through the returned FS.
+	data, err := fs.ReadFile(fsys, "workersrc/src/index.ts")
+	require.NoError(t, err)
+	assert.NotEmpty(t, data)
+}
+
+// --- NewLiveWranglerRunner tests ---
+
+func TestNewLiveWranglerRunner(t *testing.T) {
+	runner := NewLiveWranglerRunner("test-account-id")
+	require.NotNil(t, runner)
+	assert.Equal(t, "test-account-id", runner.AccountID)
+}
+
+// --- validateSourceDir not-a-directory ---
+
+func TestValidateSourceDir_NotADirectory(t *testing.T) {
+	// Create a file (not a directory) and pass it as source dir.
+	f := filepath.Join(t.TempDir(), "notadir")
+	require.NoError(t, os.WriteFile(f, []byte("content"), 0o644))
+
+	err := validateSourceDir(f)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a directory")
+}
+
+// --- LiveWranglerRunner error path tests ---
+//
+// These tests exercise the command-construction and error-handling
+// code paths in the LiveWranglerRunner methods. They use an already-
+// cancelled context so the exec call fails immediately without
+// hitting the network.
+
+func TestLiveWranglerRunner_Deploy_DurableCommandError(t *testing.T) {
+	dir := t.TempDir()
+	runner := &LiveWranglerRunner{AccountID: "test-account"}
+
+	// Cancel context immediately so exec fails without running wrangler.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	envVars := map[string]string{"KEY": "value"}
+	_, err := runner.Deploy(ctx, dir, "test-worker", "", envVars, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wrangler deploy failed")
+}
+
+func TestLiveWranglerRunner_Deploy_PreviewCommandError(t *testing.T) {
+	dir := t.TempDir()
+	runner := &LiveWranglerRunner{AccountID: "test-account"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	envVars := map[string]string{"KEY": "value"}
+	_, err := runner.Deploy(ctx, dir, "test-worker", "bt-alias", envVars, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wrangler versions upload failed")
+}
+
+func TestLiveWranglerRunner_PutSecret_CommandError(t *testing.T) {
+	runner := &LiveWranglerRunner{AccountID: "test-account"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runner.PutSecret(ctx, "test-worker", "MY_SECRET", []byte("secret-value"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wrangler secret put failed")
+}
+
+func TestLiveWranglerRunner_Delete_CommandError(t *testing.T) {
+	runner := &LiveWranglerRunner{AccountID: "test-account"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := runner.Delete(ctx, "test-worker")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wrangler delete failed")
+}
+
+// --- isHex tests ---
+
+func TestIsHex(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"", false},
+		{"0123456789abcdef", true},
+		{"ABCDEF", true},
+		{"0123456789ABCDEF", true},
+		{"abcdefg", false}, // 'g' is not hex
+		{"xyz", false},
+		{"12 34", false}, // space
+		{"a1b2c3", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			assert.Equal(t, tc.want, isHex(tc.input))
+		})
+	}
+}
+
+// --- writeSecretsFile additional tests ---
+
+func TestWriteSecretsFile_MultipleSecrets(t *testing.T) {
+	secrets := map[string][]byte{
+		"CODER_APP_PEM":  []byte("pem-data-1"),
+		"REVIEW_APP_PEM": []byte("pem-data-2"),
+	}
+	path, cleanup, err := writeSecretsFile(secrets)
+	require.NoError(t, err)
+	defer cleanup()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"CODER_APP_PEM"`)
+	assert.Contains(t, string(data), `"REVIEW_APP_PEM"`)
+	assert.Contains(t, string(data), `"pem-data-1"`)
+	assert.Contains(t, string(data), `"pem-data-2"`)
+}
+
+func TestWriteSecretsFile_EmptySecrets(t *testing.T) {
+	secrets := map[string][]byte{}
+	path, cleanup, err := writeSecretsFile(secrets)
+	require.NoError(t, err)
+	defer cleanup()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "{}", string(data))
+}
+
+// --- resolveSourceDir additional tests ---
+
+func TestResolveSourceDir_ExplicitMissingSrcDir(t *testing.T) {
+	// An explicit source dir that is not a valid Worker source should fail
+	// during Provision (at validateSourceDir).
+	stubWASMBuild(t)
+	dir := t.TempDir()
+	// Create wrangler.toml and package.json but NOT src/index.ts.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "wrangler.toml"), []byte("name = \"test\""), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}"), 0o644))
+
+	fake := &fakeWranglerRunner{deployURL: "https://test.workers.dev"}
+	p := NewProvisioner(Config{
+		AccountID: "test-account",
+		SourceDir: dir,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "src/index.ts")
+}
+
+// --- Provisioner env var passing tests ---
+
+func TestProvisioner_Provision_EmptyEnvVarPassedToWrangler(t *testing.T) {
+	// Verify that empty-string env vars are passed through to the wrangler
+	// runner (enabling --var KEY: to clear bindings with --keep-vars).
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+
+	fake := &fakeWranglerRunner{deployURL: "https://test.workers.dev"}
+	p := NewProvisioner(Config{
+		AccountID: "test-account",
+		SourceDir: sourceDir,
+		EnvVars: map[string]string{
+			"WORKFLOW_HOST_REPOS": "acme/workflows",
+			"PER_REPO_WIF_REPOS":  "",
+		},
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, fake.deployCalls, 1)
+	envVars := fake.deployCalls[0].envVars
+	assert.Equal(t, "acme/workflows", envVars["WORKFLOW_HOST_REPOS"])
+	prwr, present := envVars["PER_REPO_WIF_REPOS"]
+	assert.True(t, present, "empty env var should be present in deploy call")
+	assert.Equal(t, "", prwr, "empty env var should be empty string")
+}
+
+// --- Bootstrap (auto-create durable before preview) tests ---
+
+func boolPtr(b bool) *bool { return &b }
+
+func TestProvisioner_Provision_PreviewBootstrap_WorkerMissing(t *testing.T) {
+	// When the Worker does not exist, a preview deploy should first
+	// perform a durable bootstrap deploy, then the preview deploy.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		workerExists: boolPtr(false),
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+		EnvVars: map[string]string{
+			"PER_REPO_WIF_REPOS": "acme/widget",
+		},
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	// Expect two deploy calls: first durable bootstrap, then preview.
+	require.Len(t, fake.deployCalls, 2)
+	assert.Empty(t, fake.deployCalls[0].previewAlias, "first deploy should be durable (no preview alias)")
+	assert.Equal(t, "bt-run-42", fake.deployCalls[1].previewAlias, "second deploy should be preview")
+	assert.Equal(t, "test-mint", fake.deployCalls[0].workerName)
+	assert.Equal(t, "test-mint", fake.deployCalls[1].workerName)
+	// Bootstrap deploy must have empty env vars.
+	assert.Empty(t, fake.deployCalls[0].envVars,
+		"bootstrap deploy must not set env vars (prevents dual-enrollment via --keep-vars)")
+	assert.Empty(t, fake.deployCalls[0].secrets,
+		"bootstrap deploy must not include secrets")
+	// Preview deploy should receive the configured env vars.
+	assert.Equal(t, "acme/widget", fake.deployCalls[1].envVars["PER_REPO_WIF_REPOS"],
+		"preview deploy should receive configured env vars")
+}
+
+func TestProvisioner_Provision_PreviewBootstrap_WorkerExists(t *testing.T) {
+	// When the Worker already exists, preview deploy should NOT
+	// perform a bootstrap durable deploy.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		workerExists: boolPtr(true),
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	// Only one deploy call — no bootstrap needed.
+	require.Len(t, fake.deployCalls, 1)
+	assert.Equal(t, "bt-run-42", fake.deployCalls[0].previewAlias)
+}
+
+func TestProvisioner_Provision_PreviewBootstrap_WithSecrets(t *testing.T) {
+	// Bootstrap deploy should NOT include PEM secrets or env vars — it
+	// creates an empty durable script shell. PEM secrets and env vars
+	// land only on the preview version deployed immediately after.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	secrets := map[string][]byte{
+		"CODER_APP_PEM": []byte("pem-data"),
+	}
+	fake := &fakeWranglerRunner{
+		workerExists: boolPtr(false),
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+		EnvVars: map[string]string{
+			"PER_REPO_WIF_REPOS": "acme/widget",
+			"ROLE_APP_IDS":       `{"coder":"42"}`,
+		},
+		Secrets: secrets,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deployCalls, 2)
+	// Bootstrap durable deploy must have empty env vars and no secrets.
+	assert.Empty(t, fake.deployCalls[0].envVars,
+		"bootstrap deploy must not set env vars (prevents dual-enrollment via --keep-vars)")
+	assert.Empty(t, fake.deployCalls[0].secrets,
+		"bootstrap deploy must not include secrets (PEMs land on preview only)")
+	// Preview deploy should include both secrets and env vars.
+	assert.Equal(t, []byte("pem-data"), fake.deployCalls[1].secrets["CODER_APP_PEM"],
+		"preview deploy should include PEM secrets")
+	assert.Equal(t, "acme/widget", fake.deployCalls[1].envVars["PER_REPO_WIF_REPOS"],
+		"preview deploy should include configured env vars")
+}
+
+func TestProvisioner_Provision_PreviewBootstrap_BootstrapFails(t *testing.T) {
+	// When the bootstrap durable deploy fails, the preview deploy
+	// should not be attempted.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	callCount := 0
+	fake := &fakeWranglerRunner{
+		workerExists: boolPtr(false),
+	}
+	// Make deploy fail on the first call (bootstrap) only.
+	origDeploy := fake.Deploy
+	_ = origDeploy // unused, we override via deployErr
+	fake.deployErr = fmt.Errorf("bootstrap failed")
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bootstrap durable deploy")
+	_ = callCount
+	// Only bootstrap deploy should be attempted (which failed).
+	require.Len(t, fake.deployCalls, 1)
+}
+
+func TestProvisioner_Provision_PreviewBootstrap_CheckExistenceFails(t *testing.T) {
+	// When WorkerExists fails, Provision should return the error.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		workerExistsErr: fmt.Errorf("API timeout"),
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checking worker existence")
+	assert.Empty(t, fake.deployCalls, "no deploy should be attempted when existence check fails")
+}
+
+func TestProvisioner_Provision_DurableSkipsBootstrap(t *testing.T) {
+	// Durable deploys should never trigger a bootstrap existence check.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		// workerExists is nil (default true), but shouldn't be called at all.
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		DeployMode: DeployDurable,
+		SourceDir:  sourceDir,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	// Only one deploy call — no bootstrap check.
+	require.Len(t, fake.deployCalls, 1)
+	assert.Empty(t, fake.deployCalls[0].previewAlias)
+}
+
+// --- LiveWranglerRunner.WorkerExists tests ---
+
+func TestLiveWranglerRunner_WorkerExists_CommandError(t *testing.T) {
+	runner := &LiveWranglerRunner{AccountID: "test-account"}
+
+	// Cancel context immediately so exec fails.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := runner.WorkerExists(ctx, "test-worker")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "checking worker existence")
+}
+
+// --- copyDir additional edge case tests ---
+
+func TestCopyDir_SkipsSymlinks(t *testing.T) {
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "file.txt"), []byte("content"), 0o644)
+	// Create a symlink — it should be skipped.
+	os.Symlink(filepath.Join(src, "file.txt"), filepath.Join(src, "link.txt"))
+
+	dst := t.TempDir()
+	err := copyDir(src, dst)
+	require.NoError(t, err)
+
+	// Regular file should exist.
+	data, err := os.ReadFile(filepath.Join(dst, "file.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "content", string(data))
+
+	// Symlink should NOT exist.
+	_, err = os.Lstat(filepath.Join(dst, "link.txt"))
+	assert.True(t, os.IsNotExist(err), "symlink should not be copied")
+}
+
+// --- writeSecretsFile edge cases ---
+
+func TestWriteSecretsFile_NilSecrets(t *testing.T) {
+	// nil secrets should behave like empty map.
+	secrets := map[string][]byte(nil)
+	// writeSecretsFile doesn't special-case nil, so it should work
+	// (json.Marshal of empty map produces "{}")
+	path, cleanup, err := writeSecretsFile(secrets)
+	require.NoError(t, err)
+	defer cleanup()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "{}", string(data))
+}
+
+// --- ensureWASMArtifacts edge case: CopyWASMExec error ---
+
+func TestEnsureWASMArtifacts_CopyExecError(t *testing.T) {
+	origBuild := BuildWASMFn
+	origCopy := CopyWASMExecFn
+	BuildWASMFn = func(outPath, _, _ string, _ StatusGitHubAuth, _ TracingStamp) error {
+		return os.WriteFile(outPath, []byte("wasm"), 0o644)
+	}
+	CopyWASMExecFn = func(destPath string) error {
+		return fmt.Errorf("copy failed")
+	}
+	t.Cleanup(func() {
+		BuildWASMFn = origBuild
+		CopyWASMExecFn = origCopy
+	})
+
+	dir := t.TempDir()
+	err := ensureWASMArtifacts(dir, "", "", StatusGitHubAuth{}, TracingStamp{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "copying wasm_exec.js")
+}
+
+// --- Provisioner.Provision resolveSourceDir error test ---
+
+func TestProvisioner_Provision_SourceDirIsFile(t *testing.T) {
+	// sourceDir that is a file (not a directory) should fail validation.
+	f := filepath.Join(t.TempDir(), "notadir")
+	require.NoError(t, os.WriteFile(f, []byte("content"), 0o644))
+
+	p := NewProvisioner(Config{
+		AccountID: "abc123",
+		SourceDir: f,
+	}, &fakeWranglerRunner{})
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a directory")
+}
+
+// --- Provisioner validate edge cases ---
+
+func TestProvisioner_Provision_PreviewWithoutAlias(t *testing.T) {
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		DeployMode: DeployPreview,
+		// PreviewAlias intentionally empty.
+	}, &fakeWranglerRunner{})
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-empty PreviewAlias")
+}
+
+// --- Provisioner.Teardown durable is rejected ---
+
+func TestProvisioner_Teardown_DurableDeletesWorker_Default(t *testing.T) {
+	// Same as existing test but with default deploy mode.
+	fake := &fakeWranglerRunner{}
+	p := &Provisioner{
+		cfg: Config{
+			AccountID:  "abc123",
+			WorkerName: "test-mint",
+			// DeployMode defaults to DeployDurable (0).
+		},
+		wrangler: fake,
+	}
+
+	err := p.Teardown(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deleteCalls, 1, "durable teardown must call Delete")
+	assert.Equal(t, "test-mint", fake.deleteCalls[0])
+}
+
+func TestProvisioner_Teardown_ValidationFails(t *testing.T) {
+	// Empty AccountID should fail validation.
+	p := NewProvisioner(Config{
+		WorkerName: "test-mint",
+		DeployMode: DeployDurable,
+	}, &fakeWranglerRunner{})
+
+	err := p.Teardown(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CLOUDFLARE_ACCOUNT_ID is required")
+}
+
+func TestProvisioner_Teardown_DeleteError(t *testing.T) {
+	fake := &fakeWranglerRunner{deleteErr: fmt.Errorf("wrangler delete failed")}
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		DeployMode: DeployDurable,
+	}, fake)
+
+	err := p.Teardown(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wrangler delete failed")
+}
+
+// --- fileExistsAndNonEmpty tests ---
+
+func TestFileExistsAndNonEmpty_EmptyFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "empty")
+	require.NoError(t, os.WriteFile(f, []byte(""), 0o644))
+	assert.False(t, fileExistsAndNonEmpty(f), "empty file should return false")
+}
+
+func TestFileExistsAndNonEmpty_NonExistent(t *testing.T) {
+	assert.False(t, fileExistsAndNonEmpty("/nonexistent/path"))
+}
+
+func TestFileExistsAndNonEmpty_NonEmpty(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(f, []byte("data"), 0o644))
+	assert.True(t, fileExistsAndNonEmpty(f))
+}
+
+// --- PreviewAlias validation tests ---
+
+func TestProvisioner_Provision_PreviewBootstrap_EmptyEnvVars(t *testing.T) {
+	// When bootstrap is triggered, only the preview deploy should
+	// receive env vars. The bootstrap durable deploy must set NO env
+	// vars to prevent dual-enrollment via --keep-vars inheritance.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		workerExists: boolPtr(false),
+	}
+
+	envVars := map[string]string{
+		"PER_REPO_WIF_REPOS": "acme/widget",
+		"ROLE_APP_IDS":       `{"coder":"42"}`,
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+		EnvVars:      envVars,
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.NoError(t, err)
+	require.Len(t, fake.deployCalls, 2)
+	// Bootstrap durable deploy must have empty env vars.
+	assert.Empty(t, fake.deployCalls[0].envVars,
+		"bootstrap deploy must not set env vars")
+	// Preview deploy should receive the configured env vars.
+	assert.Equal(t, "acme/widget", fake.deployCalls[1].envVars["PER_REPO_WIF_REPOS"],
+		"preview deploy should receive configured env vars")
+	assert.Equal(t, `{"coder":"42"}`, fake.deployCalls[1].envVars["ROLE_APP_IDS"],
+		"preview deploy should receive ROLE_APP_IDS")
+}
+
+// --- FakeCloudflareAPIClient ---
+
+type fakeCloudflareAPIClient struct {
+	attachDomainCalls []attachDomainCall
+	removeDomainCalls []removeDomainCall
+
+	attachDomainErr error
+	removeDomainErr error
+
+	// lookupZoneID controls the return value of LookupZoneID.
+	lookupZoneID    string
+	lookupZoneIDErr error
+}
+
+type removeDomainCall struct {
+	accountID string
+	hostname  string
+}
+
+type attachDomainCall struct {
+	accountID  string
+	workerName string
+	zoneID     string
+	hostname   string
+}
+
+func (f *fakeCloudflareAPIClient) AttachCustomDomain(_ context.Context, accountID, workerName, zoneID, hostname string) error {
+	f.attachDomainCalls = append(f.attachDomainCalls, attachDomainCall{
+		accountID:  accountID,
+		workerName: workerName,
+		zoneID:     zoneID,
+		hostname:   hostname,
+	})
+	return f.attachDomainErr
+}
+
+func (f *fakeCloudflareAPIClient) RemoveCustomDomain(_ context.Context, accountID string, hostname string) error {
+	f.removeDomainCalls = append(f.removeDomainCalls, removeDomainCall{
+		accountID: accountID,
+		hostname:  hostname,
+	})
+	return f.removeDomainErr
+}
+
+func (f *fakeCloudflareAPIClient) LookupZoneID(_ context.Context, _ string) (string, error) {
+	if f.lookupZoneIDErr != nil {
+		return "", f.lookupZoneIDErr
+	}
+	return f.lookupZoneID, nil
+}
+
+// --- Custom domain tests ---
+
+func TestProvisioner_Provision_DurableWithCustomDomain(t *testing.T) {
+	// Given a provisioner configured with zone ID and custom domain hostname
+	// When Deploy is called in DeployDurable mode
+	// Then the Cloudflare Custom Domains API is called with the correct hostname
+	// And the mint URL uses the custom domain
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		deployURL: "https://test-mint.test-sub.workers.dev",
+	}
+	fakeCFAPI := &fakeCloudflareAPIClient{}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployDurable,
+		SourceDir:    sourceDir,
+		ZoneID:       "zone-456",
+		CustomDomain: "mint.fullsend.sh",
+	}, fake)
+	p.SetCloudflareAPI(fakeCFAPI)
+
+	result, err := p.Provision(context.Background())
+	require.NoError(t, err)
+
+	// Mint URL should be the custom domain, not workers.dev.
+	assert.Equal(t, "https://mint.fullsend.sh", result["FULLSEND_MINT_URL"])
+
+	// Custom domain should be attached.
+	require.Len(t, fakeCFAPI.attachDomainCalls, 1)
+	assert.Equal(t, "abc123", fakeCFAPI.attachDomainCalls[0].accountID)
+	assert.Equal(t, "test-mint", fakeCFAPI.attachDomainCalls[0].workerName)
+	assert.Equal(t, "zone-456", fakeCFAPI.attachDomainCalls[0].zoneID)
+	assert.Equal(t, "mint.fullsend.sh", fakeCFAPI.attachDomainCalls[0].hostname)
+}
+
+func TestProvisioner_Provision_PreviewSkipsCustomDomain(t *testing.T) {
+	// Given DeployPreview mode with custom domain would be invalid
+	// When Provision is called
+	// Then validation rejects the config
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployPreview,
+		PreviewAlias: "bt-run-42",
+		SourceDir:    sourceDir,
+		ZoneID:       "zone-456",
+		CustomDomain: "mint.fullsend.sh",
+	}, fake)
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not supported for preview deploys")
+}
+
+func TestProvisioner_Provision_DurableWithoutCustomDomain(t *testing.T) {
+	// Without CustomDomain, no CF API calls should be made.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		deployURL: "https://test-mint.test-sub.workers.dev",
+	}
+	fakeCFAPI := &fakeCloudflareAPIClient{}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		DeployMode: DeployDurable,
+		SourceDir:  sourceDir,
+		// No ZoneID or CustomDomain.
+	}, fake)
+	p.SetCloudflareAPI(fakeCFAPI)
+
+	result, err := p.Provision(context.Background())
+	require.NoError(t, err)
+
+	// Should use workers.dev URL.
+	assert.Equal(t, "https://test-mint.test-sub.workers.dev", result["FULLSEND_MINT_URL"])
+
+	// No CF API calls.
+	assert.Empty(t, fakeCFAPI.attachDomainCalls)
+}
+
+func TestProvisioner_Provision_CustomDomainAutoResolvesZoneID(t *testing.T) {
+	// CustomDomain without ZoneID should auto-resolve via LookupZoneID.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		deployURL: "https://test-mint.test-sub.workers.dev",
+	}
+	fakeCFAPI := &fakeCloudflareAPIClient{
+		lookupZoneID: "auto-resolved-zone-789",
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployDurable,
+		SourceDir:    sourceDir,
+		CustomDomain: "mint.fullsend.sh",
+		// ZoneID intentionally empty — should be auto-resolved.
+	}, fake)
+	p.SetCloudflareAPI(fakeCFAPI)
+
+	result, err := p.Provision(context.Background())
+	require.NoError(t, err)
+
+	// Mint URL should be the custom domain.
+	assert.Equal(t, "https://mint.fullsend.sh", result["FULLSEND_MINT_URL"])
+
+	// ZoneID should have been resolved and used.
+	require.Len(t, fakeCFAPI.attachDomainCalls, 1)
+	assert.Equal(t, "auto-resolved-zone-789", fakeCFAPI.attachDomainCalls[0].zoneID)
+}
+
+func TestProvisioner_Provision_CustomDomainZoneLookupFailure(t *testing.T) {
+	// When zone lookup fails, Provision should return a clear error.
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{
+		deployURL: "https://test-mint.test-sub.workers.dev",
+	}
+	fakeCFAPI := &fakeCloudflareAPIClient{
+		lookupZoneIDErr: fmt.Errorf("zone not found for domain %q — ensure the domain's zone exists in your Cloudflare account", "mint.fullsend.sh"),
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployDurable,
+		SourceDir:    sourceDir,
+		CustomDomain: "mint.fullsend.sh",
+	}, fake)
+	p.SetCloudflareAPI(fakeCFAPI)
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "looking up zone ID for custom domain")
+}
+
+func TestProvisioner_Provision_AttachDomainError(t *testing.T) {
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+	fake := &fakeWranglerRunner{}
+	fakeCFAPI := &fakeCloudflareAPIClient{
+		attachDomainErr: fmt.Errorf("domain already in use"),
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployDurable,
+		SourceDir:    sourceDir,
+		ZoneID:       "zone-456",
+		CustomDomain: "mint.fullsend.sh",
+	}, fake)
+	p.SetCloudflareAPI(fakeCFAPI)
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "attaching custom domain")
+}
+
+func TestProvisioner_Teardown_DurableWithCustomDomain(t *testing.T) {
+	// Durable teardown with custom domain should remove custom domain
+	// before deleting the Worker.
+	fake := &fakeWranglerRunner{}
+	fakeCFAPI := &fakeCloudflareAPIClient{}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployDurable,
+		CustomDomain: "mint.fullsend.sh",
+	}, fake)
+	p.SetCloudflareAPI(fakeCFAPI)
+
+	err := p.Teardown(context.Background())
+	require.NoError(t, err)
+
+	// Custom domain removed with correct accountID.
+	require.Len(t, fakeCFAPI.removeDomainCalls, 1)
+	assert.Equal(t, "abc123", fakeCFAPI.removeDomainCalls[0].accountID)
+	assert.Equal(t, "mint.fullsend.sh", fakeCFAPI.removeDomainCalls[0].hostname)
+
+	// Worker deleted.
+	require.Len(t, fake.deleteCalls, 1)
+	assert.Equal(t, "test-mint", fake.deleteCalls[0])
+}
+
+func TestProvisioner_Teardown_DurableWithoutCustomDomain(t *testing.T) {
+	// Without CustomDomain, teardown should just delete the Worker.
+	fake := &fakeWranglerRunner{}
+	fakeCFAPI := &fakeCloudflareAPIClient{}
+
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		DeployMode: DeployDurable,
+	}, fake)
+	p.SetCloudflareAPI(fakeCFAPI)
+
+	err := p.Teardown(context.Background())
+	require.NoError(t, err)
+
+	// No CF API calls.
+	assert.Empty(t, fakeCFAPI.removeDomainCalls)
+
+	// Worker deleted.
+	require.Len(t, fake.deleteCalls, 1)
+}
+
+func TestProvisioner_Teardown_RemoveDomainError(t *testing.T) {
+	fake := &fakeWranglerRunner{}
+	fakeCFAPI := &fakeCloudflareAPIClient{
+		removeDomainErr: fmt.Errorf("domain not found"),
+	}
+
+	p := NewProvisioner(Config{
+		AccountID:    "abc123",
+		WorkerName:   "test-mint",
+		DeployMode:   DeployDurable,
+		CustomDomain: "mint.fullsend.sh",
+	}, fake)
+	p.SetCloudflareAPI(fakeCFAPI)
+
+	err := p.Teardown(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "removing custom domain")
+	// Worker should NOT be deleted when domain removal fails.
+	assert.Empty(t, fake.deleteCalls)
+}
+
+func TestProvisioner_Validate_ZoneIDWithoutCustomDomain(t *testing.T) {
+	// ZoneID without CustomDomain should be rejected by validate().
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+		DeployMode: DeployDurable,
+		ZoneID:     "zone-456",
+	}, &fakeWranglerRunner{})
+
+	_, err := p.Provision(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CustomDomain is required when ZoneID is set")
+}
+
+func TestProvisioner_Validate_InvalidCustomDomainHostname(t *testing.T) {
+	// CustomDomain with invalid hostname syntax should be rejected.
+	tests := []struct {
+		name   string
+		domain string
+	}{
+		{"spaces", "mint fullsend.sh"},
+		{"no-dots", "localhost"},
+		{"trailing-dot", "mint.fullsend.sh."},
+		{"special-chars", "mint!@#.fullsend.sh"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewProvisioner(Config{
+				AccountID:    "abc123",
+				WorkerName:   "test-mint",
+				DeployMode:   DeployDurable,
+				ZoneID:       "zone-456",
+				CustomDomain: tc.domain,
+			}, &fakeWranglerRunner{})
+
+			_, err := p.Provision(context.Background())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid CustomDomain")
+		})
+	}
+}
+
+func TestProvisioner_Validate_ValidCustomDomainHostname(t *testing.T) {
+	// Valid hostnames should pass validation (may fail later in deploy).
+	stubWASMBuild(t)
+	sourceDir := createFakeWorkerSourceDir(t)
+
+	tests := []struct {
+		name   string
+		domain string
+	}{
+		{"simple", "mint.fullsend.sh"},
+		{"subdomain", "stage.mint.fullsend.sh"},
+		{"hyphen", "my-mint.fullsend.sh"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeWranglerRunner{
+				deployURL: "https://test-mint.test-sub.workers.dev",
+			}
+			fakeCFAPI := &fakeCloudflareAPIClient{}
+
+			p := NewProvisioner(Config{
+				AccountID:    "abc123",
+				WorkerName:   "test-mint",
+				DeployMode:   DeployDurable,
+				SourceDir:    sourceDir,
+				ZoneID:       "zone-456",
+				CustomDomain: tc.domain,
+			}, fake)
+			p.SetCloudflareAPI(fakeCFAPI)
+
+			result, err := p.Provision(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, "https://"+tc.domain, result["FULLSEND_MINT_URL"])
+		})
+	}
+}
+
+// --- ensureCFAPI tests ---
+
+func TestEnsureCFAPI_LazyInit(t *testing.T) {
+	// When no cfAPI is set, ensureCFAPI should create a
+	// LiveCloudflareAPIClient.
+	p := NewProvisioner(Config{
+		AccountID:  "abc123",
+		WorkerName: "test-mint",
+	}, &fakeWranglerRunner{})
+
+	// cfAPI starts nil.
+	assert.Nil(t, p.cfAPI)
+
+	client := p.ensureCFAPI()
+	require.NotNil(t, client)
+
+	// Should be a *LiveCloudflareAPIClient.
+	_, ok := client.(*LiveCloudflareAPIClient)
+	assert.True(t, ok, "ensureCFAPI should create a LiveCloudflareAPIClient")
+
+	// Subsequent calls return the same instance.
+	assert.Equal(t, client, p.ensureCFAPI())
+}
+
+// --- helpers ---
+
+func createFakeWorkerSourceDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "src"), 0o755)
+	os.WriteFile(filepath.Join(dir, "src/index.ts"), []byte("export default {}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "wrangler.toml"), []byte("name = \"test\""), 0o644)
+	os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}"), 0o644)
+	return dir
+}
+
+// stubWASMBuild replaces BuildWASMFn and CopyWASMExecFn with fakes
+// that write placeholder files. Restores the originals on cleanup.
+func stubWASMBuild(t *testing.T) {
+	t.Helper()
+	origBuild := BuildWASMFn
+	origCopy := CopyWASMExecFn
+	BuildWASMFn = func(outPath, _, _ string, _ StatusGitHubAuth, _ TracingStamp) error {
+		return os.WriteFile(outPath, []byte("fake-wasm"), 0o644)
+	}
+	CopyWASMExecFn = func(destPath string) error {
+		return os.WriteFile(destPath, []byte("fake-exec"), 0o644)
+	}
+	t.Cleanup(func() {
+		BuildWASMFn = origBuild
+		CopyWASMExecFn = origCopy
+	})
+}

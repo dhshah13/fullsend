@@ -166,6 +166,10 @@ class TestParsePrLinks(unittest.TestCase):
         linked = parse_pr_links(body, [44])
         self.assertEqual(linked, {42, 43, 44})
 
+    def test_additional_closing_verb_forms(self):
+        body = "closed #10; fixed #11; resolved #12; close #13; fixes #14; resolve #15"
+        self.assertEqual(parse_pr_links(body, []), {10, 11, 12, 13, 14, 15})
+
     def test_closing_refs_only(self):
         self.assertEqual(parse_pr_links(None, [7, 8]), {7, 8})
 

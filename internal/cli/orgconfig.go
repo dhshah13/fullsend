@@ -1,48 +1,73 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/fullsend-ai/fullsend/internal/config"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
-// tryLoadOrgConfig attempts to load org config from the given path.
-// Returns nil without error when the file is absent (best-effort).
-// Logs warnings via printer for non-ENOENT read errors and parse errors.
-func tryLoadOrgConfig(path string, printer *ui.Printer) *config.OrgConfig {
-	data, err := os.ReadFile(path)
-	if err != nil {
+// tryLoadFullsendConfig attempts to load a .fullsend config.yaml from the
+// given path. Returns nil without error when the file is absent
+// (best-effort). The returned ConfigWriter has ensured defaults.
+func tryLoadFullsendConfig(path string, printer *ui.Printer) config.ConfigWriter {
+	if _, err := os.Stat(path); err != nil {
 		if !os.IsNotExist(err) {
-			printer.StepWarn("Org config unreadable (remote resource allowlist unavailable): " + err.Error())
+			printer.StepWarn("Fullsend config unreadable (remote resource allowlist unavailable): " + err.Error())
 		}
 		return nil
 	}
-	cfg, parseErr := config.ParseOrgConfig(data)
-	if parseErr != nil {
-		printer.StepWarn("Org config malformed (remote resource allowlist unavailable): " + parseErr.Error())
+	writer, err := config.LoadConfigWriter(filepath.Dir(path), config.LoadOpts{MissingOK: false})
+	if err != nil {
+		printer.StepWarn("Config malformed (remote resource allowlist unavailable): " + err.Error())
 		return nil
 	}
-	return cfg
+	writer.SetAllowedRemoteResources(config.EnsureDefaultAllowedRemoteResources(writer.AllowedResources()))
+	return writer
 }
 
-// requireOrgConfig loads org config from the given path with strict error
-// handling. Returns differentiated errors for missing files, unreadable
-// files, and parse failures.
-func requireOrgConfig(path string, printer *ui.Printer) (*config.OrgConfig, error) {
-	data, err := os.ReadFile(path)
+// tryLoadOrgConfig is an alias of tryLoadFullsendConfig (best-effort).
+var tryLoadOrgConfig = tryLoadFullsendConfig
+
+// tryLoadLayeredFullsendConfig attempts to load the layered fullsend
+// config (config.yaml over config.base.yaml) from fullsendDir.
+// Unlike tryLoadFullsendConfig, it does not require config.yaml to
+// exist on disk: a base-only layout (config.base.yaml present,
+// config.yaml absent) is honored, matching loadLockConfig's semantics.
+// Returns nil without error when neither layer exists, or when the
+// config is malformed (best-effort, with a warning printed via
+// printer in the malformed case). The returned ConfigWriter has
+// ensured defaults.
+func tryLoadLayeredFullsendConfig(fullsendDir string, printer *ui.Printer) config.ConfigWriter {
+	writer, err := config.LoadConfigWriter(fullsendDir, config.LoadOpts{MissingOK: false})
 	if err != nil {
-		printer.StepFail("Failed to load org config")
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("URL-referenced resources require an org-level config.yaml with allowed_remote_resources (expected at %s)", path)
+		if !errors.Is(err, os.ErrNotExist) {
+			printer.StepWarn("Config malformed (remote resource allowlist unavailable): " + err.Error())
 		}
-		return nil, fmt.Errorf("reading org config for remote resource validation: %w", err)
+		return nil
 	}
-	cfg, parseErr := config.ParseOrgConfig(data)
-	if parseErr != nil {
-		printer.StepFail("Failed to parse org config")
-		return nil, fmt.Errorf("parsing org config: %w", parseErr)
-	}
-	return cfg, nil
+	writer.SetAllowedRemoteResources(config.EnsureDefaultAllowedRemoteResources(writer.AllowedResources()))
+	return writer
 }
+
+// requireFullsendConfig loads a .fullsend config.yaml from the
+// given path with strict error handling. Returns differentiated errors
+// for missing files, unreadable files, and parse failures.
+func requireFullsendConfig(path string, printer *ui.Printer) (config.ConfigWriter, error) {
+	writer, err := config.LoadConfigWriter(filepath.Dir(path), config.LoadOpts{MissingOK: false})
+	if err != nil {
+		printer.StepFail("Failed to load fullsend config")
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("URL-referenced resources require a config.yaml with allowed_remote_resources (expected at %s)", path)
+		}
+		return nil, fmt.Errorf("reading fullsend config for remote resource validation: %w", err)
+	}
+	writer.SetAllowedRemoteResources(config.EnsureDefaultAllowedRemoteResources(writer.AllowedResources()))
+	return writer, nil
+}
+
+// requireOrgConfig is an alias of requireFullsendConfig (strict).
+var requireOrgConfig = requireFullsendConfig

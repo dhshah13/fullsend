@@ -1,0 +1,73 @@
+{
+  "__typename": "PullRequest",
+  "number": 99,
+  "title": "Example PR",
+  "url": "https://github.com/acme/widget/pull/99",
+  "state": "OPEN",
+  "isDraft": false,
+  "author": {
+    "login": "fullsend-ai-coder"
+  },
+  "assignees": {
+    "nodes": []
+  },
+  "labels": {
+    "nodes": [
+      {
+        "name": "ready-for-review"
+      }
+    ]
+  },
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-02T00:00:00Z",
+  "body": "Some PR body text.",
+  "comments": {
+    "nodes": []
+  },
+  "reviewDecision": "REVIEW_REQUIRED",
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "reviewThreads": {
+    "nodes": [
+      {
+        "id": "PRRT_resolved",
+        "isResolved": true,
+        "path": "cmd/main.go",
+        "line": 10,
+        "comments": {
+          "nodes": []
+        }
+      },
+      {
+        "id": "PRRT_unresolved_1",
+        "isResolved": false,
+        "path": "internal/handler.go",
+        "line": 42,
+        "comments": {
+          "nodes": [
+            {
+              "author": {
+                "login": "fullsend-ai-review"
+              },
+              "body": "Error return value is not checked.",
+              "createdAt": "2024-01-02T01:00:00Z"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "committedDate": "2024-01-02T00:30:00Z",
+          "statusCheckRollup": {
+            "state": "SUCCESS"
+          }
+        }
+      }
+    ]
+  },
+  "baseRefName": "main"
+}

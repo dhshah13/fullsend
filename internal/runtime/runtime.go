@@ -2,31 +2,142 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
+	"github.com/fullsend-ai/fullsend/internal/forge"
 	"github.com/fullsend-ai/fullsend/internal/ui"
 )
 
 // RunMetrics collects execution statistics from stream parsing.
 type RunMetrics struct {
-	ToolCalls    atomic.Int32
-	NumTurns     int     `json:"num_turns"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
+	ToolCalls                atomic.Int32
+	NumTurns                 int     `json:"num_turns"`
+	TotalCostUSD             float64 `json:"total_cost_usd"`
+	InputTokens              int     `json:"input_tokens"`
+	OutputTokens             int     `json:"output_tokens"`
+	ReasoningTokens          int     `json:"reasoning_tokens"`
+	CacheCreationInputTokens int     `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int     `json:"cache_read_input_tokens"`
+	Model                    string  `json:"model"`
+	// PerModelUsage breaks the totals above down by the model spec that
+	// spent them. Runtimes that dispatch sub-agents fill it — pi's Agent
+	// tool with one entry per child model plus the parent's own, claude
+	// with one entry per model id from the result's modelUsage — so a run
+	// whose cost is dominated by children is legible in metrics.json;
+	// runtimes without sub-agents leave it nil and the totals stand alone.
+	PerModelUsage map[string]ModelUsage `json:"per_model_usage,omitempty"`
+	// FallbackFrom lists, in the order they were tried, the models the run
+	// moved off before Model took over (#8426): models the Vertex project
+	// did not serve, and on Claude Code any model its own --fallback-model
+	// handling left (a "model_fallback" event, for example on overload).
+	// Empty when the first model ran.
+	FallbackFrom []string `json:"fallback_from,omitempty"`
+	// FallbackReasons says why the run moved off each FallbackFrom entry,
+	// at the same index: "not_served" when the runner retried because the
+	// Vertex project does not serve the model, "claude_code:<trigger>"
+	// when Claude Code switched itself (its model_fallback trigger, for
+	// example "claude_code:last_resort"). Add entries with recordFallback
+	// so the two stay aligned.
+	FallbackReasons []string `json:"fallback_reasons,omitempty"`
 }
+
+// ModelUsage is one model's token and cost contribution to a run. Requests
+// counts the agent invocations attributed to the model (one for the parent
+// iteration, one per sub-agent call); the claude runtime has no source for
+// it and leaves it zero.
+type ModelUsage struct {
+	Requests                 int     `json:"requests"`
+	InputTokens              int     `json:"input_tokens"`
+	OutputTokens             int     `json:"output_tokens"`
+	CacheCreationInputTokens int     `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int     `json:"cache_read_input_tokens"`
+	CostUSD                  float64 `json:"cost_usd"`
+}
+
+// Add accumulates other into u.
+func (u *ModelUsage) Add(other ModelUsage) {
+	u.Requests += other.Requests
+	u.InputTokens += other.InputTokens
+	u.OutputTokens += other.OutputTokens
+	u.CacheCreationInputTokens += other.CacheCreationInputTokens
+	u.CacheReadInputTokens += other.CacheReadInputTokens
+	u.CostUSD += other.CostUSD
+}
+
+// DefaultAgentPrompt is the prompt handed to the agent CLI when RunParams
+// does not override it. It is deliberately content-free: the actual task
+// comes from the agent definition selected with --agent, so every runtime
+// adapter can pass the same string.
+const DefaultAgentPrompt = "Run the agent task"
 
 // RunParams configures a single agent invocation inside the sandbox.
 type RunParams struct {
 	SandboxName   string
 	AgentBaseName string
 	Model         string
-	RepoDir       string
-	PluginDirs    []string
-	Debug         string
-	Timeout       time.Duration
-	OutputPath    string // if set, tee stream-json stdout to this file
+	Effort        string
+	// FallbackModels is the ordered overload/retirement fallback chain
+	// (FULLSEND_FALLBACK_MODELS). Claude Code passes it as --fallback-model;
+	// runtimes without the capability ignore it with a warning. On Claude
+	// Code and pi it also replaces an alias's built-in chain
+	// (ImplicitFallbackModels) when the alias is not served.
+	FallbackModels []string
+	RepoDir        string
+	// HostRepoDir is the runner-side path of the target repository, the
+	// directory uploaded into the sandbox at RepoDir. The dummy runtime's
+	// checkout_branch op runs its git remote access there, because
+	// sandboxes cannot fetch from the forge; other runtimes ignore it.
+	HostRepoDir string
+	FullsendDir string
+	// PluginDirs are the sandbox-side directories Claude Code is pointed at
+	// with --plugin-dir, one per Claude-format plugin the runner uploaded.
+	PluginDirs []string
+	// Plugins are the harness's declared plugins (host paths and formats),
+	// the same list Bootstrap received. PiRuntime.Run re-hashes the pi-format
+	// entries to render the sandbox preflight; other runtimes ignore them.
+	Plugins []PluginInput
+	Debug   string
+	// HooksSettingsPath, if set, is passed as --settings so Claude Code
+	// loads the runner's hook wiring regardless of its working directory.
+	HooksSettingsPath string
+	Timeout           time.Duration
+	OutputPath        string           // if set, tee stream-json stdout to this file
+	OnEvent           func(AgentEvent) // if non-nil, called with normalized events during Run
+	// Prompt overrides DefaultAgentPrompt. The validation loop sets it on a
+	// retry iteration to inject the previous iteration's failure so the agent
+	// can self-correct instead of re-running blindly. See #1050, #6494.
+	//
+	// Every Runtime implementation MUST honour this field, falling back to
+	// DefaultAgentPrompt when it is empty. A runtime that ignores it turns
+	// validation_loop.feedback_mode into a silent no-op for every harness
+	// that selects that runtime, which is indistinguishable from the blind
+	// retries this field exists to remove. Runtime support is tracked in the
+	// key support matrix in docs/runtimes.md.
+	Prompt string
+	// Forge is the forge platform identifier ("github" or "gitlab").
+	// Empty defaults to "github". Used by runtimes that need
+	// forge-specific environment variable resolution.
+	Forge string
+	// ModelAliases holds per-repo model alias overrides from
+	// .fullsend/config.yaml models.aliases (#6882). When a harness or
+	// agent model value is an alias key present in this map, the
+	// runtime translates it to the mapped id before passing it to the
+	// underlying CLI. An empty or nil map means no overrides; the
+	// runtime's compiled-in alias table is used as-is.
+	ModelAliases map[string]string
+	// ForgeClient is an authenticated forge.Client for the current Forge
+	// platform, used by runtimes that need to call forge APIs from the
+	// orchestrator process itself (as opposed to the agent's own tool use
+	// inside the sandbox). Per the forge-abstraction rule (AGENTS.md,
+	// docs/contributing/forge-abstraction.md), any such call must go
+	// through this client rather than shelling out to `gh`/`glab`. May be
+	// nil when no token could be resolved; callers must treat that as
+	// "forge operations unavailable" rather than failing outright, mirroring
+	// the fail-closed-but-non-fatal handling already used for the playback
+	// tracking comment.
+	ForgeClient forge.Client
 }
 
 // TranscriptError holds extracted error information from a runtime transcript.
@@ -37,9 +148,35 @@ type TranscriptError struct {
 	Subtype      string
 }
 
+// DisplayMessage returns the sanitized, bounded message for a transcript
+// error: ErrorMessage with ANSI escapes, control characters, and GHA
+// workflow command markers stripped, or the subtype fallback when it
+// sanitizes to empty (both fields are omitempty in the transcript).
+// ErrorMessage is truncated at parse time; Subtype is not, so the
+// fallback applies the same truncateError bound before sanitizing. Every
+// sink that renders a transcript error — GHA annotations, the CLI
+// console, span status and events — goes through this one method so the
+// treatments agree.
+func (te TranscriptError) DisplayMessage() string {
+	msg := sanitizeOutput(te.ErrorMessage)
+	if msg == "" {
+		msg = fmt.Sprintf("agent terminated with error (subtype: %s)", sanitizeOutput(truncateError(te.Subtype)))
+	}
+	return msg
+}
+
 // Runtime is an agent execution backend (LLM tool-use loop) inside the sandbox.
 type Runtime interface {
 	Name() string
+	// System returns a fallback OTEL GenAI provider identity (gen_ai.system /
+	// gen_ai.provider.name) when the runtime does not implement
+	// ProviderResolver. Single-vendor runtimes return the model vendor
+	// (e.g. "anthropic"). Multi-provider runtimes must implement
+	// ProviderResolver so the agent span reports the serving endpoint for
+	// the model actually used (#7245); System() is then unused on agent
+	// spans. Kept on the runtime so telemetry stays runtime-agnostic rather
+	// than hardcoding a vendor in the CLI (ADR 0050).
+	System() string
 	ConfigDir() string
 	WorkspaceDir() string
 	EnvExports() []string
@@ -54,8 +191,128 @@ type Backend struct {
 	Transcripts TranscriptHandler
 }
 
-// Default returns the configured agent backend (Claude Code today).
+// Default returns the Claude Code backend. Prefer ResolveFromPerRepoConfig for config-aware selection.
 func Default() Backend {
 	r := ClaudeRuntime{}
 	return Backend{Runtime: r, Transcripts: r}
+}
+
+// DebugLogNamer is an optional extension a runtime or TranscriptHandler
+// implements to name the local debug-log artifact the runner writes per
+// iteration (e.g. "claude-debug.log"). Runtimes without it get
+// DefaultDebugLogName.
+type DebugLogNamer interface {
+	DebugLogName() string
+}
+
+// DefaultDebugLogName is the local debug-log filename for runtimes that do
+// not implement DebugLogNamer.
+const DefaultDebugLogName = "agent-debug.log"
+
+// DebugLogNameFor returns the debug-log filename from the first candidate
+// that implements DebugLogNamer with a non-empty name (callers pass the
+// Backend's Runtime and TranscriptHandler), falling back to
+// DefaultDebugLogName.
+func DebugLogNameFor(candidates ...any) string {
+	for _, v := range candidates {
+		if n, ok := v.(DebugLogNamer); ok {
+			if name := n.DebugLogName(); name != "" {
+				return name
+			}
+		}
+	}
+	return DefaultDebugLogName
+}
+
+// ContextBridger is an optional Runtime extension for runtimes that only
+// auto-load CLAUDE.md (not AGENTS.md) into their system context. When it
+// reports true and the target repo has AGENTS.md but no CLAUDE.md, the runner
+// injects a minimal CLAUDE.md pointer so the agent is not context-blind.
+// Runtimes that read AGENTS.md natively should not implement it (or return
+// false).
+type ContextBridger interface {
+	NeedsClaudeMDBridge() bool
+}
+
+// WantsClaudeMDBridge reports whether rt wants the CLAUDE.md→AGENTS.md
+// bridge file; false for runtimes that do not implement ContextBridger.
+func WantsClaudeMDBridge(rt Runtime) bool {
+	if b, ok := rt.(ContextBridger); ok {
+		return b.NeedsClaudeMDBridge()
+	}
+	return false
+}
+
+// HomeInstructionsBridger is implemented by runtimes that do not read the
+// target repo's AGENTS.md natively and load instructions from a file of their
+// own instead. HomeAgentsMDPath is where the runner copies the repo's
+// AGENTS.md (or the injected org-level one) inside the sandbox.
+type HomeInstructionsBridger interface {
+	HomeAgentsMDPath() string
+}
+
+// HomeAgentsMDPath returns rt's HomeAgentsMDPath, or "" for runtimes that
+// read AGENTS.md themselves.
+func HomeAgentsMDPath(rt Runtime) string {
+	if b, ok := rt.(HomeInstructionsBridger); ok {
+		return b.HomeAgentsMDPath()
+	}
+	return ""
+}
+
+// ProviderResolver is an optional Runtime extension for multi-provider
+// backends. ProviderFor returns the OTEL GenAI provider identity
+// (gen_ai.system / gen_ai.provider.name) for the model that run will call,
+// using the same resolution as the inference request. model is the runner-
+// resolved value (flag > env > agents: entry > harness model:); agentModel
+// is the agent definition's frontmatter model: and is only consulted when
+// model is empty (no runner-resolved model); aliases are the repo's
+// models.aliases. The identity is the serving endpoint (the pi provider
+// prefix after translatePiModel), not the model publisher: a Claude id on
+// Vertex is "anthropic-vertex", not "anthropic". That matches how the run
+// authenticates and which catalog a downstream consumer should look up.
+// Single-vendor runtimes omit this; GenAISystemFor falls back to System().
+//
+// Return a non-empty lowercase provider identifier (alphanumeric plus
+// hyphen, e.g. "anthropic-vertex", "openai"). Return "" to fall back to
+// System().
+type ProviderResolver interface {
+	ProviderFor(model, agentModel string, aliases map[string]string) string
+}
+
+// GenAISystemFor returns the OTEL GenAI provider identity for rt and the
+// given model. A ProviderResolver is preferred; otherwise System() is used.
+func GenAISystemFor(rt Runtime, model, agentModel string, aliases map[string]string) string {
+	if r, ok := rt.(ProviderResolver); ok {
+		if provider := r.ProviderFor(model, agentModel, aliases); provider != "" {
+			return provider
+		}
+	}
+	return rt.System()
+}
+
+// LaunchEnvExporter is an optional Runtime extension for runtimes whose
+// launch command (buildXRunCommand) exports environment variables beyond
+// the runtime's EnvExports: names the executed agent process sees but that
+// are set in the command string itself rather than by the runtime method.
+// LaunchEnvExports returns the bare variable names (no "export " prefix, no
+// value), including conditionally exported names — the flat union is the
+// contract: a consumer asks "can this runtime set it?", not "does it always
+// set it?". Runtimes whose launch commands export nothing beyond EnvExports
+// (dummy, dummy-playback) must not implement this.
+// TestLaunchEnvExportsMatchLaunchCommands derives each list from the
+// runtime's launch commands, so a declaration cannot omit a name the
+// commands export or keep one they no longer do.
+type LaunchEnvExporter interface {
+	Runtime
+	LaunchEnvExports() []string
+}
+
+// LaunchEnvExportsFor returns the launch-command environment names for rt,
+// or nil when the runtime does not implement LaunchEnvExporter.
+func LaunchEnvExportsFor(rt Runtime) []string {
+	if l, ok := rt.(LaunchEnvExporter); ok {
+		return l.LaunchEnvExports()
+	}
+	return nil
 }

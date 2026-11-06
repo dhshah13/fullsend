@@ -1,0 +1,341 @@
+package runtime
+
+import (
+	"bytes"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/fullsend-ai/fullsend/internal/ui"
+)
+
+func newTestRenderer(buf *bytes.Buffer) *EventRenderer {
+	printer := ui.New(buf)
+	return NewEventRenderer(printer)
+}
+
+func TestRendererInitEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(InitEvent{Model: "claude-opus-4-6", Version: "1.2.3"})
+
+	output := buf.String()
+	if !strings.Contains(output, "claude-opus-4-6") {
+		t.Errorf("expected model in output, got: %s", output)
+	}
+}
+
+func TestRendererDuplicateInitEventSuppressed(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(InitEvent{Model: "claude-opus-4-6", Version: "1.2.3"})
+	r.Handle(InitEvent{Model: "claude-opus-4-6"})
+	r.Handle(InitEvent{Model: "claude-opus-4-6"})
+
+	output := buf.String()
+	if count := strings.Count(output, "claude-opus-4-6"); count != 1 {
+		t.Errorf("expected init header exactly once, got %d times in: %s", count, output)
+	}
+}
+
+func TestRendererToolUseEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ToolUseEvent{Name: "Read", Summary: "/src/main.go"})
+
+	output := buf.String()
+	if !strings.Contains(output, "Read") {
+		t.Errorf("expected tool name in output, got: %s", output)
+	}
+	if !strings.Contains(output, "/src/main.go") {
+		t.Errorf("expected summary in output, got: %s", output)
+	}
+}
+
+func TestRendererToolResultEventIgnored(t *testing.T) {
+	// Tool results feed the Level 3 content collector, not the console:
+	// the renderer intentionally produces no output for them.
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ToolResultEvent{ID: "toolu_01abc", Result: "output text"})
+
+	if output := buf.String(); output != "" {
+		t.Errorf("expected no output for ToolResultEvent, got: %s", output)
+	}
+}
+
+func TestRendererToolUseEventNeverPrintsArguments(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ToolUseEvent{Name: "Bash", Summary: "make", Arguments: `{"command":"make SECRET=hunter2"}`})
+
+	if strings.Contains(buf.String(), "hunter2") {
+		t.Errorf("arguments must not reach the console, got %q", buf.String())
+	}
+}
+
+func TestRendererToolUseEventCI(t *testing.T) {
+	t.Setenv("GITHUB_ACTIONS", "true")
+
+	var buf bytes.Buffer
+	// In CI mode the renderer writes ::notice:: to stderr.
+	// We capture stderr by creating the renderer with a separate writer.
+	oldStderr := os.Stderr
+	stderrR, stderrW, _ := os.Pipe()
+	os.Stderr = stderrW
+	defer func() { os.Stderr = oldStderr }()
+
+	r := newTestRenderer(&buf)
+	r.Handle(ToolUseEvent{Name: "Bash", Summary: "make"})
+
+	stderrW.Close()
+	var stderrBuf bytes.Buffer
+	stderrBuf.ReadFrom(stderrR)
+
+	if !strings.Contains(stderrBuf.String(), "::notice::") {
+		t.Errorf("expected ::notice:: annotation in CI mode, got: %s", stderrBuf.String())
+	}
+}
+
+func TestRendererThinkingEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ThinkingEvent{Text: "Let me consider"})
+
+	output := buf.String()
+	if !strings.Contains(output, "Let me consider") {
+		t.Errorf("expected thinking text in output, got: %s", output)
+	}
+}
+
+func TestRendererTextEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(TextEvent{Text: "Here is the answer"})
+
+	output := buf.String()
+	if !strings.Contains(output, "Here is the answer") {
+		t.Errorf("expected text in output, got: %s", output)
+	}
+}
+
+func TestRendererBlockTransition(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	// Thinking -> Tool should close thinking block first
+	r.Handle(ThinkingEvent{Text: "pondering"})
+	r.Handle(ToolUseEvent{Name: "Read", Summary: "/a.go"})
+
+	output := buf.String()
+	if !strings.Contains(output, "pondering") {
+		t.Errorf("expected thinking text, got: %s", output)
+	}
+	if !strings.Contains(output, "Read") {
+		t.Errorf("expected tool name after block transition, got: %s", output)
+	}
+}
+
+func TestRendererResultEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ResultEvent{
+		NumTurns:                 8,
+		TotalCostUSD:             0.42,
+		InputTokens:              12000,
+		OutputTokens:             3400,
+		CacheCreationInputTokens: 8000,
+		CacheReadInputTokens:     5000,
+	})
+
+	output := buf.String()
+	if !strings.Contains(output, "Result") {
+		t.Errorf("expected Result header, got: %s", output)
+	}
+	if !strings.Contains(output, "8") {
+		t.Errorf("expected turns in output, got: %s", output)
+	}
+	if !strings.Contains(output, "$0.4200") {
+		t.Errorf("expected cost in output, got: %s", output)
+	}
+}
+
+func TestRendererResultEventWithError(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ResultEvent{
+		NumTurns:     3,
+		TotalCostUSD: 0.10,
+		IsError:      true,
+		ErrorMessage: "Max turns reached",
+		Subtype:      "error_max_turns",
+	})
+
+	output := buf.String()
+	if !strings.Contains(output, "ERROR") {
+		t.Errorf("expected ERROR in result header, got: %s", output)
+	}
+	if !strings.Contains(output, "Max turns reached") {
+		t.Errorf("expected error message in output, got: %s", output)
+	}
+}
+
+func TestRendererErrorEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ErrorEvent{ErrorType: "overloaded_error", Message: "rate limited"})
+
+	output := buf.String()
+	if !strings.Contains(output, "overloaded_error") {
+		t.Errorf("expected error type in output, got: %s", output)
+	}
+	if !strings.Contains(output, "rate limited") {
+		t.Errorf("expected error message in output, got: %s", output)
+	}
+}
+
+func TestRendererModelFallbackEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ModelFallbackEvent{From: "claude-opus-4-5", To: "claude-haiku-5-5", Trigger: "last_resort"})
+
+	output := buf.String()
+	if !strings.Contains(output, "model claude-opus-4-5 is not available (Claude Code: last_resort); falling back to claude-haiku-5-5") {
+		t.Errorf("expected the fallback warning, got: %s", output)
+	}
+
+	buf.Reset()
+	r.Handle(ModelFallbackEvent{From: "a::b", To: "c\x1b[31m", Trigger: ""})
+	output = buf.String()
+	if !strings.Contains(output, "model a: :b is not available (Claude Code); falling back to c") || strings.Contains(output, "\x1b") {
+		t.Errorf("expected a sanitized fallback warning with no trigger, got: %q", output)
+	}
+}
+
+func TestRendererRetryEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(RetryEvent{Attempt: 2, MaxRetries: 5, DelayMs: 1000, Error: "timeout"})
+
+	output := buf.String()
+	if !strings.Contains(output, "2") {
+		t.Errorf("expected attempt number in output, got: %s", output)
+	}
+	if !strings.Contains(output, "timeout") {
+		t.Errorf("expected error in output, got: %s", output)
+	}
+}
+
+func TestRendererPluginErrorEvent(t *testing.T) {
+	tests := []struct {
+		name string
+		evt  PluginErrorEvent
+		want string
+	}{
+		{
+			name: "with path",
+			evt:  PluginErrorEvent{Plugin: "demo@inline", Type: "path-not-found", Path: "/plugins/demo", Message: "not found"},
+			want: "Plugin demo@inline failed to load from /plugins/demo (path-not-found): not found",
+		},
+		{
+			name: "without path",
+			evt:  PluginErrorEvent{Plugin: "demo@inline", Type: "generic-error", Message: "boom"},
+			want: "Plugin demo@inline failed to load (generic-error): boom",
+		},
+		{
+			name: "unnamed, path only",
+			evt:  PluginErrorEvent{Path: "/plugins/x"},
+			want: "Plugin (unnamed) failed to load from /plugins/x",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			newTestRenderer(&buf).Handle(tt.evt)
+			if got := buf.String(); !strings.Contains(got, tt.want) {
+				t.Errorf("got %q, want it to contain %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRendererTokensEvent(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(TokensEvent{InputTokens: 4000, OutputTokens: 2000, CacheRead: 500, CacheWrite: 200})
+
+	output := buf.String()
+	if !strings.Contains(output, "TOKENS") {
+		t.Errorf("expected TOKENS in output, got: %s", output)
+	}
+	if !strings.Contains(output, "in=4000") {
+		t.Errorf("expected input token count, got: %s", output)
+	}
+	if strings.Contains(output, "reasoning=") {
+		t.Errorf("reasoning should not appear when zero, got: %s", output)
+	}
+}
+
+func TestRendererTokensEventWithReasoning(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(TokensEvent{InputTokens: 200, OutputTokens: 100, ReasoningTokens: 50, CacheRead: 80, CacheWrite: 20})
+
+	output := buf.String()
+	if !strings.Contains(output, "reasoning=50") {
+		t.Errorf("expected reasoning=50 in output, got: %s", output)
+	}
+}
+
+func TestRendererResultEventWithReasoning(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ResultEvent{
+		NumTurns:                 3,
+		TotalCostUSD:             0.20,
+		InputTokens:              1000,
+		OutputTokens:             500,
+		ReasoningTokens:          200,
+		CacheCreationInputTokens: 300,
+		CacheReadInputTokens:     400,
+	})
+
+	output := buf.String()
+	if !strings.Contains(output, "reasoning=200") {
+		t.Errorf("expected reasoning=200 in result tokens, got: %s", output)
+	}
+}
+
+func TestRendererResultEventWithoutReasoning(t *testing.T) {
+	var buf bytes.Buffer
+	r := newTestRenderer(&buf)
+
+	r.Handle(ResultEvent{
+		NumTurns:                 3,
+		TotalCostUSD:             0.20,
+		InputTokens:              1000,
+		OutputTokens:             500,
+		CacheCreationInputTokens: 300,
+		CacheReadInputTokens:     400,
+	})
+
+	output := buf.String()
+	if strings.Contains(output, "reasoning=") {
+		t.Errorf("reasoning should not appear when zero, got: %s", output)
+	}
+}

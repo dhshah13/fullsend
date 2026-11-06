@@ -1,0 +1,7 @@
+{
+  "action": "comment",
+  "pr_number": 1,
+  "repo": "owner/repo",
+  "head_sha": "abcdef0123456789abcdef0123456789abcdef01",
+  "body": "Behaviour smoke: bash-routed review completed."
+}

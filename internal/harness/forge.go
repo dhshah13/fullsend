@@ -2,26 +2,51 @@ package harness
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"strings"
+
+	"github.com/fullsend-ai/fullsend/internal/config"
+	"github.com/google/cel-go/common/types"
 )
 
 // ForgeConfig holds platform-specific harness configuration.
 // This is purely declarative YAML config — it selects which
-// scripts, skills, and env vars to use per platform. It is
+// scripts, skills, host files, and env vars to use per platform. It is
 // distinct from the forge.Client interface (internal/forge/),
 // which is the runtime abstraction for forge API operations.
 type ForgeConfig struct {
 	PreScript      string            `yaml:"pre_script,omitempty"`
 	PostScript     string            `yaml:"post_script,omitempty"`
-	Skills         []string          `yaml:"skills,omitempty"`
+	Policy         string            `yaml:"policy,omitempty"`
+	Skills         []SkillEntry      `yaml:"skills,omitempty"` // SkillEntry (not string) to support file-level overrides
+	Providers      []string          `yaml:"providers,omitempty"`
+	OpenShell      *OpenShellConfig  `yaml:"openshell,omitempty"`
+	HostFiles      []HostFile        `yaml:"host_files,omitempty"`
 	ValidationLoop *ValidationLoop   `yaml:"validation_loop,omitempty"`
 	RunnerEnv      map[string]string `yaml:"runner_env,omitempty"`
+	Env            *EnvConfig        `yaml:"env,omitempty"`
+}
+
+// OverlayEntry is a CEL-guarded conditional config block (ADR 0088).
+// Each entry carries a CEL expression in When and the same override fields
+// as ForgeConfig. All entries whose When evaluates to true are merged
+// into the harness in order (later matches override earlier matches).
+// The When expression is evaluated against the overlay CEL environment:
+// event (normevent map), runtime.forge (platform string), and config
+// (per-repo config map).
+type OverlayEntry struct {
+	When        string `yaml:"when"`
+	ForgeConfig `yaml:",inline"`
 }
 
 var validForgeKeys = map[string]bool{
 	"github": true,
 	"gitlab": true,
+	// "jira" is a temporary addition to unblock the triage-agent PoC for
+	// JIRA issues. The code agent remains blocked on a longer-term forge
+	// abstraction design (see https://github.com/fullsend-ai/fullsend/pull/6237).
+	"jira": true,
 }
 
 // ValidForgePlatform reports whether platform is a recognized forge key.
@@ -49,6 +74,11 @@ func (h *Harness) validateForge() error {
 		if fc == nil {
 			continue
 		}
+		if fc.Policy != "" && IsURL(fc.Policy) {
+			if _, _, hasHash := ParseIntegrityHash(fc.Policy); !hasHash {
+				return fmt.Errorf("forge.%s.policy URL must include #sha256=... integrity hash", key)
+			}
+		}
 		if fc.PreScript != "" && IsURL(fc.PreScript) {
 			return fmt.Errorf("forge.%s.pre_script must be a local path, not a URL", key)
 		}
@@ -56,21 +86,245 @@ func (h *Harness) validateForge() error {
 			return fmt.Errorf("forge.%s.post_script must be a local path, not a URL", key)
 		}
 		for i, s := range fc.Skills {
-			if IsURL(s) {
-				if _, _, hasHash := ParseIntegrityHash(s); !hasHash {
+			if IsURL(s.Source) {
+				if _, _, hasHash := ParseIntegrityHash(s.Source); !hasHash {
 					return fmt.Errorf("forge.%s.skills[%d] URL must include #sha256=... integrity hash", key, i)
 				}
 			}
 		}
-		if fc.ValidationLoop != nil {
-			if fc.ValidationLoop.Script == "" {
-				return fmt.Errorf("forge.%s.validation_loop.script is required when validation_loop is set", key)
+		if err := ValidateSkillOverrides(fc.Skills); err != nil {
+			return fmt.Errorf("forge.%s: %w", key, err)
+		}
+		for i, p := range fc.Providers {
+			if IsURL(p) {
+				if _, _, hasHash := ParseIntegrityHash(p); !hasHash {
+					return fmt.Errorf("forge.%s.providers[%d] URL must include #sha256=... integrity hash", key, i)
+				}
 			}
-			if IsURL(fc.ValidationLoop.Script) {
-				return fmt.Errorf("forge.%s.validation_loop.script must be a local path, not a URL", key)
+		}
+		if fc.OpenShell != nil {
+			for i, p := range fc.OpenShell.Profiles {
+				if IsURL(p) {
+					if _, _, hasHash := ParseIntegrityHash(p); !hasHash {
+						return fmt.Errorf("forge.%s.openshell.profiles[%d] URL must include #sha256=... integrity hash", key, i)
+					}
+				}
+			}
+		}
+		for i, hf := range fc.HostFiles {
+			if hf.Src == "" {
+				return fmt.Errorf("forge.%s.host_files[%d]: src is required", key, i)
+			}
+			if hf.Dest == "" {
+				return fmt.Errorf("forge.%s.host_files[%d]: dest is required", key, i)
+			}
+			if err := ValidateHostFileDest(hf.Dest); err != nil {
+				return fmt.Errorf("forge.%s.host_files[%d]: %w", key, i, err)
+			}
+			if IsURL(hf.Src) {
+				return fmt.Errorf("forge.%s.host_files[%d].src must be a local path, not a URL", key, i)
+			}
+		}
+		// Field-level merge inherits script from the top-level loop.
+		topHasScript := h.ValidationLoop != nil && h.ValidationLoop.Script != ""
+		if err := validateValidationLoop(fmt.Sprintf("forge.%s", key), fc.ValidationLoop, topHasScript); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateOverlayForgeConfig validates a ForgeConfig embedded in an overlay
+// entry, applying the same checks as validateForge per entry. OverlayEntry
+// embeds ForgeConfig via yaml:",inline" (see OverlayEntry), so overlay
+// entries carry the same override fields as forge platform blocks.
+//
+// Naming: The function references "ForgeConfig" rather than "OverlayEntry"
+// because it validates the ForgeConfig fields embedded in each overlay entry.
+// The ForgeConfig type name is a legacy artifact from the original forge
+// feature (ADR 0088 deprecated forge in favor of overlays), but the name
+// remains accurate: this function validates ForgeConfig fields.
+func validateOverlayForgeConfig(idx int, fc *ForgeConfig) error {
+	return validateOverlayForgeConfigInherit(idx, fc, false)
+}
+
+// validateOverlayForgeConfigInherit validates a ForgeConfig embedded in an
+// overlay entry, applying the same checks as validateForge per entry. When
+// inheritScript is true, an empty validation_loop.script is allowed because
+// field-level merge will inherit it from the top-level validation_loop (see
+// validateValidationLoop).
+func validateOverlayForgeConfigInherit(idx int, fc *ForgeConfig, inheritScript bool) error {
+	prefix := fmt.Sprintf("overlays[%d]", idx)
+	if fc.Policy != "" && IsURL(fc.Policy) {
+		if _, _, hasHash := ParseIntegrityHash(fc.Policy); !hasHash {
+			return fmt.Errorf("%s.policy URL must include #sha256=... integrity hash", prefix)
+		}
+	}
+	if fc.PreScript != "" && IsURL(fc.PreScript) {
+		return fmt.Errorf("%s.pre_script must be a local path, not a URL", prefix)
+	}
+	if fc.PostScript != "" && IsURL(fc.PostScript) {
+		return fmt.Errorf("%s.post_script must be a local path, not a URL", prefix)
+	}
+	for i, s := range fc.Skills {
+		if IsURL(s.Source) {
+			if _, _, hasHash := ParseIntegrityHash(s.Source); !hasHash {
+				return fmt.Errorf("%s.skills[%d] URL must include #sha256=... integrity hash", prefix, i)
 			}
 		}
 	}
+	if err := ValidateSkillOverrides(fc.Skills); err != nil {
+		return fmt.Errorf("%s: %w", prefix, err)
+	}
+	for i, p := range fc.Providers {
+		if IsURL(p) {
+			if _, _, hasHash := ParseIntegrityHash(p); !hasHash {
+				return fmt.Errorf("%s.providers[%d] URL must include #sha256=... integrity hash", prefix, i)
+			}
+		}
+	}
+	if fc.OpenShell != nil {
+		for i, p := range fc.OpenShell.Profiles {
+			if IsURL(p) {
+				if _, _, hasHash := ParseIntegrityHash(p); !hasHash {
+					return fmt.Errorf("%s.openshell.profiles[%d] URL must include #sha256=... integrity hash", prefix, i)
+				}
+			}
+		}
+	}
+	for i, hf := range fc.HostFiles {
+		if hf.Src == "" {
+			return fmt.Errorf("%s.host_files[%d]: src is required", prefix, i)
+		}
+		if hf.Dest == "" {
+			return fmt.Errorf("%s.host_files[%d]: dest is required", prefix, i)
+		}
+		if err := ValidateHostFileDest(hf.Dest); err != nil {
+			return fmt.Errorf("%s.host_files[%d]: %w", prefix, i, err)
+		}
+		if IsURL(hf.Src) {
+			return fmt.Errorf("%s.host_files[%d].src must be a local path, not a URL", prefix, i)
+		}
+	}
+	return validateValidationLoop(prefix, fc.ValidationLoop, inheritScript)
+}
+
+// validateValidationLoop applies validation_loop field checks shared by both
+// forge platform blocks (validateForge) and overlay entries
+// (validateOverlayForgeConfigInherit): script is required unless
+// inheritScript allows an empty script to inherit from the top-level
+// validation_loop, script must not be a URL, and schema must not be a URL.
+// A nil vl is valid (no validation_loop set) and returns nil.
+func validateValidationLoop(prefix string, vl *ValidationLoop, inheritScript bool) error {
+	if vl == nil {
+		return nil
+	}
+	if vl.Script == "" {
+		if !inheritScript {
+			return fmt.Errorf("%s.validation_loop.script is required when validation_loop is set", prefix)
+		}
+	} else if IsURL(vl.Script) {
+		return fmt.Errorf("%s.validation_loop.script must be a local path, not a URL", prefix)
+	}
+	if vl.Schema != "" && IsURL(vl.Schema) {
+		return fmt.Errorf("%s.validation_loop.schema must be a local path, not a URL", prefix)
+	}
+	return nil
+}
+
+// validateOverlays checks that the overlays section is well-formed:
+// mutual exclusion with forge, CEL expression compilation, and
+// ForgeConfig field validation per entry.
+func (h *Harness) validateOverlays() error {
+	if len(h.Overlays) == 0 {
+		return nil
+	}
+	if h.Forge != nil {
+		// This error includes remediation advice ("migrate forge entries to
+		// overlays") unlike other validation errors because it's a migration
+		// error guiding users from the deprecated forge feature to overlays
+		// (ADR 0088). The remediation is brief, actionable, and appropriate
+		// for a one-time migration scenario.
+		return fmt.Errorf("forge and overlays cannot coexist in the same harness; migrate forge entries to overlays")
+	}
+	for i, entry := range h.Overlays {
+		when := strings.TrimSpace(entry.When)
+		if when == "" {
+			return fmt.Errorf("overlays[%d].when is required", i)
+		}
+		env, err := NewOverlayEnv()
+		if err != nil {
+			return fmt.Errorf("overlays[%d]: creating CEL env: %w", i, err)
+		}
+		ast, issues := env.Compile(when)
+		if issues != nil && issues.Err() != nil {
+			return fmt.Errorf("overlays[%d].when: %w", i, issues.Err())
+		}
+		if !ast.OutputType().IsExactType(types.BoolType) {
+			return fmt.Errorf("overlays[%d].when must evaluate to bool, got %v", i, ast.OutputType())
+		}
+		fc := entry.ForgeConfig
+		inheritScript := h.ValidationLoop != nil && h.ValidationLoop.Script != ""
+		if err := validateOverlayForgeConfigInherit(i, &fc, inheritScript); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ResolveOverlays evaluates each overlay's When expression against the
+// overlay CEL environment (event, runtime.forge, config) and merges all
+// matching entries into the harness in order (later matches take
+// precedence over earlier matches). After resolution, h.Overlays is set
+// to nil (consumed). When h.Overlays is empty, this is a no-op. When
+// event is nil, an empty map is passed to CEL so overlays conditioned
+// only on runtime.forge or config can still match (e.g., CLI run/lock
+// flows that don't have an event context).
+//
+// CEL evaluation errors are treated as non-matching: the error is logged
+// and evaluation continues to the next entry. This matches the
+// MatchHarnesses pattern in harnessdispatch/enumerate.go and ensures that
+// a more-specific overlay (e.g., event.source.system == "jira" &&
+// runtime.forge == "github") that fails on key access when event is empty
+// does not prevent a broader fallback overlay from matching.
+func (h *Harness) ResolveOverlays(event map[string]any, forgePlatform string, config map[string]any) error {
+	// Record GITHUB_ISSUE_URL diagnostics before the overlays are consumed
+	// so Lint() still sees non-matching entries (#8742).
+	h.captureDeprecatedIssueURL()
+	if len(h.Overlays) == 0 {
+		h.Overlays = nil
+		return nil
+	}
+	// Use empty map if event is nil so overlays conditioned on runtime.forge
+	// or config can still evaluate and match (CLI paths without event context).
+	if event == nil {
+		event = make(map[string]any)
+	}
+	for i, entry := range h.Overlays {
+		matched, err := EvaluateOverlay(entry.When, event, forgePlatform, config)
+		if err != nil {
+			// Intentional exception to the harness package's return-errors
+			// convention: CEL evaluation errors are logged and treated as
+			// non-matching, allowing evaluation to continue to the next
+			// entry. This matches the MatchHarnesses pattern in
+			// harnessdispatch/enumerate.go and enables fallback overlays
+			// to match when a more-specific overlay errors (e.g.,
+			// "event.source.system == 'jira'" fails with "no such key:
+			// source" when event is empty). Validation catches malformed
+			// CEL expressions at load time; runtime errors here are
+			// typically data-dependent (missing event keys) and should
+			// not prevent the harness from loading.
+			log.Printf("harness: overlay[%d].when eval failed: %v", i, err)
+			continue
+		}
+		if matched {
+			fc := entry.ForgeConfig
+			if err := mergeForgeConfig(h, &fc); err != nil {
+				return fmt.Errorf("overlay[%d]: %w", i, err)
+			}
+		}
+	}
+	h.Overlays = nil
 	return nil
 }
 
@@ -85,6 +339,9 @@ func (h *Harness) validateForge() error {
 // call sees nil and is a no-op, which is correct because the forge map
 // was already validated before merging.
 func (h *Harness) ResolveForge(platform string) error {
+	// Record GITHUB_ISSUE_URL diagnostics before the forge map is consumed
+	// so Lint() still sees non-matching forge variants (#8742).
+	h.captureDeprecatedIssueURL()
 	if platform == "" || h.Forge == nil {
 		return nil
 	}
@@ -96,7 +353,9 @@ func (h *Harness) ResolveForge(platform string) error {
 		return fmt.Errorf("forge platform %q not configured (available: %s)", platform, forgeKeyList(h.Forge))
 	}
 	if fc != nil {
-		mergeForgeConfig(h, fc)
+		if err := mergeForgeConfig(h, fc); err != nil {
+			return fmt.Errorf("forge.%s: %w", platform, err)
+		}
 	}
 	h.Forge = nil
 	return nil
@@ -106,19 +365,53 @@ func (h *Harness) ResolveForge(platform string) error {
 //
 // Merge rules per ADR-0045:
 //   - Scalars: forge overrides if non-empty
-//   - Skills: top-level + forge (concatenated)
+//   - Skills: top-level + forge (merged by skill identity; forge overrides matching top-level)
+//   - Providers: top-level + forge (concatenated)
+//   - OpenShell.Profiles: top-level + forge (concatenated)
+//   - HostFiles: top-level + forge (concatenated with last-writer-wins dedup by Dest)
 //   - RunnerEnv: top-level merged with forge; forge keys win
-//   - ValidationLoop: forge replaces entirely if non-nil
-func mergeForgeConfig(h *Harness, fc *ForgeConfig) {
+//   - ValidationLoop: field-level merge; forge non-zero fields win
+//
+// It returns mergeSkills' error for a map-form forge skill that matches
+// more than one pinned-URL top-level skill.
+func mergeForgeConfig(h *Harness, fc *ForgeConfig) error {
 	if fc.PreScript != "" {
 		h.PreScript = fc.PreScript
 	}
 	if fc.PostScript != "" {
 		h.PostScript = fc.PostScript
 	}
+	if fc.Policy != "" {
+		h.Policy = fc.Policy
+	}
 
 	if fc.Skills != nil {
-		h.Skills = append(h.Skills, fc.Skills...)
+		skills, err := mergeSkills(h.Skills, fc.Skills)
+		if err != nil {
+			return err
+		}
+		h.Skills = skills
+	}
+
+	if fc.Providers != nil {
+		merged := make([]string, 0, len(h.Providers)+len(fc.Providers))
+		merged = append(merged, h.Providers...)
+		merged = append(merged, fc.Providers...)
+		h.Providers = merged
+	}
+
+	if fc.OpenShell != nil && len(fc.OpenShell.Profiles) > 0 {
+		if h.OpenShell == nil {
+			h.OpenShell = &OpenShellConfig{}
+		}
+		merged := make([]string, 0, len(h.OpenShell.Profiles)+len(fc.OpenShell.Profiles))
+		merged = append(merged, h.OpenShell.Profiles...)
+		merged = append(merged, fc.OpenShell.Profiles...)
+		h.OpenShell.Profiles = merged
+	}
+
+	if fc.HostFiles != nil {
+		h.HostFiles = mergeHostFiles(h.HostFiles, fc.HostFiles)
 	}
 
 	if fc.RunnerEnv != nil {
@@ -131,8 +424,17 @@ func mergeForgeConfig(h *Harness, fc *ForgeConfig) {
 	}
 
 	if fc.ValidationLoop != nil {
-		h.ValidationLoop = fc.ValidationLoop
+		h.ValidationLoop = mergeValidationLoop(h.ValidationLoop, fc.ValidationLoop)
 	}
+
+	// Env: merge sub-maps independently; forge keys win (ADR 0055)
+	if fc.Env != nil {
+		if h.Env == nil {
+			h.Env = &EnvConfig{}
+		}
+		h.Env.mergeEnvFrom(fc.Env, true)
+	}
+	return nil
 }
 
 func forgeKeyList(m map[string]*ForgeConfig) string {
@@ -141,4 +443,141 @@ func forgeKeyList(m map[string]*ForgeConfig) string {
 		keys = append(keys, k)
 	}
 	return strings.Join(keys, ", ")
+}
+
+// BuildConfigMap extracts user-facing per-repo config fields for overlay
+// CEL evaluation (ADR 0088). The returned map is exposed to overlay when
+// expressions as the "config" variable. Returns nil when cfg is nil or
+// does not implement PerRepoConfigReader.
+//
+// All safe per-repo config fields are exposed. Sensitive fields (mint_url,
+// inference provider details) are excluded. Per PR #6285 review feedback,
+// the 4-key whitelist was expanded to expose the full non-sensitive config.
+//
+// Both the CLI (run, lock) and harnessdispatch (enumerate) call sites use
+// this single implementation to ensure overlay CEL resolution sees the
+// same config shape regardless of the call path.
+func BuildConfigMap(cfg config.ConfigReader) map[string]any {
+	if cfg == nil {
+		return nil
+	}
+	pr, ok := cfg.(config.PerRepoConfigReader)
+	if !ok {
+		return nil
+	}
+	m := map[string]any{}
+
+	// Core platform fields
+	if v := pr.ConfigForge(); v != "" {
+		m["forge"] = v
+	}
+	if v := pr.ConfigRuntime(); v != "" {
+		m["runtime"] = v
+	}
+	if roles := pr.ConfigRoles(); len(roles) > 0 {
+		// Convert to []any for CEL evaluation compatibility.
+		anyRoles := make([]any, len(roles))
+		for i, r := range roles {
+			anyRoles[i] = r
+		}
+		m["roles"] = anyRoles
+	}
+
+	// Operational fields
+	if v := pr.ConfigVersion(); v != "" {
+		m["version"] = v
+	}
+	if pr.IsKillSwitchActive() {
+		m["kill_switch"] = true
+	}
+
+	// Agent entries (convert to CEL-compatible map slice)
+	if agents := pr.AgentEntries(); len(agents) > 0 {
+		anyAgents := make([]any, len(agents))
+		for i, a := range agents {
+			agentMap := map[string]any{}
+			if a.Source != "" {
+				agentMap["source"] = a.Source
+			}
+			if a.Name != "" {
+				agentMap["name"] = a.Name
+			}
+			if a.Enabled != nil {
+				agentMap["enabled"] = *a.Enabled
+			}
+			if a.Runtime != "" {
+				agentMap["runtime"] = a.Runtime
+			}
+			if a.Model != "" {
+				agentMap["model"] = a.Model
+			}
+			if a.Effort != "" {
+				agentMap["effort"] = a.Effort
+			}
+			anyAgents[i] = agentMap
+		}
+		m["agents"] = anyAgents
+	}
+
+	// Security policies
+	if arr := pr.AllowedResources(); len(arr) > 0 {
+		anyArr := make([]any, len(arr))
+		for i, r := range arr {
+			anyArr[i] = r
+		}
+		m["allowed_remote_resources"] = anyArr
+	}
+
+	// Tracker config: the provider-discriminated tracker mapping. The
+	// selected provider's key is always present (so overlays can select on
+	// it, e.g. has(config.tracker) && has(config.tracker.jira)); its
+	// allowed_targets is present only when non-empty.
+	if t := pr.IssueTracking(); t != nil && t.Provider() != "" {
+		targets := map[string]any{}
+		addList := func(key string, values []string) {
+			if len(values) == 0 {
+				return
+			}
+			anyValues := make([]any, len(values))
+			for i, v := range values {
+				anyValues[i] = v
+			}
+			targets[key] = anyValues
+		}
+		switch t.Provider() {
+		case config.TrackingProviderGitHub:
+			addList("orgs", t.GitHub.AllowedTargets.Orgs)
+			addList("repos", t.GitHub.AllowedTargets.Repos)
+		case config.TrackingProviderGitLab:
+			addList("groups", t.GitLab.AllowedTargets.Groups)
+			addList("repos", t.GitLab.AllowedTargets.Repos)
+		case config.TrackingProviderJira:
+			addList("projects", t.Jira.AllowedTargets.Projects)
+		}
+		provider := map[string]any{}
+		if len(targets) > 0 {
+			provider["allowed_targets"] = targets
+		}
+		m["tracker"] = map[string]any{t.Provider(): provider}
+	}
+
+	// Status notifications config
+	if sn := pr.StatusNotifications(); sn != nil {
+		snMap := map[string]any{}
+		if sn.Comment.Start != "" {
+			snMap["start"] = sn.Comment.Start
+		}
+		if sn.Comment.Completion != "" {
+			snMap["completion"] = sn.Comment.Completion
+		}
+		if len(snMap) > 0 {
+			m["status_notifications"] = snMap
+		}
+	}
+
+	// Note: mint_url and inference.* fields are intentionally excluded
+	// (contain credential URLs and GCP project identifiers that should not
+	// be exposed to harness CEL expressions).
+
+	return m
 }

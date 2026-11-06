@@ -4,14 +4,30 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
 
 var errInvalidHash = errors.New("cache: hash must be exactly 64 lowercase hex characters")
+
+// atomicWriteTmpRe matches the temporary files os.CreateTemp produces for
+// atomicWrite's "<name>.tmp.*" pattern before they are renamed into place.
+var atomicWriteTmpRe = regexp.MustCompile(`\.tmp\.\d+$`)
+
+// skipVanished maps fs.ErrNotExist to nil so a cache-tree walk tolerates
+// entries that a concurrent writer renamed away between the directory read
+// and the stat/read of the entry. All other errors pass through unchanged.
+func skipVanished(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
+}
 
 // CacheEntry is metadata for a cached remote resource.
 type CacheEntry struct {
@@ -134,6 +150,64 @@ func CachePut(workspaceRoot, url string, content []byte) error {
 	}
 
 	return nil
+}
+
+// CacheFindNewest scans the metadata of every single-file entry in the
+// content-addressed cache and returns the content and metadata of the most
+// recently fetched entry whose recorded URL satisfies match. Directory
+// entries are skipped. A candidate that fails CacheGet's integrity
+// re-verification is skipped in favor of the next newest. It returns
+// (nil, nil, nil) when no entry matches — including when the cache does not
+// exist yet.
+//
+// Metadata records only the last URL an identical content hash was cached
+// from, so a match against an earlier URL is a conservative miss.
+func CacheFindNewest(workspaceRoot string, match func(url string) bool) ([]byte, *CacheEntry, error) {
+	if workspaceRoot == "" {
+		return nil, nil, nil
+	}
+	root := filepath.Join(workspaceRoot, ".fullsend-cache", "resources", "sha256")
+	dirEntries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("reading cache directory: %w", err)
+	}
+
+	var candidates []CacheEntry
+	for _, de := range dirEntries {
+		if !de.IsDir() || validateHash(de.Name()) != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, de.Name(), "metadata.json"))
+		if err != nil {
+			continue
+		}
+		var meta struct {
+			CacheEntry
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil || meta.Type == "directory" {
+			continue
+		}
+		if meta.SHA256 != de.Name() || !match(meta.URL) {
+			continue
+		}
+		candidates = append(candidates, meta.CacheEntry)
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].FetchTime.After(candidates[j].FetchTime)
+	})
+	for _, c := range candidates {
+		content, entry, err := CacheGet(workspaceRoot, c.SHA256)
+		if err != nil || content == nil || !match(entry.URL) {
+			continue
+		}
+		return content, entry, nil
+	}
+	return nil, nil, nil
 }
 
 // validateCachePath resolves symlinks on the cache directory and verifies
@@ -309,12 +383,22 @@ func CacheGetDir(workspaceRoot, hash string) (string, *DirCacheEntry, error) {
 	}
 
 	// Re-verify integrity: walk the tree directory and recompute the tree hash.
+	// Concurrent writers materialize files via atomicWrite, which creates
+	// "<name>.tmp.<rand>" entries inside the tree before renaming them into
+	// place. Skip those temp entries (a crashed writer's leftover would
+	// otherwise poison the tree hash forever) and tolerate entries vanishing
+	// mid-walk (a concurrent writer renaming its temp file away). The tree-hash
+	// comparison below backstops both tolerances: skipping or losing a
+	// legitimate file still fails the integrity check.
 	files := make(map[string][]byte)
 	err = filepath.Walk(treeDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			return skipVanished(err)
 		}
 		if info.IsDir() {
+			return nil
+		}
+		if atomicWriteTmpRe.MatchString(filepath.Base(path)) {
 			return nil
 		}
 		relPath, err := filepath.Rel(treeDir, path)
@@ -323,7 +407,7 @@ func CacheGetDir(workspaceRoot, hash string) (string, *DirCacheEntry, error) {
 		}
 		content, err := os.ReadFile(path)
 		if err != nil {
-			return err
+			return skipVanished(err)
 		}
 		files[relPath] = content
 		return nil
@@ -338,6 +422,70 @@ func CacheGetDir(workspaceRoot, hash string) (string, *DirCacheEntry, error) {
 	}
 
 	return treeDir, &entry, nil
+}
+
+// CacheNamedSymlink creates a symlink in a cache directory so that a
+// cached resource can be referenced by a human-readable name instead of
+// the cache-internal filename. For directory caches the internal name is
+// "tree"; for single-file caches it is "content". The target is derived
+// automatically from filepath.Base(cachePath), so the same function works
+// for both layouts.
+//
+// linkName must be a single path segment. If it is empty or matches a
+// reserved cache file (".", "..", "metadata.json") it falls back to the
+// cache-internal name, which yields a no-op (the original cachePath is
+// returned unchanged). A linkName containing a path separator is rejected
+// so the link can never escape the cache directory — the safety property
+// then holds regardless of caller discipline.
+//
+// The link is (re)created atomically: it is built at a unique temporary
+// name in the same directory and renamed into place. rename(2) atomically
+// swaps the entry, so a concurrent reader never observes a missing path,
+// a stale or foreign entry is replaced without a read-modify-write race,
+// and concurrent writers converge (each installs the same target). The
+// function is idempotent: if a correct symlink already exists it returns
+// immediately. Callers must not place a real subdirectory at the named
+// path — renaming over a non-empty directory fails, surfacing a clear
+// error rather than silent corruption.
+func CacheNamedSymlink(cachePath, linkName string) (string, error) {
+	target := filepath.Base(cachePath) // "tree" or "content"
+	if linkName == "" || linkName == "." || linkName == ".." || linkName == "metadata.json" {
+		linkName = target
+	}
+	if strings.ContainsRune(linkName, filepath.Separator) || strings.ContainsRune(linkName, '/') {
+		return "", fmt.Errorf("cache link name %q must be a single path segment", linkName)
+	}
+	namedPath := filepath.Join(filepath.Dir(cachePath), linkName)
+	if namedPath == cachePath {
+		return cachePath, nil
+	}
+	// Idempotent fast path: a correct symlink already points at the target.
+	if got, err := os.Readlink(namedPath); err == nil && got == target {
+		return namedPath, nil
+	}
+	// Otherwise create it, or replace a stale/foreign entry, atomically:
+	// build the symlink at a unique temp name in the same directory, then
+	// rename it into place. The temp name is unique per call (os.CreateTemp),
+	// so concurrent callers never collide on it, and the final rename is what
+	// makes the swap observably atomic.
+	dir := filepath.Dir(namedPath)
+	tmp, err := os.CreateTemp(dir, ".named-*")
+	if err != nil {
+		return "", fmt.Errorf("creating named symlink: %w", err)
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	if err := os.Remove(tmpPath); err != nil {
+		return "", fmt.Errorf("creating named symlink: %w", err)
+	}
+	if err := os.Symlink(target, tmpPath); err != nil {
+		return "", fmt.Errorf("creating named symlink: %w", err)
+	}
+	if err := os.Rename(tmpPath, namedPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("installing named symlink: %w", err)
+	}
+	return namedPath, nil
 }
 
 // atomicWrite writes data to a temporary file in dir, then renames it to the

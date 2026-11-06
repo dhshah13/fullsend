@@ -48,7 +48,7 @@ func (m *VendorManifest) MarshalYAML() ([]byte, error) {
 	return yaml.Marshal(m)
 }
 
-// ParseVendorManifest parses manifest YAML from the config repo.
+// ParseVendorManifest parses manifest YAML from a repository.
 func ParseVendorManifest(data []byte) (*VendorManifest, error) {
 	var m VendorManifest
 	if err := yaml.Unmarshal(data, &m); err != nil {
@@ -135,23 +135,33 @@ func (m *VendorManifest) CleanupPaths(workflowPrefix string) []string {
 }
 
 var vendoredReusableWorkflows = []string{
-	"reusable-code.yml",
 	"reusable-dispatch.yml",
-	"reusable-fix.yml",
 	"reusable-prioritize.yml",
-	"reusable-retro.yml",
+}
+
+// retiredVendoredReusableWorkflows are no longer shipped, but remain in the
+// legacy cleanup set so disabling vendoring removes files from older installs.
+var retiredVendoredReusableWorkflows = []string{
+	"reusable-code.yml",
+	"reusable-fix.yml",
 	"reusable-review.yml",
+	"reusable-retro.yml",
 	"reusable-triage.yml",
 }
 
 var vendoredDefaultsInfraPaths = []string{
 	"action.yml",
-	".github/actions/check-e2e-authorization/action.yml",
+	".github/actions/install-fullsend-cli/action.yml",
 	".github/actions/mint-token/action.yml",
+	".github/actions/prepare-workspace/action.yml",
 	".github/actions/setup-gcp/action.yml",
 	".github/actions/validate-enrollment/action.yml",
+	".github/scripts/check-fix-eligibility.sh",
+	".github/scripts/count-fix-commits.jq",
 	".github/scripts/install-openshell.sh",
+	".github/scripts/install-podman.sh",
 	".github/scripts/openshell-version.sh",
+	".github/scripts/pre-fetch-review-body.sh",
 }
 
 // enumerateVendoredPaths returns embed-derived paths for a current --vendor install layout.
@@ -203,6 +213,12 @@ func enumerateLegacyFlatVendoredPaths(workflowPrefix string) ([]string, error) {
 			add(workflowPrefix + ".github/workflows/" + name)
 		}
 	}
+	for _, name := range retiredVendoredReusableWorkflows {
+		add(".github/workflows/" + name)
+		if workflowPrefix != "" {
+			add(workflowPrefix + ".github/workflows/" + name)
+		}
+	}
 	for _, p := range vendoredDefaultsInfraPaths {
 		add(p)
 	}
@@ -224,6 +240,34 @@ func enumerateLegacyFlatVendoredPaths(workflowPrefix string) ([]string, error) {
 	return out, nil
 }
 
+// StaleVendoredPaths returns manifest-recorded content paths that are not
+// part of the new vendored set, so a re-vendor can delete them in the same
+// commit instead of leaving untracked orphans in consumer repos (e.g. a
+// script removed from the vendoredDefaultsScripts allowlist). Only safe
+// vendored repo paths are returned; the binary and the manifest itself are
+// tracked separately and never appear in manifest.Paths.
+func StaleVendoredPaths(manifest *VendorManifest, current []string) []string {
+	if manifest == nil {
+		return nil
+	}
+	keep := make(map[string]struct{}, len(current))
+	for _, p := range current {
+		keep[p] = struct{}{}
+	}
+	var stale []string
+	for _, p := range manifest.Paths {
+		if _, ok := keep[p]; ok {
+			continue
+		}
+		if !isSafeVendoredRepoPath(p) {
+			continue
+		}
+		stale = append(stale, p)
+	}
+	sort.Strings(stale)
+	return stale
+}
+
 // ReadVendorManifest loads the manifest from a repo when present.
 func ReadVendorManifest(ctx context.Context, client forge.Client, owner, repo, workflowPrefix string) (*VendorManifest, bool, error) {
 	path := VendorManifestPath(workflowPrefix)
@@ -243,7 +287,7 @@ func ReadVendorManifest(ctx context.Context, client forge.Client, owner, repo, w
 
 // ResolveVendoredCleanupPaths returns paths to delete when disabling --vendor.
 // Prefers the committed manifest; falls back to embed enumeration for legacy installs.
-// binaryPath is included when no manifest is present (per-org or per-repo default).
+// binaryPath is included when no manifest is present.
 func ResolveVendoredCleanupPaths(ctx context.Context, client forge.Client, owner, repo, workflowPrefix, binaryPath string) ([]string, error) {
 	manifest, found, err := ReadVendorManifest(ctx, client, owner, repo, workflowPrefix)
 	if err != nil {
@@ -292,19 +336,4 @@ func PathsFromInstallFiles(files InstallFiles) []string {
 	}
 	sort.Strings(paths)
 	return paths
-}
-
-// ComparePathPresence checks which expected paths exist in the repo.
-func ComparePathPresence(ctx context.Context, client forge.Client, owner, repo string, expected []string) (missing []string, err error) {
-	for _, path := range expected {
-		_, err := client.GetFileContent(ctx, owner, repo, path)
-		if err != nil {
-			if forge.IsNotFound(err) {
-				missing = append(missing, path)
-				continue
-			}
-			return nil, fmt.Errorf("checking %s: %w", path, err)
-		}
-	}
-	return missing, nil
 }

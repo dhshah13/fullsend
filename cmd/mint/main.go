@@ -21,39 +21,38 @@ import (
 
 // buildHandler creates the HTTP handler chain from environment variables.
 func buildHandler() (http.Handler, error) {
-	allowedOrgs := splitCSV(os.Getenv("ALLOWED_ORGS"))
-	allowedWorkflows := splitCSV(os.Getenv("ALLOWED_WORKFLOW_FILES"))
+	h, _, err := buildHandlerAndTracer()
+	return h, err
+}
 
-	perRepoWIFRepos := make(map[string]bool)
-	for _, entry := range splitCSV(os.Getenv("PER_REPO_WIF_REPOS")) {
-		perRepoWIFRepos[strings.ToLower(entry)] = true
-	}
-
-	if len(allowedWorkflows) == 0 {
+// buildHandlerAndTracer is buildHandler that also returns the tracer (nil
+// when tracing is disabled) so the caller can drain pending exports on
+// shutdown.
+func buildHandlerAndTracer() (http.Handler, *mintcore.Tracer, error) {
+	if len(mintcore.SplitCSV(os.Getenv("ALLOWED_WORKFLOW_FILES"))) == 0 {
 		log.Printf("warning: ALLOWED_WORKFLOW_FILES is not set; all token requests will be rejected")
 	}
 
-	verifier := mintcore.NewJWKSVerifier(mintcore.JWKSVerifierConfig{
-		IssuerURL:            "https://token.actions.githubusercontent.com",
-		Audience:             os.Getenv("OIDC_AUDIENCE"),
-		HTTPClient:           &http.Client{Timeout: 30 * time.Second},
-		AllowedOrgs:          allowedOrgs,
-		AllowedWorkflowFiles: allowedWorkflows,
-		PerRepoWIFRepos:      perRepoWIFRepos,
+	verifier, err := mintcore.NewJWKSVerifier(mintcore.JWKSVerifierConfig{
+		IssuerURL: "https://token.actions.githubusercontent.com",
 	})
-
-	if err := registerCustomPermissions(); err != nil {
-		return nil, err
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating OIDC verifier: %w", err)
 	}
 
 	pemAccessor, err := mintcore.NewFilesystemPEMAccessor(os.Getenv("PEM_DIR"))
 	if err != nil {
-		return nil, fmt.Errorf("initializing PEM accessor: %w", err)
+		return nil, nil, fmt.Errorf("initializing PEM accessor: %w", err)
 	}
 
 	handler, err := mintcore.NewHandler(pemAccessor, verifier)
 	if err != nil {
-		return nil, fmt.Errorf("initializing handler: %w", err)
+		return nil, nil, fmt.Errorf("initializing handler: %w", err)
+	}
+
+	tracer, err := buildTracer()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	var serverHandler http.Handler = http.HandlerFunc(handler.ServeHTTP)
@@ -61,26 +60,29 @@ func buildHandler() (http.Handler, error) {
 	if fallbackURL := os.Getenv("FALLBACK_MINT_URL"); fallbackURL != "" {
 		parsed, parseErr := url.Parse(fallbackURL)
 		if parseErr != nil || strings.ToLower(parsed.Scheme) != "https" || parsed.Host == "" {
-			return nil, fmt.Errorf("FALLBACK_MINT_URL must be a valid https:// URL, got %q", fallbackURL)
+			return nil, nil, fmt.Errorf("FALLBACK_MINT_URL must be a valid https:// URL, got %q", fallbackURL)
 		}
 		localRoles, err := parseLocalRoles(os.Getenv("ROLE_APP_IDS"))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		serverHandler = newFallbackHandler(serverHandler, localRoles, fallbackURL)
 		log.Printf("fallback mint configured: %s (local roles: %v)", fallbackURL, sortedKeys(localRoles))
 	}
 
-	return serverHandler, nil
+	// Trace the whole chain, including fallback routing and proxy errors,
+	// not just the local mintcore handler. A nil tracer returns the
+	// handler unchanged.
+	return tracer.Wrap(serverHandler), tracer, nil
 }
 
 func run(ctx context.Context) error {
-	missing := checkRequired("ALLOWED_ORGS", "ROLE_APP_IDS", "OIDC_AUDIENCE", "PEM_DIR")
+	missing := checkRequired("ROLE_APP_IDS", "PEM_DIR")
 	if len(missing) > 0 {
 		return fmt.Errorf("required environment variables not set: %s", strings.Join(missing, ", "))
 	}
 
-	serverHandler, err := buildHandler()
+	serverHandler, tracer, err := buildHandlerAndTracer()
 	if err != nil {
 		return err
 	}
@@ -99,17 +101,26 @@ func run(ctx context.Context) error {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	// stopped is closed once shutdown, including the drain of pending
+	// trace exports, has finished, so run does not return (and the
+	// process exit) while exports are still in flight.
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		srv.Shutdown(shutdownCtx)
+		if err := tracer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("trace export drain incomplete: %v", err)
+		}
 	}()
 
 	log.Printf("fullsend-mint starting on :%s (standalone mode)", port)
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		return fmt.Errorf("server error: %w", err)
 	}
+	<-stopped
 	return nil
 }
 
@@ -131,19 +142,6 @@ func checkRequired(names ...string) []string {
 	return missing
 }
 
-func splitCSV(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var result []string
-	for _, entry := range strings.Split(s, ",") {
-		if trimmed := strings.TrimSpace(entry); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
 func parseLocalRoles(raw string) (map[string]bool, error) {
 	roles := make(map[string]bool)
 	if raw == "" {
@@ -162,27 +160,6 @@ func parseLocalRoles(raw string) (map[string]bool, error) {
 		}
 	}
 	return roles, nil
-}
-
-func registerCustomPermissions() error {
-	raw := os.Getenv("CUSTOM_ROLE_PERMISSIONS")
-	if raw == "" {
-		return nil
-	}
-	var perms map[string]map[string]string
-	if err := json.Unmarshal([]byte(raw), &perms); err != nil {
-		return fmt.Errorf("failed to parse CUSTOM_ROLE_PERMISSIONS: %w", err)
-	}
-	if err := mintcore.RegisterCustomRolePermissions(perms); err != nil {
-		return fmt.Errorf("registering custom role permissions: %w", err)
-	}
-	roles := make([]string, 0, len(perms))
-	for r := range perms {
-		roles = append(roles, r)
-	}
-	sort.Strings(roles)
-	log.Printf("custom role permissions registered: %v", roles)
-	return nil
 }
 
 func sortedKeys(m map[string]bool) []string {
